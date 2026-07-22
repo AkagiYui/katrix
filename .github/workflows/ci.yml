@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: build / vet / test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: katrix
+          POSTGRES_PASSWORD: katrix
+          POSTGRES_DB: katrix_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U katrix"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CGO_ENABLED: 0
+      KATRIX_TEST_DSN: postgres://katrix:katrix@localhost:5432/katrix_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: go build
+        run: go build ./...
+      - name: go vet
+        run: go vet ./...
+      - name: gofmt check
+        run: |
+          unformatted=$(gofmt -l $(find . -name '*.go' -not -path './tmp/*'))
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+      - name: go test
+        run: go test -race -count=1 ./...

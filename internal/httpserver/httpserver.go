@@ -1,0 +1,110 @@
+// Package httpserver assembles the HTTP routing for the whole homeserver:
+// Client-Server API, Server-Server API, media, admin and the embedded SPA. API
+// prefixes take priority; unmatched paths fall back to the web panel's
+// index.html for client-side routing.
+package httpserver
+
+import (
+	"io"
+	"io/fs"
+	"net/http"
+	"strings"
+
+	"github.com/AkagiYui/katrix/internal/csapi"
+	"github.com/AkagiYui/katrix/internal/federation"
+	"github.com/AkagiYui/katrix/internal/homeserver"
+	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/media"
+	"github.com/AkagiYui/katrix/internal/webui"
+)
+
+// New builds the top-level HTTP handler.
+func New(hs *homeserver.HS) (http.Handler, error) {
+	mux := http.NewServeMux()
+
+	cs := csapi.New(hs)
+	cs.Register(mux)
+
+	fed := federation.New(hs)
+	fed.Register(mux)
+
+	med := media.New(hs)
+	med.Register(mux)
+
+	// Health endpoint (also used by the healthcheck subcommand).
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		if err := hs.Store.Ping(r.Context()); err != nil {
+			httpx.WriteJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "error"})
+			return
+		}
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	// SPA fallback for everything else.
+	spa, err := spaHandler()
+	if err != nil {
+		return nil, err
+	}
+	mux.Handle("/", spa)
+
+	return withMiddleware(mux), nil
+}
+
+// apiPrefixes are never served by the SPA fallback.
+var apiPrefixes = []string{"/_matrix", "/_synapse", "/.well-known", "/health"}
+
+// spaHandler serves embedded static assets, falling back to index.html for
+// non-asset, non-API paths so client-side routing works.
+func spaHandler() (http.Handler, error) {
+	sub, err := webui.FS()
+	if err != nil {
+		return nil, err
+	}
+	fileServer := http.FileServer(http.FS(sub))
+	index, err := fs.ReadFile(sub, "index.html")
+	if err != nil {
+		return nil, err
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, p := range apiPrefixes {
+			if strings.HasPrefix(r.URL.Path, p) {
+				http.NotFound(w, r)
+				return
+			}
+		}
+		// If the requested asset exists, serve it; else serve index.html.
+		p := strings.TrimPrefix(r.URL.Path, "/")
+		if p == "" {
+			serveIndex(w, index)
+			return
+		}
+		if f, err := sub.Open(p); err == nil {
+			_ = f.Close()
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		serveIndex(w, index)
+	}), nil
+}
+
+func serveIndex(w http.ResponseWriter, index []byte) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, strings.NewReader(string(index)))
+}
+
+// withMiddleware applies CORS and server-header middleware globally.
+func withMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Server", "Katrix/"+homeserver.Version)
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
