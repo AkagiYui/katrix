@@ -14,7 +14,11 @@ SOCKDIR="/tmp/pg"
 KATRIX_DIR="/data/katrix"
 
 mkdir -p "$PGDATA" "$SOCKDIR" "$KATRIX_DIR"
+# /data is owned by postgres (for the PG data dir); the katrix runtime dir and
+# signing key must be writable by the katrix user, so chown just that subdir.
 chown -R postgres:postgres /data "$SOCKDIR"
+mkdir -p "$KATRIX_DIR"
+chown -R katrix:katrix "$KATRIX_DIR"
 
 # Clone the template cluster if this container has no data dir yet (the common
 # Complement case). cp -a preserves permissions; we then clear the old socket
