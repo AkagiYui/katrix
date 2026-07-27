@@ -82,20 +82,20 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	}
 	isDirect := req.IsDirect != nil && *req.IsDirect
 
-	// For pre-v12 the room ID is random; for v12 it is derived from the create
-	// hash. We build the create first with a placeholder ID, then (for v12)
-	// re-derive. To keep it simple: generate a random ID for all versions; the
-	// spec only requires v12 IDs be the hash, and Complement's basic suite
-	// accepts random v12 IDs as long as federation isn't exercised. Full v12
-	// derivation is wired in P5/P6.
-	roomID := ids.NewRoomID(a.ServerName())
+	// For pre-v12 the room ID is a random localpart; for v12 (MSC4291) the room
+	// ID is derived from the create event's reference hash. BuildInitialEvents
+	// handles the derivation: it builds the create event (omitting room_id for
+	// v12), derives the hash, and returns the resolved room ID in
+	// InitialEventsResult.RoomID. We then use that ID for persistence.
+	seedRoomID := ids.NewRoomID(a.ServerName())
 	now := a.Now()
 
-	initRes, err := rooms.BuildInitialEvents(roomID, version, auth.UserID, preset, req.PowerLevelOverride, isDirect, a.ServerName(), a.Key, now)
+	initRes, err := rooms.BuildInitialEvents(seedRoomID, version, auth.UserID, preset, req.PowerLevelOverride, isDirect, a.ServerName(), a.Key, now)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	roomID := initRes.RoomID
 
 	// Persist the room + initial state events.
 	{
@@ -107,7 +107,7 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, ev := range initRes.Events {
-			if err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
+			if err := persistEventInRoom(r.Context(), a.Store, ev, version, roomID); err != nil {
 				httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 				return
 			}
@@ -992,10 +992,20 @@ func (a *API) buildStateSnapshot(ctx context.Context, roomID, target, sender str
 
 // persistEvent inserts an event row derived from a signed Event.
 func persistEvent(ctx context.Context, store *storage.Store, ev *events.Event, version roomver.Version) error {
+	return persistEventInRoom(ctx, store, ev, version, ev.RoomID())
+}
+
+// persistEventInRoom inserts an event row, using roomID when the event itself
+// carries no room_id (the v12 m.room.create event omits it per MSC4291; the
+// room ID is the create's reference hash and is stored on the row instead).
+func persistEventInRoom(ctx context.Context, store *storage.Store, ev *events.Event, version roomver.Version, roomID string) error {
 	sk, _ := ev.StateKey()
+	if roomID == "" {
+		roomID = ev.RoomID()
+	}
 	row := &storage.EventRow{
 		EventID:        ev.EventID(),
-		RoomID:         ev.RoomID(),
+		RoomID:         roomID,
 		Type:           ev.Type(),
 		StateKey:       sk,
 		Sender:         ev.Sender(),

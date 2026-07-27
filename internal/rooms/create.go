@@ -154,8 +154,19 @@ func BuildInitialEvents(
 	key *crypto.SigningKey,
 	now int64,
 ) (*InitialEventsResult, error) {
-	if _, ok := roomver.Get(version); !ok {
+	rules, ok := roomver.Get(version)
+	if !ok {
 		return nil, fmt.Errorf("rooms: unsupported room version %q", version)
+	}
+
+	// For v12 (MSC4291), the room ID is derived from the create event's
+	// reference hash, and the create event itself MUST NOT carry a room_id
+	// field. We build the create with an empty room_id, derive the v12 room ID,
+	// and use it for the remaining events. For earlier versions the caller-
+	// supplied roomID is used directly in all events.
+	v12RoomID := roomID
+	if rules.RoomIDIsCreateHash {
+		roomID = "" // create event omits room_id; the derived id is filled below.
 	}
 
 	// create content
@@ -169,10 +180,18 @@ func BuildInitialEvents(
 	}
 	createRaw, _ := json.Marshal(createContent)
 
-	// Build create event (depth 0, no prev/auth).
+	// Build create event (depth 0, no prev/auth). For v12 the room_id field is
+	// omitted from the event JSON.
 	createEv, err := buildAndSign(serverName, key, version, "m.room.create", "", creator, roomID, createRaw, now, 0, nil, nil)
 	if err != nil {
 		return nil, err
+	}
+
+	// For v12, derive the real room ID from the create event's reference hash
+	// (room ID = "!" + url-safe base64 reference hash of the create event).
+	if rules.RoomIDIsCreateHash {
+		v12RoomID = BuildV12RoomID(version, createEv, serverName)
+		roomID = v12RoomID
 	}
 
 	// power_levels
@@ -213,7 +232,7 @@ func BuildInitialEvents(
 
 	evs := []*events.Event{createEv, creatorJoin, plEv, jrEv, hvEv}
 	return &InitialEventsResult{
-		RoomID:  roomID,
+		RoomID:  v12RoomID,
 		Events:  evs,
 		Version: version,
 		Create:  createEv,

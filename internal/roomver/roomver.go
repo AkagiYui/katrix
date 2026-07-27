@@ -154,7 +154,7 @@ func init() {
 
 // Default is the room version used for new rooms when the client does not
 // request one. The spec recommends v12 as of spec v1.19.
-const Default Version = "11"
+const Default Version = "12"
 
 // Supported lists every room version this server implements.
 func Supported() []Version {

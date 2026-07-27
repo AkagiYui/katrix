@@ -60,7 +60,7 @@ func (a *API) Capabilities(w http.ResponseWriter, r *http.Request) {
 			"m.set_avatar_url":  map[string]any{"enabled": true},
 			"m.3pid_changes":    map[string]any{"enabled": false},
 			"m.room_versions": map[string]any{
-				"default":   "11",
+				"default":   "12",
 				"available": roomVersionCapabilities(),
 			},
 		},

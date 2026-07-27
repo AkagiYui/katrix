@@ -38,7 +38,13 @@ func (b *Builder) Build(serverName string, key *crypto.SigningKey, version roomv
 	obj := map[string]json.RawMessage{}
 	setString(obj, "type", b.Type)
 	setString(obj, "sender", b.Sender)
-	setString(obj, "room_id", b.RoomID)
+	// For v12 (MSC4291) the m.room.create event omits room_id (the room id is
+	// derived from its reference hash). For all other events the room_id is
+	// mandatory; an empty value means the caller is intentionally omitting it
+	// (only valid for the v12 create).
+	if b.RoomID != "" || !rules.RoomIDIsCreateHash || b.Type != "m.room.create" {
+		setString(obj, "room_id", b.RoomID)
+	}
 	obj["content"] = nonNil(b.Content, `{}`)
 	obj["depth"] = mustJSON(b.Depth)
 	obj["origin_server_ts"] = mustJSON(b.OriginServerTS)
