@@ -12,11 +12,17 @@ import (
 // API bundles the Client-Server handlers.
 type API struct {
 	*homeserver.HS
-	uia *uiaStore
+	uia        *uiaStore
+	syncEngine *syncEngine
+	typing     *typingTracker
 }
 
 // New constructs the CS API surface.
-func New(hs *homeserver.HS) *API { return &API{HS: hs, uia: newUIAStore()} }
+func New(hs *homeserver.HS) *API {
+	typing := newTypingTracker()
+	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, typing), typing: typing}
+	return api
+}
 
 // supportedVersions is the list of Client-Server spec versions Katrix
 // self-reports. Per the design doc we only advertise versions whose behaviour

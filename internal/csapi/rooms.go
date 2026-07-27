@@ -626,7 +626,8 @@ func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 }
 
 // RoomTyping handles PUT /_matrix/client/v3/rooms/{roomID}/typing/{userID}.
-// (Typing state is ephemeral and lives in memory for P3 sync; here we just ack.)
+// Typing state is ephemeral, held in the in-memory TypingTracker and surfaced
+// to other users via /sync ephemeral events.
 func (a *API) RoomTyping(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomID := r.PathValue("roomID")
@@ -639,8 +640,14 @@ func (a *API) RoomTyping(w http.ResponseWriter, r *http.Request) {
 		writeRoomErr(w, err)
 		return
 	}
-	// Drain body; typing broadcast is wired in P3.
-	_, _ = readBody(r)
+	var req struct {
+		Typing  bool `json:"typing"`
+		Timeout int  `json:"timeout"`
+	}
+	_ = httpx.DecodeJSON(w, r, &req)
+	a.typing.SetTyping(roomID, auth.UserID, req.Typing)
+	// Wake other joined users so their /sync picks up the ephemeral change.
+	a.notifyRoomMembers(r.Context(), roomID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
