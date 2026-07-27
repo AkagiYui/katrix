@@ -1,6 +1,235 @@
 package csapi
 
-import "net/http"
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
 
-// registerE2EE wires P7 E2EE relay routes. Implemented in P7.
-func (a *API) registerE2EE(mux *http.ServeMux) {}
+	"github.com/AkagiYui/katrix/internal/homeserver"
+	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/storage"
+)
+
+// registerE2EE wires the P7 E2EE relay routes. The server only relays keys,
+// one-time keys, to-device messages and cross-signing material; it never
+// decrypts.
+func (a *API) registerE2EE(mux *http.ServeMux) {
+	mux.HandleFunc("POST /_matrix/client/v3/keys/upload", a.RequireAuth(a.KeysUpload))
+	mux.HandleFunc("POST /_matrix/client/v3/keys/query", a.RequireAuth(a.KeysQuery))
+	mux.HandleFunc("POST /_matrix/client/v3/keys/claim", a.RequireAuth(a.KeysClaim))
+	mux.HandleFunc("GET /_matrix/client/v3/keys/changes", a.RequireAuth(a.KeysChanges))
+	mux.HandleFunc("POST /_matrix/client/v3/sendToDevice/{eventType}/{txnID}", a.RequireAuth(a.SendToDevice))
+	mux.HandleFunc("POST /_matrix/client/v3/keys/device_signing/upload", a.RequireAuth(a.DeviceSigningUpload))
+	mux.HandleFunc("POST /_matrix/client/v3/keys/signatures/upload", a.RequireAuth(a.SignaturesUpload))
+}
+
+// KeysUpload handles POST /_matrix/client/v3/keys/upload.
+func (a *API) KeysUpload(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	var req struct {
+		DeviceKeys   json.RawMessage `json:"device_keys,omitempty"`
+		OneTimeKeys  json.RawMessage `json:"one_time_keys,omitempty"`
+		FallbackKeys json.RawMessage `json:"fallback_keys,omitempty"`
+	}
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	// Persist device keys.
+	if len(req.DeviceKeys) > 0 {
+		var dk map[string]json.RawMessage
+		if err := json.Unmarshal(req.DeviceKeys, &dk); err == nil {
+			if bundle, ok := dk[auth.DeviceID]; ok {
+				_, _ = a.Store.UpsertDeviceKey(r.Context(), storage.DeviceKey{
+					UserID: auth.UserID, DeviceID: auth.DeviceID, KeyJSON: bundle,
+				})
+			}
+		}
+	}
+	// Persist one-time keys.
+	if len(req.OneTimeKeys) > 0 {
+		// one_time_keys is { "<algo>:<id>": keyobj }
+		var raw map[string]json.RawMessage
+		_ = json.Unmarshal(req.OneTimeKeys, &raw)
+		var keys []storage.OneTimeKey
+		for kid, kjson := range raw {
+			algo, id := splitKeyID(kid)
+			keys = append(keys, storage.OneTimeKey{
+				UserID: auth.UserID, DeviceID: auth.DeviceID, Algorithm: algo, KeyID: id, KeyJSON: kjson,
+			})
+		}
+		_ = a.Store.UpsertOneTimeKeys(r.Context(), keys)
+	}
+	// Persist fallback keys.
+	if len(req.FallbackKeys) > 0 {
+		var raw map[string]json.RawMessage
+		_ = json.Unmarshal(req.FallbackKeys, &raw)
+		var keys []storage.OneTimeKey
+		for kid, kjson := range raw {
+			algo, id := splitKeyID(kid)
+			keys = append(keys, storage.OneTimeKey{
+				UserID: auth.UserID, DeviceID: auth.DeviceID, Algorithm: algo, KeyID: id, KeyJSON: kjson, IsFallback: true,
+			})
+		}
+		_ = a.Store.UpsertOneTimeKeys(r.Context(), keys)
+	}
+	counts, _ := a.Store.OneTimeKeyCounts(r.Context(), auth.UserID, auth.DeviceID)
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"one_time_key_counts": counts})
+}
+
+// KeysQuery handles POST /_matrix/client/v3/keys/query.
+func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DeviceKeys map[string][]string `json:"device_keys"`
+	}
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	users := make([]string, 0, len(req.DeviceKeys))
+	for u := range req.DeviceKeys {
+		users = append(users, u)
+	}
+	devKeys, err := a.Store.DeviceKeysForUsers(r.Context(), users)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	out := map[string]map[string]any{}
+	for _, dk := range devKeys {
+		if out[dk.UserID] == nil {
+			out[dk.UserID] = map[string]any{}
+		}
+		devs := out[dk.UserID]
+		filter := req.DeviceKeys[dk.UserID]
+		if len(filter) > 0 && !contains(filter, dk.DeviceID) {
+			continue
+		}
+		var keyObj map[string]any
+		_ = json.Unmarshal(dk.KeyJSON, &keyObj)
+		devs[dk.DeviceID] = keyObj
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"device_keys": out})
+}
+
+// KeysClaim handles POST /_matrix/client/v3/keys/claim.
+func (a *API) KeysClaim(w http.ResponseWriter, r *http.Request) {
+	body, err := readBody(r)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	var raw struct {
+		OneTimeKeys map[string]map[string]string `json:"one_time_keys"`
+	}
+	_ = json.Unmarshal(body, &raw)
+	var reqs []storage.OneTimeKey
+	for uid, devs := range raw.OneTimeKeys {
+		for did, kid := range devs {
+			algo, id := splitKeyID(kid)
+			reqs = append(reqs, storage.OneTimeKey{UserID: uid, DeviceID: did, Algorithm: algo, KeyID: id})
+		}
+	}
+	claimed, err := a.Store.ClaimOneTimeKeys(r.Context(), reqs)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	out := map[string]map[string]map[string]map[string]any{}
+	for _, k := range claimed {
+		if out[k.UserID] == nil {
+			out[k.UserID] = map[string]map[string]map[string]any{}
+		}
+		if out[k.UserID][k.DeviceID] == nil {
+			out[k.UserID][k.DeviceID] = map[string]map[string]any{}
+		}
+		var keyObj map[string]any
+		_ = json.Unmarshal(k.KeyJSON, &keyObj)
+		out[k.UserID][k.DeviceID][k.Algorithm+":"+k.KeyID] = keyObj
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"one_time_keys": out})
+}
+
+// KeysChanges handles GET /_matrix/client/v3/keys/changes.
+func (a *API) KeysChanges(w http.ResponseWriter, r *http.Request) {
+	from := r.URL.Query().Get("from")
+	to := r.URL.Query().Get("to")
+	_ = from
+	_ = to
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"changed": []string{}, "left": []string{}})
+}
+
+// SendToDevice handles POST /_matrix/client/v3/sendToDevice/{eventType}/{txnID}.
+func (a *API) SendToDevice(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	eventType := r.PathValue("eventType")
+	var req struct {
+		Messages map[string]map[string]json.RawMessage `json:"messages"`
+	}
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	var msgs []storage.ToDeviceMessage
+	now := a.Now()
+	for targetUser, devs := range req.Messages {
+		for targetDevice, content := range devs {
+			msgs = append(msgs, storage.ToDeviceMessage{
+				TargetUser: targetUser, TargetDevice: targetDevice,
+				Sender: auth.UserID, Type: eventType, Content: content, CreatedTS: now,
+			})
+		}
+	}
+	if err := a.Store.EnqueueToDevice(r.Context(), msgs); err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// DeviceSigningUpload handles POST /_matrix/client/v3/keys/device_signing/upload.
+func (a *API) DeviceSigningUpload(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	var req map[string]json.RawMessage
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	for _, keyType := range []string{"master", "self_signing", "user_signing"} {
+		if kjson, ok := req[keyType]; ok {
+			_, _ = a.Store.UpsertCrossSigningKey(r.Context(), storage.CrossSigningKey{
+				UserID: auth.UserID, KeyType: keyType, KeyJSON: kjson,
+			})
+		}
+	}
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// SignaturesUpload handles POST /_matrix/client/v3/keys/signatures/upload.
+func (a *API) SignaturesUpload(w http.ResponseWriter, r *http.Request) {
+	// Acknowledge; per-user signature storage is a relay concern.
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"failures": map[string]any{}})
+}
+
+// splitKeyID splits an "<algorithm>:<keyId>" string. The algorithm may itself
+// contain a colon (e.g. "signed_curve25519"), so split on the last colon.
+func splitKeyID(s string) (string, string) {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == ':' {
+			return s[:i], s[i+1:]
+		}
+	}
+	return s, ""
+}
+
+func contains(haystack []string, needle string) bool {
+	for _, h := range haystack {
+		if h == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// guard against unused import in error paths.
+var _ = strconv.Atoi

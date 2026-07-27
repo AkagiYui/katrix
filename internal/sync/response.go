@@ -69,6 +69,7 @@ type PresenceResp struct {
 type SyncOptions struct {
 	UserID      string
 	Localpart   string
+	DeviceID    string
 	Since       Token
 	Timeout     time.Duration
 	FullState   bool
@@ -203,6 +204,19 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 
 	// Next batch token is the current max stream.
 	resp.NextBatch = Token{Stream: maxStream}.Encode()
+
+	// To-device messages: deliver any queued for this device. DequeueToDevice
+	// deletes on delivery, so each message is received exactly once; pass
+	// since=0 to drain the queue each cycle.
+	td, err := e.store.DequeueToDevice(ctx, opts.UserID, opts.DeviceID, 0)
+	if err == nil && len(td) > 0 {
+		events := make([]json.RawMessage, 0, len(td))
+		for _, m := range td {
+			ev := mustMarshalEvent(m.Type, m.Sender, "", m.Content, m.CreatedTS, "")
+			events = append(events, ev)
+		}
+		resp.ToDevice = &EventsSection{Events: events}
+	}
 	return resp, nil
 }
 

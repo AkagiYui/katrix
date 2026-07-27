@@ -40,6 +40,7 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 	opts := syncpkg.SyncOptions{
 		UserID:    auth.UserID,
 		Localpart: auth.Localpart,
+		DeviceID:  auth.DeviceID,
 		Since:     since,
 		Timeout:   timeout,
 		FullState: fullState,
