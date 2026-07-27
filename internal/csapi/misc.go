@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/netutil/ssrf"
 )
 
 // registerMisc wires the P8 misc routes: push rules, filters, URL preview and
@@ -241,53 +241,31 @@ func (a *API) PublicRooms(w http.ResponseWriter, r *http.Request) {
 }
 
 // PreviewURL handles GET /_matrix/.../preview_url. Fetches the target URL,
-// parses OpenGraph metadata, and returns it. SSRF protection blocks private/
-// loopback/link-local addresses.
+// parses OpenGraph metadata, and returns it. SSRF protection is enforced at
+// the DNS layer: the host is resolved and every IP is checked against the
+// private/loopback/link-local/reserved ranges before dialling, and again at
+// dial time to defeat DNS rebinding. Redirects, body size and timeout are all
+// capped.
 func (a *API) PreviewURL(w http.ResponseWriter, r *http.Request) {
 	target := r.URL.Query().Get("url")
 	if target == "" {
 		httpx.WriteError(w, httpx.ErrMissingParam("url required"))
 		return
 	}
-	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
-		httpx.WriteError(w, httpx.ErrInvalidParam("url must be absolute"))
+	if !ssrf.EnsurePrefixes(target) {
+		httpx.WriteError(w, httpx.ErrInvalidParam("url must be absolute http(s)"))
 		return
 	}
-	if isPrivateURL(target) {
-		httpx.WriteError(w, httpx.NewError(http.StatusForbidden, "M_FORBIDDEN", "refused to preview private/loopback URL"))
-		return
-	}
-	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
+	resp, err := ssrf.Fetch(r.Context(), target, ssrf.DefaultLimits)
 	if err != nil {
-		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
-		return
-	}
-	req.Header.Set("User-Agent", "Katrix-URLPreview/1.0")
-	req.Header.Set("Accept", "text/html")
-	resp, err := client.Do(req)
-	if err != nil {
-		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		httpx.WriteError(w, httpx.NewError(http.StatusForbidden, "M_FORBIDDEN", "refused to preview url: "+err.Error()))
 		return
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, _ := io.ReadAll(resp.Body)
 	og := extractOpenGraph(string(body))
 	og["org.matrix.msc4095"] = map[string]any{}
 	httpx.WriteJSON(w, http.StatusOK, og)
-}
-
-// isPrivateURL performs a coarse SSRF check by rejecting hosts that look like
-// loopback/private/link-local addresses. Full resolution-based checks would
-// dial the host; this string check covers the common cases.
-func isPrivateURL(rawURL string) bool {
-	lower := strings.ToLower(rawURL)
-	for _, bad := range []string{"localhost", "127.0.0.1", "0.0.0.0", "10.", "192.168.", "169.254.", "::1", "fc00:", "fe80:"} {
-		if strings.Contains(lower, bad) {
-			return true
-		}
-	}
-	return false
 }
 
 // extractOpenGraph pulls og:title/og:description/og:image from an HTML doc.

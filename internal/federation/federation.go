@@ -23,9 +23,13 @@ type API struct {
 // New constructs the federation API surface with an outbound client for key
 // fetching and a per-event PDU signature verifier backed by that client.
 func New(hs *homeserver.HS) *API {
-	client := NewClient(hs.Store)
+	client := NewClient(hs.Store, hs.Key, hs.ServerName())
 	return &API{HS: hs, client: client, verifier: fedverify.New(client)}
 }
+
+// Client exposes the outbound federation client for other subsystems (e.g. the
+// media API uses it to lazily fetch remote media).
+func (a *API) Client() *Client { return a.client }
 
 // keyValidityWindow is how long a published server key set is considered valid.
 const keyValidityMillis = 24 * 60 * 60 * 1000

@@ -28,7 +28,7 @@ func New(hs *homeserver.HS) (http.Handler, error) {
 	fed := federation.New(hs)
 	fed.Register(mux)
 
-	med := media.New(hs)
+	med := media.New(hs, fed.Client())
 	med.Register(mux)
 
 	// Health endpoint (also used by the healthcheck subcommand).

@@ -1,6 +1,7 @@
 // Package media implements the Matrix content repository: upload, download,
 // thumbnailing (pure Go). Media bytes are stored on the local filesystem;
-// metadata and thumbnails in Postgres.
+// metadata and thumbnails in Postgres. Remote media (mxc://other-server/id)
+// is lazily fetched over federation on first access and cached locally.
 package media
 
 import (
@@ -23,19 +24,29 @@ import (
 	_ "image/gif" // decode gif
 )
 
+// RemoteFetcher fetches a media blob from a remote server over federation.
+// The federation Client implements this; the interface decouples media from
+// federation.
+type RemoteFetcher interface {
+	DownloadMedia(ctx context.Context, serverName, mediaID string) (body []byte, contentType string, err error)
+}
+
 // API bundles the content-repository handlers.
 type API struct {
 	*homeserver.HS
 	backend *FileBackend
+	remote  RemoteFetcher
 }
 
-// New constructs the media API surface with a filesystem backend.
-func New(hs *homeserver.HS) *API {
+// New constructs the media API surface with a filesystem backend. remote is
+// the outbound federation client used to lazily fetch remote media; pass nil
+// to disable remote fetching (returns M_NOT_FOUND).
+func New(hs *homeserver.HS, remote RemoteFetcher) *API {
 	backend, err := NewFileBackend(hs.Store, hs.Config.Media.StorePath)
 	if err != nil {
 		panic("media: " + err.Error())
 	}
-	return &API{HS: hs, backend: backend}
+	return &API{HS: hs, backend: backend, remote: remote}
 }
 
 // Register wires media routes.
@@ -84,14 +95,21 @@ func (a *API) Upload(w http.ResponseWriter, r *http.Request) {
 func (a *API) Download(w http.ResponseWriter, r *http.Request) {
 	mediaID := r.PathValue("mediaID")
 	serverName := r.PathValue("serverName")
-	if serverName != a.ServerName() {
-		httpx.WriteError(w, httpx.NewError(http.StatusNotFound, "M_NOT_FOUND", "remote media not supported"))
-		return
-	}
 	f, meta, err := a.backend.Download(r.Context(), mediaID)
 	if err != nil {
-		httpx.WriteError(w, httpx.ErrNotFound("media not found"))
-		return
+		// Local miss: if the media belongs to a remote server, lazily fetch it
+		// over federation and cache it.
+		if serverName != a.ServerName() && a.remote != nil {
+			if err := a.cacheRemote(r.Context(), serverName, mediaID); err != nil {
+				httpx.WriteError(w, httpx.NewError(http.StatusNotFound, "M_NOT_FOUND", "remote media not available: "+err.Error()))
+				return
+			}
+			f, meta, err = a.backend.Download(r.Context(), mediaID)
+		}
+		if err != nil {
+			httpx.WriteError(w, httpx.ErrNotFound("media not found"))
+			return
+		}
 	}
 	defer f.Close()
 	w.Header().Set("Content-Type", meta.ContentType)
@@ -106,8 +124,17 @@ func (a *API) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	mediaID := r.PathValue("mediaID")
 	serverName := r.PathValue("serverName")
 	if serverName != a.ServerName() {
-		httpx.WriteError(w, httpx.NewError(http.StatusNotFound, "M_NOT_FOUND", "remote media not supported"))
-		return
+		// Ensure remote media is cached before generating a thumbnail.
+		if _, _, err := a.backend.Download(r.Context(), mediaID); err != nil {
+			if a.remote == nil {
+				httpx.WriteError(w, httpx.NewError(http.StatusNotFound, "M_NOT_FOUND", "remote media not supported"))
+				return
+			}
+			if err := a.cacheRemote(r.Context(), serverName, mediaID); err != nil {
+				httpx.WriteError(w, httpx.NewError(http.StatusNotFound, "M_NOT_FOUND", "remote media not available: "+err.Error()))
+				return
+			}
+		}
 	}
 	q := r.URL.Query()
 	width, _ := strconv.Atoi(q.Get("width"))
@@ -141,6 +168,24 @@ func (a *API) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(out.data)))
 	w.Header().Set("Cache-Control", "public,max-age=86400")
 	_, _ = w.Write(out.data)
+}
+
+// cacheRemote fetches a remote media blob over federation and stores it locally
+// so subsequent requests are served from cache.
+func (a *API) cacheRemote(ctx context.Context, serverName, mediaID string) error {
+	if a.remote == nil {
+		return fmt.Errorf("remote media fetching disabled")
+	}
+	body, contentType, err := a.remote.DownloadMedia(ctx, serverName, mediaID)
+	if err != nil {
+		return err
+	}
+	now := a.Now()
+	// Store the blob via the backend's Upload path with the remote origin set.
+	if _, err := a.backend.UploadRemote(ctx, bytes.NewReader(body), contentType, "", serverName, mediaID, now); err != nil {
+		return err
+	}
+	return nil
 }
 
 type thumbResult struct {

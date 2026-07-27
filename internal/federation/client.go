@@ -18,18 +18,25 @@ import (
 // server discovery is delegated to Go's net/http (resolves hostnames); the
 // .well-known delegation is honoured for the base URL.
 type Client struct {
-	store *storage.Store
-	http  *http.Client
+	store      *storage.Store
+	key        *crypto.SigningKey
+	serverName string
+	http       *http.Client
 }
 
 // NewClient constructs an outbound federation client backed by store for key
-// caching.
-func NewClient(store *storage.Store) *Client {
+// caching. The signing key + serverName are used to sign outbound requests.
+func NewClient(store *storage.Store, key *crypto.SigningKey, serverName string) *Client {
 	return &Client{
-		store: store,
-		http:  &http.Client{Timeout: 30 * time.Second},
+		store:      store,
+		key:        key,
+		serverName: serverName,
+		http:       &http.Client{Timeout: 30 * time.Second},
 	}
 }
+
+// originName returns the local server name used to sign outbound requests.
+func (c *Client) originName() string { return c.serverName }
 
 // serverKeyResponse is the GET /_matrix/key/v2/server response.
 type serverKeyResponse struct {
@@ -125,4 +132,38 @@ func (c *Client) serverBaseURL(serverName string) string {
 		host = host + ":8448"
 	}
 	return "https://" + host
+}
+
+// DownloadMedia fetches a media blob from a remote server over federation
+// (GET /_matrix/media/v3/download/{serverName}/{mediaId}). The body is the raw
+// blob; the content type comes from the response headers. Used to lazily fetch
+// remote media when a local client requests it.
+func (c *Client) DownloadMedia(ctx context.Context, serverName, mediaID string) (body []byte, contentType string, err error) {
+	base := c.serverBaseURL(serverName)
+	url := base + "/_matrix/media/v3/download/" + serverName + "/" + mediaID
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	// Federation requests are signed; the remote server verifies our signature.
+	if err := signRequestWith(req, c.originName(), c.key); err != nil {
+		return nil, "", err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("federation: download media from %s: %w", serverName, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("federation: media from %s: HTTP %d", serverName, resp.StatusCode)
+	}
+	body, err = io.ReadAll(io.LimitReader(resp.Body, 50<<20))
+	if err != nil {
+		return nil, "", err
+	}
+	contentType = resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	return body, contentType, nil
 }

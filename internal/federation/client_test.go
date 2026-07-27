@@ -46,7 +46,7 @@ func TestFetchServerKeysCachesRemoteKeys(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	c := NewClient(store)
+	c := NewClient(store, nil, "")
 	// Override the base URL resolver to point at our test server.
 	ctx := context.Background()
 	// Manually inject via a fetch with the test server URL by overriding

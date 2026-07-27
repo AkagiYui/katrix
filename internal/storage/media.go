@@ -9,33 +9,61 @@ import (
 
 // MediaRow is a media metadata row.
 type MediaRow struct {
-	MediaID     string
-	ContentType string
-	UploadName  string
-	UserID      string
-	Size        int64
-	SHA256      string
-	Blurhash    string
-	CreatedTS   int64
+	MediaID      string
+	OriginServer string // "" for local; the remote server name for federated media
+	ContentType  string
+	UploadName   string
+	UserID       string
+	Size         int64
+	SHA256       string
+	Blurhash     string
+	CreatedTS    int64
+	CachedTS     int64 // when remote media was locally cached (0 for local)
 }
 
-// CreateMedia inserts media metadata.
+// CreateMedia inserts media metadata. For local media OriginServer should be
+// the local server name; for remote-cached media it is the originating server.
 func (s *Store) CreateMedia(ctx context.Context, m MediaRow) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO media(media_id, content_type, upload_name, user_id, size, sha256, blurhash, created_ts)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-		m.MediaID, m.ContentType, nullString(m.UploadName), m.UserID, m.Size, m.SHA256, nullString(m.Blurhash), m.CreatedTS)
+		`INSERT INTO media(media_id, origin_server, content_type, upload_name, user_id, size, sha256, blurhash, created_ts, cached_ts)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		 ON CONFLICT (origin_server, media_id) DO UPDATE SET cached_ts=EXCLUDED.cached_ts`,
+		m.MediaID, m.OriginServer, m.ContentType, nullString(m.UploadName), m.UserID, m.Size, m.SHA256, nullString(m.Blurhash), m.CreatedTS, m.CachedTS)
 	return err
 }
 
-// GetMedia fetches media metadata by id.
+// GetMedia fetches media metadata by id. Use this for local media (origin is
+// implied). For remote media use GetRemoteMedia.
 func (s *Store) GetMedia(ctx context.Context, mediaID string) (*MediaRow, error) {
 	var m MediaRow
 	var uploadName, blur *string
 	err := s.pool.QueryRow(ctx,
-		`SELECT media_id, content_type, upload_name, user_id, size, sha256, blurhash, created_ts
+		`SELECT media_id, COALESCE(origin_server,''), content_type, upload_name, user_id, size, sha256, blurhash, created_ts, COALESCE(cached_ts,0)
 		 FROM media WHERE media_id=$1`, mediaID,
-	).Scan(&m.MediaID, &m.ContentType, &uploadName, &m.UserID, &m.Size, &m.SHA256, &blur, &m.CreatedTS)
+	).Scan(&m.MediaID, &m.OriginServer, &m.ContentType, &uploadName, &m.UserID, &m.Size, &m.SHA256, &blur, &m.CreatedTS, &m.CachedTS)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if uploadName != nil {
+		m.UploadName = *uploadName
+	}
+	if blur != nil {
+		m.Blurhash = *blur
+	}
+	return &m, nil
+}
+
+// GetRemoteMedia fetches media metadata by (origin server, media id).
+func (s *Store) GetRemoteMedia(ctx context.Context, originServer, mediaID string) (*MediaRow, error) {
+	var m MediaRow
+	var uploadName, blur *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT media_id, COALESCE(origin_server,''), content_type, upload_name, user_id, size, sha256, blurhash, created_ts, COALESCE(cached_ts,0)
+		 FROM media WHERE origin_server=$1 AND media_id=$2`, originServer, mediaID,
+	).Scan(&m.MediaID, &m.OriginServer, &m.ContentType, &uploadName, &m.UserID, &m.Size, &m.SHA256, &blur, &m.CreatedTS, &m.CachedTS)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound

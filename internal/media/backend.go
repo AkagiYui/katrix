@@ -48,13 +48,10 @@ func (b *FileBackend) Upload(ctx context.Context, r io.Reader, contentType, uplo
 		return "", err
 	}
 	if err := b.store.CreateMedia(ctx, storage.MediaRow{
-		MediaID:     mediaID,
-		ContentType: contentType,
-		UploadName:  uploadName,
-		UserID:      userID,
-		Size:        size,
-		SHA256:      hex.EncodeToString(h.Sum(nil)),
-		CreatedTS:   now,
+		MediaID: mediaID,
+		// Local media: origin server is left empty so GetMedia (by mediaID) works.
+		ContentType: contentType, UploadName: uploadName, UserID: userID,
+		Size: size, SHA256: hex.EncodeToString(h.Sum(nil)), CreatedTS: now,
 	}); err != nil {
 		_ = os.Remove(path)
 		return "", err
@@ -62,7 +59,41 @@ func (b *FileBackend) Upload(ctx context.Context, r io.Reader, contentType, uplo
 	return mediaID, nil
 }
 
-// Download opens the blob for reading and returns metadata.
+// UploadRemote stores a fetched remote media blob with a known media id and
+// originating server name. Subsequent lookups use GetRemoteMedia(server, id).
+// It is idempotent: re-fetching the same remote media overwrites the cache.
+func (b *FileBackend) UploadRemote(ctx context.Context, r io.Reader, contentType, uploadName, originServer, mediaID string, now int64) (string, error) {
+	path := b.blobPath(mediaID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	mw := io.MultiWriter(f, h)
+	size, err := io.Copy(mw, io.LimitReader(r, maxFileRead))
+	if err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := b.store.CreateMedia(ctx, storage.MediaRow{
+		MediaID: mediaID, OriginServer: originServer,
+		ContentType: contentType, UploadName: uploadName,
+		Size: size, SHA256: hex.EncodeToString(h.Sum(nil)),
+		CreatedTS: now, CachedTS: now,
+	}); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return mediaID, nil
+}
+
+// Download opens the blob for reading and returns metadata. It tries the
+// local-media lookup first, then the remote-media lookup by id (the origin is
+// irrelevant for a cache hit).
 func (b *FileBackend) Download(ctx context.Context, mediaID string) (*os.File, *storage.MediaRow, error) {
 	meta, err := b.store.GetMedia(ctx, mediaID)
 	if err != nil {
