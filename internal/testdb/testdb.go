@@ -70,11 +70,13 @@ func Acquire(ctx context.Context) (*pgx.Conn, error) {
 func Truncate(ctx context.Context, pool pgxConn) error {
 	_, err := pool.Exec(ctx, `
 		TRUNCATE TABLE
+			forward_extremities,
 			to_device_messages, room_keys, key_backup_versions,
 			cross_signing_keys, one_time_keys, device_keys,
 			receipts, account_data,
 			room_memberships, room_state, room_aliases,
 			events, rooms, registration_tokens,
+			media_thumbnails, media,
 			access_tokens, devices, users
 		CASCADE`)
 	return err

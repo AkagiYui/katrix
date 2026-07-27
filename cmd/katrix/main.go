@@ -111,7 +111,7 @@ func runServe(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	store, err := storage.Open(ctx, cfg.Database.DSN)
+	store, err := storage.OpenWithConfig(ctx, cfg.Database.DSN, cfg.Database.MaxConns, cfg.Database.MinConns)
 	if err != nil {
 		return err
 	}

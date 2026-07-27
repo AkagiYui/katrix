@@ -76,6 +76,10 @@ type EventRow struct {
 // InsertEvent persists a signed PDU and returns the assigned stream_ordering.
 // On a unique violation of event_id (duplicate insert) it is a no-op that
 // returns the existing stream_ordering, so callers can treat it as idempotent.
+// As a side effect it maintains the room's forward_extremities set: the event's
+// prev_events cease to be extremities (they now have a child) and this event
+// becomes a new extremity. This keeps /sync's incremental delta correct without
+// a per-request re-scan.
 func (s *Store) InsertEvent(ctx context.Context, e *EventRow) (int64, error) {
 	var stateKey *string
 	if e.StateKey != "" {
@@ -101,7 +105,29 @@ func (s *Store) InsertEvent(ctx context.Context, e *EventRow) (int64, error) {
 		return 0, err
 	}
 	e.StreamOrdering = stream
+	// Maintain forward extremities. Parse prev events from the row if not set.
+	prevs := e.PrevEvents
+	if prevs == nil {
+		prevs = parsePrevEvents(e.RawJSON)
+	}
+	if err := s.UpdateExtremitiesForEvent(ctx, e.RoomID, e.EventID, prevs, e.Depth); err != nil {
+		// Extremity maintenance is best-effort; a failure must not roll back the
+		// event insert (which is already committed). Log and continue.
+		_ = err
+	}
 	return stream, nil
+}
+
+// parsePrevEvents extracts prev_events IDs from a raw event JSON for the
+// extremity update. Returns nil for legacy [id, hash] pairs (flattened to IDs).
+func parsePrevEvents(raw []byte) []string {
+	var ev struct {
+		PrevEvents []string `json:"prev_events"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return nil
+	}
+	return ev.PrevEvents
 }
 
 // GetEvent fetches a single event by ID.

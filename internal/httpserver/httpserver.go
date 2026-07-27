@@ -15,6 +15,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/media"
+	"github.com/AkagiYui/katrix/internal/metrics"
 	"github.com/AkagiYui/katrix/internal/webui"
 )
 
@@ -30,6 +31,11 @@ func New(hs *homeserver.HS) (http.Handler, error) {
 
 	med := media.New(hs, fed.Client())
 	med.Register(mux)
+
+	// Metrics endpoint (Prometheus text format).
+	if hs.Config.Metrics.Enabled {
+		mux.HandleFunc("GET /metrics", metrics.Handler())
+	}
 
 	// Health endpoint (also used by the healthcheck subcommand).
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {

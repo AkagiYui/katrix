@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/metrics"
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
 )
@@ -141,6 +142,7 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage) (string, bool) {
 	if _, err := a.Store.InsertEvent(r.Context(), row); err != nil {
 		return evID, false
 	}
+	metrics.Counters.FedInboundPDUs.Add(1)
 	if ev.StateKey != nil {
 		_ = a.Store.UpsertState(r.Context(), ev.RoomID, ev.Type, *ev.StateKey, evID)
 		// For membership state events, update the denormalised membership table.

@@ -26,13 +26,24 @@ type Store struct {
 // Pool exposes the underlying pool for advanced callers (transactions).
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
-// Open connects to Postgres, verifies connectivity and runs migrations.
+// Open connects to Postgres, verifies connectivity and runs migrations. The
+// pool is sized to the default (16 conns); use OpenWithConfig to tune.
 func Open(ctx context.Context, dsn string) (*Store, error) {
+	return OpenWithConfig(ctx, dsn, 16, 2)
+}
+
+// OpenWithConfig connects with an explicit pool size.
+func OpenWithConfig(ctx context.Context, dsn string, maxConns, minConns int32) (*Store, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("storage: parse dsn: %w", err)
 	}
-	cfg.MaxConns = 16
+	if maxConns > 0 {
+		cfg.MaxConns = maxConns
+	}
+	if minConns > 0 {
+		cfg.MinConns = minConns
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("storage: connect: %w", err)

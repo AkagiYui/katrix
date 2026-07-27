@@ -7,6 +7,7 @@ import (
 
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/metrics"
 	"github.com/AkagiYui/katrix/internal/storage"
 	syncpkg "github.com/AkagiYui/katrix/internal/sync"
 )
@@ -22,6 +23,9 @@ func (a *API) registerSync(mux *http.ServeMux) {
 // Sync handles GET /_matrix/client/v3/sync.
 func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
+	metrics.Counters.SyncRequests.Add(1)
+	metrics.Counters.SyncActive.Add(1)
+	defer metrics.Counters.SyncActive.Add(-1)
 	q := r.URL.Query()
 	sinceStr := q.Get("since")
 	since, ok := syncpkg.DecodeToken(sinceStr)

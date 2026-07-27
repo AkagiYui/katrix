@@ -18,6 +18,7 @@ import (
 
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/metrics"
 	"github.com/AkagiYui/katrix/internal/storage"
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
@@ -87,6 +88,7 @@ func (a *API) Upload(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	metrics.Counters.MediaUploads.Add(1)
 	mxc := "mxc://" + a.ServerName() + "/" + mediaID
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"content_uri": mxc})
 }
@@ -176,8 +178,10 @@ func (a *API) cacheRemote(ctx context.Context, serverName, mediaID string) error
 	if a.remote == nil {
 		return fmt.Errorf("remote media fetching disabled")
 	}
+	metrics.Counters.MediaRemoteFetch.Add(1)
 	body, contentType, err := a.remote.DownloadMedia(ctx, serverName, mediaID)
 	if err != nil {
+		metrics.Counters.MediaRemoteFetchErrors.Add(1)
 		return err
 	}
 	now := a.Now()

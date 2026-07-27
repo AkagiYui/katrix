@@ -25,7 +25,9 @@ type Config struct {
 	} `yaml:"listen"`
 
 	Database struct {
-		DSN string `yaml:"dsn"`
+		DSN      string `yaml:"dsn"`
+		MaxConns int32  `yaml:"max_conns"`
+		MinConns int32  `yaml:"min_conns"`
 	} `yaml:"database"`
 
 	SigningKeyPath string `yaml:"signing_key_path"`
@@ -43,6 +45,11 @@ type Config struct {
 
 	// FederationEnabled toggles the whole server-server surface.
 	FederationEnabled bool `yaml:"federation_enabled"`
+
+	// Metrics exposes a Prometheus-format /metrics endpoint when true.
+	Metrics struct {
+		Enabled bool `yaml:"enabled"`
+	} `yaml:"metrics"`
 }
 
 // Default returns a config populated with development defaults.
@@ -60,6 +67,9 @@ func Default() *Config {
 	c.Media.MaxUploadBytes = 50 * 1024 * 1024
 	c.Media.StorePath = "media_store"
 	c.FederationEnabled = true
+	c.Database.MaxConns = 16
+	c.Database.MinConns = 2
+	c.Metrics.Enabled = true
 	return c
 }
 
@@ -109,6 +119,14 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("KATRIX_FEDERATION_ENABLED"); v != "" {
 		c.FederationEnabled = parseBool(v, c.FederationEnabled)
+	}
+	if v := os.Getenv("KATRIX_DATABASE_MAX_CONNS"); v != "" {
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 32); err == nil && n > 0 {
+			c.Database.MaxConns = int32(n)
+		}
+	}
+	if v := os.Getenv("KATRIX_METRICS_ENABLED"); v != "" {
+		c.Metrics.Enabled = parseBool(v, c.Metrics.Enabled)
 	}
 }
 
