@@ -48,3 +48,25 @@ jobs:
       # shipped binary (built above), not the test suite.
       - name: go test (race)
         run: CGO_ENABLED=1 go test -race -count=1 ./...
+
+  web:
+    name: build web (vite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: install
+        run: pnpm -C web install --no-frozen-lockfile
+      - name: typecheck + build
+        run: pnpm -C web build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: internal/webui/dist
