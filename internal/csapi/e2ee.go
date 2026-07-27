@@ -176,6 +176,9 @@ func (a *API) KeysChanges(w http.ResponseWriter, r *http.Request) {
 }
 
 // SendToDevice handles POST /_matrix/client/v3/sendToDevice/{eventType}/{txnID}.
+// The server only relays to-device messages; it never decrypts. A target device
+// of "*" means "all of the user's devices" and is expanded server-side (used by
+// m.secret.send to fan out a secret to every session).
 func (a *API) SendToDevice(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	eventType := r.PathValue("eventType")
@@ -190,6 +193,22 @@ func (a *API) SendToDevice(w http.ResponseWriter, r *http.Request) {
 	now := a.Now()
 	for targetUser, devs := range req.Messages {
 		for targetDevice, content := range devs {
+			if targetDevice == "*" {
+				// Fan out to every device of the target user.
+				userLocalpart := a.LocalpartOf(targetUser)
+				if a.IsLocalUser(targetUser) {
+					devRows, err := a.Store.ListDevices(r.Context(), userLocalpart)
+					if err == nil {
+						for _, d := range devRows {
+							msgs = append(msgs, storage.ToDeviceMessage{
+								TargetUser: targetUser, TargetDevice: d.DeviceID,
+								Sender: auth.UserID, Type: eventType, Content: content, CreatedTS: now,
+							})
+						}
+					}
+				}
+				continue
+			}
 			msgs = append(msgs, storage.ToDeviceMessage{
 				TargetUser: targetUser, TargetDevice: targetDevice,
 				Sender: auth.UserID, Type: eventType, Content: content, CreatedTS: now,

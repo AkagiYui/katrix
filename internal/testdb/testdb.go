@@ -71,6 +71,7 @@ func Truncate(ctx context.Context, pool pgxConn) error {
 	_, err := pool.Exec(ctx, `
 		TRUNCATE TABLE
 			forward_extremities,
+			login_tokens,
 			to_device_messages, room_keys, key_backup_versions,
 			cross_signing_keys, one_time_keys, device_keys,
 			receipts, account_data,

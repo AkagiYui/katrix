@@ -40,6 +40,9 @@ func (a *API) Versions(w http.ResponseWriter, r *http.Request) {
 		"versions": supportedVersions,
 		"unstable_features": map[string]bool{
 			"org.matrix.msc3916.stable": true,
+			// QR / "sign in with another device" login (MSC4108 foundation):
+			// the m.login.token flow + POST /login/token minting endpoint.
+			"org.matrix.msc3886": true,
 		},
 	})
 }

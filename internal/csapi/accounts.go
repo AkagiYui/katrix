@@ -206,6 +206,7 @@ func (a *API) LoginFlows(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"flows": []map[string]any{
 			{"type": "m.login.password"},
+			{"type": "m.login.token"},
 		},
 	})
 }
@@ -226,39 +227,56 @@ type loginIdentifier struct {
 	User string `json:"user"`
 }
 
-// Login handles POST /_matrix/client/v3/login.
+// Login handles POST /_matrix/client/v3/login. Supports m.login.password
+// (password) and m.login.token (single-use login token, used by the QR / sign-
+// in-with-another-device flow).
 func (a *API) Login(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	if err := httpx.DecodeJSON(w, r, &req); err != nil {
 		httpx.WriteError(w, err)
 		return
 	}
-	if req.Type != "m.login.password" {
+
+	var localpart string
+	switch req.Type {
+	case "m.login.password":
+		userField := req.Identifier.User
+		if userField == "" {
+			userField = req.User
+		}
+		localpart = a.resolveLocalpart(userField)
+		if localpart == "" {
+			httpx.WriteError(w, httpx.ErrForbidden("Invalid username or password"))
+			return
+		}
+		user, err := a.Store.GetUser(r.Context(), localpart)
+		// Deactivated accounts are reported with a distinct errcode (spec).
+		if err == nil && user.Deactivated {
+			httpx.WriteError(w, httpx.NewError(http.StatusForbidden, "M_USER_DEACTIVATED", "This account has been deactivated"))
+			return
+		}
+		// Run bcrypt against a dummy hash when the user is unknown so response
+		// time does not leak account existence (timing side-channel).
+		if err != nil || user.PasswordHash == "" || !homeserver.CheckPassword(user.PasswordHash, req.Password) {
+			_ = homeserver.CheckPassword("$2a$10$0123456789012345678901ABCDEFGHIJKLMNOPQRSTUVXXXXXXXXX", req.Password)
+			httpx.WriteError(w, httpx.ErrForbidden("Invalid username or password"))
+			return
+		}
+	case "m.login.token":
+		if req.Token == "" {
+			httpx.WriteError(w, httpx.ErrMissingParam("token required for m.login.token"))
+			return
+		}
+		// Consume the login token (single-use, expiry-checked) and resolve the
+		// owning user. The new device is issued a fresh session.
+		_, lt, err := a.loginWithToken(r, req.Token, req.DeviceID, req.InitialDeviceDisplayName, req.RefreshToken)
+		if err != nil {
+			httpx.WriteError(w, err)
+			return
+		}
+		localpart = lt.UserLocalpart
+	default:
 		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_UNKNOWN", "unsupported login type"))
-		return
-	}
-
-	userField := req.Identifier.User
-	if userField == "" {
-		userField = req.User
-	}
-	localpart := a.resolveLocalpart(userField)
-	if localpart == "" {
-		httpx.WriteError(w, httpx.ErrForbidden("Invalid username or password"))
-		return
-	}
-
-	user, err := a.Store.GetUser(r.Context(), localpart)
-	// Deactivated accounts are reported with a distinct errcode (spec).
-	if err == nil && user.Deactivated {
-		httpx.WriteError(w, httpx.NewError(http.StatusForbidden, "M_USER_DEACTIVATED", "This account has been deactivated"))
-		return
-	}
-	// Run bcrypt against a dummy hash when the user is unknown so response
-	// time does not leak account existence (timing side-channel).
-	if err != nil || user.PasswordHash == "" || !homeserver.CheckPassword(user.PasswordHash, req.Password) {
-		_ = homeserver.CheckPassword("$2a$10$0123456789012345678901ABCDEFGHIJKLMNOPQRSTUVXXXXXXXXX", req.Password)
-		httpx.WriteError(w, httpx.ErrForbidden("Invalid username or password"))
 		return
 	}
 
