@@ -21,6 +21,22 @@ func (a *API) registerE2EE(mux *http.ServeMux) {
 	mux.HandleFunc("POST /_matrix/client/v3/sendToDevice/{eventType}/{txnID}", a.RequireAuth(a.SendToDevice))
 	mux.HandleFunc("POST /_matrix/client/v3/keys/device_signing/upload", a.RequireAuth(a.DeviceSigningUpload))
 	mux.HandleFunc("POST /_matrix/client/v3/keys/signatures/upload", a.RequireAuth(a.SignaturesUpload))
+
+	// Key backup (/room_keys/*) — E2EE key material relay only.
+	mux.HandleFunc("POST /_matrix/client/v3/room_keys/version", a.RequireAuth(a.CreateKeyBackup))
+	mux.HandleFunc("PUT /_matrix/client/v3/room_keys/version/{version}", a.RequireAuth(a.UpdateKeyBackup))
+	mux.HandleFunc("GET /_matrix/client/v3/room_keys/version", a.RequireAuth(a.LatestKeyBackup))
+	mux.HandleFunc("GET /_matrix/client/v3/room_keys/version/{version}", a.RequireAuth(a.GetKeyBackup))
+	mux.HandleFunc("DELETE /_matrix/client/v3/room_keys/version/{version}", a.RequireAuth(a.DeleteKeyBackup))
+	mux.HandleFunc("PUT /_matrix/client/v3/room_keys/keys", a.RequireAuth(a.PutRoomKeys))
+	mux.HandleFunc("PUT /_matrix/client/v3/room_keys/keys/{roomID}", a.RequireAuth(a.PutRoomKeysRoom))
+	mux.HandleFunc("PUT /_matrix/client/v3/room_keys/keys/{roomID}/{sessionID}", a.RequireAuth(a.PutRoomKeysSession))
+	mux.HandleFunc("GET /_matrix/client/v3/room_keys/keys", a.RequireAuth(a.GetRoomKeys))
+	mux.HandleFunc("GET /_matrix/client/v3/room_keys/keys/{roomID}", a.RequireAuth(a.GetRoomKeysRoom))
+	mux.HandleFunc("GET /_matrix/client/v3/room_keys/keys/{roomID}/{sessionID}", a.RequireAuth(a.GetRoomKeysSession))
+	mux.HandleFunc("DELETE /_matrix/client/v3/room_keys/keys", a.RequireAuth(a.DeleteRoomKeys))
+	mux.HandleFunc("DELETE /_matrix/client/v3/room_keys/keys/{roomID}", a.RequireAuth(a.DeleteRoomKeysRoom))
+	mux.HandleFunc("DELETE /_matrix/client/v3/room_keys/keys/{roomID}/{sessionID}", a.RequireAuth(a.DeleteRoomKeysSession))
 }
 
 // KeysUpload handles POST /_matrix/client/v3/keys/upload.

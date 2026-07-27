@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1.7
+#
+# Containerfile.complement — image for running the official Complement test
+# suite against Katrix. Honours Complement's runtime contract: read SERVER_NAME,
+# inject the test CA bundle, serve on the federation port, and persist state
+# under /data.
+
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /katrix ./cmd/katrix
+
+FROM alpine:3.24
+RUN apk add --no-cache ca-certificates tzdata \
+    && addgroup -S katrix && adduser -S -G katrix katrix
+COPY --from=build /katrix /usr/local/bin/katrix
+
+# Complement mounts its CA into /ca; the homeserver should trust it for outbound
+# federation TLS during tests.
+ENV SSL_CERT_FILE=/ca/complement-ca.crt \
+    SSL_CERT_DIR=/etc/ssl/certs:/ca \
+    KATRIX_DATABASE_DSN=postgres://complement:complement@localhost/katrix?sslmode=disable
+
+EXPOSE 8008 8448
+# Complement starts the binary with SERVER_NAME env and expects it to bind
+# immediately on :8008 (client) and :8448 (federation).
+ENTRYPOINT ["katrix", "serve"]

@@ -1,0 +1,51 @@
+name: complement
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: "0 4 * * *" # nightly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  complement:
+    name: Complement (black-box)
+    runs-on: ubuntu-latest
+    # Complement needs Docker-in-Docker to spin up homeserver containers.
+    services:
+      docker:
+        image: docker:dind
+        options: --privileged
+    env:
+      COMPLEMENT_BASE_IMAGE: ghcr.io/akagiyui/katrix:complement
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: build complement image
+        run: |
+          docker build -f Containerfile.complement -t "$COMPLEMENT_BASE_IMAGE" .
+      - name: checkout complement
+        uses: actions/checkout@v7
+        with:
+          repository: matrix-org/complement
+          path: complement
+      - name: run complement
+        env:
+          COMPLEMENT_SHARE_ENV_PREFIX: PASS_
+          PASS_SERVER_NAME: complement-test
+        run: |
+          cd complement
+          go test -v -tags="msc2836 msc2946 msc3030 msc3874 msc3890" ./tests/... 2>&1 | tee /tmp/complement.log || true
+      - name: upload complement log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: complement-log
+          path: /tmp/complement.log
