@@ -15,6 +15,10 @@ type MatrixError struct {
 	Message    string `json:"error"`
 	status     int
 	RetryAfter int64 `json:"retry_after_ms,omitempty"`
+	// SoftLogout is the soft-logout flag for M_UNKNOWN_TOKEN responses. When
+	// true the client should keep its local crypto material and refresh/re-login
+	// instead of wiping state. Omitted from JSON when nil.
+	SoftLogout *bool `json:"soft_logout,omitempty"`
 }
 
 func (e *MatrixError) Error() string { return e.Code + ": " + e.Message }
@@ -38,7 +42,9 @@ func ErrUnknown(msg string) *MatrixError {
 }
 func ErrForbidden(msg string) *MatrixError { return NewError(http.StatusForbidden, "M_FORBIDDEN", msg) }
 func ErrUnknownToken(softLogout bool) *MatrixError {
+	sl := softLogout
 	e := NewError(http.StatusUnauthorized, "M_UNKNOWN_TOKEN", "Invalid access token")
+	e.SoftLogout = &sl
 	return e
 }
 func ErrMissingToken() *MatrixError {

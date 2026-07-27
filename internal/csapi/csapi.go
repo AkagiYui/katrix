@@ -12,10 +12,11 @@ import (
 // API bundles the Client-Server handlers.
 type API struct {
 	*homeserver.HS
+	uia *uiaStore
 }
 
 // New constructs the CS API surface.
-func New(hs *homeserver.HS) *API { return &API{HS: hs} }
+func New(hs *homeserver.HS) *API { return &API{HS: hs, uia: newUIAStore()} }
 
 // supportedVersions is the list of Client-Server spec versions Katrix
 // self-reports. Per the design doc we only advertise versions whose behaviour
@@ -24,6 +25,7 @@ var supportedVersions = []string{
 	"r0.6.1",
 	"v1.1", "v1.2", "v1.3", "v1.4", "v1.5", "v1.6",
 	"v1.7", "v1.8", "v1.9", "v1.10", "v1.11", "v1.12",
+	"v1.13", "v1.14", "v1.15", "v1.16", "v1.17", "v1.18", "v1.19",
 }
 
 // Versions handles GET /_matrix/client/versions.

@@ -38,9 +38,14 @@ func (h *HS) Now() int64 { return time.Now().UnixMilli() }
 // UserID builds a full user ID for a localpart on this server.
 func (h *HS) UserID(localpart string) string { return "@" + localpart + ":" + h.Config.ServerName }
 
-// IsLocalUser reports whether a user ID belongs to this server.
+// IsLocalUser reports whether a user ID belongs to this server. It parses
+// strictly so malformed IDs like "@foo:evil:localhost" are rejected.
 func (h *HS) IsLocalUser(userID string) bool {
-	return strings.HasSuffix(userID, ":"+h.Config.ServerName)
+	at := strings.IndexByte(userID, ':')
+	if at < 0 {
+		return false
+	}
+	return userID[at+1:] == h.Config.ServerName
 }
 
 // LocalpartOf extracts the localpart from a local user ID.
@@ -128,11 +133,30 @@ func (h *HS) Authenticate(r *http.Request) (*Auth, error) {
 }
 
 // RequireAuth is middleware that authenticates and injects Auth into context.
+// Both regular users and guests may pass.
 func (h *HS) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		a, err := h.Authenticate(r)
 		if err != nil {
 			httpx.WriteError(w, err)
+			return
+		}
+		next(w, r.WithContext(WithAuth(r.Context(), a)))
+	}
+}
+
+// RequireUserAuth is middleware that authenticates and rejects guest sessions.
+// Use it for endpoints the spec restricts to non-guest accounts (change
+// password, deactivate, device management, profile edits).
+func (h *HS) RequireUserAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		a, err := h.Authenticate(r)
+		if err != nil {
+			httpx.WriteError(w, err)
+			return
+		}
+		if a.IsGuest {
+			httpx.WriteError(w, httpx.ErrForbidden("guest accounts cannot use this endpoint"))
 			return
 		}
 		next(w, r.WithContext(WithAuth(r.Context(), a)))

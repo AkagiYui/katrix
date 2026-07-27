@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ErrNotFound is returned when a lookup finds no row.
@@ -101,6 +102,48 @@ func (s *Store) Deactivate(ctx context.Context, localpart string) error {
 	})
 }
 
+// ---- Registration tokens ----
+
+// ConsumeRegistrationToken validates a registration token against the table,
+// atomically consuming one use if it is still valid (exists, not expired, and
+// under its uses_allowed cap). Returns (false, nil) when the token is invalid
+// or exhausted so the caller can surface M_FORBIDDEN.
+func (s *Store) ConsumeRegistrationToken(ctx context.Context, token string, now int64) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rolled back only on the success path
+
+	var usesAllowed *int
+	var usesCompleted int
+	var expires *int64
+	err = tx.QueryRow(ctx,
+		`SELECT uses_allowed, uses_completed, expires_ts
+		   FROM registration_tokens WHERE token=$1 FOR UPDATE`, token,
+	).Scan(&usesAllowed, &usesCompleted, &expires)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if expires != nil && *expires != 0 && *expires < now {
+		return false, nil
+	}
+	if usesAllowed != nil && usesCompleted >= *usesAllowed {
+		return false, nil
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE registration_tokens SET uses_completed=uses_completed+1 WHERE token=$1`, token); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ---- Devices ----
 
 // Device is a device row.
@@ -109,23 +152,29 @@ type Device struct {
 	DeviceID      string
 	DisplayName   string
 	LastSeenTS    int64
+	LastSeenIP    string
 	CreatedTS     int64
 }
 
-// UpsertDevice creates or updates a device record.
+// UpsertDevice creates or updates a device record. On conflict it refreshes
+// last_seen_ts/last_seen_ip but keeps the existing display_name when the caller
+// supplies an empty one (login without a new name).
 func (s *Store) UpsertDevice(ctx context.Context, d Device) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO devices(user_localpart, device_id, display_name, created_ts, last_seen_ts)
-		 VALUES ($1,$2,$3,$4,$4)
-		 ON CONFLICT (user_localpart, device_id) DO UPDATE SET display_name=COALESCE(EXCLUDED.display_name, devices.display_name)`,
-		d.UserLocalpart, d.DeviceID, nullString(d.DisplayName), d.CreatedTS)
+		`INSERT INTO devices(user_localpart, device_id, display_name, created_ts, last_seen_ts, last_seen_ip)
+		 VALUES ($1,$2,$3,$4,$4,$5)
+		 ON CONFLICT (user_localpart, device_id) DO UPDATE SET
+		     display_name=COALESCE(EXCLUDED.display_name, devices.display_name),
+		     last_seen_ts=EXCLUDED.last_seen_ts,
+		     last_seen_ip=COALESCE(NULLIF(EXCLUDED.last_seen_ip,''), devices.last_seen_ip)`,
+		d.UserLocalpart, d.DeviceID, nullString(d.DisplayName), d.CreatedTS, nullString(d.LastSeenIP))
 	return err
 }
 
 // ListDevices returns all devices for a user.
 func (s *Store) ListDevices(ctx context.Context, localpart string) ([]Device, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT user_localpart, device_id, COALESCE(display_name,''), COALESCE(last_seen_ts,0), created_ts
+		`SELECT user_localpart, device_id, COALESCE(display_name,''), COALESCE(last_seen_ts,0), COALESCE(last_seen_ip,''), created_ts
 		 FROM devices WHERE user_localpart=$1 ORDER BY created_ts`, localpart)
 	if err != nil {
 		return nil, err
@@ -134,7 +183,7 @@ func (s *Store) ListDevices(ctx context.Context, localpart string) ([]Device, er
 	var out []Device
 	for rows.Next() {
 		var d Device
-		if err := rows.Scan(&d.UserLocalpart, &d.DeviceID, &d.DisplayName, &d.LastSeenTS, &d.CreatedTS); err != nil {
+		if err := rows.Scan(&d.UserLocalpart, &d.DeviceID, &d.DisplayName, &d.LastSeenTS, &d.LastSeenIP, &d.CreatedTS); err != nil {
 			return nil, err
 		}
 		out = append(out, d)
@@ -146,9 +195,9 @@ func (s *Store) ListDevices(ctx context.Context, localpart string) ([]Device, er
 func (s *Store) GetDevice(ctx context.Context, localpart, deviceID string) (*Device, error) {
 	var d Device
 	err := s.pool.QueryRow(ctx,
-		`SELECT user_localpart, device_id, COALESCE(display_name,''), COALESCE(last_seen_ts,0), created_ts
+		`SELECT user_localpart, device_id, COALESCE(display_name,''), COALESCE(last_seen_ts,0), COALESCE(last_seen_ip,''), created_ts
 		 FROM devices WHERE user_localpart=$1 AND device_id=$2`, localpart, deviceID,
-	).Scan(&d.UserLocalpart, &d.DeviceID, &d.DisplayName, &d.LastSeenTS, &d.CreatedTS)
+	).Scan(&d.UserLocalpart, &d.DeviceID, &d.DisplayName, &d.LastSeenTS, &d.LastSeenIP, &d.CreatedTS)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -158,24 +207,34 @@ func (s *Store) GetDevice(ctx context.Context, localpart, deviceID string) (*Dev
 	return &d, nil
 }
 
-// UpdateDeviceDisplayName updates a device's display name.
+// UpdateDeviceDisplayName updates a device's display name. Returns
+// ErrNotFound when the device does not exist (RowsAffected==0).
 func (s *Store) UpdateDeviceDisplayName(ctx context.Context, localpart, deviceID, name string) error {
-	_, err := s.pool.Exec(ctx, `UPDATE devices SET display_name=$3 WHERE user_localpart=$1 AND device_id=$2`, localpart, deviceID, name)
-	return err
+	tag, err := s.pool.Exec(ctx, `UPDATE devices SET display_name=$3 WHERE user_localpart=$1 AND device_id=$2`, localpart, deviceID, name)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // DeleteDevice removes a device and its tokens and e2ee keys.
-func (s *Store) DeleteDevice(ctx context.Context, localpart, deviceID string) error {
-	userID := "@" + localpart // domain appended by caller normally; keep tokens/devices keyed by localpart
+func (s *Store) DeleteDevice(ctx context.Context, localpart, deviceID, serverName string) error {
+	userID := "@" + localpart + ":" + serverName
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `DELETE FROM access_tokens WHERE user_localpart=$1 AND device_id=$2`, localpart, deviceID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `DELETE FROM devices WHERE user_localpart=$1 AND device_id=$2`, localpart, deviceID); err != nil {
+		if _, err := tx.Exec(ctx, `DELETE FROM device_keys WHERE user_id=$1 AND device_id=$2`, userID, deviceID); err != nil {
 			return err
 		}
-		_ = userID
-		return nil
+		if _, err := tx.Exec(ctx, `DELETE FROM one_time_keys WHERE user_id=$1 AND device_id=$2`, userID, deviceID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM devices WHERE user_localpart=$1 AND device_id=$2`, localpart, deviceID)
+		return err
 	})
 }
 
@@ -271,20 +330,82 @@ func nullString(s string) *string {
 	return &s
 }
 
+// isUniqueViolation reports whether err is a Postgres unique_violation
+// (SQLSTATE 23505), inspected via the typed pgconn.PgError rather than
+// string-matching the message text.
 func isUniqueViolation(err error) bool {
-	// pgx surfaces SQLSTATE 23505 for unique_violation.
-	return err != nil && (contains(err.Error(), "23505") || contains(err.Error(), "duplicate key"))
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (indexOf(s, sub) >= 0)
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505"
 	}
-	return -1
+	return false
+}
+
+// ConsumeRefreshToken atomically replaces the refresh token on the row owning
+// `oldRefresh`, returning the new access+refresh pair. The atomic UPDATE ...
+// RETURNING guards against concurrent double-spend: only one of two racing
+// requests will match the row (refresh_token=$1) and consume it; the other
+// gets ErrNotFound.
+func (s *Store) ConsumeRefreshToken(ctx context.Context, oldRefresh, newAccess, newRefresh string, expiresTS, now int64) (*AccessToken, error) {
+	var t AccessToken
+	var expires *int64
+	err := s.pool.QueryRow(ctx,
+		`UPDATE access_tokens
+		   SET token=$2, refresh_token=$3, expires_ts=$4, created_ts=$5
+		 WHERE refresh_token=$1
+		 RETURNING token, user_localpart, device_id, expires_ts, created_ts`,
+		oldRefresh, newAccess, newRefresh, expiresOrNil(expiresTS), now,
+	).Scan(&t.Token, &t.UserLocalpart, &t.DeviceID, &expires, &t.CreatedTS)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	t.RefreshToken = newRefresh
+	if expires != nil {
+		t.ExpiresTS = *expires
+	}
+	return &t, nil
+}
+
+// DeleteAllAccessTokensExcept removes every token for a user except the one
+// belonging to deviceID. Used by change-password/logout_devices: the device
+// that submitted the request must stay authenticated per spec.
+func (s *Store) DeleteAllAccessTokensExcept(ctx context.Context, localpart, keepDeviceID string) error {
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM access_tokens WHERE user_localpart=$1 AND device_id<>$2`, localpart, keepDeviceID)
+	return err
+}
+
+// DeleteDevicesAndTokens removes every device (and its tokens + e2ee keys) for
+// a user except keepDeviceID. Used by logout/all and deactivation to cascade
+// device cleanup without leaving orphaned e2ee material. An empty keepDeviceID
+// removes all devices.
+func (s *Store) DeleteDevicesAndTokens(ctx context.Context, localpart, serverName, keepDeviceID string) error {
+	userID := "@" + localpart + ":" + serverName
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM access_tokens WHERE user_localpart=$1 AND ($2='' OR device_id<>$2)`, localpart, keepDeviceID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM device_keys WHERE user_id=$1 AND ($2='' OR device_id<>$2)`, userID, keepDeviceID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM one_time_keys WHERE user_id=$1 AND ($2='' OR device_id<>$2)`, userID, keepDeviceID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx,
+			`DELETE FROM devices WHERE user_localpart=$1 AND ($2='' OR device_id<>$2)`, localpart, keepDeviceID)
+		return err
+	})
+}
+
+func expiresOrNil(ts int64) any {
+	if ts > 0 {
+		return ts
+	}
+	return nil
 }
