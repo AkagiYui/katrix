@@ -5,31 +5,34 @@
 #   - read SERVER_NAME env and use it as the homeserver name,
 #   - bind the client API on :8008 and the federation API on :8448,
 #   - trust the CA bundle mounted at /ca for outbound federation TLS,
-#   - persist state under /data,
-#   - start quickly and synchronously (Complement waits for / ready).
+#   - start quickly (Complement waits ~30s for /versions to respond),
+#   - persist state under /data.
 #
-# Katrix needs a Postgres backend. Because Complement spins up a fresh
-# container per homeserver with no external services, this image bundles
-# Postgres and an entrypoint script that initialises a per-server cluster
-# under /data, starts it, runs katrix against it, and tears it down on exit.
+# Katrix needs Postgres. Complement launches a fresh container per test from
+# the base image (no persistent volumes), so initdb at build time + a fast
+# per-start clone under /data keeps startup well under the readiness timeout.
 
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-# Build the web panel so the embedded SPA is the real one, not the placeholder.
 RUN go build -trimpath -ldflags="-s -w" -o /katrix ./cmd/katrix
 
 FROM alpine:3.24
 RUN apk add --no-cache ca-certificates tzdata postgresql17 su-exec bash \
-    && addgroup -S katrix && adduser -S -G katrix katrix
+    && addgroup -S katrix && adduser -S -G katrix katrix \
+    && mkdir -p /var/lib/postgresql /data \
+    && chown -R postgres:postgres /var/lib/postgresql
+# Pre-initialise a template Postgres cluster at build time so each Complement
+# container start only clones it (fast) instead of running initdb (slow).
+RUN su-exec postgres initdb -D /var/lib/postgresql/template -U postgres -A trust \
+      --encoding=UTF8 --locale=C >/dev/null 2>&1
+
 COPY --from=build /katrix /usr/local/bin/katrix
 COPY Containerfile.complement.entrypoint.sh /usr/local/bin/katrix-complement-entrypoint.sh
 RUN chmod +x /usr/local/bin/katrix-complement-entrypoint.sh
 
-# Complement mounts its CA into /ca; the homeserver should trust it for outbound
-# federation TLS during tests.
 ENV SSL_CERT_FILE=/ca/complement-ca.crt \
     SSL_CERT_DIR=/etc/ssl/certs:/ca \
     KATRIX_LISTEN_CLIENT=:8008 \
@@ -38,6 +41,4 @@ ENV SSL_CERT_FILE=/ca/complement-ca.crt \
     KATRIX_REGISTRATION_ENABLED=true
 
 EXPOSE 8008 8448
-# Complement starts the binary with SERVER_NAME env and expects it to bind
-# immediately on :8008 (client) and :8448 (federation).
 ENTRYPOINT ["/usr/local/bin/katrix-complement-entrypoint.sh"]
