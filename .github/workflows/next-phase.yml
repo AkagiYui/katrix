@@ -1,0 +1,70 @@
+name: next-phase
+
+# Targeted CI for the next-phase goals (federation sig verification, stateres
+# v2 mainline, remote media + SSRF, v12 room id derivation, extremities +
+# metrics, QR login). Runs the pure-Go unit tests that don't need Postgres as
+# a fast gate, then the full Postgres-backed suite.
+
+on:
+  push:
+    branches: [master, feat/next-phase]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pure-go:
+    name: next-phase unit tests (no DB)
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: 1
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: vet
+        run: go vet ./internal/netutil/ssrf/... ./internal/federation/fedverify/... ./internal/stateres/... ./internal/rooms/... ./internal/events/... ./internal/crypto/... ./internal/metrics/...
+      - name: stateres v2 mainline
+        run: go test -race -count=1 ./internal/stateres/...
+      - name: federation PDU verifier
+        run: go test -race -count=1 ./internal/federation/fedverify/...
+      - name: SSRF guard
+        run: go test -race -count=1 ./internal/netutil/ssrf/...
+      - name: v12 room id derivation
+        run: go test -race -count=1 ./internal/rooms/...
+      - name: events + crypto
+        run: go test -race -count=1 ./internal/events/... ./internal/crypto/...
+
+  integration:
+    name: next-phase integration (Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: katrix
+          POSTGRES_PASSWORD: katrix
+          POSTGRES_DB: katrix_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U katrix"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CGO_ENABLED: 1
+      KATRIX_TEST_DSN: postgres://katrix:katrix@localhost:5432/katrix_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: full suite (race)
+        run: go test -race -count=1 ./internal/csapi/... ./internal/storage/... ./internal/media/... ./internal/federation/...
+      - name: QR login flow
+        run: go test -race -count=1 -run 'TestQRLoginTokenFlow|TestLoginFlowsAdvertisesToken' ./internal/csapi/...

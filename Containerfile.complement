@@ -1,29 +1,43 @@
 # syntax=docker/dockerfile:1.7
 #
 # Containerfile.complement — image for running the official Complement test
-# suite against Katrix. Honours Complement's runtime contract: read SERVER_NAME,
-# inject the test CA bundle, serve on the federation port, and persist state
-# under /data.
+# suite against Katrix. Honours Complement's runtime contract:
+#   - read SERVER_NAME env and use it as the homeserver name,
+#   - bind the client API on :8008 and the federation API on :8448,
+#   - trust the CA bundle mounted at /ca for outbound federation TLS,
+#   - persist state under /data,
+#   - start quickly and synchronously (Complement waits for / ready).
+#
+# Katrix needs a Postgres backend. Because Complement spins up a fresh
+# container per homeserver with no external services, this image bundles
+# Postgres and an entrypoint script that initialises a per-server cluster
+# under /data, starts it, runs katrix against it, and tears it down on exit.
 
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /katrix ./cmd/katrix
+# Build the web panel so the embedded SPA is the real one, not the placeholder.
+RUN go build -trimpath -ldflags="-s -w" -o /katrix ./cmd/katrix
 
 FROM alpine:3.24
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk add --no-cache ca-certificates tzdata postgresql17 su-exec bash \
     && addgroup -S katrix && adduser -S -G katrix katrix
 COPY --from=build /katrix /usr/local/bin/katrix
+COPY Containerfile.complement.entrypoint.sh /usr/local/bin/katrix-complement-entrypoint.sh
+RUN chmod +x /usr/local/bin/katrix-complement-entrypoint.sh
 
 # Complement mounts its CA into /ca; the homeserver should trust it for outbound
 # federation TLS during tests.
 ENV SSL_CERT_FILE=/ca/complement-ca.crt \
     SSL_CERT_DIR=/etc/ssl/certs:/ca \
-    KATRIX_DATABASE_DSN=postgres://complement:complement@localhost/katrix?sslmode=disable
+    KATRIX_LISTEN_CLIENT=:8008 \
+    KATRIX_LISTEN_FEDERATION=:8448 \
+    KATRIX_FEDERATION_ENABLED=true \
+    KATRIX_REGISTRATION_ENABLED=true
 
 EXPOSE 8008 8448
 # Complement starts the binary with SERVER_NAME env and expects it to bind
 # immediately on :8008 (client) and :8448 (federation).
-ENTRYPOINT ["katrix", "serve"]
+ENTRYPOINT ["/usr/local/bin/katrix-complement-entrypoint.sh"]

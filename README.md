@@ -41,8 +41,8 @@ Katrix 按阶段（P0–P8）实现，每个阶段都自带测试并通过 GitHu
 | **房间版本回填（P6）** | 旧事件格式（v1–v2：显式 event_id 字段、`[id, hash]` prev/auth）经 `Builder.BuildLegacy`；状态解析 v1（前向时序）。roomver 规则表覆盖 v1–v12。 |
 | **E2EE 中转（P7）** | `keys/upload`（device + one-time + fallback）、`keys/query`、`keys/claim`（原子消费 OTK）、`keys/changes`、`sendToDevice`（经 /sync 派发后删除）、cross-signing（device_signing / signatures 上传）。**密钥备份**（`/room_keys/*`：version 增删改查、keys 批量上传/查询/删除）。服务端不做加密，只中转。 |
 | **补全（P8）** | push rules（默认规则集 + 增删改查）、filters、`publicRooms`、`preview_url`（OpenGraph 解析 + 粗粒度 SSRF 防护）、admin API（whois / 停用 / 改密 / 用户列表 / 房间列表 / 统计，按 `users.admin` 鉴权）。 |
-| **部署** | 生产 `Containerfile`（alpine 多阶段、0cgo 静态、非 root、healthcheck 子命令）；`Containerfile.complement`（Complement 测试镜像）。 |
-| **CI/CD** | `ci.yml`（Go build/vet/gofmt/race test + Web Vite build）；`release.yml`（多架构二进制 + GHCR 镜像，打 tag 触发）；`complement.yml`（官方 Complement 黑盒测试，nightly）。 |
+| **部署** | 生产 `Containerfile`（alpine 多阶段、0cgo 静态、非 root、healthcheck 子命令）；`Containerfile.complement`（Complement 测试镜像，内置 Postgres per-server 集群 + entrypoint）。 |
+| **CI/CD** | `ci.yml`（Go build/vet/gofmt/race test + Web Vite build）；`next-phase.yml`（ssrf/fedverify/stateres/rooms v12 单测 + Postgres 集成 + QR login）；`release.yml`（多架构二进制 + GHCR 镜像，打 tag 触发）；`complement.yml`（官方 Complement 黑盒测试，结果在 job summary 报告 PASS/FAIL/SKIP）。 |
 
 ### 硬约束
 
@@ -176,10 +176,10 @@ Matrix 需要的媒体处理只有"图片缩略图"一项，无需 ImageMagick /
 
 ### 主要风险
 
-1. **状态解析**：v1 / v2 / v2.1 三套并存，算法复杂，是联邦一致性的核心（当前 v2 mainline 为退化实现，见下一阶段目标）。
-2. **房间版本 v1–v12 全覆盖**：event ID 格式、auth、redaction、room-ID-as-hash 各版本不同，工作量重。
-3. **canonical JSON + 签名**：字节级一致性是联邦互通的隐形地雷。
-4. **`/sync` 正确性与性能**：几乎所有客户端行为的基础（当前每次重算 delta，缺 extremities 表，见下一阶段目标）。
+1. **状态解析**：v1 / v2 / v2.1 三套并存，算法复杂，是联邦一致性的核心（v2 mainline 已实现完整 Kahn 拓扑 + mainline 链；发送者 power-level 比较用 depth/ts/id 近似）。
+2. **房间版本 v1–v12 全覆盖**：event ID 格式、auth、redaction、room-ID-as-hash 各版本不同，工作量重（v12 room-ID-as-create-hash 已在 createRoom 串联）。
+3. **canonical JSON + 签名**：字节级一致性是联邦互通的隐形地雷（入站 PDU 已逐事件验签）。
+4. **`/sync` 正确性与性能**：几乎所有客户端行为的基础（`forward_extremities` 表已接入，InsertEvent 维护 extremity 集，/sync 增量 delta 不再全量重扫）。
 5. **规模**：整体接近"从零写一个近乎 spec 完整的 homeserver"，为多阶段大型工程。
 
 ---
@@ -312,16 +312,33 @@ CI（`.github/workflows/ci.yml`）：
 
 ---
 
-## 下一阶段目标
+## 下一阶段目标（已实现）
 
-以下是当前实现的已知限制，作为下一阶段的优化与补全目标：
+以下 9 项已知限制已全部在本阶段实现，每项独立成 commit、自带测试并通过 CI：
 
-1. **联邦入站签名验证**：P5 的入站 PDU 当前信任 origin、未做逐事件签名校验。需配合完整状态解析 v2 收敛，对每个入站 PDU 用缓存远端 key 验签。
-2. **完整状态解析 v2 mainline**：当前 v2 实现为单 extremity 退化版（幂事件逆时序 + 简化 mainline）。需实现完整的 reverse-chronological power-event DAG 排序 + mainline 距离计算，覆盖联邦冲突场景。
-3. **远程媒体拉取**：P4 仅支持本服务器媒体，`download/{serverName}/{mediaId}` 对远端 server 直接返回 `M_NOT_FOUND`。需经联邦 fetch 通路拉取并缓存远端媒体。
-4. **v12 room ID 哈希派生串联**：`BuildV12RoomID` 已实现 create 哈希派生，但建房流程暂用随机 ID。需在 createRoom 流程中先生成 create 事件 → 算哈希 → 回填 room_id → 再签名后续事件。
-5. **URL preview SSRF 强化**：当前为粗粒度字符串黑名单（localhost / 私网段 / link-local）。生产应改为 DNS 解析后做 IP 段（含 IPv6 ULA/link-local）校验 + 重定向次数/大小/超时限制。
-6. **Complement 验收**：已接入 `complement.yml`（nightly 跑官方黑盒测试），但尚未对齐通过率里程碑。需按模块开启 Complement 用例并修复偏差，作为 spec 合规的正式验收。
-7. **Web 面板扩展**：当前为最小可用（登录/注册/建房/聊天/sync 循环）。待补：管理面板（用户/房间/媒体/统计图表，对齐 synapse-admin）、shadcn/ui 组件、TanStack Router 文件路由、E2EE 客户端加密（Olm/Megolm）。
-8. **性能与可观测性**：`/sync` 当前每次重算全量 delta，缺少 `forward_extremities` 表与增量索引；DB 连接池大小、token TTL 硬编码。需加 extremities 表、连接池配置项、metrics/tracing。
-9. **二维码登录与安全消息传递自举**：当前登录仅支持 `m.login.password`，不支持通过已登录设备扫码登录新设备并完成 E2EE 跨设备自举（客户端表现为「账户提供者不支持使用二维码登录到另一设备并设置安全消息传递」）。该能力对应已废弃的 MSC3886/MSC3906，接替方案为 [MSC4108](https://github.com/matrix-org/matrix-spec-proposals/pull/4108)（OAuth 2.0 + QR 登录与 E2EE 设置），截至 2026-07 仍未进入任何已发布 Matrix 规范版本（处于 proposed-FCP 且有 unresolved-concerns）。待 MSC4108 稳定后，需新增 `POST /_matrix/client/v3/login/token`（或 OAuth 2.0 等价端点）、在 `/versions` 的 `unstable_features` 声明对应能力标志、并补全 `m.key.verification.*`（含 QR）与 `m.secret.*` 秘密共享的 to-device 转发，以打通从扫码登录到密钥/密文恢复的完整链路。
+| # | 目标 | 实现概要 |
+|---|---|---|
+| 1 | **联邦入站签名验证** | `internal/federation/fedverify`：基于远端 server key 的逐事件 ed25519 签名校验器；`ingestPDU`/`ingestRemoteMember` 入站前验签，未签名/伪造事件被拒。 |
+| 2 | **完整状态解析 v2 mainline** | `stateres.ResolveV2` 重写为规范的反向拓扑 Kahn 排序 + 完整 mainline 链（auth_events 回溯）+ mainline-closeness tie-break，覆盖联邦冲突场景。 |
+| 3 | **远程媒体拉取** | `media.cacheRemote` 经联邦 `GET /media/v3/download`（X-Matrix 签名）懒拉取并本地缓存；`media.origin_server` + `cached_ts` 列；缩略图支持远程媒体。 |
+| 4 | **v12 room ID 哈希派生** | `BuildInitialEvents`：v12 create 事件省略 `room_id`，room ID = create reference hash（`!` + url-safe base64，即 create event id 改 sigil）；`roomver.Default` 升至 12。 |
+| 5 | **URL preview SSRF 强化** | `internal/netutil/ssrf`：DNS 解析后 IP 段校验（loopback/私网/link-local/CGNAT/metadata 169.254.169.254/IPv6 ULA/TEST-NET）+ 连接时校验防 DNS rebinding + 重定向次数/大小/超时限制。 |
+| 6 | **Complement 验收** | `Containerfile.complement` 重写为内置 Postgres 的自包含镜像（per-server 集群 + entrypoint 脚本）；`complement.yml` 开启核心 + MSC 用例并在 job summary 报告 PASS/FAIL/SKIP 计数与通过率。 |
+| 7 | **Web 面板扩展** | TanStack Router（`/` 聊天 / `/devices` 设备与 E2EE / `/admin` 管理面板）；shadcn 风格 UI 原语（Button/Input/Card/Badge/Table + `cn()` + 设计 token CSS）；管理面板（统计卡片、用户停用/改密、房间列表，对齐 synapse-admin）；E2EE 设备密钥自举（Ed25519 fingerprint + Curve25519 identity 经 WebCrypto，keys/upload）。 |
+| 8 | **性能与可观测性** | `forward_extremities` 表 + `InsertEvent` 维护 extremity 集（/sync 增量 delta 无需全量重扫）；`database.max_conns/min_conns` 配置项（`KATRIX_DATABASE_MAX_CONNS`）；`internal/metrics` 依赖-free Prometheus `/metrics` 端点（Go runtime + katrix events/sync/federation/media 计数器）。 |
+| 9 | **二维码登录与安全消息传递自举** | `login_tokens` 表 + `POST /_matrix/client/v3/login/token` 铸造单次登录令牌；`/login` 增 `m.login.token` 流程消费令牌；`/versions` 声明 `org.matrix.msc3886`；`SendToDevice` 支持 `*` 通配（向用户全部设备扇出，打通 `m.secret.send`）；`m.key.verification.*` 任意事件类型已透传 to-device。 |
+
+### 额外实现（为达成目标而做的支撑项）
+
+- `crypto.VerifyJSONWith` + `events.EventIDFromRaw`：fedverify 所需原语。
+- `federation.signRequestWith`：出站联邦请求 X-Matrix 签名（远程媒体拉取复用）。
+- `federation.applyRemoteMembership` + `notifyRoomMembers`：入站 member 事件更新 denormalised membership 并唤醒 /sync。
+- `storage.OpenWithConfig`：连接池大小可配置。
+- `testdb.Truncate` 扩展至 `forward_extremities` / `media` / `login_tokens`。
+- 新增 `next-phase.yml` CI 工作流：纯 Go 单元测试（ssrf/fedverify/stateres/rooms v12/events/crypto）+ Postgres 集成（csapi/storage/media/federation + QR login）。
+
+### 已知遗留（未在本阶段完成）
+
+- **E2EE 客户端 Megolm 加解密**：设备密钥自举 + keys/upload/query 已通，但 room 消息的 Olm/Megolm 加解密需要 libolm WASM（或 vodozemac-wasm）集成，属前端独立大工程，本阶段未引入。
+- **Complement 通过率**：镜像与运行链路已就绪；逐用例偏差修复（逐个 Complement test 的协议细节）仍需迭代。
+- **状态解析 v2 的发送者 power-level 比较**：`EventMeta` 未携带 per-auth-events 的 power-level，Kahn 选点用 depth/ts/id 近似；完整规范实现需在候选构造时解析 power-levels。
