@@ -324,3 +324,4 @@ CI（`.github/workflows/ci.yml`）：
 6. **Complement 验收**：已接入 `complement.yml`（nightly 跑官方黑盒测试），但尚未对齐通过率里程碑。需按模块开启 Complement 用例并修复偏差，作为 spec 合规的正式验收。
 7. **Web 面板扩展**：当前为最小可用（登录/注册/建房/聊天/sync 循环）。待补：管理面板（用户/房间/媒体/统计图表，对齐 synapse-admin）、shadcn/ui 组件、TanStack Router 文件路由、E2EE 客户端加密（Olm/Megolm）。
 8. **性能与可观测性**：`/sync` 当前每次重算全量 delta，缺少 `forward_extremities` 表与增量索引；DB 连接池大小、token TTL 硬编码。需加 extremities 表、连接池配置项、metrics/tracing。
+9. **二维码登录与安全消息传递自举**：当前登录仅支持 `m.login.password`，不支持通过已登录设备扫码登录新设备并完成 E2EE 跨设备自举（客户端表现为「账户提供者不支持使用二维码登录到另一设备并设置安全消息传递」）。该能力对应已废弃的 MSC3886/MSC3906，接替方案为 [MSC4108](https://github.com/matrix-org/matrix-spec-proposals/pull/4108)（OAuth 2.0 + QR 登录与 E2EE 设置），截至 2026-07 仍未进入任何已发布 Matrix 规范版本（处于 proposed-FCP 且有 unresolved-concerns）。待 MSC4108 稳定后，需新增 `POST /_matrix/client/v3/login/token`（或 OAuth 2.0 等价端点）、在 `/versions` 的 `unstable_features` 声明对应能力标志、并补全 `m.key.verification.*`（含 QR）与 `m.secret.*` 秘密共享的 to-device 转发，以打通从扫码登录到密钥/密文恢复的完整链路。
