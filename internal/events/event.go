@@ -200,6 +200,16 @@ func ReferenceHashBase64(raw []byte, rules roomver.Rules) (string, error) {
 	return crypto.UnpaddedBase64.EncodeToString(h), nil
 }
 
+// ReferenceHashBase64URL returns the unpadded url-safe-base64 reference hash,
+// used for v12 room IDs (MSC4291).
+func ReferenceHashBase64URL(raw []byte, rules roomver.Rules) (string, error) {
+	h, err := referenceHash(raw, rules)
+	if err != nil {
+		return "", err
+	}
+	return crypto.URLSafeBase64.EncodeToString(h), nil
+}
+
 // EventID returns the event's ID, computing it if necessary.
 func (e *Event) EventID() string {
 	if e.eventID != "" {
