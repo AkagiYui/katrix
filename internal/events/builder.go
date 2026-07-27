@@ -77,6 +77,80 @@ func (b *Builder) Build(serverName string, key *crypto.SigningKey, version roomv
 	return New(signed, version)
 }
 
+// BuildLegacy constructs a signed event for legacy room versions (v1-v2),
+// where the event_id is an explicit field chosen by the origin server,
+// formatted "$opaque:server", and prev/auth events are [id, hash] pairs. The
+// caller supplies the event ID localpart; the server name is appended.
+func (b *Builder) BuildLegacy(serverName string, key *crypto.SigningKey, version roomver.Version, eventIDLocalpart string) (*Event, error) {
+	rules, ok := roomver.Get(version)
+	if !ok {
+		return nil, fmt.Errorf("events: unknown room version %q", version)
+	}
+	if !rules.EventFormatV1 {
+		return nil, fmt.Errorf("events: BuildLegacy only for v1 event format")
+	}
+	eventID := "$" + eventIDLocalpart + ":" + serverName
+
+	obj := map[string]json.RawMessage{}
+	setString(obj, "type", b.Type)
+	setString(obj, "sender", b.Sender)
+	setString(obj, "room_id", b.RoomID)
+	setString(obj, "event_id", eventID)
+	obj["content"] = nonNil(b.Content, `{}`)
+	obj["depth"] = mustJSON(b.Depth)
+	obj["origin_server_ts"] = mustJSON(b.OriginServerTS)
+	// Legacy prev/auth events are [id, hash] pairs; we emit the IDs with empty
+	// hash objects since the hash is only required for federation verification.
+	obj["prev_events"] = mustJSON(legacyRefs(b.PrevEvents))
+	obj["auth_events"] = mustJSON(legacyRefs(b.AuthEvents))
+	if b.StateKey != nil {
+		setString(obj, "state_key", *b.StateKey)
+	}
+	if b.Unsigned != nil {
+		obj["unsigned"] = b.Unsigned
+	}
+
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		return nil, err
+	}
+	// Content hash + sign over the redacted form (same pipeline).
+	ch, err := ContentHash(raw)
+	if err != nil {
+		return nil, err
+	}
+	hashes, _ := json.Marshal(map[string]string{"sha256": ch})
+	var withHash map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &withHash); err != nil {
+		return nil, err
+	}
+	withHash["hashes"] = hashes
+	raw, err = json.Marshal(withHash)
+	if err != nil {
+		return nil, err
+	}
+	signed, err := SignRedacted(serverName, key, raw, rules)
+	if err != nil {
+		return nil, err
+	}
+	ev, err := New(signed, version)
+	if err != nil {
+		return nil, err
+	}
+	ev.SetEventID(eventID)
+	return ev, nil
+}
+
+// legacyRefs converts a list of event IDs to the legacy [id, hash] pair form
+// with empty hash objects.
+func legacyRefs(ids []string) [][2]any {
+	out := make([][2]any, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, [2]any{id, map[string]string{}})
+	}
+	return out
+}
+
 // SignRedacted signs raw by (a) redacting, (b) signing the redacted canonical
 // bytes, then (c) attaching the signature to the full (unredacted) event.
 func SignRedacted(serverName string, key *crypto.SigningKey, raw []byte, rules roomver.Rules) ([]byte, error) {

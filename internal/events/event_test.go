@@ -1,6 +1,7 @@
 package events
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
@@ -107,5 +108,41 @@ func TestContentHashStable(t *testing.T) {
 	}
 	if h1 != h2 {
 		t.Errorf("content hash should ignore unsigned/signatures: %s vs %s", h1, h2)
+	}
+}
+
+func TestBuildLegacyV1EventID(t *testing.T) {
+	key, _ := crypto.GenerateSigningKey("1")
+	sk := "@alice:example.org"
+	b := &Builder{
+		Type:           "m.room.member",
+		StateKey:       &sk,
+		Sender:         "@alice:example.org",
+		RoomID:         "!room:example.org",
+		Content:        []byte(`{"membership":"join"}`),
+		OriginServerTS: 1000,
+		Depth:          1,
+	}
+	ev, err := b.BuildLegacy("example.org", key, "1", "opaque123")
+	if err != nil {
+		t.Fatalf("BuildLegacy: %v", err)
+	}
+	id := ev.EventID()
+	if id != "$opaque123:example.org" {
+		t.Fatalf("legacy event id=%q, want $opaque123:example.org", id)
+	}
+	// The raw event must carry an explicit event_id field (legacy format).
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(ev.Raw(), &fields)
+	if _, ok := fields["event_id"]; !ok {
+		t.Fatal("legacy event missing event_id field")
+	}
+}
+
+func TestBuildLegacyRejectsNonV1(t *testing.T) {
+	key, _ := crypto.GenerateSigningKey("1")
+	b := &Builder{Type: "m.room.message", Sender: "@a:test", RoomID: "!r:test"}
+	if _, err := b.BuildLegacy("test", key, "11", "x"); err == nil {
+		t.Fatal("BuildLegacy should reject v11")
 	}
 }
