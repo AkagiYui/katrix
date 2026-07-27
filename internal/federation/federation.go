@@ -15,10 +15,14 @@ import (
 // API bundles the Server-Server handlers.
 type API struct {
 	*homeserver.HS
+	client *Client
 }
 
-// New constructs the federation API surface.
-func New(hs *homeserver.HS) *API { return &API{HS: hs} }
+// New constructs the federation API surface with an outbound client for key
+// fetching.
+func New(hs *homeserver.HS) *API {
+	return &API{HS: hs, client: NewClient(hs.Store)}
+}
 
 // keyValidityWindow is how long a published server key set is considered valid.
 const keyValidityMillis = 24 * 60 * 60 * 1000
