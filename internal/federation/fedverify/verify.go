@@ -1,0 +1,143 @@
+// Package fedverify implements per-event PDU signature verification for inbound
+// federation transactions. A PDU is authentic only when it carries a valid
+// ed25519 signature from the server named in its "origin" field, verified
+// against that server's published verify keys (fetched + cached by the
+// federation Client).
+//
+// This is the federation security-critical path: every inbound PDU must be
+// signature-checked before it is trusted and persisted. The check is room
+// version aware only insofar as the event-id derivation differs; the signature
+// itself is always over the redacted canonical JSON of the event.
+package fedverify
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/AkagiYui/katrix/internal/crypto"
+	"github.com/AkagiYui/katrix/internal/events"
+	"github.com/AkagiYui/katrix/internal/roomver"
+)
+
+// KeyResolver fetches a remote server's ed25519 verify key for a key ID. The
+// federation Client implements this; the interface keeps the verifier
+// testable in isolation.
+type KeyResolver interface {
+	// VerifyKeyFor returns the raw ed25519 public key bytes for (server, keyID).
+	VerifyKeyFor(ctx context.Context, serverName, keyID string) ([]byte, error)
+}
+
+// Verifier checks inbound PDU signatures.
+type Verifier struct {
+	keys KeyResolver
+}
+
+// New constructs a Verifier backed by the given key resolver.
+func New(keys KeyResolver) *Verifier { return &Verifier{keys: keys} }
+
+// VerifyResult is the outcome of verifying one PDU.
+type VerifyResult struct {
+	// EventID is the derived event id (for v3+ hash ids) or the explicit
+	// event_id (for legacy v1-v2 events).
+	EventID string
+	// Origin is the server the event claims to be from (the "origin" field).
+	Origin string
+	// Signed reports whether the event carried a signature from its origin.
+	Signed bool
+	// Valid reports whether the signature cryptographically verifies.
+	Valid bool
+	// Err is non-nil when verification could not be completed (e.g. key fetch
+	// failed). When Err is non-nil, Valid is false.
+	Err error
+}
+
+// Verify checks the signature of a single inbound PDU. raw is the canonical
+// JSON of the event; version is the room's room version.
+//
+// The verification steps:
+//  1. Parse origin and signatures from raw.
+//  2. For each (keyID, signature) under signatures[origin], fetch the
+//     matching verify key and run crypto.VerifyJSON over the redacted form.
+//  3. The event is Valid iff at least one origin signature verifies.
+//
+// For legacy (v1) events the event_id is an explicit field and is returned
+// verbatim. For v3+ the event id is derived from the reference hash.
+func (v *Verifier) Verify(ctx context.Context, raw []byte, version roomver.Version) VerifyResult {
+	res := VerifyResult{}
+	rules, ok := roomver.Get(version)
+	if !ok {
+		res.Err = fmt.Errorf("fedverify: unknown room version %q", version)
+		return res
+	}
+
+	var ev struct {
+		Origin     string                       `json:"origin"`
+		EventID    string                       `json:"event_id"`
+		Sender     string                       `json:"sender"`
+		Signatures map[string]map[string]string `json:"signatures"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		res.Err = fmt.Errorf("fedverify: parse: %w", err)
+		return res
+	}
+	res.Origin = ev.Origin
+	if ev.Origin == "" {
+		// Fall back to the sender's server name.
+		if c := lastIndexByte(ev.Sender, ':'); c >= 0 {
+			res.Origin = ev.Sender[c+1:]
+		}
+	}
+
+	// Derive the event id (also validates the reference hash is computable).
+	if rules.EventFormatV1 {
+		res.EventID = ev.EventID
+	} else {
+		if id, err := events.EventIDFromRaw(raw, rules); err == nil {
+			res.EventID = id
+		}
+	}
+
+	if res.Origin == "" {
+		res.Err = fmt.Errorf("fedverify: event has no origin and no sender domain")
+		return res
+	}
+	originSigs := ev.Signatures[res.Origin]
+	if len(originSigs) == 0 {
+		// Unsigned event: not valid. Caller decides whether to drop.
+		res.Signed = false
+		return res
+	}
+	res.Signed = true
+
+	// Try each origin signature until one verifies. A single valid signature
+	// is sufficient (spec: any of the origin's current keys).
+	var lastErr error
+	for keyID, sig := range originSigs {
+		pub, err := v.keys.VerifyKeyFor(ctx, res.Origin, keyID)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if err := crypto.VerifyJSONWith(sig, res.Origin, crypto.KeyID(keyID), pub, raw); err != nil {
+			lastErr = err
+			continue
+		}
+		res.Valid = true
+		return res
+	}
+	if lastErr != nil {
+		res.Err = fmt.Errorf("fedverify: no valid signature from %s: %w", res.Origin, lastErr)
+	}
+	return res
+}
+
+// lastIndexByte is a tiny helper to avoid importing strings just for one call.
+func lastIndexByte(s string, b byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
+}

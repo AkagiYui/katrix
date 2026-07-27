@@ -161,6 +161,28 @@ func VerifyJSON(entity string, keyID KeyID, pub ed25519.PublicKey, input []byte)
 	if err != nil {
 		return fmt.Errorf("crypto: bad signature encoding: %w", err)
 	}
+	return verifyBytes(entity, pub, sig, obj)
+}
+
+// VerifyJSONWith checks an explicit ed25519 signature value (sigB64, already
+// decoded to raw bytes via sigBytes) over the signable form of input. This is
+// the variant used by the federation PDU verifier, which already has the
+// signature bytes in hand.
+func VerifyJSONWith(sigB64, entity string, keyID KeyID, pub ed25519.PublicKey, input []byte) error {
+	sig, err := UnpaddedBase64.DecodeString(sigB64)
+	if err != nil {
+		return fmt.Errorf("crypto: bad signature encoding: %w", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(input, &obj); err != nil {
+		return err
+	}
+	return verifyBytes(entity, pub, sig, obj)
+}
+
+// verifyBytes strips signatures/unsigned from obj, canonicalises and runs the
+// ed25519 verification.
+func verifyBytes(entity string, pub ed25519.PublicKey, sig []byte, obj map[string]json.RawMessage) error {
 	delete(obj, "signatures")
 	delete(obj, "unsigned")
 	signable, err := canonicaljson.Marshal(obj)

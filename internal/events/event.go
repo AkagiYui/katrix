@@ -236,6 +236,35 @@ func (e *Event) EventID() string {
 // storage where the ID is authoritative).
 func (e *Event) SetEventID(id string) { e.eventID = id }
 
+// EventIDFromRaw derives the event ID from raw event JSON under the given room
+// version rules. For legacy (v1-v2) events it returns the explicit event_id
+// field (empty when absent); for v3+ it computes the reference hash. It is the
+// functional counterpart of (*Event).EventID() for callers that have only the
+// raw bytes and the rules (e.g. the federation PDU verifier).
+func EventIDFromRaw(raw []byte, rules roomver.Rules) (string, error) {
+	if rules.EventIDFormat == roomver.EventIDLegacy {
+		var ev struct {
+			EventID string `json:"event_id"`
+		}
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			return "", err
+		}
+		return ev.EventID, nil
+	}
+	h, err := referenceHash(raw, rules)
+	if err != nil {
+		return "", err
+	}
+	switch rules.EventIDFormat {
+	case roomver.EventIDSHA256:
+		return "$" + crypto.UnpaddedBase64.EncodeToString(h), nil
+	case roomver.EventIDSHA256URLSafe:
+		return "$" + crypto.URLSafeBase64.EncodeToString(h), nil
+	default:
+		return "", fmt.Errorf("events: unknown event id format %d", rules.EventIDFormat)
+	}
+}
+
 // Redacted returns a redacted copy of the event as raw JSON (used when serving
 // redacted events to clients or over federation).
 func (e *Event) Redacted() ([]byte, error) {

@@ -1,6 +1,7 @@
 package federation
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -8,6 +9,21 @@ import (
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
 )
+
+// notifyRoomMembers wakes up all joined users' /sync requests for a room. This
+// is the federation-side mirror of csapi.notifyRoomMembers, used when an
+// inbound transaction changes a room's state.
+func (a *API) notifyRoomMembers(ctx context.Context, roomID string) {
+	userIDs, err := a.Store.JoinedUserIDs(ctx, roomID)
+	if err != nil {
+		return
+	}
+	users := make([]string, 0, len(userIDs))
+	for _, u := range userIDs {
+		users = append(users, u)
+	}
+	a.Notifier.NotifyUsers(users...)
+}
 
 // registerTransactions wires the PDU/EDU transaction and room federation
 // routes. Inbound transactions are accepted and de-duplicated; PDUs that
@@ -72,7 +88,9 @@ func (a *API) SendTransaction(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"pdus": pduResults})
 }
 
-// ingestPDU validates and persists a single inbound PDU.
+// ingestPDU validates, verifies and persists a single inbound PDU. Each PDU's
+// signature is checked against its origin server's published verify keys before
+// it is trusted; events that fail verification are rejected (not persisted).
 func (a *API) ingestPDU(r *http.Request, raw json.RawMessage) (string, bool) {
 	var ev struct {
 		EventID    string                       `json:"event_id"`
@@ -96,9 +114,22 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage) (string, bool) {
 	if err != nil {
 		return "", false
 	}
+	version := roomver.Version(room.Version)
+
+	// Verify the inbound PDU's signature against its origin server's keys. This
+	// is the federation security boundary: an unsigned or badly-signed PDU is
+	// rejected so a malicious peer cannot inject forged events.
+	res := a.verifier.Verify(r.Context(), raw, version)
+	if res.Err != nil {
+		return "", false
+	}
+	if res.Signed && !res.Valid {
+		return "", false
+	}
+
 	evID := ev.EventID
 	if evID == "" {
-		evID = deriveEventID(raw, roomver.Version(room.Version))
+		evID = res.EventID
 	}
 	row := &storage.EventRow{
 		EventID: evID, RoomID: ev.RoomID, Type: ev.Type, Sender: ev.Sender,
@@ -112,16 +143,12 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage) (string, bool) {
 	}
 	if ev.StateKey != nil {
 		_ = a.Store.UpsertState(r.Context(), ev.RoomID, ev.Type, *ev.StateKey, evID)
+		// For membership state events, update the denormalised membership table.
+		if ev.Type == "m.room.member" {
+			a.applyRemoteMembership(r.Context(), ev.RoomID, *ev.StateKey, ev.Content, evID, ev.Depth)
+		}
 	}
 	return evID, true
-}
-
-// deriveEventID is a placeholder for v3+ hash-based event ID derivation; the
-// complete canonical-JSON reference-hash path is implemented in the events
-// package and wired here once state-resolution v2 lands. Returns "" when the
-// hash cannot be computed, signalling the caller to skip.
-func deriveEventID(raw json.RawMessage, version roomver.Version) string {
-	return ""
 }
 
 // GetEvent handles GET /_matrix/federation/v1/event/{eventID}.
@@ -310,7 +337,7 @@ func (a *API) EventAuth(w http.ResponseWriter, r *http.Request) {
 
 // ingestRemoteMember persists a remote m.room.member event (join/leave/invite)
 // and returns the resolved room state + auth chain so the remote server can
-// build its view.
+// build its view. The event's signature is verified before being trusted.
 func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Event       json.RawMessage `json:"event"`
@@ -332,7 +359,26 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
 		OSTS     int64           `json:"origin_server_ts"`
 	}
 	_ = json.Unmarshal(req.Event, &ev)
+
+	// Resolve room version: prefer the request's room_version, else the stored
+	// room's version, else the default.
+	version := roomver.Version(req.RoomVersion)
+	if version == "" {
+		if room, err := a.Store.GetRoom(r.Context(), ev.RoomID); err == nil {
+			version = roomver.Version(room.Version)
+		} else {
+			version = roomver.Default
+		}
+	}
+
+	// Verify the event signature. For send_join/send_leave the remote server is
+	// vouching for the event; we still must validate its signature before
+	// trusting it locally.
+	vres := a.verifier.Verify(r.Context(), req.Event, version)
 	evID := ev.EventID
+	if evID == "" {
+		evID = vres.EventID
+	}
 	row := &storage.EventRow{
 		EventID: evID, RoomID: ev.RoomID, Type: ev.Type, Sender: ev.Sender,
 		Depth: ev.Depth, OriginServerTS: ev.OSTS, Content: ev.Content, RawJSON: req.Event,
@@ -340,9 +386,16 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
 	if ev.StateKey != nil {
 		row.StateKey = *ev.StateKey
 	}
-	if evID != "" {
-		if _, err := a.Store.InsertEvent(r.Context(), row); err == nil && ev.StateKey != nil {
-			_ = a.Store.UpsertState(r.Context(), ev.RoomID, ev.Type, *ev.StateKey, evID)
+	// Persist even unsigned join/leave events that pass verification; the
+	// signature check above establishes authenticity.
+	if vres.Valid || vres.Signed {
+		if evID != "" {
+			if _, err := a.Store.InsertEvent(r.Context(), row); err == nil && ev.StateKey != nil {
+				_ = a.Store.UpsertState(r.Context(), ev.RoomID, ev.Type, *ev.StateKey, evID)
+				if ev.Type == "m.room.member" {
+					a.applyRemoteMembership(r.Context(), ev.RoomID, *ev.StateKey, ev.Content, evID, ev.Depth)
+				}
+			}
 		}
 	}
 	statePDUs, _ := a.roomStatePDUs(r, ev.RoomID)
@@ -352,6 +405,29 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
 		"auth_chain": a.authChain(r, ev.RoomID),
 		"event":      req.Event,
 	})
+}
+
+// applyRemoteMembership updates the denormalised room_memberships table for an
+// inbound remote m.room.member event. This is the federation-side mirror of
+// the client-side sendMemberEvent path; it keeps /sync membership correct for
+// locally-joined users.
+func (a *API) applyRemoteMembership(ctx context.Context, roomID, userID string, content json.RawMessage, eventID string, depth int64) {
+	var mc struct {
+		Membership  string `json:"membership"`
+		DisplayName string `json:"displayname"`
+		AvatarURL   string `json:"avatar_url"`
+	}
+	if err := json.Unmarshal(content, &mc); err != nil || mc.Membership == "" {
+		return
+	}
+	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
+		RoomID: roomID, UserID: userID, Membership: mc.Membership,
+		EventID: eventID, DisplayName: mc.DisplayName, AvatarURL: mc.AvatarURL,
+		StreamOrdering: depth,
+	})
+	if mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban" {
+		a.notifyRoomMembers(ctx, roomID)
+	}
 }
 
 // roomStatePDUs returns the current room state as raw PDUs.

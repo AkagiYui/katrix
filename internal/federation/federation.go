@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
+	"github.com/AkagiYui/katrix/internal/federation/fedverify"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 )
@@ -15,13 +16,15 @@ import (
 // API bundles the Server-Server handlers.
 type API struct {
 	*homeserver.HS
-	client *Client
+	client   *Client
+	verifier *fedverify.Verifier
 }
 
 // New constructs the federation API surface with an outbound client for key
-// fetching.
+// fetching and a per-event PDU signature verifier backed by that client.
 func New(hs *homeserver.HS) *API {
-	return &API{HS: hs, client: NewClient(hs.Store)}
+	client := NewClient(hs.Store)
+	return &API{HS: hs, client: client, verifier: fedverify.New(client)}
 }
 
 // keyValidityWindow is how long a published server key set is considered valid.
