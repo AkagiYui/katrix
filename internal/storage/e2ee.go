@@ -69,6 +69,33 @@ type OneTimeKey struct {
 
 // ClaimOneTimeKeys atomically claims unused one-time keys for the given
 // (user, device, algorithm) tuples, marking them used. Returns the claimed keys.
+// ClaimOneTimeKeyByAlgo claims one available (unused, non-fallback) one-time
+// key for the given user/device/algorithm, marking it used. Returns the
+// claimed key or empty if none available.
+func (s *Store) ClaimOneTimeKeyByAlgo(ctx context.Context, userID, deviceID, algorithm string) ([]OneTimeKey, error) {
+	var keyID string
+	var keyJSON json.RawMessage
+	err := s.pool.QueryRow(ctx,
+		`UPDATE one_time_keys SET used=TRUE
+		 WHERE ctid IN (
+		   SELECT ctid FROM one_time_keys
+		   WHERE user_id=$1 AND device_id=$2 AND algorithm=$3 AND used=FALSE AND is_fallback=FALSE
+		   LIMIT 1 FOR UPDATE SKIP LOCKED
+		 )
+		 RETURNING key_id, key_json`,
+		userID, deviceID, algorithm,
+	).Scan(&keyID, &keyJSON)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return []OneTimeKey{{
+		UserID: userID, DeviceID: deviceID, Algorithm: algorithm, KeyID: keyID, KeyJSON: keyJSON,
+	}}, nil
+}
+
 func (s *Store) ClaimOneTimeKeys(ctx context.Context, requests []OneTimeKey) ([]OneTimeKey, error) {
 	var out []OneTimeKey
 	for _, req := range requests {

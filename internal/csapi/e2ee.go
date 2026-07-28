@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
@@ -128,6 +129,12 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := map[string]map[string]any{}
+	// Ensure every requested user has an entry (empty dict if no keys).
+	for u := range req.DeviceKeys {
+		if out[u] == nil {
+			out[u] = map[string]any{}
+		}
+	}
 	for _, dk := range devKeys {
 		if out[dk.UserID] == nil {
 			out[dk.UserID] = map[string]any{}
@@ -155,29 +162,46 @@ func (a *API) KeysClaim(w http.ResponseWriter, r *http.Request) {
 		OneTimeKeys map[string]map[string]string `json:"one_time_keys"`
 	}
 	_ = json.Unmarshal(body, &raw)
-	var reqs []storage.OneTimeKey
+	// For each (user, device, algorithm_or_keyid) tuple, claim a key. If the
+	// value contains ":", it is a specific key id (algo:id); otherwise it is
+	// an algorithm name and any available key of that algorithm is claimed.
+	type claimReq struct{ uid, did, algo, keyID string }
+	var reqs []claimReq
 	for uid, devs := range raw.OneTimeKeys {
-		for did, kid := range devs {
-			algo, id := splitKeyID(kid)
-			reqs = append(reqs, storage.OneTimeKey{UserID: uid, DeviceID: did, Algorithm: algo, KeyID: id})
+		for did, val := range devs {
+			if strings.Contains(val, ":") {
+				algo, id := splitKeyID(val)
+				reqs = append(reqs, claimReq{uid, did, algo, id})
+			} else {
+				reqs = append(reqs, claimReq{uid, did, val, ""})
+			}
 		}
 	}
-	claimed, err := a.Store.ClaimOneTimeKeys(r.Context(), reqs)
-	if err != nil {
-		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
-		return
+	var claimed []storage.OneTimeKey
+	for _, rq := range reqs {
+		if rq.keyID != "" {
+			ks, e := a.Store.ClaimOneTimeKeys(r.Context(), []storage.OneTimeKey{{
+				UserID: rq.uid, DeviceID: rq.did, Algorithm: rq.algo, KeyID: rq.keyID,
+			}})
+			if e == nil {
+				claimed = append(claimed, ks...)
+			}
+		} else {
+			ks, e := a.Store.ClaimOneTimeKeyByAlgo(r.Context(), rq.uid, rq.did, rq.algo)
+			if e == nil {
+				claimed = append(claimed, ks...)
+			}
+		}
 	}
-	out := map[string]map[string]map[string]map[string]any{}
+	out := map[string]map[string]map[string]json.RawMessage{}
 	for _, k := range claimed {
 		if out[k.UserID] == nil {
-			out[k.UserID] = map[string]map[string]map[string]any{}
+			out[k.UserID] = map[string]map[string]json.RawMessage{}
 		}
 		if out[k.UserID][k.DeviceID] == nil {
-			out[k.UserID][k.DeviceID] = map[string]map[string]any{}
+			out[k.UserID][k.DeviceID] = map[string]json.RawMessage{}
 		}
-		var keyObj map[string]any
-		_ = json.Unmarshal(k.KeyJSON, &keyObj)
-		out[k.UserID][k.DeviceID][k.Algorithm+":"+k.KeyID] = keyObj
+		out[k.UserID][k.DeviceID][k.Algorithm+":"+k.KeyID] = k.KeyJSON
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"one_time_keys": out})
 }
