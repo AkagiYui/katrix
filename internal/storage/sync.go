@@ -154,3 +154,40 @@ func (s *Store) LeftRooms(ctx context.Context, userID string) ([]string, error) 
 	}
 	return out, rows.Err()
 }
+
+// PresenceRow is a user's presence state.
+type PresenceRow struct {
+	UserID       string `json:"user_id"`
+	Presence     string `json:"presence"`
+	StatusMsg    string `json:"status_msg,omitempty"`
+	LastActiveTS int64  `json:"last_active_ago"`
+}
+
+// SetPresence upserts a user's presence state.
+func (s *Store) SetPresence(ctx context.Context, userID, presence, statusMsg string, ts int64) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO presence(user_id, presence, status_msg, last_active_ts)
+		 VALUES ($1,$2,$3,$4)
+		 ON CONFLICT (user_id) DO UPDATE SET presence=$2, status_msg=$3, last_active_ts=$4`,
+		userID, presence, statusMsg, ts)
+	return err
+}
+
+// GetPresence returns a user's presence state, or nil if unset.
+func (s *Store) GetPresence(ctx context.Context, userID string) (*PresenceRow, error) {
+	var p PresenceRow
+	var statusMsg *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT user_id, presence, status_msg, last_active_ts FROM presence WHERE user_id=$1`,
+		userID).Scan(&p.UserID, &p.Presence, &statusMsg, &p.LastActiveTS)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if statusMsg != nil {
+		p.StatusMsg = *statusMsg
+	}
+	return &p, nil
+}

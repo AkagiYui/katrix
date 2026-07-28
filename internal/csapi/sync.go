@@ -8,6 +8,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/metrics"
+	"github.com/AkagiYui/katrix/internal/rooms"
 	"github.com/AkagiYui/katrix/internal/storage"
 	syncpkg "github.com/AkagiYui/katrix/internal/sync"
 )
@@ -18,6 +19,9 @@ func (a *API) registerSync(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /_matrix/client/v3/user/{userID}/account_data/{type}", a.RequireAuth(a.PutAccountData))
 	mux.HandleFunc("PUT /_matrix/client/v3/user/{userID}/rooms/{roomID}/account_data/{type}", a.RequireAuth(a.PutRoomAccountData))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/read_markers", a.RequireAuth(a.ReadMarkers))
+	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/receipt/{receiptType}/{eventID}", a.RequireAuth(a.Receipt))
+	mux.HandleFunc("GET /_matrix/client/v3/presence/{userID}/status", a.RequireAuth(a.PresenceGet))
+	mux.HandleFunc("PUT /_matrix/client/v3/presence/{userID}/status", a.RequireAuth(a.PresencePut))
 }
 
 // Sync handles GET /_matrix/client/v3/sync.
@@ -152,6 +156,59 @@ func (a *API) ReadMarkers(w http.ResponseWriter, r *http.Request) {
 		_, _ = a.Store.SetReceipt(r.Context(), storage.ReceiptRow{
 			RoomID: roomID, UserID: auth.UserID, ReceiptType: "m.fully_read", EventID: *req.FullyRead, TS: now,
 		})
+	}
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// Receipt handles POST /_matrix/client/v3/rooms/{roomID}/receipt/{receiptType}/{eventID}.
+// It records a read receipt for the calling user on the given event.
+func (a *API) Receipt(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	roomID := r.PathValue("roomID")
+	receiptType := r.PathValue("receiptType")
+	eventID := r.PathValue("eventID")
+	if err := a.checkMembership(r.Context(), roomID, auth.UserID, rooms.MembershipJoin); err != nil {
+		httpx.WriteError(w, httpx.ErrForbidden("not joined to room"))
+		return
+	}
+	_, _ = a.Store.SetReceipt(r.Context(), storage.ReceiptRow{
+		RoomID: roomID, UserID: auth.UserID, ReceiptType: receiptType, EventID: eventID, TS: a.Now(),
+	})
+	a.notifyRoomMembers(r.Context(), roomID)
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// PresenceGet handles GET /_matrix/client/v3/presence/{userID}/status.
+func (a *API) PresenceGet(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("userID")
+	status, err := a.Store.GetPresence(r.Context(), userID)
+	if err != nil || status == nil {
+		// Default presence: online, no status message.
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"presence": "online"})
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, status)
+}
+
+// PresencePut handles PUT /_matrix/client/v3/presence/{userID}/status.
+func (a *API) PresencePut(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	userID := r.PathValue("userID")
+	if auth.UserID != userID {
+		httpx.WriteError(w, httpx.ErrForbidden("can only set own presence"))
+		return
+	}
+	var req struct {
+		Presence  string `json:"presence"`
+		StatusMsg string `json:"status_msg,omitempty"`
+	}
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	if err := a.Store.SetPresence(r.Context(), userID, req.Presence, req.StatusMsg, a.Now()); err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
