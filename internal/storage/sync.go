@@ -80,12 +80,16 @@ func (s *Store) SetReceipt(ctx context.Context, r ReceiptRow) (int64, error) {
 	return streamID, err
 }
 
-// ReceiptsSince returns receipts with stream_id > since for the given user.
+// ReceiptsSince returns receipts with stream_id > since for rooms the given
+// user is joined to. It includes all users' receipts (not just the requester's)
+// so clients see other users' read receipts in the ephemeral sync section.
 func (s *Store) ReceiptsSince(ctx context.Context, userID string, since int64) ([]ReceiptRow, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT room_id, user_id, receipt_type, COALESCE(thread_id,''), event_id, ts, COALESCE(stream_id,0)
-		 FROM receipts WHERE user_id=$1 AND stream_id>$2
-		 ORDER BY stream_id ASC`, userID, since)
+		`SELECT r.room_id, r.user_id, r.receipt_type, COALESCE(r.thread_id,''), r.event_id, r.ts, COALESCE(r.stream_id,0)
+		 FROM receipts r
+		 JOIN room_memberships m ON m.room_id = r.room_id AND m.user_id = $1 AND m.membership='join'
+		 WHERE r.stream_id > $2
+		 ORDER BY r.stream_id ASC`, userID, since)
 	if err != nil {
 		return nil, err
 	}

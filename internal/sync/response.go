@@ -155,6 +155,28 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 		}
 	}
 
+	// Presence: include the calling user's own presence state.
+	if p, err := e.store.GetPresence(ctx, opts.UserID); err == nil && p != nil {
+		ev, _ := json.Marshal(map[string]any{
+			"type": "m.presence",
+			"content": map[string]any{
+				"presence": p.Presence,
+				"user_id":  p.UserID,
+			},
+		})
+		if p.StatusMsg != "" {
+			ev, _ = json.Marshal(map[string]any{
+				"type": "m.presence",
+				"content": map[string]any{
+					"presence":   p.Presence,
+					"user_id":    p.UserID,
+					"status_msg": p.StatusMsg,
+				},
+			})
+		}
+		resp.Presence = &PresenceResp{Events: []json.RawMessage{ev}}
+	}
+
 	// Ephemeral: typing + receipts.
 	for roomID := range rooms.Join {
 		jr := rooms.Join[roomID]
@@ -169,31 +191,25 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 			})
 			jr.Ephemeral = append(jr.Ephemeral, eph)
 		}
-		// Receipts ephemeral (since-based).
+		// Receipts ephemeral (since-based). Include all users' receipts for
+		// rooms the syncer is joined to.
 		receipts, _ := e.store.ReceiptsSince(ctx, opts.UserID, opts.Since.Stream)
 		if len(receipts) > 0 {
-			byRoom := map[string]map[string]map[string]map[string]string{}
+			// Build content: {event_id: {receipt_type: {ts: N, user_id: "@u:hs"}}}
+			byRoom := map[string]map[string]map[string]map[string]any{}
 			for _, rc := range receipts {
-				if rc.UserID != opts.UserID {
-					continue
-				}
-				thread := rc.ThreadID
-				if thread == "" {
-					thread = "main"
-				}
 				if byRoom[rc.RoomID] == nil {
-					byRoom[rc.RoomID] = map[string]map[string]map[string]string{}
+					byRoom[rc.RoomID] = map[string]map[string]map[string]any{}
 				}
 				if byRoom[rc.RoomID][rc.EventID] == nil {
-					byRoom[rc.RoomID][rc.EventID] = map[string]map[string]string{}
+					byRoom[rc.RoomID][rc.EventID] = map[string]map[string]any{}
 				}
-				byRoom[rc.RoomID][rc.EventID][rc.ReceiptType] = map[string]string{"ts": fmt.Sprintf("%d", rc.TS)}
-				_ = thread
+				byRoom[rc.RoomID][rc.EventID][rc.ReceiptType] = map[string]any{
+					"ts":      rc.TS,
+					"user_id": rc.UserID,
+				}
 			}
-			for rid, evMap := range byRoom {
-				if rid != roomID {
-					continue
-				}
+			if evMap, ok := byRoom[roomID]; ok {
 				eph, _ := json.Marshal(map[string]any{
 					"type":    "m.receipt",
 					"content": evMap,
