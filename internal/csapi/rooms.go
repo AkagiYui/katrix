@@ -755,8 +755,35 @@ func (a *API) DirectoryPutAlias(w http.ResponseWriter, r *http.Request) {
 }
 
 // DirectoryDeleteAlias handles DELETE /_matrix/client/v3/directory/room/{roomAlias}.
+// It returns 404 if the alias doesn't exist and 403 if the caller is not the
+// alias creator or a room admin.
 func (a *API) DirectoryDeleteAlias(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
 	alias := r.PathValue("roomAlias")
+	roomID, err := a.Store.LookupAlias(r.Context(), alias)
+	if err != nil || roomID == "" {
+		httpx.WriteError(w, httpx.ErrNotFound("alias not found"))
+		return
+	}
+	// Check ownership: the alias creator or a room power-level admin can delete.
+	creator, _ := a.Store.AliasCreator(r.Context(), alias)
+	canDelete := creator == auth.UserID
+	if !canDelete {
+		// Check room power levels: if the user has power to set canonical_alias (50+).
+		if id, e := a.Store.GetStateEvent(r.Context(), roomID, "m.room.power_levels", ""); e == nil {
+			if ev, e := a.Store.GetEvent(r.Context(), id); e == nil {
+				if pl, e := rooms.ParsePowerLevels(ev.Content); e == nil {
+					if pl.UserLevel(auth.UserID) >= pl.EventLevel("m.room.canonical_alias", true) {
+						canDelete = true
+					}
+				}
+			}
+		}
+	}
+	if !canDelete {
+		httpx.WriteError(w, httpx.ErrForbidden("not allowed to delete this alias"))
+		return
+	}
 	if err := a.Store.DeleteAlias(r.Context(), alias); err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return

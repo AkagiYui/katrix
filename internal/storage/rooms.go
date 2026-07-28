@@ -452,6 +452,19 @@ func (s *Store) LookupAlias(ctx context.Context, alias string) (string, error) {
 	return roomID, nil
 }
 
+// AliasCreator returns the creator user ID of an alias, or "" if not found.
+func (s *Store) AliasCreator(ctx context.Context, alias string) (string, error) {
+	var creator string
+	err := s.pool.QueryRow(ctx, `SELECT creator FROM room_aliases WHERE alias=$1`, alias).Scan(&creator)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	return creator, nil
+}
+
 // AliasesForRoom returns all aliases for a room.
 func (s *Store) AliasesForRoom(ctx context.Context, roomID string) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `SELECT alias FROM room_aliases WHERE room_id=$1`, roomID)
