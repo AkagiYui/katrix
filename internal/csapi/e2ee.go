@@ -57,6 +57,27 @@ func (a *API) KeysUpload(w http.ResponseWriter, r *http.Request) {
 		var dk map[string]json.RawMessage
 		if err := json.Unmarshal(req.DeviceKeys, &dk); err == nil {
 			if bundle, ok := dk[auth.DeviceID]; ok {
+				// Validate the device_keys bundle: algorithms, keys and signatures
+				// are required; if user_id/device_id are present they must match the caller.
+				var fields struct {
+					UserID     string         `json:"user_id"`
+					DeviceID   string         `json:"device_id"`
+					Algorithms json.RawMessage `json:"algorithms"`
+					Keys       json.RawMessage `json:"keys"`
+					Signatures json.RawMessage `json:"signatures"`
+				}
+				if err := json.Unmarshal(bundle, &fields); err != nil {
+					httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON", "device_keys: invalid JSON"))
+					return
+				}
+				if fields.UserID != "" && fields.UserID != auth.UserID {
+					httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON", "device_keys: user_id does not match the authenticated user"))
+					return
+				}
+				if len(fields.Algorithms) == 0 || len(fields.Keys) == 0 || len(fields.Signatures) == 0 {
+					httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON", "device_keys: algorithms, keys and signatures are required"))
+					return
+				}
 				_, _ = a.Store.UpsertDeviceKey(r.Context(), storage.DeviceKey{
 					UserID: auth.UserID, DeviceID: auth.DeviceID, KeyJSON: bundle,
 				})
