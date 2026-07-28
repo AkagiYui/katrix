@@ -20,14 +20,19 @@ type AccountDataRow struct {
 
 // SetAccountData upserts an account_data row.
 func (s *Store) SetAccountData(ctx context.Context, userLocalpart, roomID, eventType string, content []byte) (int64, error) {
+	// Use the event stream-id space so /sync's "since" token (which tracks
+	// event stream_ordering) also gates account_data. Set stream_id to the
+	// current max event stream_ordering + 1 so it appears on the next poll.
 	var streamID int64
-	err := s.pool.QueryRow(ctx,
-		`INSERT INTO account_data(user_localpart, room_id, type, content)
-		 VALUES ($1,$2,$3,$4)
-		 ON CONFLICT (user_localpart, room_id, type) DO UPDATE SET content=EXCLUDED.content
-		 RETURNING stream_id`,
-		userLocalpart, roomID, eventType, content,
-	).Scan(&streamID)
+	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(stream_ordering),0)+1 FROM events`).Scan(&streamID); err != nil {
+		return 0, err
+	}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO account_data(user_localpart, room_id, type, content, stream_id)
+		 VALUES ($1,$2,$3,$4,$5)
+		 ON CONFLICT (user_localpart, room_id, type) DO UPDATE SET content=EXCLUDED.content, stream_id=EXCLUDED.stream_id`,
+		userLocalpart, roomID, eventType, content, streamID,
+	)
 	return streamID, err
 }
 
