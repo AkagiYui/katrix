@@ -44,6 +44,12 @@ func (s *Store) GetRoom(ctx context.Context, roomID string) (*Room, error) {
 	return &r, nil
 }
 
+// SetRoomVisibility updates a room's is_public flag (public room directory).
+func (s *Store) SetRoomVisibility(ctx context.Context, roomID string, isPublic bool) error {
+	_, err := s.pool.Exec(ctx, `UPDATE rooms SET is_public=$2 WHERE room_id=$1`, roomID, isPublic)
+	return err
+}
+
 // RoomExists reports whether a room exists.
 func (s *Store) RoomExists(ctx context.Context, roomID string) (bool, error) {
 	var exists bool

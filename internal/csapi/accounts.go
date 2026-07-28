@@ -319,19 +319,27 @@ func (a *API) resolveLocalpart(user string) string {
 
 // ---- Logout / refresh / whoami ----
 
-// Logout handles POST /_matrix/client/v3/logout.
+// Logout handles POST /_matrix/client/v3/logout. It invalidates the current
+// access token and removes the associated device, per the spec.
 func (a *API) Logout(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
 	token := bearer(r)
 	if token != "" {
 		_ = a.Store.DeleteAccessToken(r.Context(), token)
 	}
+	if auth != nil && auth.DeviceID != "" {
+		_ = a.Store.DeleteDevice(r.Context(), auth.Localpart, auth.DeviceID, a.ServerName())
+	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
-// LogoutAll handles POST /_matrix/client/v3/logout/all.
+// LogoutAll handles POST /_matrix/client/v3/logout/all. It invalidates all
+// access tokens and removes all devices for the user.
 func (a *API) LogoutAll(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
-	_ = a.Store.DeleteAllAccessTokens(r.Context(), auth.Localpart)
+	if auth != nil {
+		_ = a.Store.DeleteDevicesAndTokens(r.Context(), auth.Localpart, a.ServerName(), "")
+	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 

@@ -210,17 +210,19 @@ func (a *API) checkPasswordUIA(w http.ResponseWriter, r *http.Request, raw json.
 		}
 	}
 
-	if body.Auth == nil || body.Auth.Session == "" {
+	if body.Auth == nil {
 		id, _ := a.uia.create("password", auth.Localpart)
 		a.writeUIAChallenge(w, stages, id, nil)
 		return false, nil
 	}
 
+	// If the client supplied an auth type but no session, start a new session
+	// and process the supplied stage immediately (single-request completion).
 	sess := a.uia.get(body.Auth.Session)
 	if sess == nil || sess.op != "password" || sess.localpart != auth.Localpart {
-		id, _ := a.uia.create("password", auth.Localpart)
-		a.writeUIAChallenge(w, stages, id, nil)
-		return false, nil
+		id, s := a.uia.create("password", auth.Localpart)
+		sess = s
+		body.Auth.Session = id
 	}
 
 	if body.Auth.Type == "m.login.password" {

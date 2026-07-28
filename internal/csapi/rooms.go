@@ -49,6 +49,9 @@ func (a *API) registerRooms(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/directory/room/{roomAlias}", a.DirectoryLookupAlias)
 	mux.HandleFunc("PUT /_matrix/client/v3/directory/room/{roomAlias}", a.RequireAuth(a.DirectoryPutAlias))
 	mux.HandleFunc("DELETE /_matrix/client/v3/directory/room/{roomAlias}", a.RequireAuth(a.DirectoryDeleteAlias))
+	mux.HandleFunc("PUT /_matrix/client/v3/directory/list/room/{roomID}", a.RequireAuth(a.DirectoryListRoomPut))
+	mux.HandleFunc("GET /_matrix/client/v3/directory/list/room/{roomID}", a.RequireAuth(a.DirectoryListRoomGet))
+	mux.HandleFunc("DELETE /_matrix/client/v3/directory/list/room/{roomID}", a.RequireAuth(a.DirectoryListRoomDelete))
 }
 
 // ---- createRoom ----
@@ -565,6 +568,9 @@ func (a *API) RoomAliases(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	if aliases == nil {
+		aliases = []string{}
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"aliases": aliases})
 }
 
@@ -755,6 +761,45 @@ func (a *API) DirectoryDeleteAlias(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// DirectoryListRoomPut handles PUT /_matrix/client/v3/directory/list/room/{roomID}.
+// It publishes (visibility=public) or unpublishes (visibility=private) a room
+// in the public room directory.
+func (a *API) DirectoryListRoomPut(w http.ResponseWriter, r *http.Request) {
+	roomID := r.PathValue("roomID")
+	var req struct {
+		Visibility string `json:"visibility"`
+	}
+	_ = httpx.DecodeJSON(w, r, &req)
+	isPublic := req.Visibility == "public"
+	if err := a.Store.SetRoomVisibility(r.Context(), roomID, isPublic); err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// DirectoryListRoomGet handles GET /_matrix/client/v3/directory/list/room/{roomID}.
+func (a *API) DirectoryListRoomGet(w http.ResponseWriter, r *http.Request) {
+	roomID := r.PathValue("roomID")
+	room, err := a.Store.GetRoom(r.Context(), roomID)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
+		return
+	}
+	vis := "private"
+	if room.IsPublic {
+		vis = "public"
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"visibility": vis})
+}
+
+// DirectoryListRoomDelete handles DELETE /_matrix/client/v3/directory/list/room/{roomID}.
+func (a *API) DirectoryListRoomDelete(w http.ResponseWriter, r *http.Request) {
+	roomID := r.PathValue("roomID")
+	_ = a.Store.SetRoomVisibility(r.Context(), roomID, false)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
