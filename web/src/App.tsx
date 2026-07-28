@@ -28,7 +28,17 @@ export interface MatrixEvent {
   type: string;
   state_key?: string;
   sender: string;
-  content: { body?: string; name?: string; membership?: string };
+  content: {
+    body?: string;
+    name?: string;
+    membership?: string;
+    // E2EE: m.room.encrypted content
+    algorithm?: string;
+    ciphertext?: string;
+    sender_key?: string;
+    device_id?: string;
+    session_id?: string;
+  };
   origin_server_ts?: number;
   event_id?: string;
 }

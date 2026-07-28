@@ -118,12 +118,25 @@ export async function joinRoom(roomIdOrAlias: string): Promise<{ room_id: string
 export async function sendMessage(
   roomId: string,
   txnId: string,
-  body: string,
+  body: unknown,
 ): Promise<{ event_id: string }> {
   return request(
     "PUT",
     `/_matrix/client/v3/rooms/${roomId}/send/m.room.message/${txnId}`,
-    { body, msgtype: "m.text" },
+    body,
+  );
+}
+
+/** Send a m.room.encrypted event (for E2EE rooms). */
+export async function sendEncryptedMessage(
+  roomId: string,
+  txnId: string,
+  encrypted: unknown,
+): Promise<{ event_id: string }> {
+  return request(
+    "PUT",
+    `/_matrix/client/v3/rooms/${roomId}/send/m.room.encrypted/${txnId}`,
+    encrypted,
   );
 }
 
@@ -187,10 +200,17 @@ export async function listDevices(): Promise<{ devices: Device[] }> {
   return request("GET", "/_matrix/client/v3/devices");
 }
 
-// ---- E2EE keys ----
+// ---- E2EE client ----
+// The full Olm/Megolm implementation lives in ./e2ee.ts (using @matrix-org/olm).
+// This file exposes the raw key-upload/query endpoints the E2EE module uses.
 
-export async function uploadDeviceKeys(deviceKeys: unknown): Promise<{ one_time_key_counts: Record<string, number> }> {
-  return request("POST", "/_matrix/client/v3/keys/upload", { device_keys: deviceKeys });
+export async function uploadDeviceKeys(
+  deviceKeys: unknown,
+  oneTimeKeys?: unknown,
+): Promise<{ one_time_key_counts: Record<string, number> }> {
+  const body: Record<string, unknown> = { device_keys: deviceKeys };
+  if (oneTimeKeys !== undefined) body.one_time_keys = oneTimeKeys;
+  return request("POST", "/_matrix/client/v3/keys/upload", body);
 }
 export async function queryKeys(
   deviceKeys: Record<string, string[]>,
@@ -211,52 +231,5 @@ export async function mintLoginToken(): Promise<LoginTokenResponse> {
 }
 export async function loginWithToken(token: string, deviceId?: string): Promise<LoginResponse> {
   return request("POST", "/_matrix/client/v3/login", { type: "m.login.token", token, device_id: deviceId });
-}
-
-// ---- E2EE client (device-key bootstrap) ----
-// A minimal client-side crypto bootstrap. Full Olm/Megolm requires a WASM
-// build of libolm; this module generates an Ed25519 identity key + Curve25519
-// one-time keys using WebCrypto (where available) and uploads them so a
-// session is E2EE-ready at the protocol level (keys/upload + keys/query).
-// Actual Megolm session encryption/decryption of room messages is left to a
-// future integration of matrix-olm / vodozemac-wasm.
-export interface DeviceKeyBundle {
-  user_id: string;
-  device_id: string;
-  algorithms: string[];
-  keys: Record<string, string>;
-  // signature omitted in the minimal bootstrap (requires a stable Ed25519
-  // signing key persisted in IndexedDB; added in a follow-up).
-}
-
-export async function bootstrapDeviceKeys(userId: string, deviceId: string): Promise<DeviceKeyBundle> {
-  // Generate an ephemeral identity + one-time keypair using WebCrypto.
-  // Note: WebCrypto does not expose raw X25519/Ed25519 in all browsers; we
-  // fall back to a random base64 placeholder when the algorithm is unavailable
-  // so the UI flow is demonstrable. This is explicitly NOT secure E2EE yet.
-  const idKey = await randomBase64(32);
-  const fingerprintKey = await randomBase64(32);
-  return {
-    user_id: userId,
-    device_id: deviceId,
-    algorithms: ["m.olm.v1.curve25519-keys-are-assumed", "m.megolm.v1.aes-sha2"],
-    keys: {
-      [`ed25519:${deviceId}`]: fingerprintKey,
-      [`curve25519:${deviceId}`]: idKey,
-    },
-  };
-}
-
-async function randomBase64(bytes: number): Promise<string> {
-  const buf = new Uint8Array(bytes);
-  if (globalThis.crypto?.getRandomValues) {
-    globalThis.crypto.getRandomValues(buf);
-  } else {
-    for (let i = 0; i < bytes; i++) buf[i] = Math.floor(Math.random() * 256);
-  }
-  // base64url without padding
-  let bin = "";
-  for (const b of buf) bin += String.fromCharCode(b);
-  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 

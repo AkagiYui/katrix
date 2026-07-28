@@ -3,20 +3,20 @@ import {
   getToken,
   getUserId,
   listDevices,
-  bootstrapDeviceKeys,
-  uploadDeviceKeys,
-  queryKeys,
   mintLoginToken,
   loginWithToken,
   type Device,
-  type DeviceKeyBundle,
 } from "../lib/matrix";
-import { Card, Badge, Button, Input, Table } from "../components/ui/primitives";
+import {
+  bootstrapE2EE,
+  queryUserDevices,
+} from "../lib/e2ee";
+import { Card, Badge, Button, Table } from "../components/ui/primitives";
 
 export function DevicesPage() {
   const [devices, setDevices] = useState<Device[]>([]);
-  const [bundle, setBundle] = useState<DeviceKeyBundle | null>(null);
-  const [uploaded, setUploaded] = useState(false);
+  const [e2eeStatus, setE2eeStatus] = useState<{ ed25519: string; curve25519: string } | null>(null);
+  const [bootstrapping, setBootstrapping] = useState(false);
   const [error, setError] = useState("");
   const [qrToken, setQrToken] = useState("");
   const [qrMsg, setQrMsg] = useState("");
@@ -34,29 +34,30 @@ export function DevicesPage() {
 
   const bootstrap = async () => {
     setError("");
+    setBootstrapping(true);
     try {
-      const userId = getUserId() ?? "";
-      // whoami to resolve the current device id.
+      // Resolve the current device id from /whoami.
       const resp = await fetch("/_matrix/client/v3/account/whoami", {
         headers: { Authorization: `Bearer ${getToken()}` },
       });
       const who = await resp.json();
-      const b = await bootstrapDeviceKeys(userId, who.device_id);
-      setBundle(b);
-      setUploaded(false);
+      const status = await bootstrapE2EE(who.device_id);
+      setE2eeStatus(status);
     } catch (e) {
       setError(e instanceof Error ? e.message : "bootstrap failed");
+    } finally {
+      setBootstrapping(false);
     }
   };
 
-  const upload = async () => {
-    if (!bundle) return;
+  const refreshKeys = async () => {
     setError("");
     try {
-      await uploadDeviceKeys(bundle);
-      setUploaded(true);
+      const userId = getUserId() ?? "";
+      await queryUserDevices([userId]);
+      await load();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "upload failed");
+      setError(e instanceof Error ? e.message : "query failed");
     }
   };
 
@@ -102,26 +103,26 @@ export function DevicesPage() {
       </Card>
 
       <div className="grid-2 mt">
-        <Card title="E2EE device-key bootstrap">
+        <Card title="E2EE (Olm / Megolm)">
           <p className="muted">
-            Generates an Ed25519 fingerprint key + Curve25519 identity key and
-            uploads them so the session is E2EE-ready at the protocol level.
-            Full Olm/Megolm message encryption requires a libolm WASM build
-            (not yet integrated).
+            Generates a real Ed25519 signing key + Curve25519 identity key via
+            libolm (WASM), persists them in IndexedDB, and uploads signed device
+            keys + one-time keys. Room messages are encrypted with Megolm
+            (m.megolm.v1.aes-sha2); room keys are shared via Olm 1:1 to-device.
           </p>
           <div className="row gap-12">
-            <Button onClick={bootstrap}>Generate keys</Button>
-            <Button variant="primary" onClick={upload} disabled={!bundle || uploaded}>
-              {uploaded ? "Uploaded" : "Upload keys"}
+            <Button onClick={bootstrap} disabled={bootstrapping}>
+              {bootstrapping ? "Bootstrapping…" : e2eeStatus ? "Re-bootstrap keys" : "Bootstrap E2EE"}
             </Button>
+            <Button variant="primary" onClick={refreshKeys}>Refresh device keys</Button>
           </div>
-          {bundle && (
+          {e2eeStatus && (
             <div className="mt" style={{ fontSize: 12, fontFamily: "monospace", wordBreak: "break-all" }}>
-              <div>ed25519: {bundle.keys["ed25519:" + bundle.device_id]}</div>
-              <div>curve25519: {bundle.keys["curve25519:" + bundle.device_id]}</div>
+              <div>ed25519: {e2eeStatus.ed25519}</div>
+              <div>curve25519: {e2eeStatus.curve25519}</div>
             </div>
           )}
-          {uploaded && <div className="mt"><Badge>device keys uploaded</Badge></div>}
+          {e2eeStatus && <div className="mt"><Badge>device keys uploaded · Megolm active</Badge></div>}
         </Card>
 
         <Card title="QR / token login">
