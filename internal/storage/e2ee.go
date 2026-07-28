@@ -80,6 +80,7 @@ func (s *Store) ClaimOneTimeKeyByAlgo(ctx context.Context, userID, deviceID, alg
 		 WHERE ctid IN (
 		   SELECT ctid FROM one_time_keys
 		   WHERE user_id=$1 AND device_id=$2 AND algorithm=$3 AND used=FALSE AND is_fallback=FALSE
+		   ORDER BY ctid ASC
 		   LIMIT 1 FOR UPDATE SKIP LOCKED
 		 )
 		 RETURNING key_id, key_json`,
