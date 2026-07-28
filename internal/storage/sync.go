@@ -36,6 +36,22 @@ func (s *Store) SetAccountData(ctx context.Context, userLocalpart, roomID, event
 	return streamID, err
 }
 
+// GetAccountData returns the content for a global (roomID="") account_data
+// entry, or ErrNotFound if not set.
+func (s *Store) GetAccountData(ctx context.Context, userLocalpart, roomID, eventType string) ([]byte, error) {
+	var content []byte
+	err := s.pool.QueryRow(ctx,
+		`SELECT content FROM account_data WHERE user_localpart=$1 AND COALESCE(room_id,'')=$2 AND type=$3`,
+		userLocalpart, roomID, eventType).Scan(&content)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return content, nil
+}
+
 // AccountDataSince returns account_data rows for a user with stream_id > since.
 // roomFilter "" means global only; set to a room id to fetch room-specific.
 func (s *Store) AccountDataSince(ctx context.Context, userLocalpart string, since int64) ([]AccountDataRow, error) {

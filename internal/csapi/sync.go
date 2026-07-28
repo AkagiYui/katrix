@@ -17,7 +17,9 @@ import (
 func (a *API) registerSync(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/sync", a.RequireAuth(a.Sync))
 	mux.HandleFunc("PUT /_matrix/client/v3/user/{userID}/account_data/{type}", a.RequireAuth(a.PutAccountData))
+	mux.HandleFunc("GET /_matrix/client/v3/user/{userID}/account_data/{type}", a.RequireAuth(a.GetAccountData))
 	mux.HandleFunc("PUT /_matrix/client/v3/user/{userID}/rooms/{roomID}/account_data/{type}", a.RequireAuth(a.PutRoomAccountData))
+	mux.HandleFunc("GET /_matrix/client/v3/user/{userID}/rooms/{roomID}/account_data/{type}", a.RequireAuth(a.GetRoomAccountData))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/read_markers", a.RequireAuth(a.ReadMarkers))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/receipt/{receiptType}/{eventID}", a.RequireAuth(a.Receipt))
 	mux.HandleFunc("GET /_matrix/client/v3/presence/{userID}/status", a.RequireAuth(a.PresenceGet))
@@ -211,4 +213,41 @@ func (a *API) PresencePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// GetAccountData handles GET /_matrix/client/v3/user/{userID}/account_data/{type}.
+func (a *API) GetAccountData(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	userID := r.PathValue("userID")
+	if auth.UserID != userID {
+		httpx.WriteError(w, httpx.ErrForbidden("can only get own account data"))
+		return
+	}
+	eventType := r.PathValue("type")
+	content, err := a.Store.GetAccountData(r.Context(), auth.Localpart, "", eventType)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("account data not found"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(content)
+}
+
+// GetRoomAccountData handles GET /_matrix/client/v3/user/{userID}/rooms/{roomID}/account_data/{type}.
+func (a *API) GetRoomAccountData(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	userID := r.PathValue("userID")
+	if auth.UserID != userID {
+		httpx.WriteError(w, httpx.ErrForbidden("can only get own account data"))
+		return
+	}
+	roomID := r.PathValue("roomID")
+	eventType := r.PathValue("type")
+	content, err := a.Store.GetAccountData(r.Context(), auth.Localpart, roomID, eventType)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("account data not found"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(content)
 }
