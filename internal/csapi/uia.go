@@ -147,17 +147,21 @@ func (a *API) checkUIA(w http.ResponseWriter, r *http.Request, raw json.RawMessa
 		stages = []string{"m.login.registration_token", "m.login.dummy"}
 	}
 
-	if body.Auth == nil || body.Auth.Session == "" {
+	if body.Auth == nil {
 		id, _ := a.uia.create("register", "")
 		a.writeUIAChallenge(w, stages, id, nil)
 		return false, nil
 	}
 
+	// If the client supplied an auth type but no session, start a new session
+	// and fall through to process the supplied stage immediately. This lets a
+	// client complete a no-parameter flow (e.g. m.login.dummy) in a single
+	// request, as the spec and Complement expect.
 	sess := a.uia.get(body.Auth.Session)
 	if sess == nil || sess.op != "register" {
-		id, _ := a.uia.create("register", "")
-		a.writeUIAChallenge(w, stages, id, nil)
-		return false, nil
+		id, s := a.uia.create("register", "")
+		sess = s
+		body.Auth.Session = id
 	}
 
 	switch body.Auth.Type {

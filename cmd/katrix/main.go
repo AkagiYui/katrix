@@ -5,9 +5,15 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,6 +26,27 @@ import (
 	"github.com/AkagiYui/katrix/internal/httpserver"
 	"github.com/AkagiYui/katrix/internal/storage"
 )
+
+// certPEMToX509 parses a PEM-encoded certificate.
+func certPEMToX509(pemBytes []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, fmt.Errorf("no PEM block found")
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
+// keyPEMToPrivateKey parses a PEM-encoded private key (PKCS8 or PKCS1).
+func keyPEMToPrivateKey(pemBytes []byte) (interface{}, error) {
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, fmt.Errorf("no PEM block found")
+	}
+	if key, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+		return key, nil
+	}
+	return x509.ParsePKCS1PrivateKey(block.Bytes)
+}
 
 // version is set via -ldflags at build time.
 var version = "0.1.0-dev"
@@ -42,10 +69,12 @@ func main() {
 		err = runHealthcheck(args)
 	case "genkey":
 		err = runGenKey(args)
+	case "gencert":
+		err = runGenCert(args)
 	case "version":
 		fmt.Println("katrix", version)
 	default:
-		err = fmt.Errorf("unknown command %q (want serve|healthcheck|genkey|version)", cmd)
+		err = fmt.Errorf("unknown command %q (want serve|healthcheck|genkey|gencert|version)", cmd)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "katrix:", err)
@@ -136,7 +165,13 @@ func runServe(args []string) error {
 	if cfg.FederationEnabled && cfg.Listen.Federation != cfg.Listen.Client {
 		go func() {
 			fmt.Printf("katrix: federation API listening on %s\n", cfg.Listen.Federation)
-			if err := fedSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			var err error
+			if cfg.FederationTLS.CertPath != "" && cfg.FederationTLS.KeyPath != "" {
+				err = fedSrv.ListenAndServeTLS(cfg.FederationTLS.CertPath, cfg.FederationTLS.KeyPath)
+			} else {
+				err = fedSrv.ListenAndServe()
+			}
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- err
 			}
 		}()
@@ -189,5 +224,124 @@ func runGenKey(args []string) error {
 		return err
 	}
 	fmt.Println(crypto.EncodeSigningKey(key))
+	return nil
+}
+
+// runGenCert generates a TLS leaf certificate signed by a CA, for the
+// federation listener. Used by the Complement entrypoint: Complement mounts
+// its CA at /complement/ca/ca.crt + /complement/ca/ca.key, and the homeserver
+// must present a certificate signed by that CA on :8448.
+//
+// Usage: katrix gencert -ca-cert <path> -ca-key <path> -server-name <name>
+//
+//	-out-cert <path> -out-key <path>
+func runGenCert(args []string) error {
+	var caCertPath, caKeyPath, serverName, outCert, outKey string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-ca-cert", "--ca-cert":
+			i++
+			if i < len(args) {
+				caCertPath = args[i]
+			}
+		case "-ca-key", "--ca-key":
+			i++
+			if i < len(args) {
+				caKeyPath = args[i]
+			}
+		case "-server-name", "--server-name":
+			i++
+			if i < len(args) {
+				serverName = args[i]
+			}
+		case "-out-cert", "--out-cert":
+			i++
+			if i < len(args) {
+				outCert = args[i]
+			}
+		case "-out-key", "--out-key":
+			i++
+			if i < len(args) {
+				outKey = args[i]
+			}
+		}
+	}
+	if caCertPath == "" {
+		caCertPath = os.Getenv("KATRIX_GENCERT_CA_CERT")
+	}
+	if caKeyPath == "" {
+		caKeyPath = os.Getenv("KATRIX_GENCERT_CA_KEY")
+	}
+	if serverName == "" {
+		serverName = os.Getenv("KATRIX_SERVER_NAME")
+	}
+	if outCert == "" {
+		outCert = os.Getenv("KATRIX_GENCERT_OUT_CERT")
+	}
+	if outKey == "" {
+		outKey = os.Getenv("KATRIX_GENCERT_OUT_KEY")
+	}
+	if caCertPath == "" || caKeyPath == "" || serverName == "" || outCert == "" || outKey == "" {
+		return fmt.Errorf("gencert: -ca-cert, -ca-key, -server-name, -out-cert, -out-key are required")
+	}
+	caCertPEM, err := os.ReadFile(caCertPath)
+	if err != nil {
+		return fmt.Errorf("gencert: read CA cert: %w", err)
+	}
+	caKeyPEM, err := os.ReadFile(caKeyPath)
+	if err != nil {
+		return fmt.Errorf("gencert: read CA key: %w", err)
+	}
+	caCert, err := certPEMToX509(caCertPEM)
+	if err != nil {
+		return fmt.Errorf("gencert: parse CA cert: %w", err)
+	}
+	caKey, err := keyPEMToPrivateKey(caKeyPEM)
+	if err != nil {
+		return fmt.Errorf("gencert: parse CA key: %w", err)
+	}
+
+	// Generate a leaf private key + certificate signed by the CA.
+	leafKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return fmt.Errorf("gencert: generate key: %w", err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: serverName},
+		DNSNames:     []string{serverName, "localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, caCert, &leafKey.PublicKey, caKey)
+	if err != nil {
+		return fmt.Errorf("gencert: sign cert: %w", err)
+	}
+
+	certOut, err := os.Create(outCert)
+	if err != nil {
+		return err
+	}
+	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+		return err
+	}
+	certOut.Close()
+
+	keyOut, err := os.OpenFile(outKey, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer keyOut.Close()
+	keyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
+	if err != nil {
+		return err
+	}
+	if err := pem.Encode(keyOut, &pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}); err != nil {
+		return err
+	}
+	fmt.Printf("gencert: wrote %s and %s for %s\n", outCert, outKey, serverName)
 	return nil
 }

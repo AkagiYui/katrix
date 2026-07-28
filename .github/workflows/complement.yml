@@ -35,7 +35,6 @@ jobs:
       - name: run complement
         env:
           COMPLEMENT_SHARE_ENV_PREFIX: PASS_
-          PASS_SERVER_NAME: complement-test
         run: |
           cd complement
           go test -v -tags="msc2836 msc2946 msc3030 msc3874 msc3890 msisns" ./tests/... 2>&1 \

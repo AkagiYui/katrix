@@ -46,6 +46,15 @@ type Config struct {
 	// FederationEnabled toggles the whole server-server surface.
 	FederationEnabled bool `yaml:"federation_enabled"`
 
+	// Federation TLS: when both cert and key paths are set, the federation
+	// listener serves HTTPS (required by Complement, which mounts a CA at
+	// /complement/ca and expects the homeserver to present a certificate
+	// signed by that CA on :8448).
+	FederationTLS struct {
+		CertPath string `yaml:"cert_path"`
+		KeyPath  string `yaml:"key_path"`
+	} `yaml:"federation_tls"`
+
 	// Metrics exposes a Prometheus-format /metrics endpoint when true.
 	Metrics struct {
 		Enabled bool `yaml:"enabled"`
@@ -119,6 +128,12 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("KATRIX_FEDERATION_ENABLED"); v != "" {
 		c.FederationEnabled = parseBool(v, c.FederationEnabled)
+	}
+	if v := os.Getenv("KATRIX_FEDERATION_TLS_CERT"); v != "" {
+		c.FederationTLS.CertPath = v
+	}
+	if v := os.Getenv("KATRIX_FEDERATION_TLS_KEY"); v != "" {
+		c.FederationTLS.KeyPath = v
 	}
 	if v := os.Getenv("KATRIX_DATABASE_MAX_CONNS"); v != "" {
 		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 32); err == nil && n > 0 {

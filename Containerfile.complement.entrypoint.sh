@@ -63,6 +63,28 @@ export KATRIX_REGISTRATION_ENABLED="${KATRIX_REGISTRATION_ENABLED:-true}"
 mkdir -p /ca
 touch /ca/complement-ca.crt 2>/dev/null || true
 
+# Generate a TLS leaf certificate signed by Complement's CA so the federation
+# listener (:8448) can serve HTTPS. Complement mounts its CA at
+# /complement/ca/ca.crt + /complement/ca/ca.key; the homeserver must present a
+# certificate signed by that CA. If the CA is not mounted (local runs), fall
+# back to plain HTTP federation.
+COMPLEMENT_CA="/complement/ca/ca.crt"
+COMPLEMENT_CA_KEY="/complement/ca/ca.key"
+FED_CERT="$KATRIX_DIR/fed.crt"
+FED_KEY="$KATRIX_DIR/fed.key"
+if [ -s "$COMPLEMENT_CA" ] && [ -s "$COMPLEMENT_CA_KEY" ]; then
+  # Ensure the katrix user can read the CA files (Complement mounts them as root).
+  chmod a+r "$COMPLEMENT_CA" "$COMPLEMENT_CA_KEY" 2>/dev/null || true
+  su-exec katrix /usr/local/bin/katrix gencert \
+    -ca-cert "$COMPLEMENT_CA" \
+    -ca-key "$COMPLEMENT_CA_KEY" \
+    -server-name "$SERVER_NAME" \
+    -out-cert "$FED_CERT" \
+    -out-key "$FED_KEY" >/dev/null 2>&1 && \
+  export KATRIX_FEDERATION_TLS_CERT="$FED_CERT" \
+         KATRIX_FEDERATION_TLS_KEY="$FED_KEY"
+fi
+
 # Run katrix in the foreground (PID 1) so Complement's SIGTERM reaches it
 # directly.
 exec su-exec katrix /usr/local/bin/katrix serve
