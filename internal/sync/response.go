@@ -195,19 +195,19 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 		// rooms the syncer is joined to.
 		receipts, _ := e.store.ReceiptsSince(ctx, opts.UserID, opts.Since.Stream)
 		if len(receipts) > 0 {
-			// Build content: {event_id: {receipt_type: {ts: N, user_id: "@u:hs"}}}
-			byRoom := map[string]map[string]map[string]map[string]any{}
+			// Build content: {event_id: {receipt_type: {user_id: {ts: N}}}}
+			byRoom := map[string]map[string]map[string]map[string]int64{}
 			for _, rc := range receipts {
 				if byRoom[rc.RoomID] == nil {
-					byRoom[rc.RoomID] = map[string]map[string]map[string]any{}
+					byRoom[rc.RoomID] = map[string]map[string]map[string]int64{}
 				}
 				if byRoom[rc.RoomID][rc.EventID] == nil {
-					byRoom[rc.RoomID][rc.EventID] = map[string]map[string]any{}
+					byRoom[rc.RoomID][rc.EventID] = map[string]map[string]int64{}
 				}
-				byRoom[rc.RoomID][rc.EventID][rc.ReceiptType] = map[string]any{
-					"ts":      rc.TS,
-					"user_id": rc.UserID,
+				if byRoom[rc.RoomID][rc.EventID][rc.ReceiptType] == nil {
+					byRoom[rc.RoomID][rc.EventID][rc.ReceiptType] = map[string]int64{}
 				}
+				byRoom[rc.RoomID][rc.EventID][rc.ReceiptType][rc.UserID] = rc.TS
 			}
 			if evMap, ok := byRoom[roomID]; ok {
 				eph, _ := json.Marshal(map[string]any{

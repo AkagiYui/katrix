@@ -73,7 +73,7 @@ func (s *Store) SetReceipt(ctx context.Context, r ReceiptRow) (int64, error) {
 	// the receipt's stream_id to the current max event stream_ordering so a
 	// receipt posted after a sync token will be returned on the next poll.
 	var streamID int64
-	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(stream_ordering),0) FROM events`).Scan(&streamID); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(stream_ordering),0)+1 FROM events`).Scan(&streamID); err != nil {
 		return 0, err
 	}
 	thread := r.ThreadID
