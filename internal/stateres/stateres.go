@@ -8,12 +8,17 @@
 // -> event_id map.
 package stateres
 
-import (
-	"sort"
-)
+import "sort"
+
+// MaxCreatorPowerLevel is the effective power level of a room creator under
+// room versions that implement MSC4289 (v12+), mirroring Synapse's
+// CREATOR_POWER_LEVEL. It is larger than any user-supplied power level so that
+// the creator always wins the reverse-topological power-event sort.
+const MaxCreatorPowerLevel = int64(1) << 53
 
 // EventMeta is the minimal metadata stateres needs for an event: its ID, type,
-// state_key, sender, depth, origin_server_ts, and power-level contribution.
+// state_key, sender, depth, origin_server_ts, and the power-level contribution
+// used to order power events during state resolution.
 type EventMeta struct {
 	EventID        string
 	Type           string
@@ -30,6 +35,14 @@ type EventMeta struct {
 	// order over power events (a power event must come after all its prev
 	// power events). Optional.
 	PrevEvents []string
+	// SenderPowerLevel is the sender's effective power level resolved from the
+	// event's own auth_events (the m.room.power_levels ancestor's users map,
+	// or MaxCreatorPowerLevel when the sender is the room creator under a
+	// CreatorPrivileged room version). It is the primary sort key for the
+	// reverse-topological ordering of power events: a higher level makes the
+	// event sort earlier (it is "smaller"). Zero when the caller does not
+	// supply it, in which case the sort falls back to the spec's tie-breakers.
+	SenderPowerLevel int64
 }
 
 // IsPowerLevelEvent reports whether meta is an m.room.power_levels state event.
@@ -44,7 +57,10 @@ func (e EventMeta) IsPowerLevelEvent() bool { return e.Type == "m.room.power_lev
 //     other events.
 //  2. Order power events using a reverse-chronological iterative ordering that
 //     respects the topological constraints of the DAG (a power event comes
-//     after all of its auth-event power events it references).
+//     after all of its auth-event power events it references). Among candidate
+//     leaves, the one whose sender has the highest power level (resolved from
+//     the event's own auth_events) is chosen first; ties fall back to earliest
+//     origin_server_ts then smallest event_id.
 //  3. Build the "mainline" by walking the auth_events chain of the final
 //     power_levels event (most recent in the resolved order).
 //  4. Order the other events by mainline closeness, then by shallowest depth,
@@ -69,14 +85,14 @@ func ResolveV2(candidates []EventMeta) []string {
 
 	// 3. Build the mainline from the latest power_levels event in the resolved
 	//    order. The mainline is the chain of m.room.power_levels events found
-	//    by walking auth_events, oldest-first.
+	//    by walking auth_events, newest-first (head at index 0).
 	mainline := buildMainline(orderedPower)
 
 	// 4. Order other events by mainline closeness then depth/ts/id.
 	sort.SliceStable(other, func(i, j int) bool {
 		a, b := other[i], other[j]
-		ca := mainlineCloseness(a, mainline)
-		cb := mainlineCloseness(b, mainline)
+		ca := mainlineDepth(a, mainline)
+		cb := mainlineDepth(b, mainline)
 		if ca != cb {
 			return ca < cb
 		}
@@ -99,20 +115,19 @@ func ResolveV2(candidates []EventMeta) []string {
 	return out
 }
 
-// orderPowerEvents returns the power events in reverse-chronological
-// (topological) order: the most recent power event first. It uses the iterative
-// algorithm described in the spec:
+// orderPowerEvents returns the power events in reverse-topological order using
+// Kahn's algorithm. The graph's edges point from an event to its auth/prev
+// ancestors (a power event references its ancestors in auth_events/prev_events).
+// A node with no outgoing edges to unprocessed nodes is a "leaf" (no later
+// power event depends on it).
 //
-//	ordered = []
-//	while there are unprocessed power events:
-//	  find the "leaf" set: events whose own children (by auth_events and
-//	  prev_events references from other power events) are all already ordered,
-//	  i.e. no later power event depends on them.
-//	  among the leaves pick the one with the greatest (depth, ts, id) tuple.
-//	  prepend it to `ordered`.
+// Among candidate leaves, the spec selects the one whose sender has the highest
+// power level (resolved from the event's own auth_events); ties are broken by
+// earliest origin_server_ts then smallest event_id. This mirrors Synapse's
+// lexicographical_topological_sort keyed by (-power_level, ts, event_id).
 //
-// "Children" here means power events that reference this event in their
-// auth_events or prev_events. A leaf has no children remaining.
+// The output runs earliest-to-latest in resolved order so that a caller
+// applying the events in sequence lets the latest overwrite earlier state.
 func orderPowerEvents(power []EventMeta) []EventMeta {
 	if len(power) == 0 {
 		return nil
@@ -122,44 +137,39 @@ func orderPowerEvents(power []EventMeta) []EventMeta {
 	for _, e := range power {
 		byID[e.EventID] = e
 	}
-	// Build child sets: children[id] = set of power-event IDs that reference id
-	// in their auth_events or prev_events.
-	children := make(map[string]map[string]struct{}, len(power))
+	// Build the set of outgoing edges: edges[id] = power-event IDs that this
+	// event references in its auth_events/prev_events (i.e. its ancestors in
+	// the power-event DAG). A node with an empty remaining edge set is a leaf.
+	edges := make(map[string]map[string]struct{}, len(power))
 	processed := make(map[string]bool, len(power))
 	for _, e := range power {
-		children[e.EventID] = map[string]struct{}{}
+		edges[e.EventID] = map[string]struct{}{}
 	}
 	for _, e := range power {
 		for _, ref := range e.AuthEvents {
 			if _, ok := byID[ref]; ok {
-				if children[ref] == nil {
-					children[ref] = map[string]struct{}{}
-				}
-				children[ref][e.EventID] = struct{}{}
+				edges[e.EventID][ref] = struct{}{}
 			}
 		}
 		for _, ref := range e.PrevEvents {
 			if _, ok := byID[ref]; ok {
-				if children[ref] == nil {
-					children[ref] = map[string]struct{}{}
-				}
-				children[ref][e.EventID] = struct{}{}
+				edges[e.EventID][ref] = struct{}{}
 			}
 		}
 	}
 
 	ordered := make([]EventMeta, 0, len(power))
 	for len(processed) < len(power) {
-		// Leaves: power events all of whose children (successors in the DAG)
-		// are already processed.
+		// Leaves: power events whose every referenced ancestor is already
+		// processed (no outgoing edge to an unprocessed node).
 		var leaves []EventMeta
 		for _, e := range power {
 			if processed[e.EventID] {
 				continue
 			}
 			isLeaf := true
-			for child := range children[e.EventID] {
-				if !processed[child] {
+			for ref := range edges[e.EventID] {
+				if !processed[ref] {
 					isLeaf = false
 					break
 				}
@@ -178,15 +188,15 @@ func orderPowerEvents(power []EventMeta) []EventMeta {
 			}
 		}
 		// Per spec (Kahn's algorithm), among the candidate leaves pick the
-		// "smallest" vertex and append it. The spec's primary comparison is by
-		// the sender's power level under the event's own auth_events (higher
-		// power = smaller); EventMeta does not carry that, so we approximate
-		// with the spec's tie-breakers: earlier origin_server_ts = smaller, then
-		// smaller event_id = smaller. depth is used as a final tie-breaker so
-		// shallower (earlier-in-DAG) events win, keeping the output earliest-to-
-		// latest so that applying events in order lets the latest overwrite.
+		// "smallest" vertex: highest sender power level, then earliest
+		// origin_server_ts, then smallest event_id. A stable sort yields the
+		// correct lexicographic minimum without a heap.
 		sort.SliceStable(leaves, func(i, j int) bool {
 			a, b := leaves[i], leaves[j]
+			if a.SenderPowerLevel != b.SenderPowerLevel {
+				// Higher power level sorts earlier (is "smaller").
+				return a.SenderPowerLevel > b.SenderPowerLevel
+			}
 			if a.OriginServerTS != b.OriginServerTS {
 				return a.OriginServerTS < b.OriginServerTS
 			}
@@ -205,11 +215,10 @@ func orderPowerEvents(power []EventMeta) []EventMeta {
 }
 
 // buildMainline walks the auth_events chain of the most recent power_levels
-// event in the resolved order (the last power event), collecting every
-// m.room.power_levels ancestor most-recent-first (head at index 0). Closeness is
-// the index into this slice: 0 = authorised directly by the current power_levels
-// (most recent), larger = older ancestor. Events authorised by an older
-// mainline ancestor are "less close" (larger index) and sort later.
+// event in the resolved order (the last power_levels event in resolved order,
+// i.e. the winning power_levels event), collecting every m.room.power_levels
+// ancestor newest-first (head at index 0). The mainline represents the
+// lineage of the resolved power_levels state.
 func buildMainline(orderedPower []EventMeta) []string {
 	byID := make(map[string]EventMeta, len(orderedPower))
 	for _, e := range orderedPower {
@@ -228,7 +237,7 @@ func buildMainline(orderedPower []EventMeta) []string {
 		return nil
 	}
 	// Walk auth_events backwards, collecting power_levels ancestors
-	// most-recent-first (head at index 0).
+	// newest-first (head at index 0).
 	chain := make([]string, 0, 8)
 	seen := map[string]bool{}
 	cur := head
@@ -250,28 +259,33 @@ func buildMainline(orderedPower []EventMeta) []string {
 	return chain
 }
 
-// mainlineCloseness returns the index into mainline of the closest power-levels
-// ancestor of e. 0 means e's closest mainline ancestor is the most recent
-// power_levels event (the head). Events whose auth chain contains no mainline
-// event are assigned len(mainline) (least close). Smaller index = more recent =
-// sorts earlier.
+// mainlineDepth returns the depth of the closest m.room.power_levels ancestor
+// of e that lies on the mainline. This mirrors Synapse's mainline_map:
 //
-// The search walks e's auth_events; for each auth event that is on the mainline
-// we take the one with the smallest index (most recent). Because the mainline
-// already represents the power_levels ancestry chain, a direct match is
-// sufficient -- there is no need to recurse past a mainline event.
-func mainlineCloseness(e EventMeta, mainline []string) int {
+//	mainline_map = {ev_id: i+1 for i, ev_id in enumerate(reversed(mainline))}
+//
+// i.e. the OLDEST ancestor is depth 1, the newest (head) is depth len(mainline),
+// and an event whose auth chain contains no mainline event is depth 0. Smaller
+// depth sorts earlier. Because the mainline chain already records the
+// power_levels ancestry, it suffices to walk e's auth_events looking for a
+// direct mainline member.
+func mainlineDepth(e EventMeta, mainline []string) int {
 	if len(mainline) == 0 {
 		return 0
 	}
+	// reversed(mainline): oldest at index 0 -> depth i+1; head at the end ->
+	// depth len(mainline).
 	index := make(map[string]int, len(mainline))
 	for i, id := range mainline {
-		index[id] = i
+		// mainline[0] is the head (newest); reversed position is len-1-i,
+		// and depth is that position + 1.
+		depth := len(mainline) - i
+		index[id] = depth
 	}
-	best := len(mainline)
+	best := 0
 	for _, ref := range e.AuthEvents {
-		if i, ok := index[ref]; ok && i < best {
-			best = i
+		if d, ok := index[ref]; ok && (best == 0 || d < best) {
+			best = d
 		}
 	}
 	return best

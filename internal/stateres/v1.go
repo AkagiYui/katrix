@@ -32,8 +32,10 @@ func ResolveV1(candidates []EventMeta) []string {
 }
 
 // Resolve dispatches to the correct algorithm based on the room-version's
-// state-resolution version. v1 -> ResolveV1; v2/v2.1 -> ResolveV2 (the v2.1
-// creator-privilege is applied by the caller via auth rules, not here).
+// state-resolution version. v1 -> ResolveV1; v2/v2.1 -> ResolveV2. The v2.1
+// (room version 12) MSC4289 creator-privilege is expressed solely through the
+// sender power level (the caller sets SenderPowerLevel to
+// MaxCreatorPowerLevel for the creator), so v2.1 needs no separate code path.
 func Resolve(candidates []EventMeta, v int) []string {
 	if v == 1 {
 		return ResolveV1(candidates)

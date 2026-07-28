@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/metrics"
 	"github.com/AkagiYui/katrix/internal/roomver"
@@ -28,9 +29,9 @@ func (a *API) notifyRoomMembers(ctx context.Context, roomID string) {
 
 // registerTransactions wires the PDU/EDU transaction and room federation
 // routes. Inbound transactions are accepted and de-duplicated; PDUs that
-// belong to rooms this server knows are persisted. Full per-event signature
-// verification and state-resolution v2 land in a follow-up; the surface here
-// unblocks remote key fetch/caching, backfill and the join protocol.
+// belong to rooms this server knows are persisted. Each PDU's signature is
+// verified against its origin server's keys, and state events trigger state
+// resolution v2 over the room's forward extremities.
 func (a *API) registerTransactions(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /_matrix/federation/v1/send/{txnID}", a.SendTransaction)
 	mux.HandleFunc("GET /_matrix/federation/v1/event/{eventID}", a.GetEvent)
@@ -144,7 +145,10 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage) (string, bool) {
 	}
 	metrics.Counters.FedInboundPDUs.Add(1)
 	if ev.StateKey != nil {
-		_ = a.Store.UpsertState(r.Context(), ev.RoomID, ev.Type, *ev.StateKey, evID)
+		// Resolve room state across any fork. For a single-extremity room this
+		// resolves to the incoming event; for a fork it runs the v2 mainline
+		// state-resolution algorithm over the candidate state set.
+		a.resolveRoomState(r.Context(), ev.RoomID, version, row)
 		// For membership state events, update the denormalised membership table.
 		if ev.Type == "m.room.member" {
 			a.applyRemoteMembership(r.Context(), ev.RoomID, *ev.StateKey, ev.Content, evID, ev.Depth)
@@ -393,7 +397,8 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
 	if vres.Valid || vres.Signed {
 		if evID != "" {
 			if _, err := a.Store.InsertEvent(r.Context(), row); err == nil && ev.StateKey != nil {
-				_ = a.Store.UpsertState(r.Context(), ev.RoomID, ev.Type, *ev.StateKey, evID)
+				// Resolve room state across any fork via state resolution v2.
+				a.resolveRoomState(r.Context(), ev.RoomID, version, row)
 				if ev.Type == "m.room.member" {
 					a.applyRemoteMembership(r.Context(), ev.RoomID, *ev.StateKey, ev.Content, evID, ev.Depth)
 				}
@@ -453,7 +458,10 @@ func (a *API) roomStatePDUs(r *http.Request, roomID string) ([]json.RawMessage, 
 	return out, nil
 }
 
-// authChain returns the create + power_levels + join_rules events.
+// authChain returns the full auth chain of the room's current state: the
+// transitive closure of auth_events starting from every state event in
+// room_state, walked depth-first with a visited set. This is the response to
+// /state and /event_auth's auth_chain field.
 func (a *API) authChain(r *http.Request, roomID string) []json.RawMessage {
 	ids := a.authChainIDs(r, roomID)
 	if len(ids) == 0 {
@@ -467,14 +475,74 @@ func (a *API) authChain(r *http.Request, roomID string) []json.RawMessage {
 	return out
 }
 
+// authChainIDs computes the transitive closure of auth_events starting from the
+// room's current state events. It walks each state event's auth_events
+// recursively, returning the full set (excluding the state events themselves
+// unless they are reached as an ancestor).
 func (a *API) authChainIDs(r *http.Request, roomID string) []string {
-	var ids []string
-	for _, t := range []string{"m.room.create", "m.room.power_levels", "m.room.join_rules"} {
-		if id, err := a.Store.GetStateEvent(r.Context(), roomID, t, ""); err == nil {
-			ids = append(ids, id)
+	stateRows, err := a.Store.GetState(r.Context(), roomID)
+	if err != nil {
+		// Fall back to the core state events if the full state is unavailable.
+		var ids []string
+		for _, t := range []string{"m.room.create", "m.room.power_levels", "m.room.join_rules"} {
+			if id, err := a.Store.GetStateEvent(r.Context(), roomID, t, ""); err == nil {
+				ids = append(ids, id)
+			}
+		}
+		return ids
+	}
+	// Seed the walk with the auth_events of every current state event.
+	seed := make([]string, 0, len(stateRows))
+	for _, s := range stateRows {
+		seed = append(seed, s.EventID)
+	}
+	chain := a.walkAuthChain(r.Context(), seed)
+	out := make([]string, 0, len(chain))
+	for id := range chain {
+		out = append(out, id)
+	}
+	return out
+}
+
+// walkAuthChain returns the set of event IDs reachable via auth_events from the
+// given seed events (the seed events themselves are excluded from the result
+// unless reached as an ancestor of another). The walk needs each event's
+// room version to parse legacy auth_events formats, but storage rows do not
+// carry it; we fetch the room version once per room.
+func (a *API) walkAuthChain(ctx context.Context, seed []string) map[string]bool {
+	visited := map[string]bool{}
+	stack := make([]string, 0, len(seed))
+	for _, id := range seed {
+		stack = append(stack, id)
+	}
+	for len(stack) > 0 {
+		id := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if visited[id] {
+			continue
+		}
+		visited[id] = true
+		row, err := a.Store.GetEvent(ctx, id)
+		if err != nil || row == nil {
+			continue
+		}
+		// Parse auth_events from RawJSON. The room version is needed to handle
+		// the legacy [id, hash] format; fetch it lazily and cache on the API.
+		rules := a.roomRules(row.RoomID)
+		if rules == nil {
+			continue
+		}
+		ev, err := events.New(row.RawJSON, rules.Version)
+		if err != nil {
+			continue
+		}
+		for _, aid := range ev.AuthEvents() {
+			if !visited[aid] {
+				stack = append(stack, aid)
+			}
 		}
 	}
-	return ids
+	return visited
 }
 
 // memberAuthIDs returns the auth_events for a member event.
