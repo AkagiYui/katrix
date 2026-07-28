@@ -68,15 +68,21 @@ type ReceiptRow struct {
 
 // SetReceipt upserts a receipt for a user in a room.
 func (s *Store) SetReceipt(ctx context.Context, r ReceiptRow) (int64, error) {
+	// Use the same stream-id space as events so /sync's incremental "since"
+	// token (which tracks event stream_ordering) also gates receipts. We set
+	// the receipt's stream_id to the current max event stream_ordering so a
+	// receipt posted after a sync token will be returned on the next poll.
 	var streamID int64
+	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(stream_ordering),0) FROM events`).Scan(&streamID); err != nil {
+		return 0, err
+	}
 	thread := r.ThreadID
-	err := s.pool.QueryRow(ctx,
-		`INSERT INTO receipts(room_id, user_id, receipt_type, thread_id, event_id, ts)
-		 VALUES ($1,$2,$3,$4,$5,$6)
-		 ON CONFLICT (room_id, user_id, receipt_type, thread_id) DO UPDATE SET event_id=EXCLUDED.event_id, ts=EXCLUDED.ts
-		 RETURNING stream_id`,
-		r.RoomID, r.UserID, r.ReceiptType, thread, r.EventID, r.TS,
-	).Scan(&streamID)
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO receipts(room_id, user_id, receipt_type, thread_id, event_id, ts, stream_id)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7)
+		 ON CONFLICT (room_id, user_id, receipt_type, thread_id) DO UPDATE SET event_id=EXCLUDED.event_id, ts=EXCLUDED.ts, stream_id=EXCLUDED.stream_id`,
+		r.RoomID, r.UserID, r.ReceiptType, thread, r.EventID, r.TS, streamID,
+	)
 	return streamID, err
 }
 
