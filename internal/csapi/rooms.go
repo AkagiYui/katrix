@@ -32,9 +32,15 @@ func (a *API) registerRooms(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/state", a.RequireAuth(a.RoomStateGet))
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/state/{eventType}", a.RequireAuth(a.RoomStateGetType))
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/state/{eventType}/{stateKey}", a.RequireAuth(a.RoomStateGetKey))
+	// Trailing-slash variants for empty state_key: GET /state/{eventType}/ and
+	// PUT /state/{eventType}/ map to the empty-state-key handlers (Complement
+	// and other clients URL-encode an empty state_key as a trailing slash).
+	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/state/{eventType}/", a.RequireAuth(a.RoomStateGetType))
+	mux.HandleFunc("PUT /_matrix/client/v3/rooms/{roomID}/state/{eventType}/", a.RequireAuth(a.RoomStatePutNoKey))
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/event/{eventID}", a.RequireAuth(a.RoomGetEvent))
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/members", a.RequireAuth(a.RoomMembers))
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/joined_members", a.RequireAuth(a.RoomJoinedMembers))
+	mux.HandleFunc("GET /_matrix/client/v3/joined_rooms", a.RequireAuth(a.JoinedRooms))
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/aliases", a.RequireAuth(a.RoomAliases))
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/messages", a.RequireAuth(a.RoomMessages))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/redact/{eventID}/{txnID}", a.RequireAuth(a.RoomRedact))
@@ -48,16 +54,24 @@ func (a *API) registerRooms(mux *http.ServeMux) {
 // ---- createRoom ----
 
 type createRoomRequest struct {
-	CreationContent    json.RawMessage `json:"creation_content,omitempty"`
-	Name               string          `json:"name,omitempty"`
-	Topic              string          `json:"topic,omitempty"`
-	RoomVersion        roomver.Version `json:"room_version,omitempty"`
-	Preset             string          `json:"preset,omitempty"`
-	RoomAliasName      string          `json:"room_alias_name,omitempty"`
-	Visibility         string          `json:"visibility,omitempty"`
-	Invite             []string        `json:"invite,omitempty"`
-	IsDirect           *bool           `json:"is_direct,omitempty"`
-	PowerLevelOverride json.RawMessage `json:"power_level_content_override,omitempty"`
+	CreationContent    json.RawMessage     `json:"creation_content,omitempty"`
+	Name               string              `json:"name,omitempty"`
+	Topic              string              `json:"topic,omitempty"`
+	RoomVersion        roomver.Version     `json:"room_version,omitempty"`
+	Preset             string              `json:"preset,omitempty"`
+	RoomAliasName      string              `json:"room_alias_name,omitempty"`
+	Visibility         string              `json:"visibility,omitempty"`
+	Invite             []string            `json:"invite,omitempty"`
+	IsDirect           *bool               `json:"is_direct,omitempty"`
+	PowerLevelOverride json.RawMessage     `json:"power_level_content_override,omitempty"`
+	InitialState       []initialStateEvent `json:"initial_state,omitempty"`
+}
+
+// initialStateEvent is one entry of the createRoom initial_state array.
+type initialStateEvent struct {
+	Type     string          `json:"type"`
+	StateKey string          `json:"state_key,omitempty"`
+	Content  json.RawMessage `json:"content"`
 }
 
 // CreateRoom handles POST /_matrix/client/v3/createRoom.
@@ -90,7 +104,7 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	seedRoomID := ids.NewRoomID(a.ServerName())
 	now := a.Now()
 
-	initRes, err := rooms.BuildInitialEvents(seedRoomID, version, auth.UserID, preset, req.PowerLevelOverride, isDirect, a.ServerName(), a.Key, now)
+	initRes, err := rooms.BuildInitialEvents(seedRoomID, version, auth.UserID, preset, req.PowerLevelOverride, req.CreationContent, isDirect, a.ServerName(), a.Key, now)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
@@ -141,7 +155,13 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Optional name/topic events (state events after creation).
+	// Apply initial_state events (before name/topic so those override).
+	for _, ev := range req.InitialState {
+		sk := ev.StateKey
+		a.sendStateEvent(r, auth, roomID, version, ev.Type, sk, ev.Content)
+	}
+
+	// Optional name/topic events (state events after creation; override initial_state).
 	if req.Name != "" {
 		a.sendStateEvent(r, auth, roomID, version, "m.room.name", "", map[string]any{"name": req.Name})
 	}
@@ -507,6 +527,22 @@ func (a *API) RoomJoinedMembers(w http.ResponseWriter, r *http.Request) {
 		joined[m.UserID] = ev
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"joined": joined})
+}
+
+// JoinedRooms handles GET /_matrix/client/v3/joined_rooms. It lists the room
+// IDs of every room the calling user is currently joined to.
+func (a *API) JoinedRooms(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	roomIDs, err := a.Store.RoomsForUser(r.Context(), auth.UserID)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	joined := make([]string, 0, len(roomIDs))
+	for _, id := range roomIDs {
+		joined = append(joined, id)
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"joined_rooms": joined})
 }
 
 // RoomAliases handles GET /_matrix/client/v3/rooms/{roomID}/aliases.

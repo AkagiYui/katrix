@@ -149,6 +149,7 @@ func BuildInitialEvents(
 	creator string,
 	preset string,
 	powerOverride json.RawMessage,
+	creationContent json.RawMessage,
 	isDirect bool,
 	serverName string,
 	key *crypto.SigningKey,
@@ -177,6 +178,25 @@ func BuildInitialEvents(
 	}
 	if isDirect {
 		createContent["m.federate"] = false // DMs typically non-federated
+	}
+	// Merge caller-supplied creation_content, which may carry custom keys and
+	// override m.federate. Per the spec, room_version in creation_content is
+	// ignored (the top-level room_version field controls the version); creator
+	// is set by the server.
+	if len(creationContent) > 0 {
+		var extra map[string]json.RawMessage
+		if json.Unmarshal(creationContent, &extra) == nil {
+			for k, v := range extra {
+				if k == "room_version" || k == "creator" {
+					continue // reserved, server-controlled
+				}
+				// Decode the raw value into an any so the create event carries
+				// the typed value rather than a raw JSON blob.
+				var val any
+				_ = json.Unmarshal(v, &val)
+				createContent[k] = val
+			}
+		}
 	}
 	createRaw, _ := json.Marshal(createContent)
 
@@ -241,6 +261,10 @@ func BuildInitialEvents(
 
 // buildAndSign is a thin wrapper over events.Builder for the genesis flow.
 func buildAndSign(serverName string, key *crypto.SigningKey, version roomver.Version, eventType, stateKey, sender, roomID string, content json.RawMessage, ts int64, depth int64, prev, auth []string) (*events.Event, error) {
+	rules, ok := roomver.Get(version)
+	if !ok {
+		return nil, fmt.Errorf("rooms: unsupported room version %q", version)
+	}
 	b := events.Builder{
 		Type:           eventType,
 		Sender:         sender,
@@ -256,6 +280,17 @@ func buildAndSign(serverName string, key *crypto.SigningKey, version roomver.Ver
 	// A nil StateKey would make it a non-state message, so always set it.
 	sk := stateKey
 	b.StateKey = &sk
+	if rules.EventFormatV1 {
+		// Room versions 1-2 use the legacy event format: explicit event_id
+		// field and [id, hash] prev/auth references. Derive a stable event ID
+		// localpart from the event type + depth so initial events are
+		// deterministic across re-runs.
+		localpart := ids.RandomTxnSuffix()
+		if eventType == "m.room.create" {
+			localpart = "create0"
+		}
+		return b.BuildLegacy(serverName, key, version, localpart)
+	}
 	return b.Build(serverName, key, version)
 }
 

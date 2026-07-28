@@ -48,13 +48,15 @@ func (h *HS) IsLocalUser(userID string) bool {
 	return userID[at+1:] == h.Config.ServerName
 }
 
-// LocalpartOf extracts the localpart from a local user ID.
+// LocalpartOf extracts the localpart from a local user ID. The localpart is
+// lowercased to match the normalised storage form (user IDs are case-insensitive
+// in their localpart per the spec).
 func (h *HS) LocalpartOf(userID string) string {
 	userID = strings.TrimPrefix(userID, "@")
 	if i := strings.IndexByte(userID, ':'); i >= 0 {
-		return userID[:i]
+		return strings.ToLower(userID[:i])
 	}
-	return userID
+	return strings.ToLower(userID)
 }
 
 // HashPassword returns a bcrypt hash of the plaintext password.

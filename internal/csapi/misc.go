@@ -3,6 +3,7 @@ package csapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -186,6 +187,10 @@ func (a *API) PostFilter(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
 		httpx.WriteError(w, err)
+		return
+	}
+	if err := validateFilter(body); err != nil {
+		httpx.WriteError(w, httpx.ErrInvalidParam(err.Error()))
 		return
 	}
 	id, err := a.Store.SaveFilter(r.Context(), auth.Localpart, body)
@@ -435,3 +440,139 @@ func (a *API) isAdmin(auth *homeserver.Auth) bool {
 
 // guard against unused import.
 var _ = strconv.Atoi
+
+// validateFilter checks a filter definition against the Matrix spec's schema
+// (§Filtering). It returns a descriptive error for any structurally invalid
+// filter so the caller can reject it with M_INVALID_PARAM (400).
+func validateFilter(raw []byte) error {
+	if len(raw) == 0 {
+		return nil // empty filter is valid (use defaults)
+	}
+	var f map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return fmt.Errorf("invalid JSON")
+	}
+	// Top-level: presence, event_format, event_fields, room.
+	if v, ok := f["presence"]; ok {
+		if err := requireObject(v); err != nil {
+			return fmt.Errorf("presence: %w", err)
+		}
+	}
+	if v, ok := f["event_format"]; ok {
+		var n json.Number
+		if json.Unmarshal(v, &n) != nil {
+			return fmt.Errorf("event_format: must be an integer")
+		}
+	}
+	if v, ok := f["event_fields"]; ok {
+		if err := requireStringList(v); err != nil {
+			return fmt.Errorf("event_fields: %w", err)
+		}
+	}
+	if v, ok := f["room"]; ok {
+		if err := requireObject(v); err != nil {
+			return fmt.Errorf("room: %w", err)
+		}
+		var room map[string]json.RawMessage
+		if json.Unmarshal(v, &room) == nil {
+			for _, sec := range []string{"state", "timeline", "ephemeral", "account_data"} {
+				if sv, ok := room[sec]; ok {
+					if err := requireObject(sv); err != nil {
+						return fmt.Errorf("room.%s: %w", sec, err)
+					}
+					if err := validateFilterSection(sv); err != nil {
+						return fmt.Errorf("room.%s: %w", sec, err)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// validateFilterSection validates the common keys of a state/timeline/
+// ephemeral/account_data filter section: types, not_types, rooms, not_rooms,
+// senders, not_senders must be string lists (and types/not_types string lists
+// or integer lists are rejected as the elements must be strings).
+func validateFilterSection(raw json.RawMessage) error {
+	var sec map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &sec); err != nil {
+		return fmt.Errorf("invalid object")
+	}
+	for _, key := range []string{"types", "not_types"} {
+		if v, ok := sec[key]; ok {
+			if err := requireStringList(v); err != nil {
+				return fmt.Errorf("%s: %w", key, err)
+			}
+		}
+	}
+	for _, key := range []string{"rooms", "not_rooms"} {
+		if v, ok := sec[key]; ok {
+			if err := requireRoomIDList(v); err != nil {
+				return fmt.Errorf("%s: %w", key, err)
+			}
+		}
+	}
+	for _, key := range []string{"senders", "not_senders"} {
+		if v, ok := sec[key]; ok {
+			if err := requireUserIDList(v); err != nil {
+				return fmt.Errorf("%s: %w", key, err)
+			}
+		}
+	}
+	return nil
+}
+
+// requireObject ensures raw is a JSON object (map), not a scalar/array.
+func requireObject(raw json.RawMessage) error {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil {
+		return fmt.Errorf("must be an object")
+	}
+	return nil
+}
+
+// requireStringList ensures raw is a JSON array whose elements are all strings.
+func requireStringList(raw json.RawMessage) error {
+	var arr []json.RawMessage
+	if json.Unmarshal(raw, &arr) != nil {
+		return fmt.Errorf("must be a list")
+	}
+	for _, el := range arr {
+		var s string
+		if json.Unmarshal(el, &s) != nil {
+			return fmt.Errorf("list elements must be strings")
+		}
+	}
+	return nil
+}
+
+// requireRoomIDList ensures raw is a JSON array of valid room IDs (start with
+// "!" and contain a server name after ":").
+func requireRoomIDList(raw json.RawMessage) error {
+	var arr []string
+	if json.Unmarshal(raw, &arr) != nil {
+		return fmt.Errorf("must be a list")
+	}
+	for _, s := range arr {
+		if !strings.HasPrefix(s, "!") || !strings.Contains(s, ":") {
+			return fmt.Errorf("list elements must be valid room IDs")
+		}
+	}
+	return nil
+}
+
+// requireUserIDList ensures raw is a JSON array of valid user IDs (start with
+// "@" and contain a server name after ":").
+func requireUserIDList(raw json.RawMessage) error {
+	var arr []string
+	if json.Unmarshal(raw, &arr) != nil {
+		return fmt.Errorf("must be a list")
+	}
+	for _, s := range arr {
+		if !strings.HasPrefix(s, "@") || !strings.Contains(s, ":") {
+			return fmt.Errorf("list elements must be valid user IDs")
+		}
+	}
+	return nil
+}

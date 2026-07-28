@@ -100,7 +100,8 @@ func serveIndex(w http.ResponseWriter, index []byte) {
 	_, _ = io.Copy(w, strings.NewReader(string(index)))
 }
 
-// withMiddleware applies CORS and server-header middleware globally.
+// withMiddleware applies the r0->v3 path rewrite, CORS and server-header
+// middleware globally.
 func withMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Server", "Katrix/"+homeserver.Version)
@@ -109,6 +110,15 @@ func withMiddleware(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization")
 			w.WriteHeader(http.StatusOK)
+			return
+		}
+		// Transparently map the legacy r0 API path prefix to v3 so both paths
+		// reach the same handlers. Only /_matrix/client/r0/ is rewritten.
+		if strings.HasPrefix(r.URL.Path, "/_matrix/client/r0/") {
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/_matrix/client/v3/" + r.URL.Path[len("/_matrix/client/r0/"):]
+			r2.URL.RawPath = ""
+			next.ServeHTTP(w, r2)
 			return
 		}
 		next.ServeHTTP(w, r)

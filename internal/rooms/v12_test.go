@@ -19,7 +19,7 @@ func TestBuildInitialEventsV12DerivesRoomID(t *testing.T) {
 	}
 	res, err := BuildInitialEvents(
 		"!placeholder:ignored", roomver.Version("12"),
-		"@alice:test", PresetPublicChat, nil, false,
+		"@alice:test", PresetPublicChat, nil, nil, false,
 		"test", key, 1000,
 	)
 	if err != nil {
@@ -63,7 +63,7 @@ func TestBuildInitialEventsV11KeepsRoomID(t *testing.T) {
 	}
 	res, err := BuildInitialEvents(
 		"!random:test", roomver.Version("11"),
-		"@alice:test", PresetPublicChat, nil, false,
+		"@alice:test", PresetPublicChat, nil, nil, false,
 		"test", key, 1000,
 	)
 	if err != nil {
