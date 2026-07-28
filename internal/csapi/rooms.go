@@ -173,7 +173,11 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	}
 	// Invite listed users.
 	for _, invitee := range req.Invite {
-		_ = a.sendMemberEvent(r, auth, roomID, "", invitee, rooms.MembershipInvite, "")
+		content := map[string]any{"membership": rooms.MembershipInvite}
+		if isDirect {
+			content["is_direct"] = true
+		}
+		_ = a.sendMemberEventWithContent(r, auth, roomID, invitee, content)
 	}
 
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"room_id": roomID})
@@ -914,15 +918,21 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string) (*
 
 // sendMemberEvent builds, authorises and persists an m.room.member event.
 func (a *API) sendMemberEvent(r *http.Request, auth *homeserver.Auth, roomID, _stateKey, target, membership, reason string) error {
+	content := map[string]any{"membership": membership}
+	if reason != "" {
+		content["reason"] = reason
+	}
+	return a.sendMemberEventWithContent(r, auth, roomID, target, content)
+}
+
+// sendMemberEventWithContent builds, authorises and persists an m.room.member
+// event with the given content (which must include "membership").
+func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth, roomID, target string, content map[string]any) error {
 	room, err := a.Store.GetRoom(r.Context(), roomID)
 	if err != nil {
 		return newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
 	}
 	version := roomver.Version(room.Version)
-	content := map[string]any{"membership": membership}
-	if reason != "" {
-		content["reason"] = reason
-	}
 	contentRaw, _ := json.Marshal(content)
 	st, err := a.buildStateSnapshot(r.Context(), roomID, target, auth.UserID)
 	if err != nil {
