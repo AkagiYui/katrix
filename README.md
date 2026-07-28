@@ -361,5 +361,5 @@ CI（`.github/workflows/ci.yml`）：
 
 ### 已知遗留（未在本阶段完成）
 
-- **Complement 逐用例通过率**：federation TLS + UIA 单请求 + per-server 命名修复已就绪（解锁联邦测试运行）；逐用例偏差修复（联邦 profile 查询、远程房间 join、device list 跨服务器更新等逐个协议特性）仍需迭代。
+- **Complement 逐用例通过率**：federation TLS + UIA 单请求 + per-server 命名 + r0 别名 + 客户端事件格式 + txn 幂等 + receipt/presence 端点 + E2EE 密钥验证/领取 等系统性根因已修复（csapi 通过率从 2 提升至 30/124，联邦测试解锁运行）。剩余逐用例偏差（联邦 profile 查询、远程房间 join、device list 跨服务器更新、canonical_alias 验证、presence sync 传播等）仍需迭代。
 - **状态解析快照表**：当前 `room_state` 为 last-writer-wins 单一映射，无 state-snapshot/state-groups 表。`resolveRoomState` 在 fork 时基于当前 room_state + 新事件做候选集解析；深层 fork 历史（多 extremity 的 state-before-event）需要快照表才能完全正确解析，属后续存储层增强。
