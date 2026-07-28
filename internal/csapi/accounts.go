@@ -391,7 +391,7 @@ func (a *API) Whoami(w http.ResponseWriter, r *http.Request) {
 
 type changePasswordRequest struct {
 	NewPassword   string          `json:"new_password"`
-	LogoutDevices bool            `json:"logout_devices"`
+	LogoutDevices *bool           `json:"logout_devices"`
 	Auth          json.RawMessage `json:"auth"`
 }
 
@@ -434,7 +434,13 @@ func (a *API) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
-	if req.LogoutDevices {
+	// Per spec, changing the password logs out all other devices by default
+	// unless logout_devices is explicitly false.
+	logoutDevices := true
+	if req.LogoutDevices != nil {
+		logoutDevices = *req.LogoutDevices
+	}
+	if logoutDevices {
 		if err := a.Store.DeleteAllAccessTokensExcept(r.Context(), auth.Localpart, auth.DeviceID); err != nil {
 			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
