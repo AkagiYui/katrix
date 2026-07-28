@@ -26,7 +26,6 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      CGO_ENABLED: 0
       KATRIX_TEST_DSN: postgres://katrix:katrix@localhost:5432/katrix_test?sslmode=disable
     steps:
       - uses: actions/checkout@v7
@@ -34,20 +33,16 @@ jobs:
         with:
           go-version: '1.26'
           cache: true
-      - name: go build (0cgo)
-        run: CGO_ENABLED=0 go build ./...
-      - name: go vet
-        run: go vet ./...
-      - name: gofmt check
-        run: |
+      - run: CGO_ENABLED=0 go build ./...
+      - run: go vet ./...
+      - run: |
           unformatted=$(gofmt -l $(find . -name '*.go' -not -path './tmp/*'))
           if [ -n "$unformatted" ]; then
             echo "These files need gofmt:"; echo "$unformatted"; exit 1
           fi
-      # The race detector requires cgo; the 0cgo hard constraint applies to the
+      # Race detector requires cgo; the 0cgo hard constraint applies to the
       # shipped binary (built above), not the test suite.
-      - name: go test (race)
-        run: CGO_ENABLED=1 go test -race -count=1 ./...
+      - run: CGO_ENABLED=1 go test -race -count=1 ./...
 
   web:
     name: build web (vite)
@@ -62,10 +57,8 @@ jobs:
           node-version: '24'
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
-      - name: install
-        run: pnpm -C web install --no-frozen-lockfile
-      - name: typecheck + build
-        run: pnpm -C web build
+      - run: pnpm -C web install --no-frozen-lockfile
+      - run: pnpm -C web build
       - uses: actions/upload-artifact@v4
         with:
           name: web-dist

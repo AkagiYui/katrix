@@ -2,7 +2,7 @@ name: complement
 
 on:
   push:
-    branches: [master, feat/next-phase]
+    branches: [master]
   pull_request:
   schedule:
     - cron: "0 4 * * *" # nightly
@@ -15,7 +15,6 @@ jobs:
   complement:
     name: Complement (black-box)
     runs-on: ubuntu-latest
-    # Complement needs Docker-in-Docker to spin up homeserver containers.
     services:
       docker:
         image: docker:dind
@@ -28,42 +27,31 @@ jobs:
         with:
           go-version: '1.26'
           cache: true
-      - name: build complement image
-        run: |
-          docker build -f Containerfile.complement -t "$COMPLEMENT_BASE_IMAGE" .
-      - name: checkout complement
-        uses: actions/checkout@v7
+      - run: docker build -f Containerfile.complement -t "$COMPLEMENT_BASE_IMAGE" .
+      - uses: actions/checkout@v7
         with:
           repository: matrix-org/complement
           path: complement
-      - name: run complement (core + msc suites)
+      - name: run complement
         env:
           COMPLEMENT_SHARE_ENV_PREFIX: PASS_
           PASS_SERVER_NAME: complement-test
         run: |
           cd complement
-          # Run the core CS API + federation + selected MSC suites. The full
-          # Complement suite is large; we enable the suites Katrix targets for
-          # spec-compliance acceptance and report pass/fail counts.
           go test -v -tags="msc2836 msc2946 msc3030 msc3874 msc3890 msisns" ./tests/... 2>&1 \
             | tee /tmp/complement.log || true
-      - name: summarise results
+      - name: summary
         if: always()
         run: |
+          p=$(grep -c -- '--- PASS:' /tmp/complement.log || true)
+          f=$(grep -c -- '--- FAIL:' /tmp/complement.log || true)
+          s=$(grep -c -- '--- SKIP:' /tmp/complement.log || true)
           echo "## Complement results" >> "$GITHUB_STEP_SUMMARY"
-          passed=$(grep -c -- '--- PASS:' /tmp/complement.log || true)
-          failed=$(grep -c -- '--- FAIL:' /tmp/complement.log || true)
-          skipped=$(grep -c -- '--- SKIP:' /tmp/complement.log || true)
-          echo "| Suite | Count |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| PASS | ${passed:-0} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| FAIL | ${failed:-0} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| SKIP | ${skipped:-0} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Pass rate: $passed / $((passed + failed + skipped))" >> "$GITHUB_STEP_SUMMARY"
-      - name: upload complement log
+          echo "| PASS | FAIL | SKIP | Pass rate |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ${p:-0} | ${f:-0} | ${s:-0} | ${p:-0} / $((p + f + s)) |" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
           name: complement-log
           path: /tmp/complement.log
