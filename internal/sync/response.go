@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/AkagiYui/katrix/internal/storage"
 )
 
 // Response is the /sync response body.
@@ -237,7 +239,7 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	}
 	timeline := Timeline{Events: make([]json.RawMessage, 0, len(evs))}
 	for _, ev := range evs {
-		timeline.Events = append(timeline.Events, ev.RawJSON)
+		timeline.Events = append(timeline.Events, clientEvent(&ev))
 	}
 	if len(timeline.Events) >= 50 {
 		timeline.Limited = true
@@ -258,7 +260,7 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		stateEvs, _ := e.store.EventsByIDs(ctx, ids)
 		jr.State.Events = make([]json.RawMessage, 0, len(stateEvs))
 		for _, se := range stateEvs {
-			jr.State.Events = append(jr.State.Events, se.RawJSON)
+			jr.State.Events = append(jr.State.Events, clientEvent(&se))
 		}
 	}
 	return jr, nil
@@ -326,4 +328,35 @@ func mustMarshalEvent(eventType, sender, stateKey string, content []byte, ts int
 	}
 	b, _ := json.Marshal(m)
 	return b
+}
+
+// clientEvent converts a stored PDU (EventRow.RawJSON) into the client-visible
+// event format. The Client-Server API must return the "stripped" event: only
+// type, content, sender, state_key (if state), origin_server_ts, event_id —
+// never auth_events, hashes, prev_events, or signatures.
+func clientEvent(row *storage.EventRow) json.RawMessage {
+	m := map[string]any{
+		"type":             row.Type,
+		"content":          json.RawMessage(row.Content),
+		"sender":           row.Sender,
+		"origin_server_ts": row.OriginServerTS,
+		"event_id":         row.EventID,
+	}
+	if row.StateKey != "" || isStateTypeSync(row.Type) {
+		m["state_key"] = row.StateKey
+	}
+	b, _ := json.Marshal(m)
+	return b
+}
+
+func isStateTypeSync(eventType string) bool {
+	switch eventType {
+	case "m.room.create", "m.room.power_levels", "m.room.join_rules",
+		"m.room.history_visibility", "m.room.name", "m.room.topic",
+		"m.room.member", "m.room.third_party_invite", "m.room.canonical_alias",
+		"m.room.aliases", "m.room.encryption", "m.room.tombstone",
+		"m.room.server_acl", "m.room.pinned_events":
+		return true
+	}
+	return false
 }

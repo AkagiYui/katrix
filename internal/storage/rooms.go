@@ -508,3 +508,30 @@ func scanEventRows(rows pgx.Rows) (EventRow, error) {
 	}
 	return e, nil
 }
+
+// ---- Client transaction idempotency ----
+
+// GetTxnEventID returns the event_id previously produced for a client
+// transaction, if any. This makes PUT /send/{txnID} idempotent: re-sending the
+// same txn returns the same event_id without creating a duplicate event.
+func (s *Store) GetTxnEventID(ctx context.Context, userLocalpart, roomID, txnID string) (string, error) {
+	var eventID string
+	err := s.pool.QueryRow(ctx,
+		`SELECT event_id FROM event_txns WHERE user_localpart=$1 AND room_id=$2 AND txn_id=$3`,
+		userLocalpart, roomID, txnID).Scan(&eventID)
+	if err == pgx.ErrNoRows {
+		return "", nil
+	}
+	return eventID, err
+}
+
+// RecordTxnEventID remembers the event_id produced for a client transaction so
+// future PUT /send calls with the same txn return the same id. If the txn
+// already exists the existing mapping is kept (ON CONFLICT DO NOTHING).
+func (s *Store) RecordTxnEventID(ctx context.Context, userLocalpart, roomID, txnID, eventID string, createdTS int64) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO event_txns(user_localpart, room_id, txn_id, event_id, created_ts)
+		 VALUES ($1,$2,$3,$4,$5) ON CONFLICT (user_localpart, room_id, txn_id) DO NOTHING`,
+		userLocalpart, roomID, txnID, eventID, createdTS)
+	return err
+}

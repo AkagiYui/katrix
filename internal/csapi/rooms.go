@@ -318,6 +318,12 @@ func (a *API) RoomSend(w http.ResponseWriter, r *http.Request) {
 		writeRoomErr(w, err)
 		return
 	}
+	// Idempotency: if this (user, room, txn) was already sent, return the same
+	// event_id without creating a duplicate.
+	if existingID, err := a.Store.GetTxnEventID(r.Context(), auth.Localpart, roomID, txnID); err == nil && existingID != "" {
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": existingID})
+		return
+	}
 	var content json.RawMessage
 	body, err := readBody(r)
 	if err != nil {
@@ -334,6 +340,7 @@ func (a *API) RoomSend(w http.ResponseWriter, r *http.Request) {
 		writeRoomErr(w, err)
 		return
 	}
+	_ = a.Store.RecordTxnEventID(r.Context(), auth.Localpart, roomID, txnID, ev.EventID(), a.Now())
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": ev.EventID()})
 }
 
@@ -474,7 +481,7 @@ func (a *API) RoomGetEvent(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrNotFound("event not found"))
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, json.RawMessage(ev.RawJSON))
+	httpx.WriteJSON(w, http.StatusOK, clientEvent(ev))
 }
 
 // RoomMembers handles GET /_matrix/client/v3/rooms/{roomID}/members.
@@ -594,8 +601,9 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	chunk := make([]json.RawMessage, 0, len(evs))
 	var startTok, endTok int64
-	for _, e := range evs {
-		chunk = append(chunk, json.RawMessage(e.RawJSON))
+	for i := range evs {
+		e := evs[i]
+		chunk = append(chunk, clientEvent(&e))
 		if startTok == 0 || e.StreamOrdering < startTok {
 			startTok = e.StreamOrdering
 		}

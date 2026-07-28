@@ -18,6 +18,7 @@ func (a *API) registerE2EE(mux *http.ServeMux) {
 	mux.HandleFunc("POST /_matrix/client/v3/keys/query", a.RequireAuth(a.KeysQuery))
 	mux.HandleFunc("POST /_matrix/client/v3/keys/claim", a.RequireAuth(a.KeysClaim))
 	mux.HandleFunc("GET /_matrix/client/v3/keys/changes", a.RequireAuth(a.KeysChanges))
+	mux.HandleFunc("PUT /_matrix/client/v3/sendToDevice/{eventType}/{txnID}", a.RequireAuth(a.SendToDevice))
 	mux.HandleFunc("POST /_matrix/client/v3/sendToDevice/{eventType}/{txnID}", a.RequireAuth(a.SendToDevice))
 	mux.HandleFunc("POST /_matrix/client/v3/keys/device_signing/upload", a.RequireAuth(a.DeviceSigningUpload))
 	mux.HandleFunc("POST /_matrix/client/v3/keys/signatures/upload", a.RequireAuth(a.SignaturesUpload))
