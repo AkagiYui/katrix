@@ -52,31 +52,17 @@ func (a *API) KeysUpload(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	// Persist device keys.
+	// Persist device keys. device_keys is a single DeviceKeys object (per spec),
+	// not a device-keyed map.
 	if len(req.DeviceKeys) > 0 {
-		var dk map[string]json.RawMessage
-		if err := json.Unmarshal(req.DeviceKeys, &dk); err != nil {
-			httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON", "device_keys: invalid JSON"))
-			return
-		}
-		bundle, ok := dk[auth.DeviceID]
-		if !ok {
-			// device_keys must be keyed by the caller's device_id. If the
-			// bundle is absent the upload is malformed (e.g. a flat object
-			// with user_id/device_id instead of a device-keyed map).
-			httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON", "device_keys: missing entry for this device_id"))
-			return
-		}
-		// Validate the device_keys bundle: algorithms, keys and signatures
-		// are required; if user_id/device_id are present they must match the caller.
 		var fields struct {
-			UserID     string          `json:"user_id"`
-			DeviceID   string          `json:"device_id"`
-			Algorithms json.RawMessage `json:"algorithms"`
-			Keys       json.RawMessage `json:"keys"`
-			Signatures json.RawMessage `json:"signatures"`
+			UserID     string            `json:"user_id"`
+			DeviceID   string            `json:"device_id"`
+			Algorithms json.RawMessage   `json:"algorithms"`
+			Keys       map[string]string `json:"keys"`
+			Signatures json.RawMessage   `json:"signatures"`
 		}
-		if err := json.Unmarshal(bundle, &fields); err != nil {
+		if err := json.Unmarshal(req.DeviceKeys, &fields); err != nil {
 			httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON", "device_keys: invalid JSON"))
 			return
 		}
@@ -84,12 +70,12 @@ func (a *API) KeysUpload(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON", "device_keys: user_id does not match the authenticated user"))
 			return
 		}
-		if len(fields.Algorithms) == 0 || len(fields.Keys) == 0 || len(fields.Signatures) == 0 {
+		if len(fields.Algorithms) == 0 || fields.Keys == nil || len(fields.Signatures) == 0 {
 			httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON", "device_keys: algorithms, keys and signatures are required"))
 			return
 		}
 		_, _ = a.Store.UpsertDeviceKey(r.Context(), storage.DeviceKey{
-			UserID: auth.UserID, DeviceID: auth.DeviceID, KeyJSON: bundle,
+			UserID: auth.UserID, DeviceID: auth.DeviceID, KeyJSON: req.DeviceKeys,
 		})
 	}
 	// Persist one-time keys.

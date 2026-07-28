@@ -16,7 +16,11 @@ func TestKeysUploadQueryClaim(t *testing.T) {
 	// Upload device keys + one-time keys.
 	code, _ := doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/keys/upload", tok, map[string]any{
 		"device_keys": map[string]any{
-			deviceID: map[string]any{"algorithms": []string{"m.olm.v1.curve25519"}, "keys": map[string]string{}, "signatures": map[string]any{}},
+			"user_id":    "@alice:test.katrix",
+			"device_id":  deviceID,
+			"algorithms": []string{"m.olm.v1.curve25519"},
+			"keys":       map[string]string{},
+			"signatures": map[string]any{},
 		},
 		"one_time_keys": map[string]any{
 			"signed_curve25519:AAAAAA": map[string]any{"key": "otk1"},
