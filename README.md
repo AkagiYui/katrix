@@ -23,7 +23,7 @@ Katrix 是一个从零实现的、尽量贴近 [Matrix 规范](https://spec.matr
   - [主要风险](#主要风险)
 - [如何使用](#如何使用)
 - [测试](#测试)
-- [下一阶段目标](#下一阶段目标)
+- [后续阶段实现（已完成）](#后续阶段实现已完成)
 
 ---
 
@@ -33,16 +33,20 @@ Katrix 按阶段（P0–P8）实现，每个阶段都自带测试并通过 GitHu
 
 | 模块 | 实现范围 |
 |---|---|
-| **账户（P1）** | 注册（含 guest）、登录、登出、登出全部、access/refresh token 轮换、`/whoami`、改密、停用、设备管理（列表/查询/改名/删除）、用户资料（昵称/头像）。UIA（m.login.dummy / m.login.password / registration_token）、guest 中间件、soft_logout、登录时序侧信道防护。 |
+| **账户（P1）** | 注册（含 guest）、登录、登出、登出全部、access/refresh token 轮换、`/whoami`、改密、停用、设备管理（列表/查询/改名/删除）、用户资料（昵称/头像）。UIA（m.login.dummy / m.login.password / registration_token，支持单请求完成无参流程）、guest 中间件、soft_logout、登录时序侧信道防护。 |
 | **房间核心（P2）** | `createRoom`、join/leave/invite/kick/ban/unban、`send`、`state` 读写、`event`、`members`、`joined_members`、`aliases`、`messages` 分页、`redact`、`typing`、`forget`、目录别名 CRUD。事件授权规则（m.room.create/member/power_levels/join_rules，含 v12 creator 特权）、power levels、成员状态机、knock 支持。 |
 | **Sync（P3）** | `/sync` 全量 + 增量、long-poll（经 Notifier 唤醒）、typing 临时状态、receipts、account_data（全局 + 房间）、to-device 派发。 |
-| **媒体 + UI（P4）** | 上传/下载/缩略图（v1 + v3 端点）。纯 Go 缩略图（JPEG/PNG/GIF/WebP 解码，JPEG/PNG 输出，scale/crop，DB 缓存）。React 19 + Vite 8 SPA（登录/注册/建房/聊天/实时 sync 循环）。 |
-| **联邦（P5）** | 远端 server key 拉取 + Postgres 缓存、`/send/{txnId}`（去重 + PDU 入库）、`/event`、`/state`、`/state_ids`、`/backfill`、`/get_missing_events`、`/make_join` + `/send_join`、`/make_leave` + `/send_leave`、`/invite`、`/event_auth`。出站 federation Client、状态解析 v2。 |
-| **房间版本回填（P6）** | 旧事件格式（v1–v2：显式 event_id 字段、`[id, hash]` prev/auth）经 `Builder.BuildLegacy`；状态解析 v1（前向时序）。roomver 规则表覆盖 v1–v12。 |
-| **E2EE 中转（P7）** | `keys/upload`（device + one-time + fallback）、`keys/query`、`keys/claim`（原子消费 OTK）、`keys/changes`、`sendToDevice`（经 /sync 派发后删除）、cross-signing（device_signing / signatures 上传）。**密钥备份**（`/room_keys/*`：version 增删改查、keys 批量上传/查询/删除）。服务端不做加密，只中转。 |
-| **补全（P8）** | push rules（默认规则集 + 增删改查）、filters、`publicRooms`、`preview_url`（OpenGraph 解析 + 粗粒度 SSRF 防护）、admin API（whois / 停用 / 改密 / 用户列表 / 房间列表 / 统计，按 `users.admin` 鉴权）。 |
-| **部署** | 生产 `Containerfile`（alpine 多阶段、0cgo 静态、非 root、healthcheck 子命令）；`Containerfile.complement`（Complement 测试镜像，内置 Postgres per-server 集群 + entrypoint）。 |
-| **CI/CD** | `ci.yml`（Go build/vet/gofmt/race test + Web Vite build）；`next-phase.yml`（ssrf/fedverify/stateres/rooms v12 单测 + Postgres 集成 + QR login）；`release.yml`（多架构二进制 + GHCR 镜像，打 tag 触发）；`complement.yml`（官方 Complement 黑盒测试，结果在 job summary 报告 PASS/FAIL/SKIP）。 |
+| **媒体 + UI（P4）** | 上传/下载/缩略图（v1 + v3 端点）。纯 Go 缩略图（JPEG/PNG/GIF/WebP 解码，JPEG/PNG 输出，scale/crop，DB 缓存）。远程媒体拉取（经联邦 `GET /media/v3/download`，X-Matrix 签名，懒拉取 + 本地缓存，缩略图支持远程）。React 19 + Vite 8 SPA（登录/注册/建房/聊天/实时 sync 循环）。 |
+| **联邦（P5）** | 远端 server key 拉取 + Postgres 缓存、`/send/{txnId}`（去重 + PDU 入库 + 入站逐事件 ed25519 签名验证）、`/event`、`/state`、`/state_ids`（auth chain 递归遍历）、`/backfill`、`/get_missing_events`、`/make_join` + `/send_join`、`/make_leave` + `/send_leave`、`/invite`、`/event_auth`。出站 federation Client、状态解析 v2 接入 ingest 路径（resolveRoomState 在 fork 时运行状态解析，取代盲目 UpsertState）。**TLS**：联邦端口支持 HTTPS（`federation_tls.cert_path/key_path` 配置 + `katrix gencert` 子命令用 CA 签发 leaf 证书）。 |
+| **房间版本回填（P6）** | 旧事件格式（v1–v2：显式 event_id 字段、`[id, hash]` prev/auth）经 `Builder.BuildLegacy`；状态解析 v1（前向时序）。roomver 规则表覆盖 v1–v12。v12 room ID = create reference hash 派生（`BuildInitialEvents` 省略 room_id，`roomver.Default` = 12）。 |
+| **状态解析（核心）** | `stateres.ResolveV2`：规范的出度模型反向拓扑 Kahn 排序（祖先优先），**发送者 power-level 为主排序键**（从候选事件的 auth_events 解析 m.room.power_levels 的 users map；v12 creator 无限 power = 2^53），mainline depth 对齐 Synapse（最老祖先 depth=1，head depth=len，无匹配 depth=0）。v1 前向时序。 |
+| **E2EE 中转 + 客户端 Megolm（P7）** | 服务端：`keys/upload`（device + one-time + fallback）、`keys/query`、`keys/claim`（原子消费 OTK）、`keys/changes`、`sendToDevice`（经 /sync 派发后删除，`*` 通配扇出）、cross-signing、**密钥备份**（`/room_keys/*`）。服务端不做加密，只中转。**前端**：`@matrix-org/olm`（libolm WASM）完整集成 — Ed25519/Curve25519 设备密钥（canonical JSON 签名 + keys/upload）、one-time/fallback keys、IndexedDB 持久化、Megolm 出站会话（m.megolm.v1.aes-sha2 加密 m.room.message → m.room.encrypted）、Megolm 入站会话（room key 导入 + 解密）、Olm 1:1 会话（keys/claim + sendToDevice m.room_key 分发）、to-device m.encrypted 解密处理、keys/query 设备密钥缓存。 |
+| **补全（P8）** | push rules（默认规则集 + 增删改查）、filters、`publicRooms`、`preview_url`（OpenGraph 解析 + SSRF 防护：DNS 解析后 IP 段校验 [loopback/私网/link-local/CGNAT/metadata/IPv6 ULA/TEST-NET] + 连接时校验防 DNS rebinding + 重定向/大小/超时限制）、admin API（whois / 停用 / 改密 / 用户列表 / 房间列表 / 统计，按 `users.admin` 鉴权）。 |
+| **性能与可观测性** | `forward_extremities` 表 + `InsertEvent` 维护 extremity 集（/sync 增量 delta 无需全量重扫）；`database.max_conns/min_conns` 配置项；`internal/metrics` 依赖-free Prometheus `/metrics` 端点（Go runtime + katrix events/sync/federation/media 计数器）。 |
+| **Web 面板扩展** | TanStack Router（`/` 聊天 / `/devices` 设备与 E2EE / `/admin` 管理面板）；shadcn 风格 UI 原语（Button/Input/Card/Badge/Table + `cn()` + 设计 token CSS）；管理面板（统计卡片、用户停用/改密、房间列表，对齐 synapse-admin）；E2EE 设备密钥自举 + Megolm 加解密全链路。 |
+| **登录增强** | `login_tokens` 表 + `POST /login/token` 铸造单次令牌；`/login` 增 `m.login.token` 流程；`/versions` 声明 `org.matrix.msc3886`；`SendToDevice` `*` 通配扇出（打通 `m.secret.send`）；`m.key.verification.*` 透传。 |
+| **部署** | 生产 `Containerfile`（alpine 多阶段、0cgo 静态、非 root、healthcheck 子命令）；`Containerfile.complement`（Complement 测试镜像，内置 Postgres per-server 集群 + entrypoint，federation TLS 自动签发）。子命令：serve / healthcheck / genkey / **gencert** / version。 |
+| **CI/CD** | `ci.yml`（Go build/vet/gofmt/race test + Web Vite build）；`release.yml`（多架构二进制 + GHCR 镜像，打 tag 触发）；`complement.yml`（官方 Complement 黑盒测试 [核心 + MSC 用例]，federation TLS 就绪，结果在 job summary 报告 PASS/FAIL/SKIP）。 |
 
 ### 硬约束
 
@@ -58,16 +62,16 @@ Katrix 按阶段（P0–P8）实现，每个阶段都自带测试并通过 GitHu
 
 ```
 katrix/
-├── cmd/katrix/main.go          # 入口：serve / healthcheck / genkey / version
+├── cmd/katrix/main.go          # 入口：serve / healthcheck / genkey / gencert / version
 ├── internal/
-│   ├── config/                 # YAML + env 配置
+│   ├── config/                 # YAML + env 配置（含 federation_tls）
 │   ├── httpserver/             # 顶层路由装配 + SPA fallback
 │   ├── csapi/                  # Client-Server API handlers
-│   ├── federation/             # Server-Server API（key/发现/PDU/EDU/join）
-│   ├── media/                  # 内容仓库（上传/下载/缩略图/URL preview）
+│   ├── federation/             # Server-Server API（key/发现/PDU/EDU/join/状态解析接入）
+│   ├── media/                  # 内容仓库（上传/下载/缩略图/URL preview/远程媒体拉取）
 │   ├── rooms/                  # 房间状态机、成员、事件授权规则
 │   ├── roomver/                # v1–v12 房间版本规则表
-│   ├── stateres/               # 状态解析 v1 / v2
+│   ├── stateres/               # 状态解析 v1 / v2（含 sender power-level 主排序键）
 │   ├── events/                 # 事件模型、canonical JSON、hashing、redaction、签名
 │   ├── crypto/                 # ed25519 签名/验签、密钥管理
 │   ├── sync/                   # /sync 引擎（Token、TypingTracker、Response 构建）
@@ -75,12 +79,15 @@ katrix/
 │   ├── homeserver/             # 共享状态容器（config/store/key/notifier + 认证中间件）
 │   ├── httpx/                  # Matrix 标准错误码 + JSON 响应
 │   ├── ids/                    # user/room/alias/device id 解析与生成
+│   ├── netutil/ssrf/           # URL preview SSRF 防护
+│   ├── metrics/                # Prometheus /metrics 端点
 │   ├── testdb/                 # 测试用 Postgres advisory lock（跨进程隔离）
 │   └── webui/                  # //go:embed all:dist
-├── web/                        # 前端源码（pnpm + Vite + React 19）
+├── web/                        # 前端源码（pnpm + Vite + React 19 + libolm WASM）
+│   └── src/lib/{e2ee,olm-init,canonical-json,matrix}.ts
 ├── .github/workflows/          # ci / release / complement
 ├── Containerfile               # 生产镜像（alpine）
-├── Containerfile.complement    # Complement 测试镜像
+├── Containerfile.complement    # Complement 测试镜像（含 federation TLS 自动签发）
 └── README.md
 ```
 
@@ -107,8 +114,9 @@ Matrix 里有几套相互独立的版本编号，实现时必须分清：
 - **房间版本规则表**（`internal/roomver`）：以数据表方式描述每个版本的差异开关（event ID 格式、auth 规则集、redaction 规则、是否 room-ID-as-hash、状态解析版本等），供其他模块查询。
 - **状态解析三套**（`internal/stateres`）：
   - **v1**（房间 v1）：前向时序算法。
-  - **v2**（房间 v2–v11）：幂事件逆时序排序 + mainline tie-break。
-  - **v2.1**（房间 v12，含 MSC4289 创建者 power）：在 v2 基础上，creator 经授权规则层（`rooms.Authorize` 的 `CreatorPrivileged` 分支）豁免 power-level 检查。
+  - **v2**（房间 v2–v11）：出度模型反向拓扑 Kahn 排序（祖先优先）+ mainline tie-break。Kahn 选点的**主排序键为发送者 power-level**（从候选事件的 auth_events 解析 m.room.power_levels 的 users map，v12 creator 无限 power = 2^53），tie-break 为 origin_server_ts + event_id。
+  - **v2.1**（房间 v12，含 MSC4289 创建者 power）：v2 基础上 creator 无限 power 经 SenderPowerLevel 表达，无需单独代码路径。
+  - **mainline depth** 对齐 Synapse：最老祖先 depth=1，head depth=len(mainline)，无匹配 depth=0，升序排序。
 - **canonical JSON + 签名**（`internal/canonicaljson` + `internal/events`）：字节级一致是联邦互通的隐形地雷。键按 Unicode code point 排序、无空白、整数渲染无小数点、禁止浮点、UTF-8 原样、仅强制转义。content hash + reference hash 按 room version 派生 event ID；redaction 算法按版本分支（v11+ `UpdatedRedaction` 修剪 origin/membership/prev_state、保留 create 全内容、保留 m.room.member.third_party_invite.signed、保留 m.room.redaction.redacts）。
 
 ### 联邦（Server-Server API）
@@ -125,9 +133,18 @@ Matrix 里有几套相互独立的版本编号，实现时必须分清：
 
 - `/_matrix/client/v3/keys/upload`、`/keys/query`、`/keys/claim`、`/keys/changes`
 - one-time keys 计数与原子分发（claim 标记 used）
-- `/sendToDevice/{eventType}/{txnId}`（to-device 消息中转，经 /sync 派发后删除）
+- `/sendToDevice/{eventType}/{txnId}`（to-device 消息中转，经 /sync 派发后删除，`*` 通配扇出）
 - cross-signing 密钥的存储与查询、`/keys/device_signing/upload`、`/keys/signatures/upload`
-- **密钥备份** `/room_keys/*`：version 增删改查 + keys 批量上传/查询/删除（`/room_keys/version`、`/room_keys/keys`，含 room/session 维度过滤）
+- **密钥备份** `/room_keys/*`：version 增删改查 + keys 批量上传/查询/删除
+
+**客户端 Megolm 加解密**（`web/src/lib/e2ee.ts`，基于 `@matrix-org/olm` libolm WASM）：
+
+- Ed25519 签名密钥 + Curve25519 身份密钥（canonical JSON 签名后 keys/upload），IndexedDB 持久化
+- one-time keys（signed_curve25519）+ fallback key 生成与上传
+- Megolm 出站会话（per-room m.megolm.v1.aes-sha2）：encryptRoomMessage 加密 m.room.message → m.room.encrypted
+- Megolm 入站会话：importRoomKey 导入 room key，decryptRoomMessage 解密入站 m.room.encrypted
+- Olm 1:1 会话：keys/claim + sendToDevice 包装 m.room_key 为 m.encrypted 分发给已知设备
+- to-device m.encrypted 解密（建立入站 Olm 会话），keys/query 设备密钥缓存
 
 ### 媒体处理策略
 
@@ -169,14 +186,14 @@ Matrix 需要的媒体处理只有"图片缩略图"一项，无需 ImageMagick /
 - **存储**：单 `*storage.Store` 包裹 pgx 连接池，按域分文件（accounts、rooms、events、state、memberships、media、e2ee、keybackup、push、federation）。迁移经 `embed` SQL 在 `Open` 时自动应用。
 - **事件流水线**：`events.Builder.Build` / `BuildLegacy` 组装 -> canonical JSON -> content hash -> 对 redacted form 签名。事件 ID 按 room version 派生（v1–2 显式、v3 标准 base64 hash、v4+ url-safe hash）。
 - **事件授权**：`rooms.Authorize` 按 room version 规则执行 create/member/power_levels/join_rules/generic 五类检查；v12 creator 免 power-level 检查；成员状态机覆盖 join/leave/invite/ban/knock 转换合法性。
-- **状态解析**：`stateres.Resolve` 按 state-res 版本分发（v1 前向时序 / v2 幂事件逆时序 + mainline）。单 extremity 房间走 `PickLatest` 退化路径。
+- **状态解析**：`stateres.Resolve` 按 state-res 版本分发（v1 前向时序 / v2 出度模型反向拓扑 Kahn 排序 + mainline depth）。Kahn 选点主排序键为发送者 power-level（从 auth_events 解析）。单 extremity 房间走 `PickLatest` 退化路径。`federation.resolveRoomState` 在 fork 时运行状态解析取代盲目 UpsertState。
 - **认证**：`homeserver.Authenticate` 解析 bearer token -> access token 行 -> user；`RequireAuth` 放行 guest，`RequireUserAuth` 拒绝 guest。UIA 会话绑定操作 + 用户 + TTL，防止跨端点重放。
 - **/sync**：`sync.Engine` 构建完整响应（joined/invited/left、timeline 窗口、account_data、ephemeral typing/receipts、to_device）。long-poll 经 `Notifier.Wait` 唤醒。
 - **配置**：YAML 文件 + 环境变量覆盖（`KATRIX_*`），单节点开发零配置。
 
 ### 主要风险
 
-1. **状态解析**：v1 / v2 / v2.1 三套并存，算法复杂，是联邦一致性的核心（v2 mainline 已实现完整 Kahn 拓扑 + mainline 链；发送者 power-level 比较用 depth/ts/id 近似）。
+1. **状态解析**：v1 / v2 / v2.1 三套并存，算法复杂，是联邦一致性的核心（v2 mainline 已实现完整 Kahn 拓扑 + mainline 链；发送者 power-level 为主排序键，从候选事件的 auth_events 解析；mainline depth 方向对齐 Synapse）。
 2. **房间版本 v1–v12 全覆盖**：event ID 格式、auth、redaction、room-ID-as-hash 各版本不同，工作量重（v12 room-ID-as-create-hash 已在 createRoom 串联）。
 3. **canonical JSON + 签名**：字节级一致性是联邦互通的隐形地雷（入站 PDU 已逐事件验签）。
 4. **`/sync` 正确性与性能**：几乎所有客户端行为的基础（`forward_extremities` 表已接入，InsertEvent 维护 extremity 集，/sync 增量 delta 不再全量重扫）。
@@ -312,33 +329,37 @@ CI（`.github/workflows/ci.yml`）：
 
 ---
 
-## 下一阶段目标（已实现）
+## 后续阶段实现（已完成）
 
-以下 9 项已知限制已全部在本阶段实现，每项独立成 commit、自带测试并通过 CI：
+以下 9+3 项已知限制已全部实现，每项独立成 commit、自带测试并通过 CI：
 
 | # | 目标 | 实现概要 |
 |---|---|---|
 | 1 | **联邦入站签名验证** | `internal/federation/fedverify`：基于远端 server key 的逐事件 ed25519 签名校验器；`ingestPDU`/`ingestRemoteMember` 入站前验签，未签名/伪造事件被拒。 |
-| 2 | **完整状态解析 v2 mainline** | `stateres.ResolveV2` 重写为规范的反向拓扑 Kahn 排序 + 完整 mainline 链（auth_events 回溯）+ mainline-closeness tie-break，覆盖联邦冲突场景。 |
+| 2 | **完整状态解析 v2 mainline** | `stateres.ResolveV2` 规范的出度模型反向拓扑 Kahn 排序 + 完整 mainline 链（auth_events 回溯）+ mainline-depth tie-break，覆盖联邦冲突场景。 |
 | 3 | **远程媒体拉取** | `media.cacheRemote` 经联邦 `GET /media/v3/download`（X-Matrix 签名）懒拉取并本地缓存；`media.origin_server` + `cached_ts` 列；缩略图支持远程媒体。 |
 | 4 | **v12 room ID 哈希派生** | `BuildInitialEvents`：v12 create 事件省略 `room_id`，room ID = create reference hash（`!` + url-safe base64，即 create event id 改 sigil）；`roomver.Default` 升至 12。 |
 | 5 | **URL preview SSRF 强化** | `internal/netutil/ssrf`：DNS 解析后 IP 段校验（loopback/私网/link-local/CGNAT/metadata 169.254.169.254/IPv6 ULA/TEST-NET）+ 连接时校验防 DNS rebinding + 重定向次数/大小/超时限制。 |
-| 6 | **Complement 验收** | `Containerfile.complement` 重写为内置 Postgres 的自包含镜像（per-server 集群 + entrypoint 脚本）；`complement.yml` 开启核心 + MSC 用例并在 job summary 报告 PASS/FAIL/SKIP 计数与通过率。 |
-| 7 | **Web 面板扩展** | TanStack Router（`/` 聊天 / `/devices` 设备与 E2EE / `/admin` 管理面板）；shadcn 风格 UI 原语（Button/Input/Card/Badge/Table + `cn()` + 设计 token CSS）；管理面板（统计卡片、用户停用/改密、房间列表，对齐 synapse-admin）；E2EE 设备密钥自举（Ed25519 fingerprint + Curve25519 identity 经 WebCrypto，keys/upload）。 |
+| 6 | **Complement 验收** | `Containerfile.complement` 重写为内置 Postgres 的自包含镜像（per-server 集群 + entrypoint 脚本 + **federation TLS 自动签发**）；`complement.yml` 开启核心 + MSC 用例并在 job summary 报告 PASS/FAIL/SKIP 计数与通过率。 |
+| 7 | **Web 面板扩展** | TanStack Router（`/` 聊天 / `/devices` 设备与 E2EE / `/admin` 管理面板）；shadcn 风格 UI 原语（Button/Input/Card/Badge/Table + `cn()` + 设计 token CSS）；管理面板（统计卡片、用户停用/改密、房间列表，对齐 synapse-admin）。 |
 | 8 | **性能与可观测性** | `forward_extremities` 表 + `InsertEvent` 维护 extremity 集（/sync 增量 delta 无需全量重扫）；`database.max_conns/min_conns` 配置项（`KATRIX_DATABASE_MAX_CONNS`）；`internal/metrics` 依赖-free Prometheus `/metrics` 端点（Go runtime + katrix events/sync/federation/media 计数器）。 |
-| 9 | **二维码登录与安全消息传递自举** | `login_tokens` 表 + `POST /_matrix/client/v3/login/token` 铸造单次登录令牌；`/login` 增 `m.login.token` 流程消费令牌；`/versions` 声明 `org.matrix.msc3886`；`SendToDevice` 支持 `*` 通配（向用户全部设备扇出，打通 `m.secret.send`）；`m.key.verification.*` 任意事件类型已透传 to-device。 |
+| 9 | **二维码登录与安全消息传递自举** | `login_tokens` 表 + `POST /login/token` 铸造单次登录令牌；`/login` 增 `m.login.token` 流程消费令牌；`/versions` 声明 `org.matrix.msc3886`；`SendToDevice` 支持 `*` 通配（向用户全部设备扇出，打通 `m.secret.send`）；`m.key.verification.*` 任意事件类型已透传 to-device。 |
+| 10 | **状态解析 v2 发送者 power-level** | `EventMeta.SenderPowerLevel`：从候选事件的 auth_events 解析 m.room.power_levels 的 users map（v12 creator = 2^53）；Kahn 选点主排序键从 (ts, id, depth) 改为 (-power, ts, id) 对齐 Synapse `_get_power_order`；mainline depth 方向修正对齐 Synapse `mainline_map`；出度模型（祖先优先）替代入度模型。 |
+| 11 | **E2EE 客户端 Megolm 加解密** | `@matrix-org/olm`（libolm WASM）完整集成：Ed25519/Curve25519 设备密钥（canonical JSON 签名 + keys/upload）、IndexedDB 持久化、Megolm 出站/入站会话（m.megolm.v1.aes-sha2 加密/解密）、Olm 1:1 会话（keys/claim + sendToDevice m.room_key 分发）、to-device m.encrypted 解密、keys/query 设备密钥缓存。chat.tsx 集成发送加密 / 渲染解密 / room key 分发全链路。 |
+| 12 | **Complement federation TLS + UIA 单请求注册** | 联邦端口支持 HTTPS（`federation_tls` 配置 + `katrix gencert` 子命令用 CA 签发 leaf 证书 + Complement entrypoint 自动签发）；UIA `m.login.dummy` 支持单请求完成（无 session 时自动创建并完成）；CI 移除 `PASS_SERVER_NAME`（避免覆盖 Complement per-server 命名）；`/state_ids` auth chain 改为递归遍历。 |
 
 ### 额外实现（为达成目标而做的支撑项）
 
 - `crypto.VerifyJSONWith` + `events.EventIDFromRaw`：fedverify 所需原语。
 - `federation.signRequestWith`：出站联邦请求 X-Matrix 签名（远程媒体拉取复用）。
 - `federation.applyRemoteMembership` + `notifyRoomMembers`：入站 member 事件更新 denormalised membership 并唤醒 /sync。
+- `federation.stateres.go`：`resolveRoomState`（fork 时运行状态解析取代盲目 UpsertState）、`buildEventMeta`（从存储事件构建 EventMeta，解析 auth/prev + sender power-level）、递归 `authChain` 遍历。
+- `stateres.MaxCreatorPowerLevel`（2^53）对齐 Synapse `CREATOR_POWER_LEVEL`。
 - `storage.OpenWithConfig`：连接池大小可配置。
+- `web/src/lib/{olm-init,canonical-json,e2ee}.ts`：libolm WASM 初始化、canonical JSON 编码（设备密钥签名）、完整 E2EE 模块。
 - `testdb.Truncate` 扩展至 `forward_extremities` / `media` / `login_tokens`。
-- 新增 `next-phase.yml` CI 工作流：纯 Go 单元测试（ssrf/fedverify/stateres/rooms v12/events/crypto）+ Postgres 集成（csapi/storage/media/federation + QR login）。
 
 ### 已知遗留（未在本阶段完成）
 
-- **E2EE 客户端 Megolm 加解密**：设备密钥自举 + keys/upload/query 已通，但 room 消息的 Olm/Megolm 加解密需要 libolm WASM（或 vodozemac-wasm）集成，属前端独立大工程，本阶段未引入。
-- **Complement 通过率**：镜像与运行链路已就绪；逐用例偏差修复（逐个 Complement test 的协议细节）仍需迭代。
-- **状态解析 v2 的发送者 power-level 比较**：`EventMeta` 未携带 per-auth-events 的 power-level，Kahn 选点用 depth/ts/id 近似；完整规范实现需在候选构造时解析 power-levels。
+- **Complement 逐用例通过率**：federation TLS + UIA 单请求 + per-server 命名修复已就绪（解锁联邦测试运行）；逐用例偏差修复（联邦 profile 查询、远程房间 join、device list 跨服务器更新等逐个协议特性）仍需迭代。
+- **状态解析快照表**：当前 `room_state` 为 last-writer-wins 单一映射，无 state-snapshot/state-groups 表。`resolveRoomState` 在 fork 时基于当前 room_state + 新事件做候选集解析；深层 fork 历史（多 extremity 的 state-before-event）需要快照表才能完全正确解析，属后续存储层增强。
