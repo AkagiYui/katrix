@@ -1,0 +1,223 @@
+name: test
+
+# Black-box / integration test suite, modelled on Dendrite's "single workflow,
+# parallel jobs + alls-green gate" layout. Complement is the only hard gate;
+# SyTest and complement-crypto are informational baselines (continue-on-error)
+# while katrix is still early — they establish a progress baseline rather than
+# blocking PRs.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: "0 4 * * *" # nightly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  complement:
+    name: Complement (black-box)
+    runs-on: ubuntu-latest
+    env:
+      COMPLEMENT_BASE_IMAGE: ghcr.io/akagiyui/katrix:complement
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      - run: docker build -f Containerfile.complement -t "$COMPLEMENT_BASE_IMAGE" .
+      - uses: actions/checkout@v7
+        with:
+          repository: matrix-org/complement
+          path: complement
+      - name: run complement
+        env:
+          COMPLEMENT_SHARE_ENV_PREFIX: PASS_
+        run: |
+          cd complement
+          go test -v -tags="msc2836 msc2946 msc3030 msc3874 msc3890 msisns" ./tests/... 2>&1 \
+            | tee /tmp/complement.log || true
+      - name: summary
+        if: always()
+        run: |
+          p=$(grep -c -- '--- PASS:' /tmp/complement.log || true)
+          f=$(grep -c -- '--- FAIL:' /tmp/complement.log || true)
+          s=$(grep -c -- '--- SKIP:' /tmp/complement.log || true)
+          echo "## Complement results" >> "$GITHUB_STEP_SUMMARY"
+          echo "| PASS | FAIL | SKIP | Pass rate |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ${p:-0} | ${f:-0} | ${s:-0} | ${p:-0} / $((p + f + s)) |" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: complement-log
+          path: /tmp/complement.log
+
+  sytest:
+    name: SyTest
+    runs-on: ubuntu-latest
+    continue-on-error: true # informational baseline; katrix is early
+    env:
+      DOCKER_BUILDKIT: '1'
+    steps:
+      - uses: actions/checkout@v7
+      # SyTest keeps per-homeserver logic in its own lib/scripts (not the HS
+      # repo). Fetch it and graft katrix's homeserver module + runner on top.
+      - name: checkout sytest
+        uses: actions/checkout@v7
+        with:
+          repository: matrix-org/sytest
+          ref: develop
+          path: sytest-src
+      - name: graft katrix sytest support
+        run: |
+          cp sytest/Katrix.pm sytest-src/lib/SyTest/Homeserver/Katrix.pm
+          cp sytest/katrix_sytest.sh sytest-src/scripts/katrix_sytest.sh
+          chmod +x sytest-src/scripts/katrix_sytest.sh
+      - name: build sytest-katrix image
+        run: docker build -f Containerfile.sytest -t sytest-katrix .
+      - name: run sytest
+        run: |
+          mkdir -p sytest-logs
+          docker run --rm \
+            -v "$PWD/sytest-src:/sytest" \
+            -v "$PWD:/src" \
+            -v "$PWD/sytest-logs:/logs" \
+            -e POSTGRES=1 \
+            -e SYTEST_DEFAULT_BRANCH=develop \
+            sytest-katrix 2>&1 | tee /tmp/sytest.log || true
+      - name: summary
+        if: always()
+        run: |
+          tap="$PWD/sytest-logs/results.tap"
+          if [ -f "$tap" ]; then
+            ok=$(grep -c -- '^ok' "$tap" || true)
+            notok=$(grep -c -- '^not ok' "$tap" || true)
+          else
+            ok=0; notok=0
+          fi
+          echo "## SyTest results" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ok | not ok | total |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ${ok:-0} | ${notok:-0} | $(( ${ok:-0} + ${notok:-0} )) |" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sytest-logs
+          path: |
+            sytest-logs/
+            /tmp/sytest.log
+
+  complement-crypto:
+    name: Complement Crypto
+    runs-on: ubuntu-latest
+    continue-on-error: true # informational baseline; crypto impl is incomplete
+    env:
+      # complement-crypto expects the homeserver image at this ref.
+      COMPLEMENT_BASE_IMAGE: homeserver
+      COMPLEMENT_ENABLE_DIRTY_RUNS: '1'
+      COMPLEMENT_SHARE_ENV_PREFIX: PASS_
+      COMPLEMENT_CRYPTO_TEST_CLIENT_MATRIX: jr,rj
+      COMPLEMENT_CRYPTO_MITMDUMP: mitm.dump
+      TESTCONTAINERS_RYUK_DISABLED: 'true'
+      DOCKER_BUILDKIT: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      # Build the katrix complement base image and tag it as `homeserver:latest`
+      # (the ref COMPLEMENT_BASE_IMAGE points at).
+      - name: build katrix complement image
+        run: docker build -f Containerfile.complement -t homeserver:latest .
+
+      - name: checkout complement-crypto
+        uses: actions/checkout@v7
+        with:
+          repository: matrix-org/complement-crypto
+          ref: main
+          path: complement-crypto
+      - name: checkout matrix-rust-sdk
+        uses: actions/checkout@v7
+        with:
+          repository: matrix-org/matrix-rust-sdk
+          ref: main
+          path: complement-crypto/rust-sdk
+
+      # --- toolchains for the two SDK client axes (jr,rj) ---
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 'lts/*'
+          cache: yarn
+          cache-dependency-path: complement-crypto/internal/api/js/js-sdk/yarn.lock
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: complement-crypto/rust-sdk
+
+      # complement-crypto vendorises the JS SDK into its own tree via yarn.
+      - name: build JS SDK
+        run: |
+          cd complement-crypto
+          ./rebuild_js_sdk.sh "matrix-js-sdk@https://github.com/matrix-org/matrix-js-sdk#main"
+
+      # Build the matrix-sdk-ffi crate and generate the Go bindings
+      # (uniffi-bindgen-go + rebuild_rust_sdk.sh live in the complement-crypto repo).
+      - name: install uniffi-bindgen-go
+        run: |
+          cd complement-crypto
+          ./install_uniffi_bindgen_go.sh
+      - name: build Rust FFI bindings
+        run: |
+          cd complement-crypto
+          ./rebuild_rust_sdk.sh ./rust-sdk
+          echo "RUST_SDK_LIB=$GITHUB_WORKSPACE/complement-crypto/rust-sdk/target/debug" >> "$GITHUB_ENV"
+
+      - name: build RPC client
+        env:
+          LIBRARY_PATH: ${{ env.RUST_SDK_LIB }}
+          LD_LIBRARY_PATH: ${{ env.RUST_SDK_LIB }}
+        run: |
+          cd complement-crypto
+          go build -tags='jssdk,rust' -o rpc ./cmd/rpc
+
+      - name: run complement-crypto
+        env:
+          LIBRARY_PATH: ${{ env.RUST_SDK_LIB }}
+          LD_LIBRARY_PATH: ${{ env.RUST_SDK_LIB }}
+          COMPLEMENT_CRYPTO_RPC_BINARY: ${{ github.workspace }}/complement-crypto/rpc
+        shell: bash
+        run: |
+          cd complement-crypto
+          set -o pipefail
+          go test -p 3 -v -json -tags='jssdk,rust' -count=1 -timeout 15m \
+            ./tests ./tests/js ./tests/rust 2>&1 | tee /tmp/crypto.log || true
+      - name: summary
+        if: always()
+        run: |
+          f=$(grep -c -- '"Action":"fail"' /tmp/crypto.log 2>/dev/null || echo 0)
+          echo "## Complement Crypto results" >> "$GITHUB_STEP_SUMMARY"
+          echo "Note: baseline run, expected to fail widely." >> "$GITHUB_STEP_SUMMARY"
+          echo "| fail events |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ${f:-0} |" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: complement-crypto-log
+          path: /tmp/crypto.log
+
+  integration-done:
+    name: integration tests done
+    needs: [complement, sytest, complement-crypto]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: re-actors/alls-green@release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}

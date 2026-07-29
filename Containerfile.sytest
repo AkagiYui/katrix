@@ -1,0 +1,32 @@
+# Thin per-homeserver SyTest image, modelled on sytest's dendrite.Dockerfile.
+# The base matrixdotorg/sytest image already has SyTest's Perl deps, Postgres,
+# and the /bootstrap.sh entrypoint; we only add the Go toolchain katrix needs
+# and point the entrypoint at the "katrix" target.
+#
+# SyTest's per-homeserver logic (lib/SyTest/Homeserver/Katrix.pm + the
+# katrix_sytest.sh runner) is grafted onto a sytest checkout at CI time
+# (see .github/workflows/test.yml), not baked into this image.
+
+ARG SYTEST_IMAGE_TAG=bookworm
+FROM matrixdotorg/sytest:${SYTEST_IMAGE_TAG}
+
+ARG GO_VERSION=1.26.0
+ARG TARGETARCH
+
+RUN mkdir -p /goroot /gopath \
+ && wget -q "https://dl.google.com/go/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" -O go.tar.gz \
+ && tar xf go.tar.gz -C /goroot --strip-components=1 \
+ && rm go.tar.gz
+
+ENV GOROOT=/goroot
+ENV GOPATH=/gopath
+ENV PATH="/goroot/bin:${PATH}"
+
+# Fall back to sytest's develop branch when the katrix checkout's branch
+# can't be matched to a sytest branch.
+ENV SYTEST_DEFAULT_BRANCH=develop
+
+# katrix source is bind-mounted here at run time.
+RUN mkdir -p /src
+
+ENTRYPOINT [ "/bin/bash", "/bootstrap.sh", "katrix" ]

@@ -1,0 +1,4 @@
+# SyTest whitelist: tests expected to PASS. A test listed here that fails is a
+# regression (fails the run). Initially empty — katrix is early, so nothing is
+# gated yet. Add tests here as katrix gains parity. One test path per line;
+# lines starting with '#' are ignored.

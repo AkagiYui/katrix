@@ -1,0 +1,18 @@
+# Keep docker build contexts small. The vendored reference repos under tmp/
+# (dendrite/synapse, ~750M) must never enter a build context.
+.git
+tmp/
+.github/
+web/node_modules/
+web/dist/
+internal/webui/dist/assets/
+*.log
+signing.key
+media_store/
+katrix
+sytest-src/
+sytest-logs/
+complement/
+complement-crypto/
+matrix-js-sdk/
+matrix-rust-sdk/

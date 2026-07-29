@@ -1,0 +1,6 @@
+# SyTest blacklist: tests expected to FAIL. A test listed here that passes is
+# flagged as "passed but expected fail" (prompts you to move it to the
+# whitelist). Initially empty — katrix is early, so every failing test is a
+# plain failure rather than an expected one. Populate this as you triage, so
+# the run can go green while known-broken tests are excluded. One test path
+# per line; lines starting with '#' are ignored.
