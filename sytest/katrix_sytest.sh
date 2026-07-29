@@ -74,10 +74,11 @@ else
 fi
 
 # Check for new tests to be added to the test whitelist. Skipped while the
-# whitelist is empty: at that stage every passing test trips the "not in
-# whitelist" check and emits a ::error:: annotation, which is pure noise for a
-# baseline run. Re-enable once the whitelist is populated.
-if [ -s /src/sytest/whitelist ]; then
+# whitelist has no real entries: at that stage every passing test trips the
+# "not in whitelist" check and emits a ::error:: annotation, which is pure
+# noise for a baseline run. Re-enable once the whitelist is populated with
+# actual test names (ignoring comment/blank lines).
+if grep -qE '^[^#[:space:]]' /src/sytest/whitelist 2>/dev/null; then
     /src/sytest/show-expected-fail-tests.sh /logs/results.tap /src/sytest/whitelist \
         /src/sytest/blacklist | tee /work/show_expected_fail_tests_output.txt || TEST_STATUS=$?
 fi
