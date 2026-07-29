@@ -578,13 +578,14 @@ func (a *API) RoomAliases(w http.ResponseWriter, r *http.Request) {
 
 // roomEventFilter is the subset of the spec room event filter honoured by
 // /messages: contains_url (only events whose content has a top-level `url`
-// field, i.e. media messages) and org.matrix.msc3874.rel_types (only events
-// whose m.relates_to.rel_type matches one of the given values). An absent
-// filter keeps all events.
+// field, i.e. media messages), org.matrix.msc3874.rel_types (only events whose
+// m.relates_to.rel_type matches one of the given values), and
+// org.matrix.msc3874.not_rel_types (only events whose rel_type does NOT match).
+// An absent filter keeps all events.
 type roomEventFilter struct {
-	containsURL   *bool
-	relTypes      map[string]bool
-	relTypesEmpty bool
+	containsURL *bool
+	relTypes    map[string]bool
+	notRelTypes map[string]bool
 }
 
 // parseRoomEventFilter parses the `filter` query param. The value is a JSON
@@ -599,6 +600,7 @@ func parseRoomEventFilter(raw string) (roomEventFilter, error) {
 	var v struct {
 		ContainsURL *bool    `json:"contains_url"`
 		RelTypes    []string `json:"org.matrix.msc3874.rel_types"`
+		NotRelTypes []string `json:"org.matrix.msc3874.not_rel_types"`
 	}
 	if err := json.Unmarshal([]byte(raw), &v); err != nil {
 		return f, httpx.ErrInvalidParam("invalid filter: " + err.Error())
@@ -609,12 +611,12 @@ func parseRoomEventFilter(raw string) (roomEventFilter, error) {
 		for _, rt := range v.RelTypes {
 			f.relTypes[rt] = true
 		}
-		f.relTypesEmpty = false
-	} else if v.RelTypes != nil {
-		// An explicitly empty rel_types array filters out all related events
-		// (i.e. keeps only events without a relation).
-		f.relTypes = map[string]bool{}
-		f.relTypesEmpty = true
+	}
+	if len(v.NotRelTypes) > 0 {
+		f.notRelTypes = make(map[string]bool, len(v.NotRelTypes))
+		for _, rt := range v.NotRelTypes {
+			f.notRelTypes[rt] = true
+		}
 	}
 	return f, nil
 }
@@ -629,6 +631,12 @@ func (f roomEventFilter) keep(e *storage.EventRow) bool {
 	if f.relTypes != nil {
 		rt := contentRelType(e.Content)
 		if !f.relTypes[rt] {
+			return false
+		}
+	}
+	if f.notRelTypes != nil {
+		rt := contentRelType(e.Content)
+		if f.notRelTypes[rt] {
 			return false
 		}
 	}
@@ -1152,17 +1160,19 @@ func validateCanonicalAlias(ctx context.Context, store *storage.Store, eventType
 }
 
 // validateAliasForRoom checks that a single alias is well-formed and points at
-// roomID. Returns a M_INVALID_PARAM roomError (400) on any failure.
+// roomID. Returns a M_BAD_ALIAS roomError (400) on any failure: the spec uses
+// M_BAD_ALIAS for canonical_alias content that references an alias which is
+// malformed, unknown, or points at a different room.
 func validateAliasForRoom(ctx context.Context, store *storage.Store, alias, roomID string) error {
 	if _, err := ids.ParseRoomAlias(alias); err != nil {
-		return newRoomError(http.StatusBadRequest, "M_INVALID_PARAM", "invalid room alias: "+alias)
+		return newRoomError(http.StatusBadRequest, "M_BAD_ALIAS", "invalid room alias: "+alias)
 	}
 	resolved, err := store.LookupAlias(ctx, alias)
 	if err != nil {
-		return newRoomError(http.StatusBadRequest, "M_INVALID_PARAM", "unknown room alias: "+alias)
+		return newRoomError(http.StatusBadRequest, "M_BAD_ALIAS", "unknown room alias: "+alias)
 	}
 	if resolved != roomID {
-		return newRoomError(http.StatusBadRequest, "M_INVALID_PARAM", "alias does not point to this room: "+alias)
+		return newRoomError(http.StatusBadRequest, "M_BAD_ALIAS", "alias does not point to this room: "+alias)
 	}
 	return nil
 }

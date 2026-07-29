@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/AkagiYui/katrix/internal/events"
+	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
 )
 
@@ -348,8 +350,11 @@ func mustMarshalEvent(eventType, sender, stateKey string, content []byte, ts int
 
 // clientEvent converts a stored PDU (EventRow.RawJSON) into the client-visible
 // event format. The Client-Server API must return the "stripped" event: only
-// type, content, sender, state_key (if state), origin_server_ts, event_id —
+// type, content, sender, state_key (if state), origin_server_ts, event_id -
 // never auth_events, hashes, prev_events, or signatures.
+//
+// If the event has been redacted, the content is replaced with its pruned
+// redacted form (per the default room version redaction rules).
 func clientEvent(row *storage.EventRow) json.RawMessage {
 	m := map[string]any{
 		"type":             row.Type,
@@ -360,6 +365,15 @@ func clientEvent(row *storage.EventRow) json.RawMessage {
 	}
 	if row.StateKey != "" || isStateTypeSync(row.Type) {
 		m["state_key"] = row.StateKey
+	}
+	if row.Redacted {
+		if rules, ok := roomver.Get(roomver.Default); ok {
+			if red, err := events.Redact(row.RawJSON, rules); err == nil {
+				if c, exists := red["content"]; exists {
+					m["content"] = c
+				}
+			}
+		}
 	}
 	b, _ := json.Marshal(m)
 	return b

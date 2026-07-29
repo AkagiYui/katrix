@@ -28,7 +28,12 @@ func TestValidateEventJSON(t *testing.T) {
 		{"-Infinity", `{"v":-Infinity}`, true},
 		{"trailing data", `{}garbage`, true},
 		{"malformed", `{not json`, true},
-		{"number too large", `{"v":1e400}`, true}, // +Inf
+		{"number too large", `{"v":1e400}`, true},          // +Inf
+		{"int at safe limit", `9007199254740991`, false},   // 2^53-1
+		{"int over safe limit", `9007199254740993`, true},  // 2^53+1
+		{"huge int", `1e30`, true},                         // finite but > 2^53
+		{"negative safe int", `-9007199254740991`, false},  // -(2^53-1)
+		{"negative over limit", `-9007199254740993`, true}, // -(2^53+1)
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

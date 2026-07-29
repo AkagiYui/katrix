@@ -85,17 +85,34 @@ type errStr string
 func (e errStr) Error() string { return string(e) }
 
 // scanNumbers walks a decoded JSON value and rejects json.Number values that
-// are NaN or Infinity (encoding/json tokenises these as numbers that ParseFloat
-// accepts, so we must check explicitly).
+// are NaN, Infinity, or integers outside the range a Matrix canonical-JSON
+// document may represent ([-(2^53-1), 2^53-1], per the spec). Fractional
+// numbers are allowed in event content even though canonical JSON forbids
+// them, because they are structurally valid JSON and only rejected at the
+// signing/hashing layer.
 func scanNumbers(v any) error {
 	switch val := v.(type) {
 	case json.Number:
+		// Try integer first: out-of-range integers must be rejected.
+		if i, err := val.Int64(); err == nil {
+			if i > maxSafeInt || i < -maxSafeInt {
+				return errStr("integer out of range")
+			}
+			return nil
+		}
+		// Not a plain integer: accept finite fractional numbers, reject
+		// NaN/Infinity (which encoding/json tokenises as bare tokens).
 		f, err := val.Float64()
 		if err != nil {
 			return err
 		}
 		if math.IsNaN(f) || math.IsInf(f, 0) {
 			return errStr("NaN/Infinity not allowed")
+		}
+		// An integer-like number that overflowed int64 (e.g. 1e30) but is
+		// finite also exceeds the canonical-JSON range; reject it.
+		if math.Trunc(f) == f && (f > maxSafeInt || f < -maxSafeInt) {
+			return errStr("integer out of range")
 		}
 		return nil
 	case map[string]any:
@@ -113,6 +130,10 @@ func scanNumbers(v any) error {
 	}
 	return nil
 }
+
+// maxSafeInt is 2^53-1, the largest integer a Matrix canonical-JSON document
+// may represent.
+const maxSafeInt = (1 << 53) - 1
 
 // bearer extracts the access token from the request (Authorization header or
 // legacy access_token query parameter). It is the csapi-local alias of the
