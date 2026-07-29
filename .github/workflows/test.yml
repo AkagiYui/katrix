@@ -38,9 +38,11 @@ jobs:
           path: complement
       # Vendor an hs_katrix.go so Complement knows which HS is under test
       # (via the katrix_blacklist build tag). Stops the "Complement doesn't
-      # know which HS is running" warnings from runtime.SkipIf.
+      # know which HS is running" warnings from runtime.SkipIf. Lives under
+      # .complement-runtime/ (not complement/, which is overwritten by the
+      # complement checkout above).
       - name: register katrix with complement
-        run: cp complement/hs_katrix.go complement/runtime/hs_katrix.go
+        run: cp .complement-runtime/hs_katrix.go complement/runtime/hs_katrix.go
       - name: run complement
         env:
           COMPLEMENT_SHARE_ENV_PREFIX: PASS_

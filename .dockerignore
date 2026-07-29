@@ -16,3 +16,5 @@ complement/
 complement-crypto/
 matrix-js-sdk/
 matrix-rust-sdk/
+# Vendored Complement runtime file (grafted at CI time)
+.complement-runtime/
