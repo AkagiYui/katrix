@@ -76,8 +76,10 @@ jobs:
       - name: graft katrix sytest support
         run: |
           cp sytest/Katrix.pm sytest-src/lib/SyTest/Homeserver/Katrix.pm
+          cp sytest/KatrixFactory.pm sytest-src/lib/SyTest/HomeserverFactory/Katrix.pm
           cp sytest/katrix_sytest.sh sytest-src/scripts/katrix_sytest.sh
           chmod +x sytest-src/scripts/katrix_sytest.sh
+          chmod +x sytest/are-we-synapse-yet.py sytest/show-expected-fail-tests.sh
       - name: build sytest-katrix image
         run: docker build -f Containerfile.sytest -t sytest-katrix .
       - name: run sytest
@@ -161,10 +163,13 @@ jobs:
           workspaces: complement-crypto/rust-sdk
 
       # complement-crypto vendorises the JS SDK into its own tree via yarn.
+      # matrix-js-sdk's active branch is "develop" (it has no "main"), which is
+      # what complement-crypto's resolve_branch.sh resolves to on its main
+      # branch.
       - name: build JS SDK
         run: |
           cd complement-crypto
-          ./rebuild_js_sdk.sh "matrix-js-sdk@https://github.com/matrix-org/matrix-js-sdk#main"
+          ./rebuild_js_sdk.sh "matrix-js-sdk@https://github.com/matrix-org/matrix-js-sdk#develop"
 
       # Build the matrix-sdk-ffi crate and generate the Go bindings
       # (uniffi-bindgen-go + rebuild_rust_sdk.sh live in the complement-crypto repo).
