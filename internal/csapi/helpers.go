@@ -85,11 +85,11 @@ type errStr string
 func (e errStr) Error() string { return string(e) }
 
 // scanNumbers walks a decoded JSON value and rejects json.Number values that
-// are NaN, Infinity, or integers outside the range a Matrix canonical-JSON
-// document may represent ([-(2^53-1), 2^53-1], per the spec). Fractional
-// numbers are allowed in event content even though canonical JSON forbids
-// them, because they are structurally valid JSON and only rejected at the
-// signing/hashing layer.
+// are NaN, Infinity, fractional (non-integer) numbers, or integers outside the
+// range a Matrix canonical-JSON document may represent ([-(2^53-1), 2^53-1],
+// per the spec). The Matrix spec requires servers to reject event content
+// containing such numbers (they cannot be represented in canonical JSON, so
+// the event could never be signed/hashed).
 func scanNumbers(v any) error {
 	switch val := v.(type) {
 	case json.Number:
@@ -100,8 +100,8 @@ func scanNumbers(v any) error {
 			}
 			return nil
 		}
-		// Not a plain integer: accept finite fractional numbers, reject
-		// NaN/Infinity (which encoding/json tokenises as bare tokens).
+		// Not a plain int64: this is either a fractional number, an
+		// out-of-int64-range integer, or NaN/Infinity. All must be rejected.
 		f, err := val.Float64()
 		if err != nil {
 			return err
@@ -109,12 +109,13 @@ func scanNumbers(v any) error {
 		if math.IsNaN(f) || math.IsInf(f, 0) {
 			return errStr("NaN/Infinity not allowed")
 		}
-		// An integer-like number that overflowed int64 (e.g. 1e30) but is
-		// finite also exceeds the canonical-JSON range; reject it.
-		if math.Trunc(f) == f && (f > maxSafeInt || f < -maxSafeInt) {
-			return errStr("integer out of range")
+		// Fractional numbers (non-integer) are rejected per the spec.
+		if math.Trunc(f) != f {
+			return errStr("fractional number not allowed")
 		}
-		return nil
+		// A finite integer-like number that overflowed int64 (e.g. 1e30) or
+		// exceeds the 2^53-1 canonical-JSON range.
+		return errStr("integer out of range")
 	case map[string]any:
 		for _, item := range val {
 			if err := scanNumbers(item); err != nil {

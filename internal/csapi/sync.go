@@ -1,6 +1,7 @@
 package csapi
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"time"
@@ -13,6 +14,17 @@ import (
 	syncpkg "github.com/AkagiYui/katrix/internal/sync"
 )
 
+// isEmptyJSONObject reports whether body is a JSON object with no keys
+// (possibly whitespace-padded). Per MSC3391 this is the "delete" signal for
+// account_data PUTs.
+func isEmptyJSONObject(body []byte) bool {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return false
+	}
+	return len(m) == 0
+}
+
 // registerSync wires P3 sync routes.
 func (a *API) registerSync(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/sync", a.RequireAuth(a.Sync))
@@ -22,6 +34,9 @@ func (a *API) registerSync(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /_matrix/client/v3/user/{userID}/rooms/{roomID}/account_data/{type}", a.RequireAuth(a.PutRoomAccountData))
 	mux.HandleFunc("GET /_matrix/client/v3/user/{userID}/rooms/{roomID}/account_data/{type}", a.RequireAuth(a.GetRoomAccountData))
 	mux.HandleFunc("DELETE /_matrix/client/v3/user/{userID}/rooms/{roomID}/account_data/{type}", a.RequireAuth(a.DeleteRoomAccountData))
+	// MSC3391: account data delete lives under the unstable namespace.
+	mux.HandleFunc("DELETE /_matrix/client/unstable/org.matrix.msc3391/user/{userID}/account_data/{type}", a.RequireAuth(a.DeleteAccountData))
+	mux.HandleFunc("DELETE /_matrix/client/unstable/org.matrix.msc3391/user/{userID}/rooms/{roomID}/account_data/{type}", a.RequireAuth(a.DeleteRoomAccountData))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/read_markers", a.RequireAuth(a.ReadMarkers))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/receipt/{receiptType}/{eventID}", a.RequireAuth(a.Receipt))
 	mux.HandleFunc("GET /_matrix/client/v3/presence/{userID}/status", a.RequireAuth(a.PresenceGet))
@@ -91,6 +106,9 @@ type accountDataBody struct {
 }
 
 // PutAccountData handles PUT /_matrix/client/v3/user/{userID}/account_data/{type}.
+// Per MSC3391, PUTting an empty object ({}) deletes the entry rather than
+// storing an empty value: a subsequent GET returns 404 and the entry is
+// removed from /sync.
 func (a *API) PutAccountData(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	userID := r.PathValue("userID")
@@ -104,7 +122,12 @@ func (a *API) PutAccountData(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	if _, err := a.Store.SetAccountData(r.Context(), auth.Localpart, "", eventType, body); err != nil {
+	if isEmptyJSONObject(body) {
+		if _, err := a.Store.DeleteAccountData(r.Context(), auth.Localpart, "", eventType); err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+	} else if _, err := a.Store.SetAccountData(r.Context(), auth.Localpart, "", eventType, body); err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
@@ -113,6 +136,7 @@ func (a *API) PutAccountData(w http.ResponseWriter, r *http.Request) {
 }
 
 // PutRoomAccountData handles PUT /_matrix/client/v3/user/{userID}/rooms/{roomID}/account_data/{type}.
+// Per MSC3391, PUTting an empty object ({}) deletes the entry.
 func (a *API) PutRoomAccountData(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	userID := r.PathValue("userID")
@@ -127,7 +151,12 @@ func (a *API) PutRoomAccountData(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	if _, err := a.Store.SetAccountData(r.Context(), auth.Localpart, roomID, eventType, body); err != nil {
+	if isEmptyJSONObject(body) {
+		if _, err := a.Store.DeleteAccountData(r.Context(), auth.Localpart, roomID, eventType); err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+	} else if _, err := a.Store.SetAccountData(r.Context(), auth.Localpart, roomID, eventType, body); err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}

@@ -20,9 +20,10 @@ func TestValidateEventJSON(t *testing.T) {
 		{"empty object", `{}`, false},
 		{"string", `"hello"`, false},
 		{"integer", `42`, false},
-		{"fractional", `1.5`, false}, // legal in event content
+		{"fractional", `1.5`, true}, // canonical JSON forbids non-integers
 		{"array", `[1,2,3]`, false},
-		{"nested", `{"a":{"b":[1,2.5,{"c":true}]}}`, false},
+		{"nested", `{"a":{"b":[1,2,{"c":true}]}}`, false},
+		{"nested fractional", `{"a":{"b":[1,2.5,{"c":true}]}}`, true},
 		{"NaN", `{"v":NaN}`, true},
 		{"Infinity", `{"v":Infinity}`, true},
 		{"-Infinity", `{"v":-Infinity}`, true},

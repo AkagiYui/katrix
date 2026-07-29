@@ -1319,6 +1319,11 @@ func (a *API) notifyRoomMembers(ctx context.Context, roomID string) {
 
 // parseIntToken parses a pagination token (stream_ordering) from a string.
 func parseIntToken(s string) (int64, error) {
+	// Pagination tokens share the opaque sync-token format ("s<digits>").
+	// Accept both the prefixed form and a bare integer for robustness.
+	if len(s) > 0 && s[0] == 's' {
+		s = s[1:]
+	}
 	var n int64
 	for _, c := range s {
 		if c < '0' || c > '9' {
@@ -1330,8 +1335,10 @@ func parseIntToken(s string) (int64, error) {
 }
 
 func formatIntToken(n int64) string {
+	// Match the opaque sync-token format ("s<digits>") so pagination tokens
+	// returned by /messages are interchangeable with /sync tokens.
 	if n == 0 {
-		return "0"
+		return "s0"
 	}
 	var buf [20]byte
 	i := len(buf)
@@ -1340,5 +1347,5 @@ func formatIntToken(n int64) string {
 		buf[i] = byte('0' + n%10)
 		n /= 10
 	}
-	return string(buf[i:])
+	return "s" + string(buf[i:])
 }
