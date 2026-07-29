@@ -52,6 +52,20 @@ func (s *Store) GetAccountData(ctx context.Context, userLocalpart, roomID, event
 	return content, nil
 }
 
+// DeleteAccountData removes an account_data entry. It is idempotent: deleting
+// a non-existent entry succeeds (no rows affected). It returns the entry's
+// stream_id (for /sync gating) or 0 if the entry was absent.
+func (s *Store) DeleteAccountData(ctx context.Context, userLocalpart, roomID, eventType string) (int64, error) {
+	var streamID int64
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM account_data WHERE user_localpart=$1 AND COALESCE(room_id,'')=$2 AND type=$3`,
+		userLocalpart, roomID, eventType)
+	// stream_id is not returned on DELETE; the /sync delta for account_data
+	// uses the next-poll token, so a 0 here is acceptable (the absence is what
+	// surfaces to the client on the next /sync).
+	return streamID, err
+}
+
 // AccountDataSince returns account_data rows for a user with stream_id > since.
 // roomFilter "" means global only; set to a room id to fetch room-specific.
 func (s *Store) AccountDataSince(ctx context.Context, userLocalpart string, since int64) ([]AccountDataRow, error) {

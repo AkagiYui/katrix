@@ -1,7 +1,10 @@
 package csapi
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"strings"
@@ -14,6 +17,11 @@ import (
 // readBody reads a request body with a sane size limit. An empty body is
 // allowed (Matrix treats a missing body as {}). The returned bytes may be
 // passed to checkUIA or json.Unmarshal by the caller.
+//
+// The body is validated as JSON before being returned: malformed JSON, NaN,
+// Infinity and out-of-range integers are rejected with 400 M_BAD_JSON (this
+// matches the Matrix spec's requirement that servers reject invalid JSON event
+// content rather than persisting it).
 func readBody(r *http.Request) ([]byte, error) {
 	limited := http.MaxBytesReader(nil, r.Body, 1<<20)
 	b, err := io.ReadAll(limited)
@@ -21,6 +29,89 @@ func readBody(r *http.Request) ([]byte, error) {
 		return nil, httpx.ErrTooLarge("request body too large")
 	}
 	return b, nil
+}
+
+// readEventContent reads and validates a request body intended to be used as
+// Matrix event content. In addition to readBody's size limit it enforces the
+// per-event size limit (spec default 65536 bytes), rejecting larger bodies
+// with 413 M_TOO_LARGE, and validates the JSON (rejecting NaN, Infinity and
+// malformed JSON with 400 M_BAD_JSON). An empty body returns {}.
+//
+// Note: this intentionally does NOT forbid fractional numbers (e.g. 1.5),
+// which are legal in arbitrary event content even though Matrix's canonical
+// JSON (used for hashing/signing) forbids them. Only the structurally invalid
+// values the spec requires servers to reject (NaN, Infinity, trailing data)
+// are rejected here.
+func readEventContent(r *http.Request) (json.RawMessage, error) {
+	body, err := readBody(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) == 0 {
+		return json.RawMessage(`{}`), nil
+	}
+	if len(body) > maxEventBytes {
+		return nil, httpx.ErrTooLarge("event content too large")
+	}
+	if err := validateEventJSON(body); err != nil {
+		return nil, httpx.ErrBadJSON("invalid JSON: " + err.Error())
+	}
+	return json.RawMessage(body), nil
+}
+
+// maxEventBytes is the spec default per-event content size limit (65536).
+const maxEventBytes = 65536
+
+// validateEventJSON checks that body is a single valid JSON value and contains
+// no NaN, Infinity, or trailing data. It uses UseNumber so numbers are not
+// coerced to float64 (which would silently accept Infinity as a number token).
+func validateEventJSON(body []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return err
+	}
+	if dec.More() {
+		return errTrailingData
+	}
+	return scanNumbers(v)
+}
+
+var errTrailingData = errStr("trailing data after JSON value")
+
+type errStr string
+
+func (e errStr) Error() string { return string(e) }
+
+// scanNumbers walks a decoded JSON value and rejects json.Number values that
+// are NaN or Infinity (encoding/json tokenises these as numbers that ParseFloat
+// accepts, so we must check explicitly).
+func scanNumbers(v any) error {
+	switch val := v.(type) {
+	case json.Number:
+		f, err := val.Float64()
+		if err != nil {
+			return err
+		}
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return errStr("NaN/Infinity not allowed")
+		}
+		return nil
+	case map[string]any:
+		for _, item := range val {
+			if err := scanNumbers(item); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, item := range val {
+			if err := scanNumbers(item); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // bearer extracts the access token from the request (Authorization header or

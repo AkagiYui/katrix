@@ -149,3 +149,24 @@ func ParseMember(raw json.RawMessage) (*MemberContent, error) {
 	}
 	return &c, nil
 }
+
+// CanonicalAliasContent is the parsed m.room.canonical_alias event content.
+// Per the spec, `alias` and each entry of `alt_aliases` must be a valid room
+// alias pointing at the room the event is being sent in; servers validate this
+// before accepting the event (rejecting with M_INVALID_PARAM otherwise).
+type CanonicalAliasContent struct {
+	Alias      string   `json:"alias,omitempty"`
+	AltAliases []string `json:"alt_aliases,omitempty"`
+}
+
+// ParseCanonicalAlias decodes m.room.canonical_alias content.
+func ParseCanonicalAlias(raw json.RawMessage) (*CanonicalAliasContent, error) {
+	var c CanonicalAliasContent
+	if len(raw) == 0 {
+		return &c, nil
+	}
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return nil, fmt.Errorf("rooms: parse canonical_alias: %w", err)
+	}
+	return &c, nil
+}

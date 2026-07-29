@@ -236,7 +236,7 @@ func TestRedactEvent(t *testing.T) {
 	}
 	eventID := body["event_id"].(string)
 	// Redact it.
-	code, _ = doJSON(t, srv, http.MethodPost,
+	code, _ = doJSON(t, srv, http.MethodPut,
 		"/_matrix/client/v3/rooms/"+roomID+"/redact/"+eventID+"/r1", tok,
 		map[string]any{"reason": "spam"})
 	if code != 200 {

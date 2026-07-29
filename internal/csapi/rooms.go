@@ -44,7 +44,7 @@ func (a *API) registerRooms(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/joined_rooms", a.RequireAuth(a.JoinedRooms))
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/aliases", a.RequireAuth(a.RoomAliases))
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/messages", a.RequireAuth(a.RoomMessages))
-	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/redact/{eventID}/{txnID}", a.RequireAuth(a.RoomRedact))
+	mux.HandleFunc("PUT /_matrix/client/v3/rooms/{roomID}/redact/{eventID}/{txnID}", a.RequireAuth(a.RoomRedact))
 	mux.HandleFunc("PUT /_matrix/client/v3/rooms/{roomID}/typing/{userID}", a.RequireAuth(a.RoomTyping))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/forget", a.RequireAuth(a.RoomForget))
 	mux.HandleFunc("GET /_matrix/client/v3/directory/room/{roomAlias}", a.DirectoryLookupAlias)
@@ -210,12 +210,26 @@ func (a *API) RoomJoin(w http.ResponseWriter, r *http.Request) {
 }
 
 // RoomLeave handles POST /_matrix/client/v3/rooms/{roomID}/leave.
+// Per the spec, a user may leave from the join, invite or knock membership;
+// leaving from invite rejects the invite. Leaving when already left is a
+// no-op that still returns 200; a user who was never a member gets 403.
 func (a *API) RoomLeave(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomID := r.PathValue("roomID")
-	if err := a.checkMembership(r.Context(), roomID, auth.UserID, rooms.MembershipJoin); err != nil {
-		writeRoomErr(w, err)
+	m, err := a.Store.GetMembership(r.Context(), roomID, auth.UserID)
+	if err != nil {
+		writeRoomErr(w, newRoomError(http.StatusForbidden, "M_FORBIDDEN", "not a member of the room"))
 		return
+	}
+	switch m.Membership {
+	case rooms.MembershipLeave:
+		// Already left: idempotent no-op.
+		httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+		return
+	case rooms.MembershipJoin, rooms.MembershipInvite, rooms.MembershipKnock:
+		// Allowed to leave (invite rejection / knock cancellation / leave).
+	default:
+		// e.g. banned: cannot leave without unban; let the auth rules reject.
 	}
 	if err := a.sendMemberEvent(r, auth, roomID, "", auth.UserID, rooms.MembershipLeave, ""); err != nil {
 		writeRoomErr(w, err)
@@ -327,15 +341,10 @@ func (a *API) RoomSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var content json.RawMessage
-	body, err := readBody(r)
+	content, err := readEventContent(r)
 	if err != nil {
 		httpx.WriteError(w, err)
 		return
-	}
-	if len(body) > 0 {
-		content = json.RawMessage(body)
-	} else {
-		content = json.RawMessage(`{}`)
 	}
 	ev, err := a.buildAndPersistMessage(r, auth, roomID, eventType, txnID, content)
 	if err != nil {
@@ -363,16 +372,10 @@ func (a *API) RoomStatePut(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
 	eventType := r.PathValue("eventType")
 	stateKey := r.PathValue("stateKey")
-	body, err := readBody(r)
+	content, err := readEventContent(r)
 	if err != nil {
 		httpx.WriteError(w, err)
 		return
-	}
-	var content json.RawMessage
-	if len(body) > 0 {
-		content = json.RawMessage(body)
-	} else {
-		content = json.RawMessage(`{}`)
 	}
 	if eventType == "m.room.member" {
 		// Member state via PUT is treated as a membership transition; route via
@@ -573,6 +576,86 @@ func (a *API) RoomAliases(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"aliases": aliases})
 }
 
+// roomEventFilter is the subset of the spec room event filter honoured by
+// /messages: contains_url (only events whose content has a top-level `url`
+// field, i.e. media messages) and org.matrix.msc3874.rel_types (only events
+// whose m.relates_to.rel_type matches one of the given values). An absent
+// filter keeps all events.
+type roomEventFilter struct {
+	containsURL   *bool
+	relTypes      map[string]bool
+	relTypesEmpty bool
+}
+
+// parseRoomEventFilter parses the `filter` query param. The value is a JSON
+// object (per the spec it may also be a filter ID; that is not supported here
+// and is treated as an invalid param). An empty value yields a pass-through
+// filter. Malformed JSON yields M_INVALID_PARAM (400).
+func parseRoomEventFilter(raw string) (roomEventFilter, error) {
+	f := roomEventFilter{}
+	if raw == "" {
+		return f, nil
+	}
+	var v struct {
+		ContainsURL *bool    `json:"contains_url"`
+		RelTypes    []string `json:"org.matrix.msc3874.rel_types"`
+	}
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return f, httpx.ErrInvalidParam("invalid filter: " + err.Error())
+	}
+	f.containsURL = v.ContainsURL
+	if len(v.RelTypes) > 0 {
+		f.relTypes = make(map[string]bool, len(v.RelTypes))
+		for _, rt := range v.RelTypes {
+			f.relTypes[rt] = true
+		}
+		f.relTypesEmpty = false
+	} else if v.RelTypes != nil {
+		// An explicitly empty rel_types array filters out all related events
+		// (i.e. keeps only events without a relation).
+		f.relTypes = map[string]bool{}
+		f.relTypesEmpty = true
+	}
+	return f, nil
+}
+
+// keep reports whether an event passes the filter.
+func (f roomEventFilter) keep(e *storage.EventRow) bool {
+	if f.containsURL != nil && *f.containsURL {
+		if !contentHasURL(e.Content) {
+			return false
+		}
+	}
+	if f.relTypes != nil {
+		rt := contentRelType(e.Content)
+		if !f.relTypes[rt] {
+			return false
+		}
+	}
+	return true
+}
+
+// contentHasURL reports whether the event content has a top-level "url" string
+// field (used by contains_url filtering for media messages).
+func contentHasURL(content json.RawMessage) bool {
+	var c struct {
+		URL any `json:"url"`
+	}
+	_ = json.Unmarshal(content, &c)
+	return c.URL != nil
+}
+
+// contentRelType extracts m.relates_to.rel_type from event content ("" if none).
+func contentRelType(content json.RawMessage) string {
+	var c struct {
+		RelatesTo struct {
+			RelType string `json:"rel_type"`
+		} `json:"m.relates_to"`
+	}
+	_ = json.Unmarshal(content, &c)
+	return c.RelatesTo.RelType
+}
+
 // RoomMessages handles GET /_matrix/client/v3/rooms/{roomID}/messages.
 func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
@@ -599,6 +682,11 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 			limit = int(n)
 		}
 	}
+	flt, err := parseRoomEventFilter(q.Get("filter"))
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
 	evs, err := a.Store.EventsForRoom(r.Context(), roomID, from, to, limit, dir)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
@@ -608,6 +696,9 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	var startTok, endTok int64
 	for i := range evs {
 		e := evs[i]
+		if !flt.keep(&e) {
+			continue
+		}
 		chunk = append(chunk, clientEvent(&e))
 		if startTok == 0 || e.StreamOrdering < startTok {
 			startTok = e.StreamOrdering
@@ -624,7 +715,7 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, resp)
 }
 
-// RoomRedact handles POST /_matrix/client/v3/rooms/{roomID}/redact/{eventID}/{txnID}.
+// RoomRedact handles PUT /_matrix/client/v3/rooms/{roomID}/redact/{eventID}/{txnID}.
 func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomID := r.PathValue("roomID")
@@ -634,17 +725,12 @@ func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 		writeRoomErr(w, err)
 		return
 	}
-	body, err := readBody(r)
+	body, err := readEventContent(r)
 	if err != nil {
 		httpx.WriteError(w, err)
 		return
 	}
-	var content json.RawMessage
-	if len(body) > 0 {
-		content = json.RawMessage(body)
-	} else {
-		content = json.RawMessage(`{}`)
-	}
+	content := body
 	// Inject redacts into content.
 	var c map[string]any
 	_ = json.Unmarshal(content, &c)
@@ -701,9 +787,18 @@ func (a *API) RoomTyping(w http.ResponseWriter, r *http.Request) {
 }
 
 // RoomForget handles POST /_matrix/client/v3/rooms/{roomID}/forget.
+// A user may only forget a room they have left (or never joined). Forgetting
+// a room the user is still in (joined/invited) is rejected with M_BAD_STATE.
 func (a *API) RoomForget(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomID := r.PathValue("roomID")
+	if m, err := a.Store.GetMembership(r.Context(), roomID, auth.UserID); err == nil {
+		switch m.Membership {
+		case rooms.MembershipJoin, rooms.MembershipInvite, rooms.MembershipKnock, rooms.MembershipBan:
+			httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_STATE", "cannot forget a room you are still in"))
+			return
+		}
+	}
 	if err := a.Store.SetForgotten(r.Context(), roomID, auth.UserID, true); err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
@@ -1009,6 +1104,9 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	if !ok {
 		return nil, newRoomError(http.StatusBadRequest, "M_UNSUPPORTED_ROOM_VERSION", "unknown room version")
 	}
+	if err := validateCanonicalAlias(r.Context(), a.Store, eventType, roomID, content); err != nil {
+		return nil, err
+	}
 	if err := rooms.Authorize(rules, eventType, stateKey, auth.UserID, content, st); err != nil {
 		return nil, newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
 	}
@@ -1022,6 +1120,51 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	// room_state is maintained by persistEvent (snapshot + recompute).
 	a.notifyRoomMembers(r.Context(), roomID)
 	return ev, nil
+}
+
+// validateCanonicalAlias checks that an m.room.canonical_alias event's `alias`
+// and each entry of `alt_aliases` are valid room aliases that point at the room
+// the event is being sent in. The spec requires servers to reject (with
+// M_INVALID_PARAM) aliases that are malformed, point at a different room, or
+// have been deleted. A deleted alias is hard-deleted from room_aliases, so
+// LookupAlias returns ErrNotFound and is caught by the "not found" path.
+func validateCanonicalAlias(ctx context.Context, store *storage.Store, eventType, roomID string, content json.RawMessage) error {
+	if eventType != "m.room.canonical_alias" {
+		return nil
+	}
+	c, err := rooms.ParseCanonicalAlias(content)
+	if err != nil {
+		return newRoomError(http.StatusBadRequest, "M_BAD_JSON", err.Error())
+	}
+	// Validate the primary alias (if present).
+	if c.Alias != "" {
+		if err := validateAliasForRoom(ctx, store, c.Alias, roomID); err != nil {
+			return err
+		}
+	}
+	// Validate every alt_aliases entry.
+	for _, a := range c.AltAliases {
+		if err := validateAliasForRoom(ctx, store, a, roomID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateAliasForRoom checks that a single alias is well-formed and points at
+// roomID. Returns a M_INVALID_PARAM roomError (400) on any failure.
+func validateAliasForRoom(ctx context.Context, store *storage.Store, alias, roomID string) error {
+	if _, err := ids.ParseRoomAlias(alias); err != nil {
+		return newRoomError(http.StatusBadRequest, "M_INVALID_PARAM", "invalid room alias: "+alias)
+	}
+	resolved, err := store.LookupAlias(ctx, alias)
+	if err != nil {
+		return newRoomError(http.StatusBadRequest, "M_INVALID_PARAM", "unknown room alias: "+alias)
+	}
+	if resolved != roomID {
+		return newRoomError(http.StatusBadRequest, "M_INVALID_PARAM", "alias does not point to this room: "+alias)
+	}
+	return nil
 }
 
 // buildEvent constructs a signed event for the room, computing prev_events and

@@ -18,8 +18,10 @@ func (a *API) registerSync(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/sync", a.RequireAuth(a.Sync))
 	mux.HandleFunc("PUT /_matrix/client/v3/user/{userID}/account_data/{type}", a.RequireAuth(a.PutAccountData))
 	mux.HandleFunc("GET /_matrix/client/v3/user/{userID}/account_data/{type}", a.RequireAuth(a.GetAccountData))
+	mux.HandleFunc("DELETE /_matrix/client/v3/user/{userID}/account_data/{type}", a.RequireAuth(a.DeleteAccountData))
 	mux.HandleFunc("PUT /_matrix/client/v3/user/{userID}/rooms/{roomID}/account_data/{type}", a.RequireAuth(a.PutRoomAccountData))
 	mux.HandleFunc("GET /_matrix/client/v3/user/{userID}/rooms/{roomID}/account_data/{type}", a.RequireAuth(a.GetRoomAccountData))
+	mux.HandleFunc("DELETE /_matrix/client/v3/user/{userID}/rooms/{roomID}/account_data/{type}", a.RequireAuth(a.DeleteRoomAccountData))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/read_markers", a.RequireAuth(a.ReadMarkers))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/receipt/{receiptType}/{eventID}", a.RequireAuth(a.Receipt))
 	mux.HandleFunc("GET /_matrix/client/v3/presence/{userID}/status", a.RequireAuth(a.PresenceGet))
@@ -126,6 +128,43 @@ func (a *API) PutRoomAccountData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := a.Store.SetAccountData(r.Context(), auth.Localpart, roomID, eventType, body); err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	a.Notifier.NotifyUser(auth.UserID)
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// DeleteAccountData handles DELETE /_matrix/client/v3/user/{userID}/account_data/{type}.
+// It is idempotent: deleting a non-existent entry still returns 200.
+func (a *API) DeleteAccountData(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	userID := r.PathValue("userID")
+	if auth.UserID != userID {
+		httpx.WriteError(w, httpx.ErrForbidden("can only delete own account data"))
+		return
+	}
+	eventType := r.PathValue("type")
+	if _, err := a.Store.DeleteAccountData(r.Context(), auth.Localpart, "", eventType); err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	a.Notifier.NotifyUser(auth.UserID)
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// DeleteRoomAccountData handles DELETE /_matrix/client/v3/user/{userID}/rooms/{roomID}/account_data/{type}.
+// It is idempotent: deleting a non-existent entry still returns 200.
+func (a *API) DeleteRoomAccountData(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	userID := r.PathValue("userID")
+	if auth.UserID != userID {
+		httpx.WriteError(w, httpx.ErrForbidden("can only delete own account data"))
+		return
+	}
+	roomID := r.PathValue("roomID")
+	eventType := r.PathValue("type")
+	if _, err := a.Store.DeleteAccountData(r.Context(), auth.Localpart, roomID, eventType); err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
