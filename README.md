@@ -119,7 +119,7 @@ Matrix 里有几套相互独立的版本编号，实现时必须分清：
   - **v2.1**（房间 v12，含 MSC4289 创建者 power）：v2 基础上 creator 无限 power 经 SenderPowerLevel 表达（`stateres.MaxCreatorPowerLevel` = 2^53，对齐 Synapse `CREATOR_POWER_LEVEL`），无需单独代码路径。
   - **mainline depth** 对齐 Synapse：最老祖先 depth=1，head depth=len(mainline)，无匹配 depth=0，升序排序。
 - **canonical JSON + 签名**（`internal/canonicaljson` + `internal/events`）：字节级一致是联邦互通的隐形地雷。键按 Unicode code point 排序、无空白、整数渲染无小数点、禁止浮点、UTF-8 原样、仅强制转义。content hash + reference hash 按 room version 派生 event ID；redaction 算法按版本分支（v11+ `UpdatedRedaction` 修剪 origin/membership/prev_state、保留 create 全内容、保留 m.room.member.third_party_invite.signed、保留 m.room.redaction.redacts）。
-- **状态快照**（`internal/eventstate`）：每事件入库时维护一份 state-at-event 快照（`event_state_snapshots` 表）：0 prev（create）= `{}` + 自身 tuple；1 prev = 拷贝 prev 快照；>1 prev（merge）= `stateres.Resolve` 合并各 prev 快照。`room_state` 由对所有 `forward_extremities` 的快照做 `stateres.Resolve` 重算（单 extremity 直接用其快照），统一取代各调用点的盲写 `UpsertState`，正确处理深层 fork/merge。
+- **状态快照**（`internal/eventstate`）：每事件入库时维护一份 state-at-event 快照（`event_state_snapshots` 表）：0 prev（create）= `{}` + 自身 tuple；1 prev = 拷贝 prev 快照；>1 prev（merge）= `stateres.Resolve` 合并各 prev 快照。`room_state` 由对所有 `forward_extremities` 的快照做 `stateres.Resolve` 重算（单 extremity 直接用其快照），统一取代各调用点的盲写 `UpsertState`，正确处理深层 fork/merge。csapi 与 federation 两条入库路径均接入。
 
 ### 联邦（Server-Server API）
 
@@ -335,4 +335,3 @@ CI（`.github/workflows/ci.yml`）：
 ## 已知遗留（未在本阶段完成）
 
 - **Complement 逐用例通过率**：federation TLS + UIA 单请求 + per-server 命名 + r0 别名 + 客户端事件格式 + txn 幂等 + receipt/presence 端点 + E2EE 密钥验证/领取 等系统性根因已修复（csapi 通过率从 2 提升至 30/124，联邦测试解锁运行）。剩余逐用例偏差（联邦 profile 查询、远程房间 join、device list 跨服务器更新、canonical_alias 验证、presence sync 传播等）仍需迭代。
-- **状态解析快照表（已实现）**：新增 `event_state_snapshots` 表存储每事件的 state-at-event 快照（`internal/eventstate` 包）。`room_state` 不再由各调用点盲写 `UpsertState`，而是在每次事件入库后由 `eventstate.Maintain` 统一维护：先计算并存该事件的 state-at-event 快照（0 prev = `{}`+自身 tuple；1 prev = 拷贝 prev 快照；>1 prev = `stateres.Resolve` 合并 prev 快照），再基于 `forward_extremities` 重算 `room_state`（单 extremity 直接用其快照；多 extremity 走 `stateres.Resolve` 解析各 extremity 快照）。这使深层 fork/merge 能基于真实的 state-before-event 正确解析，不再退化为 last-writer-wins。csapi 与 federation 两条入库路径均接入。
