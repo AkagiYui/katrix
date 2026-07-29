@@ -36,12 +36,17 @@ jobs:
         with:
           repository: matrix-org/complement
           path: complement
+      # Vendor an hs_katrix.go so Complement knows which HS is under test
+      # (via the katrix_blacklist build tag). Stops the "Complement doesn't
+      # know which HS is running" warnings from runtime.SkipIf.
+      - name: register katrix with complement
+        run: cp complement/hs_katrix.go complement/runtime/hs_katrix.go
       - name: run complement
         env:
           COMPLEMENT_SHARE_ENV_PREFIX: PASS_
         run: |
           cd complement
-          go test -v -tags="msc2836 msc2946 msc3030 msc3874 msc3890 msisns" ./tests/... 2>&1 \
+          go test -v -tags="katrix_blacklist msc2836 msc2946 msc3030 msc3874 msc3890 msisns" ./tests/... 2>&1 \
             | tee /tmp/complement.log || true
       - name: summary
         if: always()
@@ -53,7 +58,7 @@ jobs:
           echo "| PASS | FAIL | SKIP | Pass rate |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| ${p:-0} | ${f:-0} | ${s:-0} | ${p:-0} / $((p + f + s)) |" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: complement-log
@@ -108,7 +113,7 @@ jobs:
           echo "| ok | not ok | total |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| ${ok:-0} | ${notok:-0} | $(( ${ok:-0} + ${notok:-0} )) |" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: sytest-logs
@@ -213,7 +218,7 @@ jobs:
           echo "| fail events |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| ${f:-0} |" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: complement-crypto-log

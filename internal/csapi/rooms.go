@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/AkagiYui/katrix/internal/events"
+	"github.com/AkagiYui/katrix/internal/eventstate"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/ids"
@@ -128,13 +129,7 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 				httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 				return
 			}
-			// Update room_state for state events.
-			if sk, ok := ev.StateKey(); ok {
-				if err := a.Store.UpsertState(r.Context(), roomID, ev.Type(), sk, ev.EventID()); err != nil {
-					httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
-					return
-				}
-			}
+			// room_state is maintained by persistEventInRoom (snapshot + recompute).
 			// Update memberships for m.room.member.
 			if ev.Type() == "m.room.member" {
 				sk, _ := ev.StateKey()
@@ -952,10 +947,8 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	if err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
 		return err
 	}
-	// Update room_state + membership.
-	if err := a.Store.UpsertState(r.Context(), roomID, "m.room.member", target, ev.EventID()); err != nil {
-		return err
-	}
+	// room_state is maintained by persistEvent (snapshot + recompute).
+	// Update the denormalised membership table.
 	mc, _ := rooms.ParseMember(contentRaw)
 	if mc != nil {
 		if err := a.Store.UpsertMembership(r.Context(), storage.MembershipRow{
@@ -979,7 +972,7 @@ func (a *API) sendStateEvent(r *http.Request, auth *homeserver.Auth, roomID stri
 	if err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
 		return
 	}
-	_ = a.Store.UpsertState(r.Context(), roomID, eventType, stateKey, ev.EventID())
+	// room_state is maintained by persistEvent (snapshot + recompute).
 	a.notifyRoomMembers(r.Context(), roomID)
 }
 
@@ -1026,9 +1019,7 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	if err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
 		return nil, err
 	}
-	if err := a.Store.UpsertState(r.Context(), roomID, eventType, stateKey, ev.EventID()); err != nil {
-		return nil, err
-	}
+	// room_state is maintained by persistEvent (snapshot + recompute).
 	a.notifyRoomMembers(r.Context(), roomID)
 	return ev, nil
 }
@@ -1124,6 +1115,10 @@ func persistEvent(ctx context.Context, store *storage.Store, ev *events.Event, v
 // persistEventInRoom inserts an event row, using roomID when the event itself
 // carries no room_id (the v12 m.room.create event omits it per MSC4291; the
 // room ID is the create's reference hash and is stored on the row instead).
+// After inserting it maintains the event's state-at-event snapshot and
+// recomputes the room's current state from the forward extremities, so that
+// forks are resolved correctly via the snapshot table rather than via a blind
+// last-writer-wins UpsertState.
 func persistEventInRoom(ctx context.Context, store *storage.Store, ev *events.Event, version roomver.Version, roomID string) error {
 	sk, _ := ev.StateKey()
 	if roomID == "" {
@@ -1144,6 +1139,14 @@ func persistEventInRoom(ctx context.Context, store *storage.Store, ev *events.Ev
 	}
 	if _, err := store.InsertEvent(ctx, row); err != nil {
 		return err
+	}
+	// Maintain the per-event state snapshot and recompute room_state from the
+	// forward extremities. For an unsupported room version we skip this (the
+	// event is still persisted; room_state is left as-is).
+	if rules, ok := roomver.Get(version); ok {
+		if err := eventstate.Maintain(ctx, store, row, rules); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -78,6 +78,7 @@ func Truncate(ctx context.Context, pool pgxConn) error {
 			cross_signing_keys, one_time_keys, device_keys,
 			receipts, account_data,
 			room_memberships, room_state, room_aliases,
+			event_state_snapshots,
 			events, rooms, registration_tokens,
 			media_thumbnails, media,
 			access_tokens, devices, users

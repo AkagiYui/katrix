@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/AkagiYui/katrix/internal/events"
+	"github.com/AkagiYui/katrix/internal/eventstate"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/metrics"
 	"github.com/AkagiYui/katrix/internal/roomver"
@@ -144,11 +145,19 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage) (string, bool) {
 		return evID, false
 	}
 	metrics.Counters.FedInboundPDUs.Add(1)
+	// Maintain the per-event state snapshot and recompute room_state from the
+	// forward extremities (handles single-extremity fast path and multi-
+	// extremity fork resolution). For a non-state event the snapshot is the
+	// prev's snapshot copied; for a state event the event's tuple is applied.
+	if rules, ok := roomver.Get(version); ok {
+		if err := eventstate.Maintain(r.Context(), a.Store, row, rules); err != nil {
+			// Snapshot maintenance is best-effort on the ingest path: the event
+			// is already persisted, so log-and-continue (mirroring the prior
+			// resolveRoomState swallow of errors).
+			_ = err
+		}
+	}
 	if ev.StateKey != nil {
-		// Resolve room state across any fork. For a single-extremity room this
-		// resolves to the incoming event; for a fork it runs the v2 mainline
-		// state-resolution algorithm over the candidate state set.
-		a.resolveRoomState(r.Context(), ev.RoomID, version, row)
 		// For membership state events, update the denormalised membership table.
 		if ev.Type == "m.room.member" {
 			a.applyRemoteMembership(r.Context(), ev.RoomID, *ev.StateKey, ev.Content, evID, ev.Depth)
@@ -396,10 +405,15 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
 	// signature check above establishes authenticity.
 	if vres.Valid || vres.Signed {
 		if evID != "" {
-			if _, err := a.Store.InsertEvent(r.Context(), row); err == nil && ev.StateKey != nil {
-				// Resolve room state across any fork via state resolution v2.
-				a.resolveRoomState(r.Context(), ev.RoomID, version, row)
-				if ev.Type == "m.room.member" {
+			if _, err := a.Store.InsertEvent(r.Context(), row); err == nil {
+				// Maintain the per-event state snapshot and recompute room_state
+				// from the forward extremities (handles fork resolution).
+				if rules, ok := roomver.Get(version); ok {
+					if err := eventstate.Maintain(r.Context(), a.Store, row, rules); err != nil {
+						_ = err
+					}
+				}
+				if ev.StateKey != nil && ev.Type == "m.room.member" {
 					a.applyRemoteMembership(r.Context(), ev.RoomID, *ev.StateKey, ev.Content, evID, ev.Depth)
 				}
 			}
