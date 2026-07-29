@@ -1,10 +1,11 @@
 name: test
 
 # Black-box / integration test suite, modelled on Dendrite's "single workflow,
-# parallel jobs + alls-green gate" layout. Complement is the only hard gate;
-# SyTest and complement-crypto are informational baselines (continue-on-error)
-# while katrix is still early — they establish a progress baseline rather than
-# blocking PRs.
+# parallel jobs + alls-green gate" layout. All three jobs are informational
+# baselines (continue-on-error) while katrix is still early — they establish a
+# progress baseline rather than blocking PRs. The integration-done gate is
+# therefore effectively a no-op today; flip a job's continue-on-error off (and
+# drop the `|| true` on its run step) once its pass rate is high enough to gate.
 
 on:
   push:
@@ -21,6 +22,7 @@ jobs:
   complement:
     name: Complement (black-box)
     runs-on: ubuntu-latest
+    continue-on-error: true # informational baseline; katrix is early
     env:
       COMPLEMENT_BASE_IMAGE: ghcr.io/akagiyui/katrix:complement
     steps:
