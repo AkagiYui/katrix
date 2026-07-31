@@ -58,10 +58,19 @@ export KATRIX_LISTEN_FEDERATION=":8448"
 export KATRIX_FEDERATION_ENABLED="${KATRIX_FEDERATION_ENABLED:-true}"
 export KATRIX_REGISTRATION_ENABLED="${KATRIX_REGISTRATION_ENABLED:-true}"
 
-# Touch the CA file so SSL_CERT_FILE points at a real path even when Complement
-# has not mounted one (avoids a noisy open error on first outbound request).
+# Trust Complement's CA for OUTBOUND federation requests too: SSL_CERT_FILE
+# points at /ca/complement-ca.crt, so when Complement mounts its CA (at
+# /complement/ca/ca.crt) we must copy it there. Without the copy the file stays
+# empty and every outbound make_join/send_join/key request fails TLS with
+# "certificate signed by unknown authority". When no CA is mounted (local
+# runs), an empty file just means the default system roots are used.
 mkdir -p /ca
-touch /ca/complement-ca.crt 2>/dev/null || true
+if [ -s "/complement/ca/ca.crt" ]; then
+  chmod a+r "/complement/ca/ca.crt" 2>/dev/null || true
+  cp "/complement/ca/ca.crt" /ca/complement-ca.crt
+else
+  touch /ca/complement-ca.crt 2>/dev/null || true
+fi
 
 # Generate a TLS leaf certificate signed by Complement's CA so the federation
 # listener (:8448) can serve HTTPS. Complement mounts its CA at
