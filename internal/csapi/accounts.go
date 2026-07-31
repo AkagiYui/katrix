@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
@@ -62,9 +63,14 @@ func (a *API) RegisterAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	var req registerRequest
 	if len(body) > 0 {
+		// Go's json.Unmarshal silently replaces invalid UTF-8 bytes with
+		// U+FFFD, so reject malformed bodies up front (M_NOT_JSON; Complement
+		// asserts this errcode for POST /register with an invalid utf-8 body).
+		if !utf8.Valid(body) {
+			httpx.WriteError(w, httpx.ErrNotJSON())
+			return
+		}
 		if err := json.Unmarshal(body, &req); err != nil {
-			// The whole body was not valid JSON: M_NOT_JSON (Complement asserts
-			// this errcode for POST /register with a malformed utf-8 body).
 			httpx.WriteError(w, httpx.ErrNotJSON())
 			return
 		}

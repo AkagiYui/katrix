@@ -97,6 +97,12 @@ func (a *API) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 			Type     string `json:"type"`
 			Session  string `json:"session"`
 			Password string `json:"password"`
+			// The identifier block (m.id.user) names whose password is being
+			// supplied; the spec requires it to match the device owner.
+			Identifier *struct {
+				Type string `json:"type"`
+				User string `json:"user"`
+			} `json:"identifier"`
 		} `json:"auth"`
 	}
 	if len(body) > 0 {
@@ -110,6 +116,13 @@ func (a *API) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 			Params:  map[string]any{},
 			Session: id,
 		})
+		return
+	}
+	// The UIA user (when specified) must match the device owner; otherwise the
+	// request is forbidden outright (403), per "requires UI auth user to match
+	// device owner".
+	if ad.Auth.Identifier != nil && ad.Auth.Identifier.User != "" && ad.Auth.Identifier.User != auth.UserID {
+		httpx.WriteError(w, httpx.ErrForbidden("UI auth user does not match the device owner"))
 		return
 	}
 	// Verify the supplied password.

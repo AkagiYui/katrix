@@ -468,6 +468,12 @@ func (a *API) serveStateContent(w http.ResponseWriter, r *http.Request, stateKey
 		httpx.WriteError(w, httpx.ErrNotFound("state event not found"))
 		return
 	}
+	// ?format=event returns the full client event (sender/room_id/content/...)
+	// instead of just the content object.
+	if r.URL.Query().Get("format") == "event" {
+		httpx.WriteJSON(w, http.StatusOK, clientEvent(ev))
+		return
+	}
 	httpx.WriteJSON(w, http.StatusOK, json.RawMessage(ev.Content))
 }
 

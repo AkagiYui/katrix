@@ -284,41 +284,48 @@ func (a *API) DeviceSigningUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Determine whether any supplied key replaces an existing different key.
+	// Per MSC3967: no UIA is required for the very first upload, or when
+	// re-uploading exactly the same keys. Once the user has any cross-signing
+	// key, adding a new key type or replacing an existing one requires UIA.
 	// Request keys use the "_key" suffix (master_key/self_signing_key/
 	// user_signing_key); stored key_type omits it. Comparison is on canonical
 	// JSON because the key_json column is JSONB and Postgres normalises the
 	// stored bytes (key order/whitespace), so a byte-wise compare would flag
 	// every re-upload as a "replacement".
-	replacing := false
+	needUIA := false
 	keys, err := a.Store.CrossSigningKeys(r.Context(), auth.UserID)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
-	for _, keyType := range []string{"master", "self_signing", "user_signing"} {
-		kjson, ok := req[keyType+"_key"]
-		if !ok {
-			continue
-		}
-		canon, err := canonicaljson.Canonical(kjson)
-		if err != nil {
-			continue
-		}
-		for _, k := range keys {
-			if k.KeyType != keyType {
+	if len(keys) > 0 {
+		for _, keyType := range []string{"master", "self_signing", "user_signing"} {
+			kjson, ok := req[keyType+"_key"]
+			if !ok {
 				continue
 			}
-			stored, err := canonicaljson.Canonical(k.KeyJSON)
+			canon, err := canonicaljson.Canonical(kjson)
 			if err != nil {
 				continue
 			}
-			if !bytes.Equal(stored, canon) {
-				replacing = true
+			// An uploaded key is "unchanged" only if the stored key of the same
+			// type is byte-identical after canonicalisation.
+			identical := false
+			for _, k := range keys {
+				if k.KeyType != keyType {
+					continue
+				}
+				stored, err := canonicaljson.Canonical(k.KeyJSON)
+				if err == nil && bytes.Equal(stored, canon) {
+					identical = true
+				}
+			}
+			if !identical {
+				needUIA = true
 			}
 		}
 	}
-	if replacing {
+	if needUIA {
 		ok, err := a.checkPasswordUIA(w, r, body)
 		if err != nil {
 			httpx.WriteError(w, err)
