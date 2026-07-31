@@ -1396,6 +1396,13 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 		}); err != nil {
 			return err
 		}
+		// A join/leave changes the user's device-list visibility to the room's
+		// other members: their /sync must learn the user in device_lists.changed
+		// (join) or device_lists.left (leave/ban). The change advances the shared
+		// sync stream; notifyRoomMembers below wakes the room's syncing users.
+		if mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban" {
+			_, _ = a.Store.RecordDeviceListChange(r.Context(), target, mc.Membership != "join")
+		}
 	}
 	a.notifyRoomMembers(r.Context(), roomID)
 	return nil

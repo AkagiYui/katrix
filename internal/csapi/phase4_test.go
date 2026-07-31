@@ -299,3 +299,26 @@ func TestAsyncMediaUpload(t *testing.T) {
 		t.Fatalf("expected M_CANNOT_OVERWRITE_MEDIA, got %d %v", code, body)
 	}
 }
+
+// TestUserDirectorySearchByMxid verifies directory search matches a user ID
+// prefix (Complement searches by the mxid up to the first '-').
+func TestUserDirectorySearchByMxid(t *testing.T) {
+	_, srv := testAPI(t)
+	alice := registerUser(t, srv, "user-1-alice", "pw")
+	code, _ := doJSON(t, srv, http.MethodPut,
+		"/_matrix/client/v3/profile/@user-1-alice:test.katrix/displayname", alice,
+		map[string]any{"displayname": "Alice Cooper"})
+	if code != 200 {
+		t.Fatalf("set displayname: %d", code)
+	}
+	bob := registerUser(t, srv, "user-2-bob", "pw")
+	code, resp := doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/user_directory/search", bob,
+		map[string]any{"search_term": "@user"})
+	if code != 200 {
+		t.Fatalf("directory search: %d", code)
+	}
+	results, _ := resp["results"].([]any)
+	if len(results) == 0 {
+		t.Fatalf("mxid-prefix search returned no results: %v", resp)
+	}
+}

@@ -27,8 +27,9 @@ func (s *Store) SearchUserDirectory(ctx context.Context, serverName, term string
 		 FROM users
 		 WHERE deactivated=FALSE AND is_guest=FALSE
 		   AND (LOWER(COALESCE(display_name,'')) LIKE '%'||$1||'%'
-		        OR LOWER(localpart) LIKE '%'||$1||'%')
-		 ORDER BY localpart ASC LIMIT 50`, term)
+		        OR LOWER(localpart) LIKE '%'||$1||'%'
+		        OR LOWER('@'||localpart||':'||$2) LIKE '%'||$1||'%')
+		 ORDER BY localpart ASC LIMIT 50`, term, serverName)
 	if err != nil {
 		return nil, err
 	}
