@@ -48,6 +48,7 @@ func (a *API) registerTransactions(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/federation/v1/make_join/{roomID}/{userID}", a.MakeJoin)
 	mux.HandleFunc("GET /_matrix/federation/v1/make_leave/{roomID}/{userID}", a.MakeLeave)
 	mux.HandleFunc("GET /_matrix/federation/v1/event_auth/{roomID}/{eventID}", a.EventAuth)
+	mux.HandleFunc("GET /_matrix/federation/v1/query/directory/{roomAlias}", a.QueryDirectory)
 }
 
 // txnBody is the PUT /send/{txnId} request body.
@@ -348,6 +349,18 @@ func (a *API) EventAuth(w http.ResponseWriter, r *http.Request) {
 		"origin":     a.ServerName(),
 		"auth_chain": a.authChain(r, roomID),
 	})
+}
+
+// QueryDirectory handles GET /_matrix/federation/v1/query/directory/{roomAlias},
+// resolving a local room alias for a remote server.
+func (a *API) QueryDirectory(w http.ResponseWriter, r *http.Request) {
+	alias := r.PathValue("roomAlias")
+	roomID, err := a.Store.LookupAlias(r.Context(), alias)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("room alias not found"))
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"room_id": roomID})
 }
 
 // ingestRemoteMember persists a remote m.room.member event (join/leave/invite)

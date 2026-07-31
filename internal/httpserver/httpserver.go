@@ -24,9 +24,11 @@ func New(hs *homeserver.HS) (http.Handler, error) {
 	mux := http.NewServeMux()
 
 	cs := csapi.New(hs)
-	cs.Register(mux)
-
 	fed := federation.New(hs)
+	// The CS API needs the outbound federation client for remote room joins and
+	// alias resolution; the federation API is constructed first and handed over.
+	cs.SetFederation(fed)
+	cs.Register(mux)
 	fed.Register(mux)
 
 	med := media.New(hs, fed.Client())

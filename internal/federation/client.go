@@ -146,6 +146,8 @@ func (c *Client) DownloadMedia(ctx context.Context, serverName, mediaID string) 
 		return nil, "", err
 	}
 	// Federation requests are signed; the remote server verifies our signature.
+	// req.Host carries the logical destination server name used in the signature.
+	req.Host = serverName
 	if err := signRequestWith(req, c.originName(), c.key); err != nil {
 		return nil, "", err
 	}

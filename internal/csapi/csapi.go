@@ -5,6 +5,7 @@ package csapi
 import (
 	"net/http"
 
+	"github.com/AkagiYui/katrix/internal/federation"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 )
@@ -15,6 +16,7 @@ type API struct {
 	uia        *uiaStore
 	syncEngine *syncEngine
 	typing     *typingTracker
+	fed        *federation.API
 }
 
 // New constructs the CS API surface.
@@ -23,6 +25,11 @@ func New(hs *homeserver.HS) *API {
 	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, typing), typing: typing}
 	return api
 }
+
+// SetFederation wires the outbound federation API, used for federated room
+// joins and remote alias resolution. It is called once during HTTP server
+// assembly (the federation API is constructed after the CS API).
+func (a *API) SetFederation(fed *federation.API) { a.fed = fed }
 
 // supportedVersions is the list of Client-Server spec versions Katrix
 // self-reports. Per the design doc we only advertise versions whose behaviour

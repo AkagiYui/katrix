@@ -1,0 +1,79 @@
+package federation
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestPickJoinDestination(t *testing.T) {
+	tests := []struct {
+		name   string
+		roomID string
+		via    []string
+		want   string
+	}{
+		{"via hint wins", "!abc:remote.example", []string{"hs2.example"}, "hs2.example"},
+		{"empty via fallback to room domain", "!abc:remote.example", nil, "remote.example"},
+		{"empty via string skipped", "!abc:remote.example", []string{""}, "remote.example"},
+		{"v12 room id no via", "!base64ish", nil, ""},
+		{"v12 room id with via", "!base64ish", []string{"hs2.example"}, "hs2.example"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pickJoinDestination(tt.roomID, tt.via); got != tt.want {
+				t.Fatalf("pickJoinDestination(%q, %v) = %q, want %q", tt.roomID, tt.via, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTplEventRefs(t *testing.T) {
+	t.Run("v3+ plain id arrays", func(t *testing.T) {
+		raw := json.RawMessage(`{"prev_events":["$a","$b"],"auth_events":["$c","$d"],"content":{"membership":"join"},"depth":5}`)
+		prev, auth := tplEventRefs(raw)
+		if len(prev) != 2 || prev[0] != "$a" || prev[1] != "$b" {
+			t.Fatalf("prev = %v", prev)
+		}
+		if len(auth) != 2 || auth[0] != "$c" || auth[1] != "$d" {
+			t.Fatalf("auth = %v", auth)
+		}
+		if c := tplEventContent(raw); string(c) != `{"membership":"join"}` {
+			t.Fatalf("content = %s", c)
+		}
+		if d := tplEventDepth(raw); d != 5 {
+			t.Fatalf("depth = %d", d)
+		}
+	})
+	t.Run("legacy id/hash pairs", func(t *testing.T) {
+		raw := json.RawMessage(`{"prev_events":[["$a",{"sha256":"x"}]],"auth_events":[["$b",{"sha256":"y"}]]}`)
+		prev, auth := tplEventRefs(raw)
+		if len(prev) != 1 || prev[0] != "$a" {
+			t.Fatalf("prev = %v", prev)
+		}
+		if len(auth) != 1 || auth[0] != "$b" {
+			t.Fatalf("auth = %v", auth)
+		}
+	})
+	t.Run("missing fields", func(t *testing.T) {
+		prev, auth := tplEventRefs(json.RawMessage(`{"content":{}}`))
+		if prev != nil || auth != nil {
+			t.Fatalf("expected nil refs, got prev=%v auth=%v", prev, auth)
+		}
+	})
+}
+
+func TestTplEventTS(t *testing.T) {
+	raw := json.RawMessage(`{"origin_server_ts":1234}`)
+	if got := tplEventTS(raw, 999); got != 1234 {
+		t.Fatalf("ts = %d, want 1234", got)
+	}
+	if got := tplEventTS(json.RawMessage(`{}`), 999); got != 999 {
+		t.Fatalf("fallback ts = %d, want 999", got)
+	}
+}
+
+func TestURLPathEscape(t *testing.T) {
+	if got := urlPathEscape("#room:example.org"); got != "%23room:example.org" {
+		t.Fatalf("escape = %q", got)
+	}
+}

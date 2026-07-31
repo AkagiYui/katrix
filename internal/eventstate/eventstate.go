@@ -376,3 +376,31 @@ func Maintain(ctx context.Context, store *storage.Store, row *storage.EventRow, 
 	}
 	return nil
 }
+
+// SeedRemoteJoin persists the room view delivered by a successful outbound
+// send_join: the join event plus the room state the remote server returned. The
+// join event's state-at-event snapshot is seeded directly from that delivered
+// state (plus the join's own tuple), the join event is made the room's sole
+// forward extremity, and room_state is recomputed from it. This makes the room
+// usable locally without ever having received its history. The join event row
+// is expected to already be persisted; stateRows are the (already persisted)
+// state events delivered in the send_join response.
+func SeedRemoteJoin(ctx context.Context, store *storage.Store, roomID string, rules roomver.Rules, joinRow *storage.EventRow, stateRows []storage.StateRow) error {
+	base := stateRowsToMap(stateRows)
+	if joinRow.EventID != "" && joinRow.Type != "" {
+		base[joinRow.Type+stateKeySep+joinRow.StateKey] = joinRow.EventID
+	}
+	snap := stateMapToRows(roomID, base)
+	if err := store.SaveEventState(ctx, joinRow.EventID, roomID, snap); err != nil {
+		return fmt.Errorf("eventstate: seed join snapshot: %w", err)
+	}
+	if err := store.SetForwardExtremities(ctx, roomID, []storage.ForwardExtremity{
+		{RoomID: roomID, EventID: joinRow.EventID, Depth: joinRow.Depth},
+	}); err != nil {
+		return fmt.Errorf("eventstate: seed join extremity: %w", err)
+	}
+	if err := RecomputeCurrentState(ctx, store, roomID, rules); err != nil {
+		return fmt.Errorf("eventstate: seed join recompute: %w", err)
+	}
+	return nil
+}

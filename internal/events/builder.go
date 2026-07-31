@@ -20,6 +20,10 @@ type Builder struct {
 	AuthEvents     []string
 	Depth          int64
 	OriginServerTS int64
+	// Origin is the server that created the event, used on federated events
+	// (e.g. outbound make_join/send_join). It is part of the signable form for
+	// room versions < 11, so it must be set before Build signs the event.
+	Origin string
 }
 
 // Build produces a signed Event for the given room version. It computes the
@@ -38,6 +42,9 @@ func (b *Builder) Build(serverName string, key *crypto.SigningKey, version roomv
 	obj := map[string]json.RawMessage{}
 	setString(obj, "type", b.Type)
 	setString(obj, "sender", b.Sender)
+	if b.Origin != "" {
+		setString(obj, "origin", b.Origin)
+	}
 	// For v12 (MSC4291) the m.room.create event omits room_id (the room id is
 	// derived from its reference hash). For all other events the room_id is
 	// mandatory; an empty value means the caller is intentionally omitting it
@@ -101,6 +108,9 @@ func (b *Builder) BuildLegacy(serverName string, key *crypto.SigningKey, version
 	setString(obj, "type", b.Type)
 	setString(obj, "sender", b.Sender)
 	setString(obj, "room_id", b.RoomID)
+	if b.Origin != "" {
+		setString(obj, "origin", b.Origin)
+	}
 	setString(obj, "event_id", eventID)
 	obj["content"] = nonNil(b.Content, `{}`)
 	obj["depth"] = mustJSON(b.Depth)

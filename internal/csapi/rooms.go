@@ -185,12 +185,25 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 func (a *API) JoinRoom(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomIDOrAlias := r.PathValue("roomIDOrAlias")
+	via := splitVia(r.URL.Query().Get("server_name"))
 	roomID := a.resolveRoomIDOrAlias(r.Context(), roomIDOrAlias)
+	if roomID == "" && strings.HasPrefix(roomIDOrAlias, "#") {
+		// Remote alias: resolve it over federation on the alias's own domain
+		// server, then join the resolved room via that server.
+		if a.fed != nil {
+			if id, err := a.fed.ResolveRemoteAlias(r.Context(), roomIDOrAlias); err == nil && id != "" {
+				roomID = id
+				if dom := ids.DomainOf(roomIDOrAlias); dom != "" && (len(via) == 0 || via[0] == "") {
+					via = append([]string{dom}, via...)
+				}
+			}
+		}
+	}
 	if roomID == "" {
 		httpx.WriteError(w, httpx.ErrNotFound("unknown room"))
 		return
 	}
-	_, err := a.joinRoom(r, auth, roomID)
+	_, err := a.joinRoom(r, auth, roomID, via)
 	if err != nil {
 		writeRoomErr(w, err)
 		return
@@ -202,7 +215,8 @@ func (a *API) JoinRoom(w http.ResponseWriter, r *http.Request) {
 func (a *API) RoomJoin(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomID := r.PathValue("roomID")
-	_, err := a.joinRoom(r, auth, roomID)
+	via := splitVia(r.URL.Query().Get("server_name"))
+	_, err := a.joinRoom(r, auth, roomID, via)
 	if err != nil {
 		writeRoomErr(w, err)
 		return
@@ -978,8 +992,19 @@ func (a *API) DirectoryLookupAlias(w http.ResponseWriter, r *http.Request) {
 	alias := r.PathValue("roomAlias")
 	roomID, err := a.Store.LookupAlias(r.Context(), alias)
 	if err != nil {
-		httpx.WriteError(w, httpx.ErrNotFound("room alias not found"))
-		return
+		// Alias not known locally: try resolving it over federation on the
+		// alias's own domain server (unless that is this server).
+		dom := ids.DomainOf(alias)
+		if a.fed != nil && dom != "" && dom != a.ServerName() {
+			if id, rerr := a.fed.ResolveRemoteAlias(r.Context(), alias); rerr == nil && id != "" {
+				roomID = id
+				err = nil
+			}
+		}
+		if err != nil {
+			httpx.WriteError(w, httpx.ErrNotFound("room alias not found"))
+			return
+		}
 	}
 	// Resolve canonical servers.
 	servers := []string{a.ServerName()}
@@ -1157,18 +1182,41 @@ func (a *API) checkMembershipAny(ctx context.Context, roomID, userID, allowed st
 	return nil
 }
 
-// joinRoom performs a join for the authenticated user, running auth rules and
-// persisting the m.room.member(join) event.
-func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string) (*events.Event, error) {
-	_, err := a.Store.GetRoom(r.Context(), roomID)
-	if err != nil {
-		return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
+// joinRoom performs a join for the authenticated user: a local join (auth
+// rules + persist the m.room.member(join) event) when the room is known
+// locally, or a federated join against a remote server when it is not.
+func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, via []string) (*events.Event, error) {
+	if _, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
+		if err := a.sendMemberEvent(r, auth, roomID, "", auth.UserID, rooms.MembershipJoin, ""); err != nil {
+			return nil, err
+		}
+		return nil, nil
 	}
-	if err := a.sendMemberEvent(r, auth, roomID, "", auth.UserID, rooms.MembershipJoin, ""); err != nil {
-		return nil, err
+	// Not a local room: federated join (make_join/send_join against a remote
+	// server, then persist the delivered room state).
+	if a.fed != nil {
+		if err := a.fed.JoinRemoteRoom(r.Context(), auth.UserID, roomID, via); err != nil {
+			return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", err.Error())
+		}
+		return nil, nil
 	}
-	// Fetch the freshly created event for the response (best effort).
-	return nil, nil
+	return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
+}
+
+// splitVia parses the server_name query parameter (a comma-separated list of
+// servers to try when joining a remote room).
+func splitVia(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	var out []string
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // sendMemberEvent builds, authorises and persists an m.room.member event.
