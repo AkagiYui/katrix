@@ -151,6 +151,8 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Start background workers (e.g. MSC4140 delayed-event firing).
+	handler.CSAPI().StartDelayedWorker(ctx)
 
 	clientSrv := &http.Server{Addr: cfg.Listen.Client, Handler: handler, ReadHeaderTimeout: 30 * time.Second}
 	fedSrv := &http.Server{Addr: cfg.Listen.Federation, Handler: handler, ReadHeaderTimeout: 30 * time.Second}

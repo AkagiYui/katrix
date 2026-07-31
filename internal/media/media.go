@@ -62,6 +62,10 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/media/v3/download/{serverName}/{mediaID}/{fileName}", a.RequireAuth(a.Download))
 	mux.HandleFunc("GET /_matrix/client/v1/media/thumbnail/{serverName}/{mediaID}", a.RequireAuth(a.Thumbnail))
 	mux.HandleFunc("GET /_matrix/media/v3/thumbnail/{serverName}/{mediaID}", a.RequireAuth(a.Thumbnail))
+	// Async upload (MSC2246): reserve a media ID, then upload the blob to it.
+	mux.HandleFunc("POST /_matrix/media/v1/create", a.RequireAuth(a.CreateMedia))
+	mux.HandleFunc("PUT /_matrix/media/v3/upload/{serverName}/{mediaID}", a.RequireAuth(a.UploadAsync))
+	mux.HandleFunc("PUT /_matrix/media/v3/upload/{serverName}/{mediaID}/{fileName}", a.RequireAuth(a.UploadAsync))
 }
 
 // Config_ handles GET /_matrix/.../config.
@@ -93,10 +97,82 @@ func (a *API) Upload(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"content_uri": mxc})
 }
 
+// CreateMedia handles POST /_matrix/media/v1/create (MSC2246): reserves a media
+// ID and returns its mxc:// URI without any bytes yet. The blob is uploaded
+// later via PUT /_matrix/media/v3/upload/{serverName}/{mediaID}.
+func (a *API) CreateMedia(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	mediaID := randomMediaID()
+	if err := a.Store.CreatePendingMedia(r.Context(), mediaID, auth.UserID, a.Now()); err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	mxc := "mxc://" + a.ServerName() + "/" + mediaID
+	httpx.WriteJSON(w, http.StatusOK, map[string]string{
+		"content_uri":          mxc,
+		"unstable_content_uri": mxc,
+	})
+}
+
+// UploadAsync handles PUT /_matrix/media/v3/upload/{serverName}/{mediaID}
+// (MSC2246): uploads the blob for a media ID previously reserved via
+// POST /media/v1/create. Uploading to an ID that already has a blob is
+// rejected with M_CANNOT_OVERWRITE_MEDIA.
+func (a *API) UploadAsync(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	mediaID := r.PathValue("mediaID")
+	serverName := r.PathValue("serverName")
+	if serverName != a.ServerName() {
+		httpx.WriteError(w, httpx.ErrNotFound("media not found"))
+		return
+	}
+	// Already uploaded -> cannot overwrite.
+	if _, _, err := a.backend.Download(r.Context(), mediaID); err == nil {
+		httpx.WriteError(w, httpx.NewError(http.StatusConflict, "M_CANNOT_OVERWRITE_MEDIA", "cannot overwrite an already uploaded media"))
+		return
+	}
+	// Must have been reserved first.
+	owner, err := a.Store.PendingMedia(r.Context(), mediaID)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("media not found"))
+		return
+	}
+	if owner != "" && owner != auth.UserID {
+		httpx.WriteError(w, httpx.ErrForbidden("media was created by another user"))
+		return
+	}
+	if cl := r.ContentLength; cl > a.HS.Config.Media.MaxUploadBytes {
+		httpx.WriteError(w, httpx.ErrTooLarge(fmt.Sprintf("upload exceeds limit (%d bytes)", a.HS.Config.Media.MaxUploadBytes)))
+		return
+	}
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	uploadName := r.URL.Query().Get("filename")
+	if uploadName == "" {
+		uploadName = r.PathValue("fileName")
+	}
+	if err := a.backend.UploadTo(r.Context(), mediaID, r.Body, contentType, uploadName, auth.UserID, a.Now()); err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	_ = a.Store.CompletePendingMedia(r.Context(), mediaID)
+	metrics.Counters.MediaUploads.Add(1)
+	mxc := "mxc://" + a.ServerName() + "/" + mediaID
+	httpx.WriteJSON(w, http.StatusOK, map[string]string{"content_uri": mxc})
+}
+
 // Download handles GET /_matrix/.../download/{serverName}/{mediaID}.
 func (a *API) Download(w http.ResponseWriter, r *http.Request) {
 	mediaID := r.PathValue("mediaID")
 	serverName := r.PathValue("serverName")
+	// A media ID that was reserved but not yet uploaded returns
+	// M_NOT_YET_UPLOADED (MSC2246).
+	if _, err := a.Store.PendingMedia(r.Context(), mediaID); err == nil {
+		httpx.WriteError(w, httpx.NewError(http.StatusGatewayTimeout, "M_NOT_YET_UPLOADED", "the media has not yet been uploaded"))
+		return
+	}
 	f, meta, err := a.backend.Download(r.Context(), mediaID)
 	if err != nil {
 		// Local miss: if the media belongs to a remote server, lazily fetch it

@@ -47,6 +47,7 @@ func (a *API) registerRooms(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /_matrix/client/v3/rooms/{roomID}/redact/{eventID}/{txnID}", a.RequireAuth(a.RoomRedact))
 	mux.HandleFunc("PUT /_matrix/client/v3/rooms/{roomID}/typing/{userID}", a.RequireAuth(a.RoomTyping))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/forget", a.RequireAuth(a.RoomForget))
+	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/upgrade", a.RequireAuth(a.RoomUpgrade))
 	mux.HandleFunc("GET /_matrix/client/v3/directory/room/{roomAlias}", a.DirectoryLookupAlias)
 	mux.HandleFunc("PUT /_matrix/client/v3/directory/room/{roomAlias}", a.RequireAuth(a.DirectoryPutAlias))
 	mux.HandleFunc("DELETE /_matrix/client/v3/directory/room/{roomAlias}", a.RequireAuth(a.DirectoryDeleteAlias))
@@ -361,6 +362,17 @@ func (a *API) RoomSend(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
+	// MSC4140: a delay query parameter schedules the event instead of sending
+	// it immediately.
+	if d := delayQuery(r); d > 0 {
+		delayID, err := a.scheduleDelayedEvent(auth.Localpart, roomID, eventType, "", txnID, content, d, false)
+		if err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"delay_id": delayID})
+		return
+	}
 	ev, err := a.buildAndPersistMessage(r, auth, roomID, eventType, txnID, content)
 	if err != nil {
 		writeRoomErr(w, err)
@@ -390,6 +402,17 @@ func (a *API) RoomStatePut(w http.ResponseWriter, r *http.Request) {
 	content, err := readEventContent(r)
 	if err != nil {
 		httpx.WriteError(w, err)
+		return
+	}
+	// MSC4140: a delay query parameter schedules the state event instead of
+	// sending it immediately.
+	if d := delayQuery(r); d > 0 {
+		delayID, err := a.scheduleDelayedEvent(auth.Localpart, roomID, eventType, stateKey, "", content, d, true)
+		if err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"delay_id": delayID})
 		return
 	}
 	if eventType == "m.room.member" {
@@ -963,6 +986,113 @@ func (a *API) RoomTyping(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
+// RoomUpgrade handles POST /_matrix/client/v3/rooms/{roomID}/upgrade. It
+// creates a new room with the requested version whose create event names the
+// old room as its predecessor, sends an m.room.tombstone into the old room
+// pointing at the new one, and copies the upgrading user's room-specific push
+// rules for the old room across to the new room (Synapse/Dendrite behaviour
+// for local users).
+func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	roomID := r.PathValue("roomID")
+	var req struct {
+		NewVersion string `json:"new_version"`
+	}
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	version := roomver.Version(req.NewVersion)
+	if version == "" {
+		version = roomver.Default
+	}
+	if !roomver.IsSupported(version) {
+		httpx.WriteError(w, httpx.ErrUnknownRoomVersion("unsupported room version"))
+		return
+	}
+	if err := a.checkMembership(r.Context(), roomID, auth.UserID, rooms.MembershipJoin); err != nil {
+		writeRoomErr(w, err)
+		return
+	}
+	// The creator of the new room is the user performing the upgrade.
+	creationContent, _ := json.Marshal(map[string]any{
+		"predecessor": map[string]any{"room_id": roomID},
+	})
+	seedRoomID := ids.NewRoomID(a.ServerName())
+	initRes, err := rooms.BuildInitialEvents(seedRoomID, version, auth.UserID, "", nil, creationContent, false, a.ServerName(), a.Key, a.Now())
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	newRoomID := initRes.RoomID
+	{
+		if err := a.Store.CreateRoom(r.Context(), storage.Room{
+			RoomID: newRoomID, Version: string(version), Creator: auth.UserID, CreatedTS: a.Now(),
+		}); err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+		for _, ev := range initRes.Events {
+			stream, err := persistEventInRoom(r.Context(), a.Store, ev, version, newRoomID)
+			if err != nil {
+				httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+				return
+			}
+			// Mirror CreateRoom: record memberships for the initial member event
+			// so the creator is joined to the new room.
+			if ev.Type() == "m.room.member" {
+				sk, _ := ev.StateKey()
+				mc, _ := rooms.ParseMember(ev.Content())
+				if mc != nil {
+					_ = a.Store.UpsertMembership(r.Context(), storage.MembershipRow{
+						RoomID: newRoomID, UserID: sk, Membership: mc.Membership,
+						EventID: ev.EventID(), DisplayName: mc.DisplayName, AvatarURL: mc.AvatarURL,
+						StreamOrdering: stream,
+					})
+				}
+			}
+		}
+	}
+	// Send the tombstone into the old room.
+	tombstone, _ := json.Marshal(map[string]any{
+		"body":             "This room has been replaced",
+		"replacement_room": newRoomID,
+	})
+	if _, err := a.buildAndPersistState(r, auth, roomID, "m.room.tombstone", "", tombstone); err != nil {
+		writeRoomErr(w, err)
+		return
+	}
+	// Copy the user's per-room push rules for the old room to the new room.
+	a.copyPushRulesForRoom(auth.Localpart, roomID, newRoomID)
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"replacement_room": newRoomID})
+}
+
+// copyPushRulesForRoom clones a user's room-specific push rules from oldRoomID
+// to newRoomID (used by room upgrade so local users keep their per-room
+// notification settings in the replacement room).
+func (a *API) copyPushRulesForRoom(localpart, oldRoomID, newRoomID string) {
+	rules := a.loadRules(localpart)
+	global, _ := rules["global"].(map[string]any)
+	list, _ := global["room"].([]any)
+	for _, e := range list {
+		em, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		if em["rule_id"] != oldRoomID {
+			continue
+		}
+		clone := map[string]any{}
+		for k, v := range em {
+			clone[k] = v
+		}
+		clone["rule_id"] = newRoomID
+		global["room"] = append(list, clone)
+	}
+	rules["global"] = global
+	_ = a.savePushRules(localpart, rules)
+}
+
 // RoomForget handles POST /_matrix/client/v3/rooms/{roomID}/forget.
 // A user may only forget a room they have left (or never joined). Forgetting
 // a room the user is still in (joined/invited) is rejected with M_BAD_STATE.
@@ -1501,6 +1631,10 @@ func persistEventInRoom(ctx context.Context, store *storage.Store, ev *events.Ev
 	if err != nil {
 		return 0, err
 	}
+	// Index the event's relates_to relation (if any) so /relations and
+	// /threads can answer from the index. Best-effort: a malformed relates_to
+	// must not roll back the event insert.
+	indexEventRelation(ctx, store, row)
 	// Maintain the per-event state snapshot and recompute room_state from the
 	// forward extremities. For an unsupported room version we skip this (the
 	// event is still persisted; room_state is left as-is).
@@ -1510,6 +1644,32 @@ func persistEventInRoom(ctx context.Context, store *storage.Store, ev *events.Ev
 		}
 	}
 	return stream, nil
+}
+
+// indexEventRelation extracts an event's m.relates_to reference and records it
+// in the event_relations index. A missing or malformed relates_to is ignored.
+func indexEventRelation(ctx context.Context, store *storage.Store, row *storage.EventRow) {
+	var content struct {
+		RelatesTo struct {
+			EventID string `json:"event_id"`
+			RelType string `json:"rel_type"`
+		} `json:"m.relates_to"`
+	}
+	if err := json.Unmarshal(row.Content, &content); err != nil {
+		return
+	}
+	if content.RelatesTo.EventID == "" || content.RelatesTo.RelType == "" {
+		return
+	}
+	_ = store.InsertRelation(ctx, storage.RelationRow{
+		EventID:        row.EventID,
+		RoomID:         row.RoomID,
+		ParentEventID:  content.RelatesTo.EventID,
+		RelType:        content.RelatesTo.RelType,
+		EventType:      row.Type,
+		Sender:         row.Sender,
+		StreamOrdering: row.StreamOrdering,
+	})
 }
 
 // notifyRoomMembers wakes up all joined users' /sync requests for a room.

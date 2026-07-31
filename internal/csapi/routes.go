@@ -21,4 +21,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	a.registerE2EE(mux)
 	a.registerQRAuth(mux)
 	a.registerMisc(mux)
+	a.registerRelations(mux)
+	a.registerDirectory(mux)
+	a.registerDelayedEvents(mux)
 }

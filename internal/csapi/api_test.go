@@ -14,6 +14,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/config"
 	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/homeserver"
+	"github.com/AkagiYui/katrix/internal/media"
 	"github.com/AkagiYui/katrix/internal/storage"
 	"github.com/AkagiYui/katrix/internal/testdb"
 )
@@ -48,9 +49,14 @@ func testAPI(t *testing.T) (*API, *httptest.Server) {
 		t.Fatal(err)
 	}
 	hs := homeserver.New(cfg, store, key)
+	// Media backend needs a writable store path; use a per-test temp dir.
+	cfg.Media.StorePath = t.TempDir()
 	api := New(hs)
 	mux := http.NewServeMux()
 	api.Register(mux)
+	// The media API is part of the full server surface; register it so
+	// async-media and other media endpoints are reachable in tests.
+	media.New(hs, nil).Register(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return api, srv

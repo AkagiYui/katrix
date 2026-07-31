@@ -116,3 +116,35 @@ func (s *Store) GetThumbnail(ctx context.Context, mediaID string, width, height 
 	}
 	return &t, nil
 }
+
+// ---- Async media upload (MSC2246) ----
+
+// CreatePendingMedia reserves a media ID for async upload. The blob is uploaded
+// later via PUT /_matrix/media/v3/upload/{serverName}/{mediaID}.
+func (s *Store) CreatePendingMedia(ctx context.Context, mediaID, userID string, now int64) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO media_pending(media_id, user_id, created_ts) VALUES ($1,$2,$3)
+		 ON CONFLICT (media_id) DO NOTHING`,
+		mediaID, userID, now)
+	return err
+}
+
+// PendingMedia returns the owner of a created-but-not-uploaded media ID, or
+// ErrNotFound.
+func (s *Store) PendingMedia(ctx context.Context, mediaID string) (string, error) {
+	var userID string
+	err := s.pool.QueryRow(ctx, `SELECT user_id FROM media_pending WHERE media_id=$1`, mediaID).Scan(&userID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	return userID, nil
+}
+
+// CompletePendingMedia removes the pending marker once the blob is uploaded.
+func (s *Store) CompletePendingMedia(ctx context.Context, mediaID string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM media_pending WHERE media_id=$1`, mediaID)
+	return err
+}

@@ -31,13 +31,23 @@ func NewFileBackend(store *storage.Store, root string) (*FileBackend, error) {
 // Upload reads the blob, stores it, records metadata, and returns the media id.
 func (b *FileBackend) Upload(ctx context.Context, r io.Reader, contentType, uploadName, userID string, now int64) (string, error) {
 	mediaID := randomMediaID()
+	if err := b.UploadTo(ctx, mediaID, r, contentType, uploadName, userID, now); err != nil {
+		return "", err
+	}
+	return mediaID, nil
+}
+
+// UploadTo stores a blob under a specific media ID (used by the async upload
+// path, where the ID is reserved first via POST /media/v1/create). It is the
+// same write path as Upload.
+func (b *FileBackend) UploadTo(ctx context.Context, mediaID string, r io.Reader, contentType, uploadName, userID string, now int64) error {
 	path := b.blobPath(mediaID)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", err
+		return err
 	}
 	f, err := os.Create(path)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer f.Close()
 	h := sha256.New()
@@ -45,7 +55,7 @@ func (b *FileBackend) Upload(ctx context.Context, r io.Reader, contentType, uplo
 	size, err := io.Copy(mw, io.LimitReader(r, maxFileRead))
 	if err != nil {
 		_ = os.Remove(path)
-		return "", err
+		return err
 	}
 	if err := b.store.CreateMedia(ctx, storage.MediaRow{
 		MediaID: mediaID,
@@ -54,9 +64,9 @@ func (b *FileBackend) Upload(ctx context.Context, r io.Reader, contentType, uplo
 		Size: size, SHA256: hex.EncodeToString(h.Sum(nil)), CreatedTS: now,
 	}); err != nil {
 		_ = os.Remove(path)
-		return "", err
+		return err
 	}
-	return mediaID, nil
+	return nil
 }
 
 // UploadRemote stores a fetched remote media blob with a known media id and

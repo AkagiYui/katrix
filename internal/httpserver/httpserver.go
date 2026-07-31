@@ -19,8 +19,18 @@ import (
 	"github.com/AkagiYui/katrix/internal/webui"
 )
 
+// Server is the assembled HTTP handler with access to the constructed CS API
+// (for background workers started by cmd/katrix, e.g. the delayed-event worker).
+type Server struct {
+	http.Handler
+	cs *csapi.API
+}
+
+// CSAPI returns the constructed CS API.
+func (s *Server) CSAPI() *csapi.API { return s.cs }
+
 // New builds the top-level HTTP handler.
-func New(hs *homeserver.HS) (http.Handler, error) {
+func New(hs *homeserver.HS) (*Server, error) {
 	mux := http.NewServeMux()
 
 	cs := csapi.New(hs)
@@ -55,7 +65,7 @@ func New(hs *homeserver.HS) (http.Handler, error) {
 	}
 	mux.Handle("/", spa)
 
-	return withMiddleware(mux), nil
+	return &Server{Handler: withMiddleware(mux), cs: cs}, nil
 }
 
 // apiPrefixes are never served by the SPA fallback.
