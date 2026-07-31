@@ -879,17 +879,19 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	// Per spec, for a backward page `end` is the token of the oldest event in
 	// the chunk (pass it as `from` to paginate further back) and `start` is the
 	// newest; for a forward page the roles are reversed. Emitting them the
-	// wrong way round makes clients loop or skip events.
-	var startTok, endTok int64
-	if dir == "b" {
-		startTok, endTok = maxTok, minTok
-	} else {
-		startTok, endTok = minTok, maxTok
-	}
-	resp := map[string]any{
-		"chunk": chunk,
-		"start": formatIntToken(startTok),
-		"end":   formatIntToken(endTok),
+	// wrong way round makes clients loop or skip events. When no events are
+	// returned (start of timeline / no permission), `end` is OMITTED so clients
+	// know to stop paginating — an empty chunk with an `end` token loops forever.
+	resp := map[string]any{"chunk": chunk}
+	if len(chunk) > 0 {
+		var startTok, endTok int64
+		if dir == "b" {
+			startTok, endTok = maxTok, minTok
+		} else {
+			startTok, endTok = minTok, maxTok
+		}
+		resp["start"] = formatIntToken(startTok)
+		resp["end"] = formatIntToken(endTok)
 	}
 	httpx.WriteJSON(w, http.StatusOK, resp)
 }
