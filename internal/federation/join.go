@@ -206,10 +206,12 @@ func tplEventTS(raw json.RawMessage, now int64) int64 {
 	return ts
 }
 
-// makeJoin performs GET /_matrix/federation/v2/make_join/{roomID}/{userID}
-// against dest, returning the unsigned template event + room version.
+// makeJoin performs GET /_matrix/federation/v2/send_join/{roomID}/{userID}
+// against dest — per the spec the v2 "make_join" step is a GET on the
+// send_join endpoint (the make_join path is v1 only). It returns the unsigned
+// template event + room version.
 func (c *Client) makeJoin(ctx context.Context, dest, roomID, userID string) (*makeJoinResponse, error) {
-	url := c.serverBaseURL(dest) + "/_matrix/federation/v2/make_join/" + roomID + "/" + userID
+	url := c.serverBaseURL(dest) + "/_matrix/federation/v2/send_join/" + roomID + "/" + userID
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
