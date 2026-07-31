@@ -389,6 +389,42 @@ func (s *Store) Members(ctx context.Context, roomID, membershipFilter string) ([
 	return out, rows.Err()
 }
 
+// MemberHistoryRow is one historical m.room.member event in a room.
+type MemberHistoryRow struct {
+	UserID         string
+	Membership     string
+	StreamOrdering int64
+}
+
+// MemberHistory returns the m.room.member events for a room up to (and
+// including) a stream position, ordered by stream. Used to annotate events
+// with the sender's membership at the time of the event (MSC4115
+// unsigned.membership).
+func (s *Store) MemberHistory(ctx context.Context, roomID string, upto int64) ([]MemberHistoryRow, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT state_key, content->>'membership', stream_ordering
+		 FROM events
+		 WHERE room_id=$1 AND type='m.room.member' AND state_key IS NOT NULL
+		   AND stream_ordering<=$2
+		 ORDER BY stream_ordering ASC`, roomID, upto)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MemberHistoryRow
+	for rows.Next() {
+		var h MemberHistoryRow
+		if err := rows.Scan(&h.UserID, &h.Membership, &h.StreamOrdering); err != nil {
+			return nil, err
+		}
+		if h.Membership == "" {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
 // EarliestMemberStream returns the stream_ordering of the user's first
 // m.room.member event in the room (e.g. the invite that preceded a join). It
 // is used as the history_visibility="invited" read boundary, which survives a

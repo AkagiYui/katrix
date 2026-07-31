@@ -503,11 +503,14 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// Track senders for lazy-load members.
 	senders := map[string]bool{}
 	timeline := Timeline{Events: make([]json.RawMessage, 0, len(evs))}
+	// MSC4115: annotate each timeline event with the syncing user's membership
+	// at the time of the event (unsigned.membership).
+	membershipAt := e.membershipAnnotator(ctx, roomID, opts.UserID, maxStream)
 	for _, ev := range evs {
 		if !filter.keepTimeline(&ev) {
 			continue
 		}
-		timeline.Events = append(timeline.Events, filter.applyEventFields(clientEvent(&ev)))
+		timeline.Events = append(timeline.Events, filter.applyEventFields(membershipAt(clientEvent(&ev), &ev)))
 		senders[ev.Sender] = true
 	}
 	if len(evs) >= limit {
@@ -555,6 +558,38 @@ func lazyLoadMemberEvent(ev *storage.EventRow, senders map[string]bool) bool {
 		return true
 	}
 	return false
+}
+
+// membershipAnnotator returns a function that attaches unsigned.membership to a
+// rendered client event based on the syncing user's membership at that event's
+// stream position (MSC4115). It loads the user's member-event history in the
+// room once per sync and walks it per event.
+func (e *Engine) membershipAnnotator(ctx context.Context, roomID, userID string, upto int64) func(ev json.RawMessage, row *storage.EventRow) json.RawMessage {
+	history, err := e.store.MemberHistory(ctx, roomID, upto)
+	if err != nil {
+		return func(ev json.RawMessage, _ *storage.EventRow) json.RawMessage { return ev }
+	}
+	return func(ev json.RawMessage, row *storage.EventRow) json.RawMessage {
+		if row == nil {
+			return ev
+		}
+		membership := "leave" // MSC4115: events predating the user's membership are "leave"
+		best := int64(0)
+		for _, h := range history {
+			if h.UserID == userID && h.StreamOrdering <= row.StreamOrdering && h.StreamOrdering > best {
+				best = h.StreamOrdering
+				membership = h.Membership
+			}
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(ev, &obj); err != nil {
+			return ev
+		}
+		unsigned, _ := json.Marshal(map[string]any{"membership": membership})
+		obj["unsigned"] = unsigned
+		b, _ := json.Marshal(obj)
+		return b
+	}
 }
 
 // roomSummary builds the room summary section (member counts + heroes).
