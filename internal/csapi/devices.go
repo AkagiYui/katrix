@@ -115,9 +115,16 @@ func (a *API) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	// Verify the supplied password.
 	user, err := a.Store.GetUser(r.Context(), auth.Localpart)
 	if err != nil || user.PasswordHash == "" || !homeserver.CheckPassword(user.PasswordHash, ad.Auth.Password) {
-		// UIA: a failed auth attempt is still a 401 (spec-compliant clients
-		// treat it as a new UIA challenge round); Complement asserts 401.
-		httpx.WriteError(w, httpx.NewError(http.StatusUnauthorized, "M_FORBIDDEN", "Invalid password"))
+		// UIA: a failed auth attempt is still a 401, and Complement expects the
+		// challenge shape PLUS errcode/error (flows/params/session + error).
+		id, _ := a.uia.create("password", auth.Localpart)
+		httpx.WriteJSON(w, http.StatusUnauthorized, map[string]any{
+			"errcode": "M_FORBIDDEN",
+			"error":   "Invalid password",
+			"flows":   []uiaFlow{{Stages: []string{"m.login.password"}}},
+			"params":  map[string]any{},
+			"session": id,
+		})
 		return
 	}
 	if err := a.Store.DeleteDevice(r.Context(), auth.Localpart, deviceID, a.ServerName()); err != nil {

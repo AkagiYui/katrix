@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/AkagiYui/katrix/internal/canonicaljson"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/storage"
@@ -284,6 +285,11 @@ func (a *API) DeviceSigningUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Determine whether any supplied key replaces an existing different key.
+	// Request keys use the "_key" suffix (master_key/self_signing_key/
+	// user_signing_key); stored key_type omits it. Comparison is on canonical
+	// JSON because the key_json column is JSONB and Postgres normalises the
+	// stored bytes (key order/whitespace), so a byte-wise compare would flag
+	// every re-upload as a "replacement".
 	replacing := false
 	keys, err := a.Store.CrossSigningKeys(r.Context(), auth.UserID)
 	if err != nil {
@@ -291,12 +297,23 @@ func (a *API) DeviceSigningUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, keyType := range []string{"master", "self_signing", "user_signing"} {
-		kjson, ok := req[keyType]
+		kjson, ok := req[keyType+"_key"]
 		if !ok {
 			continue
 		}
+		canon, err := canonicaljson.Canonical(kjson)
+		if err != nil {
+			continue
+		}
 		for _, k := range keys {
-			if k.KeyType == keyType && !bytes.Equal(bytes.TrimSpace(k.KeyJSON), bytes.TrimSpace(kjson)) {
+			if k.KeyType != keyType {
+				continue
+			}
+			stored, err := canonicaljson.Canonical(k.KeyJSON)
+			if err != nil {
+				continue
+			}
+			if !bytes.Equal(stored, canon) {
 				replacing = true
 			}
 		}
@@ -313,7 +330,7 @@ func (a *API) DeviceSigningUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, keyType := range []string{"master", "self_signing", "user_signing"} {
-		if kjson, ok := req[keyType]; ok {
+		if kjson, ok := req[keyType+"_key"]; ok {
 			_, _ = a.Store.UpsertCrossSigningKey(r.Context(), storage.CrossSigningKey{
 				UserID: auth.UserID, KeyType: keyType, KeyJSON: kjson,
 			})

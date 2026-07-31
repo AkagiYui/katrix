@@ -396,6 +396,32 @@ func (s *Store) EarliestMemberStream(ctx context.Context, roomID, userID string)
 	return stream, err
 }
 
+// MemberEventsAt returns each user's latest m.room.member event as of the
+// given stream_ordering, for GET /members?at=<token>. Users whose membership
+// event was created after the point are omitted.
+func (s *Store) MemberEventsAt(ctx context.Context, roomID string, at int64) ([]EventRow, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT ON (state_key) event_id, room_id, type, COALESCE(state_key,''), sender, depth,
+		        origin_server_ts, stream_ordering, content, json,
+		        COALESCE(redacts,''), redacted, outlier
+		 FROM events
+		 WHERE room_id=$1 AND type='m.room.member' AND stream_ordering <= $2
+		 ORDER BY state_key, stream_ordering DESC`, roomID, at)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EventRow
+	for rows.Next() {
+		r, err := scanEventRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // RoomsForUser returns the room IDs the user is currently a member of.
 func (s *Store) RoomsForUser(ctx context.Context, userID string) ([]string, error) {
 	rows, err := s.pool.Query(ctx,

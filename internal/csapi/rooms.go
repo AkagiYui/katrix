@@ -125,7 +125,8 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, ev := range initRes.Events {
-			if err := persistEventInRoom(r.Context(), a.Store, ev, version, roomID); err != nil {
+			stream, err := persistEventInRoom(r.Context(), a.Store, ev, version, roomID)
+			if err != nil {
 				httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 				return
 			}
@@ -138,7 +139,7 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 					_ = a.Store.UpsertMembership(r.Context(), storage.MembershipRow{
 						RoomID: roomID, UserID: sk, Membership: mc.Membership,
 						EventID: ev.EventID(), DisplayName: mc.DisplayName, AvatarURL: mc.AvatarURL,
-						StreamOrdering: ev.Depth(),
+						StreamOrdering: stream,
 					})
 				}
 			}
@@ -560,6 +561,35 @@ func (a *API) RoomMembers(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	membershipFilter := q.Get("membership")
 	notMembership := q.Get("not_membership")
+
+	// ?at=<token>: return the members as of a historical point in the stream
+	// (each user's latest member event up to that ordering).
+	var rows []storage.MembershipRow
+	if atRaw := q.Get("at"); atRaw != "" {
+		at, err := parseIntToken(atRaw)
+		if err != nil {
+			writeRoomErr(w, err)
+			return
+		}
+		evs, err := a.Store.MemberEventsAt(r.Context(), roomID, at)
+		if err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+		chunk := make([]json.RawMessage, 0, len(evs))
+		for i := range evs {
+			if notMembership != "" && memberOf(&evs[i]) == notMembership {
+				continue
+			}
+			if membershipFilter != "" && memberOf(&evs[i]) != membershipFilter {
+				continue
+			}
+			chunk = append(chunk, clientEvent(&evs[i]))
+		}
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
+		return
+	}
+
 	rows, err := a.Store.Members(r.Context(), roomID, membershipFilter)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
@@ -588,6 +618,15 @@ func (a *API) RoomMembers(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
+}
+
+// memberOf returns the membership from a member event row's content.
+func memberOf(ev *storage.EventRow) string {
+	mc, _ := rooms.ParseMember(ev.Content)
+	if mc == nil {
+		return ""
+	}
+	return mc.Membership
 }
 
 // RoomJoinedMembers handles GET /_matrix/client/v3/rooms/{roomID}/joined_members.
@@ -855,7 +894,7 @@ func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 		writeRoomErr(w, err)
 		return
 	}
-	if err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
+	if _, err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
@@ -1159,7 +1198,8 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	if err != nil {
 		return err
 	}
-	if err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
+	stream, err := persistEvent(r.Context(), a.Store, ev, version)
+	if err != nil {
 		return err
 	}
 	// room_state is maintained by persistEvent (snapshot + recompute).
@@ -1168,7 +1208,7 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	if mc != nil {
 		if err := a.Store.UpsertMembership(r.Context(), storage.MembershipRow{
 			RoomID: roomID, UserID: target, Membership: mc.Membership,
-			EventID: ev.EventID(), StreamOrdering: ev.Depth(),
+			EventID: ev.EventID(), StreamOrdering: stream,
 		}); err != nil {
 			return err
 		}
@@ -1184,7 +1224,7 @@ func (a *API) sendStateEvent(r *http.Request, auth *homeserver.Auth, roomID stri
 	if err != nil {
 		return
 	}
-	if err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
+	if _, err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
 		return
 	}
 	// room_state is maintained by persistEvent (snapshot + recompute).
@@ -1202,7 +1242,7 @@ func (a *API) buildAndPersistMessage(r *http.Request, auth *homeserver.Auth, roo
 	if err != nil {
 		return nil, err
 	}
-	if err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
+	if _, err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
 		return nil, err
 	}
 	a.notifyRoomMembers(r.Context(), roomID)
@@ -1234,7 +1274,7 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	if err != nil {
 		return nil, err
 	}
-	if err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
+	if _, err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
 		return nil, err
 	}
 	// room_state is maintained by persistEvent (snapshot + recompute).
@@ -1372,8 +1412,9 @@ func (a *API) buildStateSnapshot(ctx context.Context, roomID, target, sender str
 	return st, nil
 }
 
-// persistEvent inserts an event row derived from a signed Event.
-func persistEvent(ctx context.Context, store *storage.Store, ev *events.Event, version roomver.Version) error {
+// persistEvent inserts an event row derived from a signed Event and returns
+// its stream_ordering.
+func persistEvent(ctx context.Context, store *storage.Store, ev *events.Event, version roomver.Version) (int64, error) {
 	return persistEventInRoom(ctx, store, ev, version, ev.RoomID())
 }
 
@@ -1383,8 +1424,8 @@ func persistEvent(ctx context.Context, store *storage.Store, ev *events.Event, v
 // After inserting it maintains the event's state-at-event snapshot and
 // recomputes the room's current state from the forward extremities, so that
 // forks are resolved correctly via the snapshot table rather than via a blind
-// last-writer-wins UpsertState.
-func persistEventInRoom(ctx context.Context, store *storage.Store, ev *events.Event, version roomver.Version, roomID string) error {
+// last-writer-wins UpsertState. It returns the assigned stream_ordering.
+func persistEventInRoom(ctx context.Context, store *storage.Store, ev *events.Event, version roomver.Version, roomID string) (int64, error) {
 	sk, _ := ev.StateKey()
 	if roomID == "" {
 		roomID = ev.RoomID()
@@ -1402,18 +1443,19 @@ func persistEventInRoom(ctx context.Context, store *storage.Store, ev *events.Ev
 		AuthEvents:     ev.AuthEvents(),
 		PrevEvents:     ev.PrevEvents(),
 	}
-	if _, err := store.InsertEvent(ctx, row); err != nil {
-		return err
+	stream, err := store.InsertEvent(ctx, row)
+	if err != nil {
+		return 0, err
 	}
 	// Maintain the per-event state snapshot and recompute room_state from the
 	// forward extremities. For an unsupported room version we skip this (the
 	// event is still persisted; room_state is left as-is).
 	if rules, ok := roomver.Get(version); ok {
 		if err := eventstate.Maintain(ctx, store, row, rules); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return stream, nil
 }
 
 // notifyRoomMembers wakes up all joined users' /sync requests for a room.
