@@ -46,7 +46,7 @@ Katrix 按阶段（P0–P8）实现，每个阶段都自带测试并通过 GitHu
 | **Web 面板扩展** | TanStack Router（`/` 聊天 / `/devices` 设备与 E2EE / `/admin` 管理面板）；shadcn 风格 UI 原语（Button/Input/Card/Badge/Table + `cn()` + 设计 token CSS）；管理面板（统计卡片、用户停用/改密、房间列表，对齐 synapse-admin）；E2EE 设备密钥自举 + Megolm 加解密全链路。 |
 | **登录增强** | `login_tokens` 表 + `POST /login/token` 铸造单次令牌；`/login` 增 `m.login.token` 流程；`/versions` 声明 `org.matrix.msc3886`；`SendToDevice` `*` 通配扇出（打通 `m.secret.send`）；`m.key.verification.*` 透传。 |
 | **部署** | 生产 `Containerfile`（alpine 多阶段、0cgo 静态、非 root、healthcheck 子命令）；`Containerfile.complement`（Complement 测试镜像，内置 Postgres per-server 集群 + entrypoint，federation TLS 自动签发）。子命令：serve / healthcheck / genkey / **gencert** / version。 |
-| **CI/CD** | `ci.yml`（Go build/vet/gofmt/race test + Web Vite build）；`release.yml`（多架构二进制 + GHCR 镜像，打 tag 触发）；`complement.yml`（官方 Complement 黑盒测试 [核心 + MSC 用例]，federation TLS 就绪，结果在 job summary 报告 PASS/FAIL/SKIP）。 |
+| **CI/CD** | `ci.yml`（Go build/vet/gofmt/race test + Web Vite build）；`release.yml`（多架构二进制 + GHCR 镜像，打 tag 触发）；`test.yml`（官方 Complement 黑盒测试 [核心 + MSC 用例]、SyTest、Complement Crypto，federation TLS 就绪；job summary 经 `cmd/testreport` 报告每套件 PASS/FAIL/SKIP 与逐用例"预期 vs 实际"，原始日志上传 artifact）。 |
 
 ### 硬约束
 

@@ -18,6 +18,12 @@ RUN mkdir -p /goroot /gopath \
  && tar xf go.tar.gz -C /goroot --strip-components=1 \
  && rm go.tar.gz
 
+# python3 powers the post-run are-we-synapse-yet.py parity report; the base
+# sytest image doesn't ship it.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 \
+ && rm -rf /var/lib/apt/lists/*
+
 ENV GOROOT=/goroot
 ENV GOPATH=/gopath
 ENV PATH="/goroot/bin:${PATH}"
