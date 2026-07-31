@@ -90,7 +90,9 @@ rsync -r --ignore-missing-args --min-size=1B -av /work/server-0 /work/server-1 /
     --include "*/" --include="*.log.*" --include="*.log" --exclude="*"
 find /logs | xargs -r chmod go+rX
 
-# Sytest compliance report
-(cd /src && ./sytest/are-we-synapse-yet.py /logs/results.tap) || true
+# Sytest compliance report. Runs from /src/sytest so the script's
+# cwd-relative are-we-synapse-yet.list is found (vendored from dendrite);
+# the script itself lives in the katrix tree.
+(cd /src/sytest && ./are-we-synapse-yet.py /logs/results.tap) || true
 
 exit $TEST_STATUS

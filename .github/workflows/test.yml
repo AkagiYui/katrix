@@ -111,6 +111,15 @@ jobs:
         run: |
           tap="$PWD/sytest-logs/results.tap"
           go run ./cmd/testreport sytest "$tap" >> "$GITHUB_STEP_SUMMARY"
+          # Append the "Are We Synapse Yet?" feature-area parity summary that
+          # katrix_sytest.sh prints at the end of the container run.
+          if awk '/^Are We Synapse Yet\?/{p=1} p && /^[A-Za-z -]+ APIs:/' /tmp/sytest.log | grep -q .; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Are We Synapse Yet? (feature areas)" >> "$GITHUB_STEP_SUMMARY"
+            echo "| area | pass rate |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+            awk '/^Are We Synapse Yet\?/{p=1} p && /^[A-Za-z -]+ APIs:/{print "| " $0 " |"}' /tmp/sytest.log >> "$GITHUB_STEP_SUMMARY" || true
+          fi
       - uses: actions/upload-artifact@v7
         if: always()
         with:
