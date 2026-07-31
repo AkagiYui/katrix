@@ -847,25 +847,44 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
+	// EventsForRoom treats `from` as an exclusive lower bound and `to` as an
+	// inclusive upper bound. For backward pagination the client's `from` token
+	// is the oldest event it has already seen, so the next page must be events
+	// strictly OLDER than it: swap the bounds (from -> exclusive upper). Forward
+	// pagination keeps `from` as the exclusive lower bound.
+	if dir == "b" && from > 0 {
+		to = from - 1
+		from = 0
+	}
 	evs, err := a.Store.EventsForRoom(r.Context(), roomID, from, to, limit, dir)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
 	chunk := make([]json.RawMessage, 0, len(evs))
-	var startTok, endTok int64
+	var minTok, maxTok int64
 	for i := range evs {
 		e := evs[i]
 		if !flt.keep(&e) {
 			continue
 		}
 		chunk = append(chunk, clientEvent(&e))
-		if startTok == 0 || e.StreamOrdering < startTok {
-			startTok = e.StreamOrdering
+		if minTok == 0 || e.StreamOrdering < minTok {
+			minTok = e.StreamOrdering
 		}
-		if e.StreamOrdering > endTok {
-			endTok = e.StreamOrdering
+		if e.StreamOrdering > maxTok {
+			maxTok = e.StreamOrdering
 		}
+	}
+	// Per spec, for a backward page `end` is the token of the oldest event in
+	// the chunk (pass it as `from` to paginate further back) and `start` is the
+	// newest; for a forward page the roles are reversed. Emitting them the
+	// wrong way round makes clients loop or skip events.
+	var startTok, endTok int64
+	if dir == "b" {
+		startTok, endTok = maxTok, minTok
+	} else {
+		startTok, endTok = minTok, maxTok
 	}
 	resp := map[string]any{
 		"chunk": chunk,
