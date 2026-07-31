@@ -236,7 +236,7 @@ func parseGoVerbose(data []byte) suite {
 var (
 	runRe  = regexp.MustCompile(`^\s*=== RUN\s+(\S+)\s*$`)
 	doneRe = regexp.MustCompile(`^\s*--- (PASS|FAIL|SKIP): (\S+)\s*(\(\d+(\.\d+)?s\))?\s*$`)
-	errRe  = regexp.MustCompile(`^\s{4}([a-z_]+_test\.go:\d+:.*)$`)
+	errRe  = regexp.MustCompile(`^\s{4}([a-z0-9_]+_test\.go:\d+:.*)$`)
 )
 
 // shortPkg maps a complement package path to a short label.
@@ -311,8 +311,8 @@ func pickDetail(lines []string) string {
 }
 
 var (
-	fileLineRe = regexp.MustCompile(`^([a-z_]+_test\.go):(\d+):(.*)$`)
-	noiseRe    = regexp.MustCompile(`(?i)^(deploy times:|.*waiting for event id|.*retryuntil|.*\[csapi\]|.*sharing \[server_name|.*: end logs|.*: server logs|=== (run|name)|--- (pass|fail|skip):)`)
+	fileLineRe = regexp.MustCompile(`^([a-z0-9_]+_test\.go):(\d+):(.*)$`)
+	noiseRe    = regexp.MustCompile(`(?i)^(deploy times:|.*waiting for event id|.*retryuntil|.*\[csapi\]|.*sharing \[server_name|.*: end logs|.*: server logs|katrix: |=== (run|name)|--- (pass|fail|skip):|\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} =+|^=+$|^-+$)`)
 )
 
 func isAssertion(l string) bool {
@@ -454,20 +454,28 @@ func reportGoSuite(title string, data []byte, mode string) {
 		fmt.Println()
 	}
 
-	// Collapse to top-level tests for the failure table.
-	type topFail struct {
-		name   string
-		detail string
-	}
+	// Collapse to top-level tests for the failure table. Prefer a real
+	// assertion line ("expected vs actual") over a generic fallback: a
+	// top-level test often has no assertion of its own while its subtests do.
 	top := map[string]string{}
+	topFallback := map[string]string{}
 	for i := range s.Results {
 		r := &s.Results[i]
-		if r.Result != "FAIL" {
+		if r.Result != "FAIL" || r.Detail == "" {
 			continue
 		}
 		tl := topLevel(r.Name)
-		if top[tl] == "" && r.Detail != "" {
-			top[tl] = r.Detail
+		if isAssertion(r.Detail) {
+			if top[tl] == "" {
+				top[tl] = r.Detail
+			}
+		} else if topFallback[tl] == "" {
+			topFallback[tl] = r.Detail
+		}
+	}
+	for n, d := range topFallback {
+		if top[n] == "" {
+			top[n] = d
 		}
 	}
 	names := make([]string, 0, len(top))
