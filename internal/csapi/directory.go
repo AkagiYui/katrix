@@ -80,7 +80,7 @@ func (a *API) Search(w http.ResponseWriter, r *http.Request) {
 		// No room filter: search the user's joined rooms.
 		rooms, _ = a.Store.RoomsForUser(r.Context(), auth.UserID)
 	}
-	results, _, err := a.Store.SearchRoomEvents(r.Context(), req.SearchCategories.RoomEvents.SearchTerm, rooms, limit)
+	results, nextBatch, err := a.Store.SearchRoomEvents(r.Context(), req.SearchCategories.RoomEvents.SearchTerm, rooms, limit)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
@@ -106,8 +106,9 @@ func (a *API) Search(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"search_categories": map[string]any{
 			"room_events": map[string]any{
-				"count":   len(items),
-				"results": items,
+				"count":      len(items),
+				"results":    items,
+				"next_batch": nextBatch,
 			},
 		},
 	})

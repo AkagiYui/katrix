@@ -90,6 +90,11 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 		FullState: fullState,
 		Filter:    filter,
 	}
+	// set_presence lets a client declare its presence as part of /sync (spec
+	// "Presence can be set from sync").
+	if sp := q.Get("set_presence"); sp != "" {
+		_ = a.Store.SetPresence(r.Context(), auth.UserID, sp, "", a.Now())
+	}
 
 	// Long-poll: compute sync; if no new data, wait on the notifier and retry.
 	resp, err := a.syncEngine.Sync(r.Context(), opts)

@@ -59,24 +59,28 @@ type SearchResult struct {
 	After  []byte
 }
 
-// SearchRoomEvents returns room events whose content body/msgtype matches the
-// term (case-insensitive substring), restricted to the given rooms. It returns
-// at most limit matches ordered by stream_ordering descending, plus a
-// next_batch token of the oldest returned stream position (for back-paging).
+// SearchRoomEvents returns room events whose content matches the search term.
+// The term is tokenised on whitespace and every token must appear in the
+// event's content (case-insensitive substring per token), mirroring how
+// clients expect /search to behave ("Message 4" matches "Message number 4").
+// Results are restricted to the given rooms, ordered by stream_ordering
+// descending, capped at limit. It returns the results and a next_batch token
+// of the oldest returned stream position (empty when no further pages).
 func (s *Store) SearchRoomEvents(ctx context.Context, term string, rooms []string, limit int) ([]SearchResult, string, error) {
-	term = strings.ToLower(strings.TrimSpace(term))
-	if term == "" {
+	tokens := tokenizeSearch(term)
+	if len(tokens) == 0 {
 		return nil, "", nil
 	}
 	if limit <= 0 {
 		limit = 10
 	}
+	// Every token must appear: content::text LIKE ALL(...).
 	q := `SELECT event_id, room_id, content, type, sender, origin_server_ts, stream_ordering
 	      FROM events
-	      WHERE (LOWER(content::text) LIKE '%'||$1||'%')
+	      WHERE LOWER(content::text) LIKE ALL($1)
 	        AND room_id = ANY($2)
 	      ORDER BY stream_ordering DESC LIMIT $3`
-	rows, err := s.pool.Query(ctx, q, term, rooms, limit+1)
+	rows, err := s.pool.Query(ctx, q, tokens, rooms, limit+1)
 	if err != nil {
 		return nil, "", err
 	}
@@ -96,14 +100,25 @@ func (s *Store) SearchRoomEvents(ctx context.Context, term string, rooms []strin
 	}
 	nextBatch := ""
 	if hasMore && len(results) > 0 {
-		// Fetch the stream position of the oldest returned event for the token.
-		if id := results[len(results)-1].EventID; id != "" {
-			var st int64
-			_ = s.pool.QueryRow(ctx, `SELECT stream_ordering FROM events WHERE event_id=$1`, id).Scan(&st)
-			nextBatch = "s" + formatInt64(st)
-		}
+		var st int64
+		_ = s.pool.QueryRow(ctx, `SELECT stream_ordering FROM events WHERE event_id=$1`, results[len(results)-1].EventID).Scan(&st)
+		nextBatch = "s" + formatInt64(st)
 	}
 	return results, nextBatch, rows.Err()
+}
+
+// tokenizeSearch splits a search term into lowercased substring patterns
+// ("%tok%"), one per whitespace-separated token.
+func tokenizeSearch(term string) []string {
+	var patterns []string
+	for _, tok := range strings.Fields(term) {
+		tok = strings.ToLower(tok)
+		if tok == "" {
+			continue
+		}
+		patterns = append(patterns, "%"+tok+"%")
+	}
+	return patterns
 }
 
 func formatInt64(n int64) string {

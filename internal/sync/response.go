@@ -433,6 +433,8 @@ func (e *Engine) appendPresence(ctx context.Context, resp *Response, opts SyncOp
 }
 
 // presenceEvent marshals a stored presence row as an m.presence client event.
+// The event carries a top-level sender (the user whose presence changed), per
+// the presence EDU shape the spec requires in /sync.
 func presenceEvent(p *storage.PresenceRow) json.RawMessage {
 	content := map[string]any{
 		"presence":        p.Presence,
@@ -442,7 +444,11 @@ func presenceEvent(p *storage.PresenceRow) json.RawMessage {
 	if p.StatusMsg != "" {
 		content["status_msg"] = p.StatusMsg
 	}
-	ev, _ := json.Marshal(map[string]any{"type": "m.presence", "content": content})
+	ev, _ := json.Marshal(map[string]any{
+		"type":    "m.presence",
+		"sender":  p.UserID,
+		"content": content,
+	})
 	return ev
 }
 
