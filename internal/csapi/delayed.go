@@ -21,7 +21,10 @@ import (
 // due events, and clients can also send/cancel/restart them.
 func (a *API) registerDelayedEvents(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events", a.RequireAuth(a.DelayedEventsList))
-	mux.HandleFunc("POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delayID}/{action}", a.RequireAuth(a.DelayedEventAction))
+	// The action endpoint is not RequireAuth-wrapped: Complement asserts that an
+	// unauthenticated POST to an unknown delay ID returns 404 (not 401), and
+	// that an invalid action also 404s. Auth is checked manually below.
+	mux.HandleFunc("POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delayID}/{action}", a.DelayedEventAction)
 }
 
 // DelayedEventsList handles GET .../delayed_events.
@@ -51,11 +54,22 @@ func (a *API) DelayedEventsList(w http.ResponseWriter, r *http.Request) {
 }
 
 // DelayedEventAction handles POST .../delayed_events/{delayID}/{action} where
-// action is send | cancel | restart.
+// action is send | cancel | restart. Unknown delay IDs (and invalid actions)
+// are 404 even for unauthenticated callers, matching Complement's assertions;
+// a valid ID from an unauthenticated caller is 401.
 func (a *API) DelayedEventAction(w http.ResponseWriter, r *http.Request) {
-	auth, _ := homeserver.AuthFrom(r.Context())
 	delayID := r.PathValue("delayID")
 	action := r.PathValue("action")
+	exists := a.delayedEventExists(r.Context(), delayID)
+	auth, authErr := a.Authenticate(r)
+	if authErr != nil {
+		if !exists {
+			httpx.WriteError(w, httpx.ErrNotFound("delayed event not found"))
+			return
+		}
+		httpx.WriteError(w, authErr)
+		return
+	}
 	switch action {
 	case "send":
 		if err := a.fireDelayedEvent(r.Context(), auth.Localpart, delayID); err != nil {
@@ -73,10 +87,19 @@ func (a *API) DelayedEventAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	default:
-		httpx.WriteError(w, httpx.ErrInvalidParam("unknown action"))
+		httpx.WriteError(w, httpx.ErrNotFound("unknown action"))
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// delayedEventExists reports whether a delay ID exists for any user (used to
+// decide 404 vs 401 for unauthenticated action requests).
+func (a *API) delayedEventExists(ctx context.Context, delayID string) bool {
+	var one int
+	err := a.Store.Pool().QueryRow(ctx,
+		`SELECT 1 FROM delayed_events WHERE delay_id=$1 LIMIT 1`, delayID).Scan(&one)
+	return err == nil
 }
 
 // fireDelayedEvent builds and persists a delayed event as if the original
