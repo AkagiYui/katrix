@@ -12,6 +12,8 @@ import (
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/netutil/ssrf"
+	"github.com/AkagiYui/katrix/internal/pushrules"
+	"github.com/AkagiYui/katrix/internal/storage"
 )
 
 // registerMisc wires the P8 misc routes: push rules, filters, URL preview and
@@ -26,6 +28,14 @@ func (a *API) registerMisc(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}", a.RequireAuth(a.PutPushRule))
 	mux.HandleFunc("GET /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}", a.RequireAuth(a.GetPushRule))
 	mux.HandleFunc("DELETE /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}", a.RequireAuth(a.DeletePushRule))
+	// Push rule sub-resources: /enabled and /actions.
+	mux.HandleFunc("PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}/enabled", a.RequireAuth(a.PutPushRuleEnabled))
+	mux.HandleFunc("GET /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}/enabled", a.RequireAuth(a.GetPushRuleEnabled))
+	mux.HandleFunc("PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}/actions", a.RequireAuth(a.PutPushRuleActions))
+	mux.HandleFunc("GET /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}/actions", a.RequireAuth(a.GetPushRuleActions))
+	// Pushers (POST /pushers/set registers or removes an HTTP pusher).
+	mux.HandleFunc("POST /_matrix/client/v3/pushers/set", a.RequireAuth(a.PushSet))
+	mux.HandleFunc("GET /_matrix/client/v3/pushers", a.RequireAuth(a.PushGet))
 	// Public rooms.
 	mux.HandleFunc("GET /_matrix/client/v3/publicRooms", a.PublicRooms)
 	mux.HandleFunc("POST /_matrix/client/v3/publicRooms", a.RequireAuth(a.PublicRooms))
@@ -41,76 +51,125 @@ func (a *API) registerMisc(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/admin/statistics", a.RequireAuth(a.AdminStatistics))
 }
 
-// defaultPushRules returns the spec default global push ruleset.
-func defaultPushRules() map[string]any {
-	return map[string]any{
-		"global": map[string]any{
-			"content": []map[string]any{
-				{
-					"rule_id": ".m.rule.contains_user_name",
-					"enabled": true,
-					"actions": []map[string]any{{"set_tweak": "highlight", "value": true}, {"notify": map[string]any{}}},
-					"pattern": "",
-				},
-			},
-			"override": []map[string]any{
-				{"rule_id": ".m.rule.master", "enabled": false, "actions": []string{"dont_notify"}},
-				{"rule_id": ".m.rule.suppress_notices", "enabled": true,
-					"conditions": []map[string]any{{"kind": "event_match", "key": "content.msgtype", "pattern": "m.notice"}},
-					"actions":    []string{"dont_notify"}},
-			},
-			"room":   []any{},
-			"sender": []any{},
-			"underride": []map[string]any{
-				{"rule_id": ".m.rule.call", "enabled": true,
-					"conditions": []map[string]any{{"kind": "event_match", "key": "type", "pattern": "m.call.invite"}},
-					"actions":    []map[string]any{{"notify": map[string]any{}}, {"set_tweak": "ring", "value": true}}},
-				{"rule_id": ".m.rule.encrypted_room_one_to_one", "enabled": true, "actions": []map[string]any{{"notify": map[string]any{}}}},
-				{"rule_id": ".m.rule.room_one_to_one", "enabled": true, "actions": []map[string]any{{"notify": map[string]any{}}}},
-				{"rule_id": ".m.rule.message", "enabled": true, "actions": []map[string]any{{"notify": map[string]any{}}}},
-				{"rule_id": ".m.rule.encrypted", "enabled": true, "actions": []map[string]any{{"notify": map[string]any{}}}},
-			},
-		},
-	}
-}
-
-// GetPushRules handles GET /_matrix/client/v3/pushrules[/{scope}].
+// GetPushRules handles GET /_matrix/client/v3/pushrules[/{scope}]. The ruleset
+// is stored (and delivered in /sync) as the m.push_rules account data event,
+// so both views share one source of truth.
 func (a *API) GetPushRules(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
+	scope := r.PathValue("scope")
 	raw, err := a.Store.GetPushRules(r.Context(), auth.Localpart)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
 	if len(raw) == 0 {
-		httpx.WriteJSON(w, http.StatusOK, defaultPushRules())
+		raw = pushrules.MarshalDefault()
+	}
+	if scope == "" {
+		httpx.WriteJSON(w, http.StatusOK, json.RawMessage(raw))
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, json.RawMessage(raw))
+	if scope != "global" {
+		httpx.WriteError(w, httpx.ErrNotFound("unknown scope"))
+		return
+	}
+	var rules map[string]any
+	_ = json.Unmarshal(raw, &rules)
+	global, _ := rules["global"].(map[string]any)
+	if global == nil {
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{})
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, global)
 }
 
-// GetPushRule handles GET a single rule (returns the global ruleset slice for kind).
+// GetPushRule handles GET /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}.
 func (a *API) GetPushRule(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	kind := r.PathValue("kind")
-	raw, _ := a.Store.GetPushRules(r.Context(), auth.Localpart)
-	var rules map[string]any
-	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &rules)
-	}
-	if rules == nil {
-		rules = defaultPushRules()
-	}
+	ruleID := r.PathValue("ruleID")
+	rules := a.loadRules(auth.Localpart)
 	global := rules["global"].(map[string]any)
-	httpx.WriteJSON(w, http.StatusOK, global[kind])
+	list, _ := global[kind].([]any)
+	for _, e := range list {
+		if em, ok := e.(map[string]any); ok && em["rule_id"] == ruleID {
+			httpx.WriteJSON(w, http.StatusOK, em)
+			return
+		}
+	}
+	httpx.WriteError(w, httpx.ErrNotFound("push rule not found"))
 }
 
-// PutPushRule handles PUT a single rule (stores the whole ruleset with the
-// rule added/replaced).
+// GetPushRuleEnabled handles GET /pushrules/{scope}/{kind}/{ruleID}/enabled.
+func (a *API) GetPushRuleEnabled(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	rule := a.findRule(auth.Localpart, r.PathValue("kind"), r.PathValue("ruleID"))
+	if rule == nil {
+		httpx.WriteError(w, httpx.ErrNotFound("push rule not found"))
+		return
+	}
+	enabled, _ := rule["enabled"].(bool)
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"enabled": enabled})
+}
+
+// PutPushRuleEnabled handles PUT /pushrules/{scope}/{kind}/{ruleID}/enabled.
+func (a *API) PutPushRuleEnabled(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	if a.mutateRule(auth.Localpart, r.PathValue("kind"), r.PathValue("ruleID"), func(rule map[string]any) {
+		rule["enabled"] = req.Enabled
+	}) {
+		a.Notifier.NotifyUser(auth.UserID)
+	}
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// GetPushRuleActions handles GET /pushrules/{scope}/{kind}/{ruleID}/actions.
+func (a *API) GetPushRuleActions(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	rule := a.findRule(auth.Localpart, r.PathValue("kind"), r.PathValue("ruleID"))
+	if rule == nil {
+		httpx.WriteError(w, httpx.ErrNotFound("push rule not found"))
+		return
+	}
+	actions, _ := rule["actions"]
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"actions": actions})
+}
+
+// PutPushRuleActions handles PUT /pushrules/{scope}/{kind}/{ruleID}/actions.
+func (a *API) PutPushRuleActions(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	var req struct {
+		Actions []json.RawMessage `json:"actions"`
+	}
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	if a.mutateRule(auth.Localpart, r.PathValue("kind"), r.PathValue("ruleID"), func(rule map[string]any) {
+		rule["actions"] = req.Actions
+	}) {
+		a.Notifier.NotifyUser(auth.UserID)
+	}
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// PutPushRule handles PUT a single rule. The optional before/after query
+// parameters reorder the rule within its kind list (spec ordering semantics).
 func (a *API) PutPushRule(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	kind := r.PathValue("kind")
 	ruleID := r.PathValue("ruleID")
+	if !contains(pushrules.Kinds, kind) {
+		httpx.WriteError(w, httpx.ErrInvalidParam("unknown rule kind"))
+		return
+	}
 	body, err := readBody(r)
 	if err != nil {
 		httpx.WriteError(w, err)
@@ -119,31 +178,41 @@ func (a *API) PutPushRule(w http.ResponseWriter, r *http.Request) {
 	var newRule map[string]any
 	_ = json.Unmarshal(body, &newRule)
 	newRule["rule_id"] = ruleID
-	raw, _ := a.Store.GetPushRules(r.Context(), auth.Localpart)
-	var rules map[string]any
-	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &rules)
+	// A newly created rule is enabled by default when the body omits it.
+	if _, ok := newRule["enabled"]; !ok {
+		newRule["enabled"] = true
 	}
-	if rules == nil {
-		rules = defaultPushRules()
-	}
+	rules := a.loadRules(auth.Localpart)
 	global := rules["global"].(map[string]any)
 	list, _ := global[kind].([]any)
-	replaced := false
+	// Remove an existing rule with the same ID, remembering its position.
+	pos := -1
 	for i, e := range list {
 		if em, ok := e.(map[string]any); ok && em["rule_id"] == ruleID {
-			list[i] = newRule
-			replaced = true
+			pos = i
+			list = append(list[:i], list[i+1:]...)
 			break
 		}
 	}
-	if !replaced {
+	before := r.URL.Query().Get("before")
+	after := r.URL.Query().Get("after")
+	switch {
+	case before != "":
+		list = insertBefore(list, before, newRule)
+	case after != "":
+		list = insertAfter(list, after, newRule)
+	case pos >= 0 && pos < len(list):
+		list = append(list[:pos], append([]any{newRule}, list[pos:]...)...)
+	default:
 		list = append(list, newRule)
 	}
 	global[kind] = list
 	rules["global"] = global
-	out, _ := json.Marshal(rules)
-	_ = a.Store.SetPushRules(r.Context(), auth.Localpart, out)
+	if err := a.savePushRules(auth.Localpart, rules); err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	a.Notifier.NotifyUser(auth.UserID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
@@ -152,14 +221,7 @@ func (a *API) DeletePushRule(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	kind := r.PathValue("kind")
 	ruleID := r.PathValue("ruleID")
-	raw, _ := a.Store.GetPushRules(r.Context(), auth.Localpart)
-	var rules map[string]any
-	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &rules)
-	}
-	if rules == nil {
-		rules = defaultPushRules()
-	}
+	rules := a.loadRules(auth.Localpart)
 	global := rules["global"].(map[string]any)
 	list, _ := global[kind].([]any)
 	next := list[:0]
@@ -171,9 +233,191 @@ func (a *API) DeletePushRule(w http.ResponseWriter, r *http.Request) {
 	}
 	global[kind] = next
 	rules["global"] = global
-	out, _ := json.Marshal(rules)
-	_ = a.Store.SetPushRules(r.Context(), auth.Localpart, out)
+	if err := a.savePushRules(auth.Localpart, rules); err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	a.Notifier.NotifyUser(auth.UserID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// ---- Pushers ----
+
+// pushSetRequest is the POST /pushers/set body.
+type pushSetRequest struct {
+	ProfileTag        string          `json:"profile_tag,omitempty"`
+	Kind              string          `json:"kind,omitempty"`
+	AppID             string          `json:"app_id"`
+	AppDisplayName    string          `json:"app_display_name,omitempty"`
+	DeviceDisplayName string          `json:"device_display_name,omitempty"`
+	PushKey           string          `json:"pushkey"`
+	Lang              string          `json:"lang,omitempty"`
+	Data              json.RawMessage `json:"data,omitempty"`
+	Append            bool            `json:"append,omitempty"`
+}
+
+// PushSet handles POST /_matrix/client/v3/pushers/set. A missing app_id +
+// pushkey (or an explicit delete signal) removes the pusher; otherwise it is
+// upserted and tied to the creating access token.
+func (a *API) PushSet(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	var req pushSetRequest
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	if req.AppID == "" && req.PushKey == "" {
+		// Delete: the spec sends an empty body (or omits app_id/pushkey) to
+		// remove all pushers of the current app/token.
+		if req.AppID == "" {
+			req.AppID = "m.default"
+		}
+		_ = a.Store.DeletePusher(r.Context(), auth.Localpart, req.AppID, req.PushKey)
+		httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+		return
+	}
+	if req.AppID == "" || req.PushKey == "" {
+		httpx.WriteError(w, httpx.ErrInvalidParam("app_id and pushkey are required"))
+		return
+	}
+	if req.Kind == "" {
+		req.Kind = "http"
+	}
+	if len(req.Data) == 0 {
+		req.Data = json.RawMessage(`{}`)
+	}
+	err := a.Store.UpsertPusher(r.Context(), storage.Pusher{
+		UserLocalpart:     auth.Localpart,
+		ProfileTag:        req.ProfileTag,
+		Kind:              req.Kind,
+		AppID:             req.AppID,
+		AppDisplayName:    req.AppDisplayName,
+		DeviceDisplayName: req.DeviceDisplayName,
+		PushKey:           req.PushKey,
+		Lang:              req.Lang,
+		Data:              req.Data,
+		CreatedByToken:    homeserver.AccessToken(r),
+		CreatedTS:         a.Now(),
+	})
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// PushGet handles GET /_matrix/client/v3/pushers.
+func (a *API) PushGet(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	rows, err := a.Store.ListPushers(r.Context(), auth.Localpart)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	pushers := make([]map[string]any, 0, len(rows))
+	for _, p := range rows {
+		var data map[string]any
+		_ = json.Unmarshal(p.Data, &data)
+		if data == nil {
+			data = map[string]any{}
+		}
+		pushers = append(pushers, map[string]any{
+			"profile_tag":         p.ProfileTag,
+			"kind":                p.Kind,
+			"app_id":              p.AppID,
+			"app_display_name":    p.AppDisplayName,
+			"device_display_name": p.DeviceDisplayName,
+			"pushkey":             p.PushKey,
+			"lang":                p.Lang,
+			"data":                data,
+		})
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"pushers": pushers})
+}
+
+// ---- push rules helpers ----
+
+// savePushRules persists a user's ruleset to the push_rules table AND mirrors
+// it into the m.push_rules account data entry. The mirror is what delivers the
+// ruleset in /sync (initial + incremental) and wakes the long-poll on any
+// change; GET /pushrules reads the canonical table.
+func (a *API) savePushRules(localpart string, rules map[string]any) error {
+	out, err := json.Marshal(rules)
+	if err != nil {
+		return err
+	}
+	if err := a.Store.SetPushRules(context.Background(), localpart, out); err != nil {
+		return err
+	}
+	_, err = a.Store.SetAccountData(context.Background(), localpart, "", pushrules.PushRulesAccountDataType, out)
+	return err
+}
+
+// loadRules returns the user's ruleset map, defaulting when unset.
+func (a *API) loadRules(localpart string) map[string]any {
+	raw, _ := a.Store.GetPushRules(context.Background(), localpart)
+	if len(raw) == 0 {
+		return pushrules.DefaultRuleset()
+	}
+	var rules map[string]any
+	if err := json.Unmarshal(raw, &rules); err != nil || rules == nil || rules["global"] == nil {
+		return pushrules.DefaultRuleset()
+	}
+	return rules
+}
+
+// findRule returns a rule by kind+ID within the user's ruleset, or nil.
+func (a *API) findRule(localpart, kind, ruleID string) map[string]any {
+	rules := a.loadRules(localpart)
+	global, _ := rules["global"].(map[string]any)
+	list, _ := global[kind].([]any)
+	for _, e := range list {
+		if em, ok := e.(map[string]any); ok && em["rule_id"] == ruleID {
+			return em
+		}
+	}
+	return nil
+}
+
+// mutateRule applies fn to a rule (creating it if absent) and persists the
+// ruleset (including the m.push_rules account data mirror). It reports whether
+// a change was persisted.
+func (a *API) mutateRule(localpart, kind, ruleID string, fn func(map[string]any)) bool {
+	rules := a.loadRules(localpart)
+	global := rules["global"].(map[string]any)
+	list, _ := global[kind].([]any)
+	for _, e := range list {
+		if em, ok := e.(map[string]any); ok && em["rule_id"] == ruleID {
+			fn(em)
+			return a.savePushRules(localpart, rules) == nil
+		}
+	}
+	// Create the rule if it does not exist (enabled default true).
+	rule := map[string]any{"rule_id": ruleID, "enabled": true}
+	fn(rule)
+	global[kind] = append(list, rule)
+	rules["global"] = global
+	return a.savePushRules(localpart, rules) == nil
+}
+
+// insertBefore places rule before the rule with the given ID (or at the start).
+func insertBefore(list []any, beforeID string, rule any) []any {
+	for i, e := range list {
+		if em, ok := e.(map[string]any); ok && em["rule_id"] == beforeID {
+			return append(list[:i], append([]any{rule}, list[i:]...)...)
+		}
+	}
+	return append([]any{rule}, list...)
+}
+
+// insertAfter places rule after the rule with the given ID (or at the end).
+func insertAfter(list []any, afterID string, rule any) []any {
+	for i, e := range list {
+		if em, ok := e.(map[string]any); ok && em["rule_id"] == afterID {
+			return append(list[:i+1], append([]any{rule}, list[i+1:]...)...)
+		}
+	}
+	return append(list, rule)
 }
 
 // PostFilter handles POST /_matrix/client/v3/user/{userID}/filter.

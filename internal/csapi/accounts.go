@@ -10,6 +10,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/ids"
+	"github.com/AkagiYui/katrix/internal/pushrules"
 	"github.com/AkagiYui/katrix/internal/storage"
 )
 
@@ -140,6 +141,9 @@ func (a *API) completeRegistration(w http.ResponseWriter, r *http.Request, local
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	// Seed the default push ruleset as m.push_rules account data so an initial
+	// /sync always carries the rules, and so rule mutations have a row to bump.
+	_ = a.savePushRules(localpart, pushrules.DefaultRuleset())
 
 	resp := map[string]any{
 		"user_id":     a.UserID(localpart),
@@ -173,6 +177,7 @@ func (a *API) completeGuestRegistration(w http.ResponseWriter, r *http.Request, 
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	_ = a.savePushRules(localpart, pushrules.DefaultRuleset())
 	deviceID := ids.RandomDeviceID()
 	login, err := a.issueLogin(r, localpart, deviceID, req.InitialDeviceDisplayName, req.RefreshToken)
 	if err != nil {
@@ -450,6 +455,14 @@ func (a *API) ChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	if logoutDevices {
 		if err := a.Store.DeleteAllAccessTokensExcept(r.Context(), auth.Localpart, auth.DeviceID); err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+		// Pushers created with the now-invalidated access tokens are deleted;
+		// pushers created by the surviving device's token remain (spec
+		// "Pushers created with a different access token are deleted on
+		// password change").
+		if err := a.Store.DeletePushersForDeletedTokens(r.Context(), auth.Localpart); err != nil {
 			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
 		}

@@ -105,6 +105,10 @@ func extractToken(r *http.Request) string {
 	return r.URL.Query().Get("access_token")
 }
 
+// AccessToken returns the raw access token from a request (for handlers that
+// need to associate stored state with the creating session, e.g. pushers).
+func AccessToken(r *http.Request) string { return extractToken(r) }
+
 // Authenticate resolves the request's access token to an Auth, or returns a
 // Matrix error suitable for WriteError.
 func (h *HS) Authenticate(r *http.Request) (*Auth, error) {
