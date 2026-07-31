@@ -11,6 +11,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/storage"
+	syncpkg "github.com/AkagiYui/katrix/internal/sync"
 )
 
 // registerE2EE wires the P7 E2EE relay routes. The server only relays keys,
@@ -80,6 +81,10 @@ func (a *API) KeysUpload(w http.ResponseWriter, r *http.Request) {
 		_, _ = a.Store.UpsertDeviceKey(r.Context(), storage.DeviceKey{
 			UserID: auth.UserID, DeviceID: auth.DeviceID, KeyJSON: req.DeviceKeys,
 		})
+		// Record a device-list change so /sync delivers device_lists.changed to
+		// the user's other devices (and /keys/changes to federating servers).
+		_, _ = a.Store.RecordDeviceListChange(r.Context(), auth.UserID, false)
+		a.Notifier.NotifyUsers(auth.UserID)
 	}
 	// Persist one-time keys.
 	if len(req.OneTimeKeys) > 0 {
@@ -210,11 +215,21 @@ func (a *API) KeysClaim(w http.ResponseWriter, r *http.Request) {
 
 // KeysChanges handles GET /_matrix/client/v3/keys/changes.
 func (a *API) KeysChanges(w http.ResponseWriter, r *http.Request) {
-	from := r.URL.Query().Get("from")
-	to := r.URL.Query().Get("to")
-	_ = from
+	from, okFrom := syncpkg.DecodeToken(r.URL.Query().Get("from"))
+	if !okFrom {
+		from = syncpkg.Token{}
+	}
+	to, okTo := syncpkg.DecodeToken(r.URL.Query().Get("to"))
+	if !okTo {
+		to = syncpkg.Token{Stream: 1 << 62}
+	}
+	changed, left, err := a.Store.DeviceListChangesSince(r.Context(), from.Stream)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
 	_ = to
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"changed": []string{}, "left": []string{}})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"changed": changed, "left": left})
 }
 
 // SendToDevice handles POST /_matrix/client/v3/sendToDevice/{eventType}/{txnID}.

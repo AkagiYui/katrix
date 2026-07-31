@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/AkagiYui/katrix/internal/events"
@@ -18,6 +19,13 @@ type Response struct {
 	Presence    *PresenceResp  `json:"presence,omitempty"`
 	AccountData *EventsSection `json:"account_data,omitempty"`
 	ToDevice    *EventsSection `json:"to_device,omitempty"`
+	DeviceLists *DeviceLists   `json:"device_lists,omitempty"`
+}
+
+// DeviceLists carries device-list changes for the syncing user.
+type DeviceLists struct {
+	Changed []string `json:"changed,omitempty"`
+	Left    []string `json:"left,omitempty"`
 }
 
 // RoomsResp is the rooms section of /sync.
@@ -33,7 +41,15 @@ type JoinedRoom struct {
 	State       StateSet          `json:"state"`
 	AccountData StateSet          `json:"account_data,omitempty"`
 	Ephemeral   []json.RawMessage `json:"ephemeral,omitempty"`
+	Summary     *RoomSummary      `json:"summary,omitempty"`
 	// UnreadNotifications omitted (P8).
+}
+
+// RoomSummary carries the room's member counts (joined + invited).
+type RoomSummary struct {
+	JoinedMembers  int      `json:"m.joined_member_count,omitempty"`
+	InvitedMembers int      `json:"m.invited_member_count,omitempty"`
+	Heroes         []string `json:"m.heroes,omitempty"`
 }
 
 // InvitedRoom is a room the user is invited to.
@@ -78,6 +94,135 @@ type SyncOptions struct {
 	Timeout     time.Duration
 	FullState   bool
 	SetPresence string
+	Filter      *SyncFilter
+}
+
+// SyncFilter is the subset of the filter object that /sync honours. Unknown
+// fields are ignored (the full filter is validated at POST /filter).
+type SyncFilter struct {
+	// Room timeline filters, applied per joined room.
+	TimelineTypes      []string
+	TimelineNotTypes   []string
+	TimelineSenders    []string
+	TimelineNotSenders []string
+	TimelineLimit      int
+	// Lazy-load members: only include membership state events, and only for
+	// senders present in the timeline.
+	LazyLoadMembers bool
+	// IncludeLeave controls whether left rooms appear in the response.
+	IncludeLeave bool
+	// EventFields narrows the per-event fields returned (JSON pointer paths).
+	EventFields []string
+}
+
+// ParseSyncFilter decodes a raw filter JSON object into the subset /sync
+// honours. A nil/empty input yields a nil filter (no restriction).
+func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var obj struct {
+		Room struct {
+			Timeline struct {
+				Types      []string `json:"types"`
+				NotTypes   []string `json:"not_types"`
+				Senders    []string `json:"senders"`
+				NotSenders []string `json:"not_senders"`
+				Limit      int      `json:"limit"`
+			} `json:"timeline"`
+			State struct {
+				LazyLoadMembers bool `json:"lazy_load_members"`
+			} `json:"state"`
+			IncludeLeave bool `json:"include_leave"`
+		} `json:"room"`
+		EventFields []string `json:"event_fields"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil
+	}
+	f := &SyncFilter{
+		TimelineTypes:      obj.Room.Timeline.Types,
+		TimelineNotTypes:   obj.Room.Timeline.NotTypes,
+		TimelineSenders:    obj.Room.Timeline.Senders,
+		TimelineNotSenders: obj.Room.Timeline.NotSenders,
+		TimelineLimit:      obj.Room.Timeline.Limit,
+		LazyLoadMembers:    obj.Room.State.LazyLoadMembers,
+		IncludeLeave:       obj.Room.IncludeLeave,
+		EventFields:        obj.EventFields,
+	}
+	// A filter with nothing set behaves like no filter.
+	if !f.anySet() {
+		return nil
+	}
+	return f
+}
+
+func (f *SyncFilter) anySet() bool {
+	return f.TimelineLimit > 0 || f.LazyLoadMembers || f.IncludeLeave ||
+		len(f.TimelineTypes) > 0 || len(f.TimelineNotTypes) > 0 ||
+		len(f.TimelineSenders) > 0 || len(f.TimelineNotSenders) > 0 ||
+		len(f.EventFields) > 0
+}
+
+// keepTimeline reports whether a timeline event passes the filter.
+func (f *SyncFilter) keepTimeline(ev *storage.EventRow) bool {
+	if f == nil {
+		return true
+	}
+	if strIn(f.TimelineNotTypes, ev.Type) {
+		return false
+	}
+	if len(f.TimelineTypes) > 0 && !strIn(f.TimelineTypes, ev.Type) {
+		return false
+	}
+	if strIn(f.TimelineNotSenders, ev.Sender) {
+		return false
+	}
+	if len(f.TimelineSenders) > 0 && !strIn(f.TimelineSenders, ev.Sender) {
+		return false
+	}
+	return true
+}
+
+// lazyLoadMembers reports whether member events for timeline senders should be
+// included in the state section (and only those).
+func (f *SyncFilter) lazyLoadMembers() bool { return f != nil && f.LazyLoadMembers }
+
+// applyEventFields narrows a client event to the requested JSON pointer paths.
+// When the filter has no event_fields the event is returned unchanged.
+func (f *SyncFilter) applyEventFields(ev json.RawMessage) json.RawMessage {
+	if f == nil || len(f.EventFields) == 0 {
+		return ev
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(ev, &obj); err != nil {
+		return ev
+	}
+	out := map[string]json.RawMessage{}
+	for _, ptr := range f.EventFields {
+		key := ptr
+		if len(key) > 0 && key[0] == '/' {
+			key = key[1:]
+		}
+		// Only single-segment pointers are supported.
+		if strings.Contains(key, "/") {
+			continue
+		}
+		if v, ok := obj[key]; ok {
+			out[key] = v
+		}
+	}
+	b, _ := json.Marshal(out)
+	return b
+}
+
+func strIn(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // Sync computes the /sync response. For initial sync (Since.Stream==0) it
@@ -163,26 +308,17 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 		}
 	}
 
-	// Presence: include the calling user's own presence state.
-	if p, err := e.store.GetPresence(ctx, opts.UserID); err == nil && p != nil {
-		ev, _ := json.Marshal(map[string]any{
-			"type": "m.presence",
-			"content": map[string]any{
-				"presence": p.Presence,
-				"user_id":  p.UserID,
-			},
-		})
-		if p.StatusMsg != "" {
-			ev, _ = json.Marshal(map[string]any{
-				"type": "m.presence",
-				"content": map[string]any{
-					"presence":   p.Presence,
-					"user_id":    p.UserID,
-					"status_msg": p.StatusMsg,
-				},
-			})
+	// Presence: presence events for the calling user and for room peers whose
+	// presence changed after the sync token (incremental) or all joined room
+	// peers (initial sync).
+	e.appendPresence(ctx, resp, opts)
+
+	// Device list changes for the syncing user (their own device list updates
+	// surface on their other devices' /sync).
+	if changed, left, err := e.store.DeviceListChangesSince(ctx, opts.Since.Stream); err == nil {
+		if len(changed) > 0 || len(left) > 0 {
+			resp.DeviceLists = &DeviceLists{Changed: changed, Left: left}
 		}
-		resp.Presence = &PresenceResp{Events: []json.RawMessage{ev}}
 	}
 
 	// Ephemeral: typing + receipts.
@@ -246,32 +382,137 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	return resp, nil
 }
 
+// appendPresence fills the response's presence section: the syncing user's own
+// presence, plus room peers' presence. On incremental sync only peers whose
+// presence changed after the sync token are emitted; on initial sync all joined
+// room peers are emitted (the spec's "presence events for all users the client
+// shares a room with" on initial sync).
+func (e *Engine) appendPresence(ctx context.Context, resp *Response, opts SyncOptions) {
+	// Own presence (always included).
+	var events []json.RawMessage
+	if p, err := e.store.GetPresence(ctx, opts.UserID); err == nil && p != nil {
+		events = append(events, presenceEvent(p))
+	}
+
+	// Peers: users sharing a joined room with the syncer.
+	peers := e.roomPeers(ctx, opts)
+	if len(peers) == 0 {
+		if len(events) > 0 {
+			resp.Presence = &PresenceResp{Events: events}
+		}
+		return
+	}
+
+	var userIDs []string
+	if opts.Since.Stream > 0 {
+		// Incremental: only peers whose presence changed since the token.
+		changed, err := e.store.PresenceChangesSince(ctx, opts.Since.Stream)
+		if err != nil {
+			changed = nil
+		}
+		for _, u := range changed {
+			if peers[u] && u != opts.UserID {
+				userIDs = append(userIDs, u)
+			}
+		}
+	} else {
+		for u := range peers {
+			if u != opts.UserID {
+				userIDs = append(userIDs, u)
+			}
+		}
+	}
+	for _, u := range userIDs {
+		if p, err := e.store.GetPresence(ctx, u); err == nil && p != nil {
+			events = append(events, presenceEvent(p))
+		}
+	}
+	if len(events) > 0 {
+		resp.Presence = &PresenceResp{Events: events}
+	}
+}
+
+// presenceEvent marshals a stored presence row as an m.presence client event.
+func presenceEvent(p *storage.PresenceRow) json.RawMessage {
+	content := map[string]any{
+		"presence":        p.Presence,
+		"user_id":         p.UserID,
+		"last_active_ago": presenceLastActiveAgo(p),
+	}
+	if p.StatusMsg != "" {
+		content["status_msg"] = p.StatusMsg
+	}
+	ev, _ := json.Marshal(map[string]any{"type": "m.presence", "content": content})
+	return ev
+}
+
+func presenceLastActiveAgo(p *storage.PresenceRow) int64 {
+	if p.LastActiveTS > 0 {
+		if ago := time.Now().UnixMilli() - p.LastActiveTS; ago >= 0 {
+			return ago
+		}
+	}
+	return 0
+}
+
+// roomPeers returns the set of user IDs sharing a joined room with the syncer.
+func (e *Engine) roomPeers(ctx context.Context, opts SyncOptions) map[string]bool {
+	roomIDs, err := e.store.RoomsForUser(ctx, opts.UserID)
+	if err != nil {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, roomID := range roomIDs {
+		users, err := e.store.JoinedUserIDs(ctx, roomID)
+		if err != nil {
+			continue
+		}
+		for _, u := range users {
+			out[u] = true
+		}
+	}
+	return out
+}
+
 // buildJoinedRoom constructs the JoinedRoom section.
 func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOptions, maxStream int64) (JoinedRoom, error) {
 	jr := JoinedRoom{}
+	filter := opts.Filter
 	// Timeline: events with stream_ordering > since, limited to 50 for initial.
 	from := opts.Since.Stream
+	limit := 50
+	if filter != nil && filter.TimelineLimit > 0 {
+		limit = filter.TimelineLimit
+	}
 	if from == 0 {
-		from = maxStream - 50
+		from = maxStream - int64(limit)
 		if from < 0 {
 			from = 0
 		}
 	}
-	evs, err := e.store.EventsForRoom(ctx, roomID, from, maxStream, 50, "f")
+	evs, err := e.store.EventsForRoom(ctx, roomID, from, maxStream, limit, "f")
 	if err != nil {
 		return jr, err
 	}
+	// Track senders for lazy-load members.
+	senders := map[string]bool{}
 	timeline := Timeline{Events: make([]json.RawMessage, 0, len(evs))}
 	for _, ev := range evs {
-		timeline.Events = append(timeline.Events, clientEvent(&ev))
+		if !filter.keepTimeline(&ev) {
+			continue
+		}
+		timeline.Events = append(timeline.Events, filter.applyEventFields(clientEvent(&ev)))
+		senders[ev.Sender] = true
 	}
-	if len(timeline.Events) >= 50 {
+	if len(evs) >= limit {
 		timeline.Limited = true
 		timeline.PrevBatch = Token{Stream: from}.Encode()
 	}
 	jr.Timeline = timeline
 
 	// State: full state on initial sync or full_state; otherwise empty (delta).
+	// Lazy-load members replaces the full state with only the m.room.member
+	// events for timeline senders.
 	if opts.Since.Stream == 0 || opts.FullState {
 		stateRows, err := e.store.GetState(ctx, roomID)
 		if err != nil {
@@ -284,10 +525,59 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		stateEvs, _ := e.store.EventsByIDs(ctx, ids)
 		jr.State.Events = make([]json.RawMessage, 0, len(stateEvs))
 		for _, se := range stateEvs {
-			jr.State.Events = append(jr.State.Events, clientEvent(&se))
+			if filter.lazyLoadMembers() && !lazyLoadMemberEvent(&se, senders) {
+				continue
+			}
+			jr.State.Events = append(jr.State.Events, filter.applyEventFields(clientEvent(&se)))
 		}
 	}
+
+	// Room summary: joined/invited member counts (spec m.joined_member_count /
+	// m.invited_member_count) plus up to five hero user IDs.
+	jr.Summary = e.roomSummary(ctx, roomID, opts.UserID)
 	return jr, nil
+}
+
+// lazyLoadMemberEvent reports whether a state event should be included under a
+// lazy_load_members filter: membership events of timeline senders (and the
+// syncing user's own membership) are included; everything else is dropped.
+func lazyLoadMemberEvent(ev *storage.EventRow, senders map[string]bool) bool {
+	if ev.Type != "m.room.member" {
+		return false
+	}
+	if senders[ev.Sender] {
+		return true
+	}
+	return false
+}
+
+// roomSummary builds the room summary section (member counts + heroes).
+func (e *Engine) roomSummary(ctx context.Context, roomID, selfUserID string) *RoomSummary {
+	members, err := e.store.Members(ctx, roomID, "")
+	if err != nil {
+		return nil
+	}
+	joined, invited := 0, 0
+	var heroes []string
+	for _, m := range members {
+		switch m.Membership {
+		case "join":
+			joined++
+			if m.UserID != selfUserID && len(heroes) < 5 {
+				heroes = append(heroes, m.UserID)
+			}
+		case "invite":
+			invited++
+			if len(heroes) < 5 {
+				heroes = append(heroes, m.UserID)
+			}
+		}
+	}
+	return &RoomSummary{
+		JoinedMembers:  joined,
+		InvitedMembers: invited,
+		Heroes:         heroes,
+	}
 }
 
 // buildInvitedRoom constructs the InvitedRoom section (just the invite state).

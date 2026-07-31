@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/jackc/pgx/v5"
@@ -18,16 +19,25 @@ type AccountDataRow struct {
 	StreamID      int64
 }
 
+// NextSyncStream allocates the next position in the shared sync stream. Every
+// /sync-relevant write (events via their column default, account data,
+// receipts, device-list changes, presence changes) draws from this one
+// sequence, so /sync's since token (the stream position) advances exactly once
+// per change regardless of which source produced it.
+func (s *Store) NextSyncStream(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.pool.QueryRow(ctx, `SELECT nextval('sync_stream')`).Scan(&n)
+	return n, err
+}
+
 // SetAccountData upserts an account_data row.
 func (s *Store) SetAccountData(ctx context.Context, userLocalpart, roomID, eventType string, content []byte) (int64, error) {
-	// Use the event stream-id space so /sync's "since" token (which tracks
-	// event stream_ordering) also gates account_data. Set stream_id to the
-	// current max event stream_ordering + 1 so it appears on the next poll.
-	var streamID int64
-	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(stream_ordering),0)+1 FROM events`).Scan(&streamID); err != nil {
+	// Draw from the shared sync stream so /sync's since token gates this row.
+	streamID, err := s.NextSyncStream(ctx)
+	if err != nil {
 		return 0, err
 	}
-	_, err := s.pool.Exec(ctx,
+	_, err = s.pool.Exec(ctx,
 		`INSERT INTO account_data(user_localpart, room_id, type, content, stream_id)
 		 VALUES ($1,$2,$3,$4,$5)
 		 ON CONFLICT (user_localpart, room_id, type) DO UPDATE SET content=EXCLUDED.content, stream_id=EXCLUDED.stream_id`,
@@ -37,7 +47,7 @@ func (s *Store) SetAccountData(ctx context.Context, userLocalpart, roomID, event
 }
 
 // GetAccountData returns the content for a global (roomID="") account_data
-// entry, or ErrNotFound if not set.
+// entry, or ErrNotFound if not set (including deletion tombstones).
 func (s *Store) GetAccountData(ctx context.Context, userLocalpart, roomID, eventType string) ([]byte, error) {
 	var content []byte
 	err := s.pool.QueryRow(ctx,
@@ -49,20 +59,27 @@ func (s *Store) GetAccountData(ctx context.Context, userLocalpart, roomID, event
 		}
 		return nil, err
 	}
+	if IsAccountDataDeleted(content) {
+		return nil, ErrNotFound
+	}
 	return content, nil
 }
 
-// DeleteAccountData removes an account_data entry. It is idempotent: deleting
-// a non-existent entry succeeds (no rows affected). It returns the entry's
-// stream_id (for /sync gating) or 0 if the entry was absent.
+// DeleteAccountData removes an account_data entry. Per MSC3391 the deletion is
+// surfaced to clients as an empty-content event in /sync, so instead of
+// removing the row we set its content to {} and bump its stream position: the
+// delta then carries a tombstone the client can apply. GetAccountData reports
+// ErrNotFound for tombstoned rows so a GET still 404s.
 func (s *Store) DeleteAccountData(ctx context.Context, userLocalpart, roomID, eventType string) (int64, error) {
-	var streamID int64
-	_, err := s.pool.Exec(ctx,
-		`DELETE FROM account_data WHERE user_localpart=$1 AND COALESCE(room_id,'')=$2 AND type=$3`,
-		userLocalpart, roomID, eventType)
-	// stream_id is not returned on DELETE; the /sync delta for account_data
-	// uses the next-poll token, so a 0 here is acceptable (the absence is what
-	// surfaces to the client on the next /sync).
+	streamID, err := s.NextSyncStream(ctx)
+	if err != nil {
+		return 0, err
+	}
+	_, err = s.pool.Exec(ctx,
+		`INSERT INTO account_data(user_localpart, room_id, type, content, stream_id)
+		 VALUES ($1,$2,$3,'{}'::jsonb,$4)
+		 ON CONFLICT (user_localpart, room_id, type) DO UPDATE SET content='{}'::jsonb, stream_id=EXCLUDED.stream_id`,
+		userLocalpart, roomID, eventType, streamID)
 	return streamID, err
 }
 
@@ -88,6 +105,16 @@ func (s *Store) AccountDataSince(ctx context.Context, userLocalpart string, sinc
 	return out, rows.Err()
 }
 
+// IsAccountDataDeleted reports whether a stored account_data row is a deletion
+// tombstone (empty content, set by DeleteAccountData).
+func IsAccountDataDeleted(content []byte) bool {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(content, &m); err != nil {
+		return false
+	}
+	return len(m) == 0
+}
+
 // ---- Receipts ----
 
 // ReceiptRow is a receipt.
@@ -103,16 +130,13 @@ type ReceiptRow struct {
 
 // SetReceipt upserts a receipt for a user in a room.
 func (s *Store) SetReceipt(ctx context.Context, r ReceiptRow) (int64, error) {
-	// Use the same stream-id space as events so /sync's incremental "since"
-	// token (which tracks event stream_ordering) also gates receipts. We set
-	// the receipt's stream_id to the current max event stream_ordering so a
-	// receipt posted after a sync token will be returned on the next poll.
-	var streamID int64
-	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(stream_ordering),0)+1 FROM events`).Scan(&streamID); err != nil {
+	// Draw from the shared sync stream so /sync's since token gates this row.
+	streamID, err := s.NextSyncStream(ctx)
+	if err != nil {
 		return 0, err
 	}
 	thread := r.ThreadID
-	_, err := s.pool.Exec(ctx,
+	_, err = s.pool.Exec(ctx,
 		`INSERT INTO receipts(room_id, user_id, receipt_type, thread_id, event_id, ts, stream_id)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7)
 		 ON CONFLICT (room_id, user_id, receipt_type, thread_id) DO UPDATE SET event_id=EXCLUDED.event_id, ts=EXCLUDED.ts, stream_id=EXCLUDED.stream_id`,
@@ -146,20 +170,16 @@ func (s *Store) ReceiptsSince(ctx context.Context, userID string, since int64) (
 	return out, rows.Err()
 }
 
-// MaxStreamOrdering returns the highest stream_ordering in the events table.
+// MaxStreamOrdering returns the current position of the shared sync stream.
+// This is what /sync reports as next_batch; every sync-relevant write (events,
+// account data, receipts, device-list changes, presence changes) advances it.
 func (s *Store) MaxStreamOrdering(ctx context.Context) (int64, error) {
-	var n *int64
-	err := s.pool.QueryRow(ctx, `SELECT MAX(stream_ordering) FROM events`).Scan(&n)
+	var n int64
+	err := s.pool.QueryRow(ctx, `SELECT last_value FROM sync_stream`).Scan(&n)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, nil
-		}
 		return 0, err
 	}
-	if n == nil {
-		return 0, nil
-	}
-	return *n, nil
+	return n, nil
 }
 
 // InvitedRooms returns room IDs the user is currently invited to.
@@ -208,13 +228,24 @@ type PresenceRow struct {
 	LastActiveTS int64  `json:"last_active_ago"`
 }
 
-// SetPresence upserts a user's presence state.
+// SetPresence upserts a user's presence state and records a presence change in
+// the shared sync stream so other users' /sync deltas pick it up.
 func (s *Store) SetPresence(ctx context.Context, userID, presence, statusMsg string, ts int64) error {
-	_, err := s.pool.Exec(ctx,
+	streamID, err := s.NextSyncStream(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx,
 		`INSERT INTO presence(user_id, presence, status_msg, last_active_ts)
 		 VALUES ($1,$2,$3,$4)
 		 ON CONFLICT (user_id) DO UPDATE SET presence=$2, status_msg=$3, last_active_ts=$4`,
 		userID, presence, statusMsg, ts)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx,
+		`INSERT INTO presence_changes(user_id, stream_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+		userID, streamID)
 	return err
 }
 
@@ -235,4 +266,74 @@ func (s *Store) GetPresence(ctx context.Context, userID string) (*PresenceRow, e
 		p.StatusMsg = *statusMsg
 	}
 	return &p, nil
+}
+
+// ---- Device list changes (device_lists.changed / .left in /sync) ----
+
+// RecordDeviceListChange records a device-list change for a user in the shared
+// sync stream. Called on key upload and on device deletion (isDelete=true for
+// the latter, which feeds device_lists.left).
+func (s *Store) RecordDeviceListChange(ctx context.Context, userID string, isDelete bool) (int64, error) {
+	streamID, err := s.NextSyncStream(ctx)
+	if err != nil {
+		return 0, err
+	}
+	_, err = s.pool.Exec(ctx,
+		`INSERT INTO device_list_updates(user_id, stream_id, is_delete) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+		userID, streamID, isDelete)
+	return streamID, err
+}
+
+// DeviceListChangesSince returns the user IDs with device-list changes (changed
+// and left) after the given stream position, in stream order.
+func (s *Store) DeviceListChangesSince(ctx context.Context, since int64) (changed, left []string, err error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT user_id, is_delete FROM device_list_updates WHERE stream_id>$1 ORDER BY stream_id ASC`, since)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	seenChanged := map[string]bool{}
+	seenLeft := map[string]bool{}
+	for rows.Next() {
+		var userID string
+		var isDelete bool
+		if err := rows.Scan(&userID, &isDelete); err != nil {
+			return nil, nil, err
+		}
+		if isDelete {
+			if !seenLeft[userID] {
+				seenLeft[userID] = true
+				left = append(left, userID)
+			}
+		} else if !seenChanged[userID] {
+			seenChanged[userID] = true
+			changed = append(changed, userID)
+		}
+	}
+	return changed, left, rows.Err()
+}
+
+// PresenceChangesSince returns the user IDs whose presence changed after the
+// given stream position, in stream order.
+func (s *Store) PresenceChangesSince(ctx context.Context, since int64) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT user_id FROM presence_changes WHERE stream_id>$1 ORDER BY stream_id ASC`, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	seen := map[string]bool{}
+	for rows.Next() {
+		var userID string
+		if err := rows.Scan(&userID); err != nil {
+			return nil, err
+		}
+		if !seen[userID] {
+			seen[userID] = true
+			out = append(out, userID)
+		}
+	}
+	return out, rows.Err()
 }

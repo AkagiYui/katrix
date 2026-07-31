@@ -254,5 +254,101 @@ func TestRoomAccountData(t *testing.T) {
 	}
 }
 
+func TestSyncDeviceListsChanged(t *testing.T) {
+	_, srv := testAPI(t)
+	tok := registerUser(t, srv, "alice-dl", "pw")
+	// Login again as a second device of the same user.
+	code, body := doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/login", "",
+		map[string]any{"type": "m.login.password", "identifier": map[string]any{"type": "m.id.user", "user": "alice-dl"}, "password": "pw"})
+	if code != 200 {
+		t.Fatalf("second login: %d %v", code, body)
+	}
+	dev2Token, _ := body["access_token"].(string)
+	if dev2Token == "" {
+		t.Fatal("no token for second device")
+	}
+
+	// Device 2 initial sync to get a since token.
+	_, resp := syncNow(t, srv, dev2Token, "", 0)
+	since, _ := resp["next_batch"].(string)
+	if since == "" {
+		t.Fatal("no next_batch")
+	}
+
+	// Device 1 uploads device keys -> device 2 must see a device_lists.changed.
+	code, _ = doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/keys/upload", tok,
+		map[string]any{
+			"device_keys": map[string]any{
+				"user_id": "@alice-dl:test.katrix", "device_id": "DEVICE1",
+				"algorithms": []string{"m.olm.v1.curve25519-aes-sha2"},
+				"keys":       map[string]string{"curve25519:AAAA": "aaaa", "ed25519:BBBB": "bbbb"},
+				"signatures": map[string]any{"@alice-dl:test.katrix": map[string]string{"ed25519:BBBB": "sig"}},
+			},
+		})
+	if code != 200 {
+		t.Fatalf("keys upload: %d", code)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_, resp := syncNow(t, srv, dev2Token, since, 0)
+		if dl, ok := resp["device_lists"].(map[string]any); ok {
+			if changed, _ := dl["changed"].([]any); len(changed) > 0 {
+				return // pass
+			}
+		}
+		since, _ = resp["next_batch"].(string)
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("device 2 never saw device_lists.changed")
+}
+
+func TestSyncPresenceBroadcast(t *testing.T) {
+	_, srv := testAPI(t)
+	alice := registerUser(t, srv, "alice-pres", "pw")
+	bob := registerUser(t, srv, "bob-pres", "pw")
+	roomID := createRoom(t, srv, alice, map[string]any{"preset": "public_chat"})
+	doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/rooms/"+roomID+"/join", bob, struct{}{})
+
+	// Bob sets his presence to a custom status.
+	code, _ := doJSON(t, srv, http.MethodPut,
+		"/_matrix/client/v3/presence/@bob-pres:test.katrix/status", bob,
+		map[string]any{"presence": "online", "status_msg": "busy coding"})
+	if code != 200 {
+		t.Fatalf("set presence: %d", code)
+	}
+
+	// Alice's sync must include bob's presence (they share a room).
+	_, resp := syncNow(t, srv, alice, "", 0)
+	pres, _ := resp["presence"].(map[string]any)
+	events, _ := pres["events"].([]any)
+	for _, ev := range events {
+		em, _ := ev.(map[string]any)
+		content, _ := em["content"].(map[string]any)
+		if content["user_id"] == "@bob-pres:test.katrix" {
+			return // pass
+		}
+	}
+	t.Fatalf("alice never saw bob's presence: %v", resp["presence"])
+}
+
+func TestSyncRoomSummary(t *testing.T) {
+	_, srv := testAPI(t)
+	alice := registerUser(t, srv, "alice-sum", "pw")
+	roomID := createRoom(t, srv, alice, map[string]any{"preset": "public_chat"})
+	bob := registerUser(t, srv, "bob-sum", "pw")
+	doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/rooms/"+roomID+"/join", bob, struct{}{})
+
+	_, resp := syncNow(t, srv, alice, "", 0)
+	rooms, _ := resp["rooms"].(map[string]any)
+	join, _ := rooms["join"].(map[string]any)
+	jr, _ := join[roomID].(map[string]any)
+	summary, _ := jr["summary"].(map[string]any)
+	joined, _ := summary["m.joined_member_count"].(float64)
+	if joined < 2 {
+		t.Fatalf("expected >=2 joined members, got %v (summary=%v)", joined, summary)
+	}
+}
+
 // guard against unused imports when test helpers change.
 var _ = json.RawMessage(nil)

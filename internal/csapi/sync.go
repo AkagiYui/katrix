@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/AkagiYui/katrix/internal/homeserver"
@@ -64,6 +65,22 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 	}
 	fullState := q.Get("full_state") == "true"
 
+	var filter *syncpkg.SyncFilter
+	if f := q.Get("filter"); f != "" {
+		// A filter ID references a stored filter; an inline JSON object is used
+		// directly. Stored filters are per-user; the user may only use their own.
+		if len(f) > 1 && f[0] == '{' {
+			filter = syncpkg.ParseSyncFilter(json.RawMessage(f))
+		} else if strings.HasPrefix(f, "f") {
+			if raw, err := a.Store.GetFilter(r.Context(), auth.Localpart, f); err == nil {
+				filter = syncpkg.ParseSyncFilter(raw)
+			} else {
+				httpx.WriteError(w, httpx.ErrNotFound("filter not found"))
+				return
+			}
+		}
+	}
+
 	opts := syncpkg.SyncOptions{
 		UserID:    auth.UserID,
 		Localpart: auth.Localpart,
@@ -71,6 +88,7 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 		Since:     since,
 		Timeout:   timeout,
 		FullState: fullState,
+		Filter:    filter,
 	}
 
 	// Long-poll: compute sync; if no new data, wait on the notifier and retry.
@@ -79,7 +97,9 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
-	// If the client gave a since and we have no new events beyond it, wait.
+	// If the client gave a since and we have no new data beyond it, wait. The
+	// response already reflects the fresh state (including ephemeral/presence/
+	// device-list deltas), so only park when the token genuinely hasn't moved.
 	if since.Stream > 0 && resp.NextBatch == since.Encode() && timeout > 0 {
 		wait, cancel := a.Notifier.Wait(auth.UserID)
 		defer cancel()
@@ -280,6 +300,11 @@ func (a *API) PresencePut(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	// Wake everyone who could see this presence change. Presence changes advance
+	// the shared sync stream, so any user's long-poll that is parked will wake
+	// and pick up the presence event. The set is small in practice (room peers);
+	// the self-notify covers the user's own other devices.
+	a.Notifier.NotifyUser(userID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
