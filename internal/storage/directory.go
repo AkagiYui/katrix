@@ -65,9 +65,11 @@ type SearchResult struct {
 // event's content (case-insensitive substring per token), mirroring how
 // clients expect /search to behave ("Message 4" matches "Message number 4").
 // Results are restricted to the given rooms, ordered by stream_ordering
-// descending, capped at limit. It returns the results and a next_batch token
-// of the oldest returned stream position (empty when no further pages).
-func (s *Store) SearchRoomEvents(ctx context.Context, term string, rooms []string, limit int) ([]SearchResult, string, error) {
+// descending, capped at limit. from (a next_batch token) excludes events at or
+// after that stream position for back-pagination. It returns the results and
+// the next_batch token of the oldest returned stream position (empty when no
+// further pages).
+func (s *Store) SearchRoomEvents(ctx context.Context, term string, rooms []string, from int64, limit int) ([]SearchResult, string, error) {
 	tokens := tokenizeSearch(term)
 	if len(tokens) == 0 {
 		return nil, "", nil
@@ -75,13 +77,18 @@ func (s *Store) SearchRoomEvents(ctx context.Context, term string, rooms []strin
 	if limit <= 0 {
 		limit = 10
 	}
-	// Every token must appear: content::text LIKE ALL(...).
 	q := `SELECT event_id, room_id, content, type, sender, origin_server_ts, stream_ordering
 	      FROM events
 	      WHERE LOWER(content::text) LIKE ALL($1)
-	        AND room_id = ANY($2)
-	      ORDER BY stream_ordering DESC LIMIT $3`
-	rows, err := s.pool.Query(ctx, q, tokens, rooms, limit+1)
+	        AND room_id = ANY($2)`
+	args := []any{tokens, rooms}
+	if from > 0 {
+		q += ` AND stream_ordering<$3`
+		args = append(args, from)
+	}
+	q += ` ORDER BY stream_ordering DESC LIMIT $` + itoa(len(args)+1)
+	args = append(args, limit+1)
+	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, "", err
 	}

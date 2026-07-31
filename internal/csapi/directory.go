@@ -80,7 +80,7 @@ func (a *API) Search(w http.ResponseWriter, r *http.Request) {
 		// No room filter: search the user's joined rooms.
 		rooms, _ = a.Store.RoomsForUser(r.Context(), auth.UserID)
 	}
-	results, nextBatch, err := a.Store.SearchRoomEvents(r.Context(), req.SearchCategories.RoomEvents.SearchTerm, rooms, limit)
+	results, nextBatch, err := a.Store.SearchRoomEvents(r.Context(), req.SearchCategories.RoomEvents.SearchTerm, rooms, searchFrom(r), limit)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
@@ -132,6 +132,26 @@ func (a *API) searchContext(r *http.Request, roomID, eventID string) (before, af
 		after = append(after, clientEvent(&afterEvs[i]))
 	}
 	return before, after
+}
+
+// searchFrom parses the next_batch query parameter for search back-pagination
+// into a stream position (0 when absent).
+func searchFrom(r *http.Request) int64 {
+	v := r.URL.Query().Get("next_batch")
+	if v == "" {
+		return 0
+	}
+	if len(v) > 1 && v[0] == 's' {
+		v = v[1:]
+	}
+	var n int64
+	for _, c := range v {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int64(c-'0')
+	}
+	return n
 }
 
 var _ = storage.EventRow{}
