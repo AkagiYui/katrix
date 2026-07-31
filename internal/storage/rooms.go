@@ -159,8 +159,14 @@ func (s *Store) EventsForRoom(ctx context.Context, roomID string, from, to int64
 	              origin_server_ts, stream_ordering, content, json,
 	              COALESCE(redacts,''), redacted, outlier
 	       FROM events
-	       WHERE room_id=$1 AND stream_ordering>=$2 AND stream_ordering<=$3`
-	args := []any{roomID, from, to}
+	       WHERE room_id=$1 AND stream_ordering>$2 AND stream_ordering<=$3`
+	// `from` is exclusive (events at or before the token were already seen);
+	// a zero token means "from the start", so use -1 to keep the first event.
+	exclusiveFrom := from
+	if exclusiveFrom <= 0 {
+		exclusiveFrom = -1
+	}
+	args := []any{roomID, exclusiveFrom, to}
 	if dir == "b" {
 		q += ` ORDER BY stream_ordering DESC`
 	} else {

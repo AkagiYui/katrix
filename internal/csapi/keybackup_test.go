@@ -2,6 +2,7 @@ package csapi
 
 import (
 	"net/http"
+	"strconv"
 	"testing"
 )
 
@@ -15,9 +16,9 @@ func TestKeyBackupCRUD(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("create backup: code=%d body=%v", code, body)
 	}
-	version := int64(body["version"].(float64))
-	if version == 0 {
-		t.Fatal("no version returned")
+	version, err := strconv.ParseInt(body["version"].(string), 10, 64)
+	if err != nil || version == 0 {
+		t.Fatalf("no version returned: %v", body)
 	}
 
 	// Get the version back.

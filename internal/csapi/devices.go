@@ -131,6 +131,9 @@ func (a *API) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	// MSC3890: deleting a device clears its per-device local notification
+	// settings account data (org.matrix.msc3890.local_notification_settings.<device>).
+	_, _ = a.Store.DeleteAccountData(r.Context(), auth.Localpart, "", "org.matrix.msc3890.local_notification_settings."+deviceID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 

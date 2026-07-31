@@ -29,7 +29,9 @@ func (a *API) CreateKeyBackup(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"version": version})
+	// The spec returns the version as a string; Complement reads it via
+	// gjson .Str, which is empty for JSON numbers.
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"version": strconv.FormatInt(version, 10)})
 }
 
 // UpdateKeyBackup handles PUT /_matrix/client/v3/room_keys/version/{version}.
