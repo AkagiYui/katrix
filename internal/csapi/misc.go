@@ -24,6 +24,10 @@ func (a *API) registerMisc(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/user/{userID}/filter/{filterID}", a.RequireAuth(a.GetFilter))
 	// Push rules (global ruleset + scoped actions on override/underride).
 	mux.HandleFunc("GET /_matrix/client/v3/pushrules", a.RequireAuth(a.GetPushRules))
+	// Trailing-slash variant: the spec requires GET /pushrules/ (with the slash)
+	// to return the full ruleset (matrix-spec#457); the {scope} routes below are
+	// more specific and still win for /pushrules/global.
+	mux.HandleFunc("GET /_matrix/client/v3/pushrules/", a.RequireAuth(a.GetPushRules))
 	mux.HandleFunc("GET /_matrix/client/v3/pushrules/{scope}", a.RequireAuth(a.GetPushRules))
 	mux.HandleFunc("PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}", a.RequireAuth(a.PutPushRule))
 	mux.HandleFunc("GET /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}", a.RequireAuth(a.GetPushRule))

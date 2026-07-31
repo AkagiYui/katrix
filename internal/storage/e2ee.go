@@ -214,7 +214,10 @@ type ToDeviceMessage struct {
 	CreatedTS    int64
 }
 
-// EnqueueToDevice stores to-device messages for delivery.
+// EnqueueToDevice stores to-device messages for delivery. Each enqueue also
+// advances the shared sync stream so a syncing device's next_batch changes and
+// its long-poll is released immediately (without that, a parked /sync would
+// drain the queue on a discarded first pass and lose the messages).
 func (s *Store) EnqueueToDevice(ctx context.Context, msgs []ToDeviceMessage) error {
 	for _, m := range msgs {
 		if _, err := s.pool.Exec(ctx,
@@ -222,6 +225,12 @@ func (s *Store) EnqueueToDevice(ctx context.Context, msgs []ToDeviceMessage) err
 			 VALUES ($1,$2,$3,$4,$5,$6)`,
 			m.TargetUser, m.TargetDevice, m.Sender, m.Type, m.Content, m.CreatedTS,
 		); err != nil {
+			return err
+		}
+	}
+	if len(msgs) > 0 {
+		_, err := s.NextSyncStream(ctx)
+		if err != nil {
 			return err
 		}
 	}

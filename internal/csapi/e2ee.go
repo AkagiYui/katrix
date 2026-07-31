@@ -276,6 +276,16 @@ func (a *API) SendToDevice(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	// Wake each target user's parked /sync long-poll so the to-device messages
+	// are delivered promptly (the enqueue also advances the shared sync stream,
+	// so the first recompute returns them).
+	seen := map[string]bool{}
+	for _, m := range msgs {
+		if !seen[m.TargetUser] {
+			seen[m.TargetUser] = true
+			a.Notifier.NotifyUser(m.TargetUser)
+		}
+	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
