@@ -1,6 +1,7 @@
 package csapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -263,13 +264,54 @@ func (a *API) SendToDevice(w http.ResponseWriter, r *http.Request) {
 }
 
 // DeviceSigningUpload handles POST /_matrix/client/v3/keys/device_signing/upload.
+//
+// Per MSC3967: no UIA is required when first uploading cross-signing keys, or
+// when re-uploading exactly the same key. Replacing an existing key with a
+// different one requires User-Interactive Authentication (m.login.password).
 func (a *API) DeviceSigningUpload(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
-	var req map[string]json.RawMessage
-	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+	body, err := readBody(r)
+	if err != nil {
 		httpx.WriteError(w, err)
 		return
 	}
+	var req map[string]json.RawMessage
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			httpx.WriteError(w, httpx.ErrBadJSON("could not decode JSON: "+err.Error()))
+			return
+		}
+	}
+
+	// Determine whether any supplied key replaces an existing different key.
+	replacing := false
+	keys, err := a.Store.CrossSigningKeys(r.Context(), auth.UserID)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	for _, keyType := range []string{"master", "self_signing", "user_signing"} {
+		kjson, ok := req[keyType]
+		if !ok {
+			continue
+		}
+		for _, k := range keys {
+			if k.KeyType == keyType && !bytes.Equal(bytes.TrimSpace(k.KeyJSON), bytes.TrimSpace(kjson)) {
+				replacing = true
+			}
+		}
+	}
+	if replacing {
+		ok, err := a.checkPasswordUIA(w, r, body)
+		if err != nil {
+			httpx.WriteError(w, err)
+			return
+		}
+		if !ok {
+			return // 401 challenge written
+		}
+	}
+
 	for _, keyType := range []string{"master", "self_signing", "user_signing"} {
 		if kjson, ok := req[keyType]; ok {
 			_, _ = a.Store.UpsertCrossSigningKey(r.Context(), storage.CrossSigningKey{

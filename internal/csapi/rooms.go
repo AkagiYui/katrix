@@ -473,23 +473,80 @@ func (a *API) serveStateContent(w http.ResponseWriter, r *http.Request, stateKey
 // ---- event / members / messages ----
 
 // RoomGetEvent handles GET /_matrix/client/v3/rooms/{roomID}/event/{eventID}.
+//
+// Access control follows m.room.history_visibility:
+//   - world_readable: any user (even not joined) may fetch an event;
+//   - shared: any joined member may fetch events from before they joined;
+//   - invited: members may fetch events sent after they were invited;
+//   - joined (default for private rooms): members may only fetch events sent
+//     after they joined.
+//
+// A denied fetch returns 404 (per the spec the server must not reveal whether
+// the event exists).
 func (a *API) RoomGetEvent(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomID := r.PathValue("roomID")
 	eventID := r.PathValue("eventID")
-	if err := a.checkMembership(r.Context(), roomID, auth.UserID, rooms.MembershipJoin); err != nil {
-		writeRoomErr(w, err)
-		return
-	}
 	ev, err := a.Store.GetEvent(r.Context(), eventID)
 	if err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("event not found"))
+		return
+	}
+	if ev.RoomID != roomID {
+		httpx.WriteError(w, httpx.ErrNotFound("event not found"))
+		return
+	}
+	vis := a.historyVisibility(r.Context(), roomID)
+	m, err := a.Store.GetMembership(r.Context(), roomID, auth.UserID)
+	if err != nil {
+		// Not a member at all: only world_readable rooms allow event fetches.
+		if vis != "world_readable" {
+			httpx.WriteError(w, httpx.ErrNotFound("event not found"))
+			return
+		}
+	} else if !a.canReadEventAt(r.Context(), vis, m, ev) {
 		httpx.WriteError(w, httpx.ErrNotFound("event not found"))
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, clientEvent(ev))
 }
 
+// historyVisibility returns the room's m.room.history_visibility, defaulting
+// to "shared" when the state event is absent.
+func (a *API) historyVisibility(ctx context.Context, roomID string) string {
+	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.history_visibility", ""); err == nil {
+		if ev, err := a.Store.GetEvent(ctx, id); err == nil {
+			return rooms.HistoryVisibility(ev.Content)
+		}
+	}
+	return "shared"
+}
+
+// canReadEventAt reports whether a user with membership m may read an event
+// under the room's history_visibility. Stream orderings are compared, not
+// wall-clock timestamps, so the ordering is stable across clock skew.
+func (a *API) canReadEventAt(ctx context.Context, vis string, m *storage.MembershipRow, ev *storage.EventRow) bool {
+	switch vis {
+	case "world_readable", "shared":
+		return true
+	case "invited":
+		// Readable if the event was sent after the user's earliest membership
+		// event (invite or join) in the room. A join alone is not enough:
+		// events sent before the invite must stay hidden.
+		start, err := a.Store.EarliestMemberStream(ctx, ev.RoomID, m.UserID)
+		return err == nil && start > 0 && ev.StreamOrdering >= start
+	case "joined":
+		// Readable only for events sent after the user joined.
+		return m.Membership == rooms.MembershipJoin && m.StreamOrdering > 0 && ev.StreamOrdering >= m.StreamOrdering
+	}
+	return false
+}
+
 // RoomMembers handles GET /_matrix/client/v3/rooms/{roomID}/members.
+//
+// Returns the room's member events as an array in "chunk" (spec format),
+// optionally filtered by ?membership= or ?not_membership=. Each chunk entry
+// is the full client event (type, state_key, sender, content, room_id, ...).
 func (a *API) RoomMembers(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomID := r.PathValue("roomID")
@@ -500,22 +557,35 @@ func (a *API) RoomMembers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	membershipFilter := r.URL.Query().Get("membership")
+	q := r.URL.Query()
+	membershipFilter := q.Get("membership")
+	notMembership := q.Get("not_membership")
 	rows, err := a.Store.Members(r.Context(), roomID, membershipFilter)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
-	chunk := make(map[string]map[string]any, len(rows))
+	chunk := make([]json.RawMessage, 0, len(rows))
 	for _, m := range rows {
-		ev := map[string]any{"membership": m.Membership}
-		if m.DisplayName != "" {
-			ev["displayname"] = m.DisplayName
+		if notMembership != "" && m.Membership == notMembership {
+			continue
 		}
-		if m.AvatarURL != "" {
-			ev["avatar_url"] = m.AvatarURL
+		// If the membership event row is still available, emit the full client
+		// event; otherwise fall back to a minimal member object.
+		if ev, err := a.Store.GetEvent(r.Context(), m.EventID); err == nil && ev != nil {
+			chunk = append(chunk, clientEvent(ev))
+		} else {
+			b, _ := json.Marshal(map[string]any{
+				"type":      "m.room.member",
+				"state_key": m.UserID,
+				"sender":    m.UserID,
+				"room_id":   roomID,
+				"content": map[string]any{
+					"membership": m.Membership,
+				},
+			})
+			chunk = append(chunk, b)
 		}
-		chunk[m.UserID] = ev
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
 }
@@ -733,10 +803,36 @@ func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 		writeRoomErr(w, err)
 		return
 	}
+	// Idempotency: a repeated (user, room, txn) redaction returns the same
+	// event_id without creating a duplicate ("is idempotent").
+	if existingID, err := a.Store.GetTxnEventID(r.Context(), auth.Localpart, roomID, txnID); err == nil && existingID != "" {
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": existingID})
+		return
+	}
 	body, err := readEventContent(r)
 	if err != nil {
 		httpx.WriteError(w, err)
 		return
+	}
+	// The redacted event must exist and belong to this room; redacting an
+	// event from a different room is rejected with 400.
+	target, err := a.Store.GetEvent(r.Context(), eventID)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("event not found"))
+		return
+	}
+	if target.RoomID != roomID {
+		httpx.WriteError(w, httpx.ErrInvalidParam("event is not in this room"))
+		return
+	}
+	// Redaction permission: the sender may redact their own events; others
+	// need at least the room's redact power level.
+	pl := a.roomPowerLevels(r.Context(), roomID)
+	if target.Sender != auth.UserID {
+		if pl.UserLevel(auth.UserID) < pl.Redact {
+			httpx.WriteError(w, httpx.ErrForbidden("you do not have permission to redact this event"))
+			return
+		}
 	}
 	content := body
 	// Inject redacts into content.
@@ -763,9 +859,23 @@ func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	_ = a.Store.RecordTxnEventID(r.Context(), auth.Localpart, roomID, txnID, ev.EventID(), a.Now())
 	_ = a.Store.SetEventRedacted(r.Context(), eventID)
 	a.notifyRoomMembers(r.Context(), roomID)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": ev.EventID()})
+}
+
+// roomPowerLevels returns the room's current m.room.power_levels (or the zero
+// value when absent, which means everyone is level 0).
+func (a *API) roomPowerLevels(ctx context.Context, roomID string) *rooms.PowerLevels {
+	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.power_levels", ""); err == nil {
+		if ev, err := a.Store.GetEvent(ctx, id); err == nil {
+			if pl, err := rooms.ParsePowerLevels(ev.Content); err == nil {
+				return pl
+			}
+		}
+	}
+	return &rooms.PowerLevels{}
 }
 
 // RoomTyping handles PUT /_matrix/client/v3/rooms/{roomID}/typing/{userID}.
@@ -803,7 +913,9 @@ func (a *API) RoomForget(w http.ResponseWriter, r *http.Request) {
 	if m, err := a.Store.GetMembership(r.Context(), roomID, auth.UserID); err == nil {
 		switch m.Membership {
 		case rooms.MembershipJoin, rooms.MembershipInvite, rooms.MembershipKnock, rooms.MembershipBan:
-			httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_STATE", "cannot forget a room you are still in"))
+			// Complement asserts M_UNKNOWN for "can't forget a room you're
+			// still in".
+			httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_UNKNOWN", "cannot forget a room you are still in"))
 			return
 		}
 	}
@@ -1160,12 +1272,12 @@ func validateCanonicalAlias(ctx context.Context, store *storage.Store, eventType
 }
 
 // validateAliasForRoom checks that a single alias is well-formed and points at
-// roomID. Returns a M_BAD_ALIAS roomError (400) on any failure: the spec uses
-// M_BAD_ALIAS for canonical_alias content that references an alias which is
-// malformed, unknown, or points at a different room.
+// roomID. A syntactically invalid alias is rejected with M_INVALID_PARAM
+// (Complement asserts this for e.g. "%invalid_aliases"); an alias that is
+// unknown or points at a different room is rejected with M_BAD_ALIAS.
 func validateAliasForRoom(ctx context.Context, store *storage.Store, alias, roomID string) error {
 	if _, err := ids.ParseRoomAlias(alias); err != nil {
-		return newRoomError(http.StatusBadRequest, "M_BAD_ALIAS", "invalid room alias: "+alias)
+		return newRoomError(http.StatusBadRequest, "M_INVALID_PARAM", "invalid room alias: "+alias)
 	}
 	resolved, err := store.LookupAlias(ctx, alias)
 	if err != nil {

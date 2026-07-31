@@ -24,6 +24,7 @@ func clientEvent(row *storage.EventRow) json.RawMessage {
 		"sender":           row.Sender,
 		"origin_server_ts": row.OriginServerTS,
 		"event_id":         row.EventID,
+		"room_id":          row.RoomID,
 	}
 	if row.StateKey != "" || isStateTypeCSAPI(row.Type) {
 		m["state_key"] = row.StateKey

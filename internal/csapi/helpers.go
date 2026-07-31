@@ -62,9 +62,13 @@ func readEventContent(r *http.Request) (json.RawMessage, error) {
 // maxEventBytes is the spec default per-event content size limit (65536).
 const maxEventBytes = 65536
 
-// validateEventJSON checks that body is a single valid JSON value and contains
+// validateEventJSON checks that body is a single valid JSON object and contains
 // no NaN, Infinity, or trailing data. It uses UseNumber so numbers are not
 // coerced to float64 (which would silently accept Infinity as a number token).
+//
+// The top level must be an object: Matrix event content is always a JSON
+// object, and refusing anything else means a body that serialises to a bare
+// JSON string/number/array (e.g. a base64 blob) is rejected with 400.
 func validateEventJSON(body []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
@@ -75,10 +79,16 @@ func validateEventJSON(body []byte) error {
 	if dec.More() {
 		return errTrailingData
 	}
+	if _, ok := v.(map[string]any); !ok {
+		return errNotObject
+	}
 	return scanNumbers(v)
 }
 
-var errTrailingData = errStr("trailing data after JSON value")
+var (
+	errTrailingData = errStr("trailing data after JSON value")
+	errNotObject    = errStr("event content must be a JSON object")
+)
 
 type errStr string
 

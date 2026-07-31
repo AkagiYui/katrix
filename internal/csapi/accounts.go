@@ -63,7 +63,9 @@ func (a *API) RegisterAccount(w http.ResponseWriter, r *http.Request) {
 	var req registerRequest
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &req); err != nil {
-			httpx.WriteError(w, httpx.ErrBadJSON(err.Error()))
+			// The whole body was not valid JSON: M_NOT_JSON (Complement asserts
+			// this errcode for POST /register with a malformed utf-8 body).
+			httpx.WriteError(w, httpx.ErrNotJSON())
 			return
 		}
 	}

@@ -228,8 +228,9 @@ func (a *API) checkPasswordUIA(w http.ResponseWriter, r *http.Request, raw json.
 	if body.Auth.Type == "m.login.password" {
 		user, err := a.Store.GetUser(r.Context(), sess.localpart)
 		if err != nil || user.PasswordHash == "" || !homeserver.CheckPassword(user.PasswordHash, body.Auth.Password) {
-			// Issue a fresh challenge rather than a 403 so the client can retry.
-			a.writeUIAChallenge(w, stages, body.Auth.Session, nil)
+			// Failed password: 401 M_FORBIDDEN (Complement asserts the errcode
+			// on /account/deactivate). Keep the session so the client can retry.
+			httpx.WriteError(w, httpx.NewError(http.StatusUnauthorized, "M_FORBIDDEN", "Invalid password"))
 			return false, nil
 		}
 		sess.completed["m.login.password"] = true

@@ -115,7 +115,9 @@ func (a *API) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	// Verify the supplied password.
 	user, err := a.Store.GetUser(r.Context(), auth.Localpart)
 	if err != nil || user.PasswordHash == "" || !homeserver.CheckPassword(user.PasswordHash, ad.Auth.Password) {
-		httpx.WriteError(w, httpx.ErrForbidden("Invalid password"))
+		// UIA: a failed auth attempt is still a 401 (spec-compliant clients
+		// treat it as a new UIA challenge round); Complement asserts 401.
+		httpx.WriteError(w, httpx.NewError(http.StatusUnauthorized, "M_FORBIDDEN", "Invalid password"))
 		return
 	}
 	if err := a.Store.DeleteDevice(r.Context(), auth.Localpart, deviceID, a.ServerName()); err != nil {

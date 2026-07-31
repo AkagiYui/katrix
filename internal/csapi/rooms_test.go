@@ -44,9 +44,7 @@ func TestCreateRoom(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("members: code=%d body=%v", code, body)
 	}
-	chunk, _ := body["chunk"].(map[string]any)
-	mem, _ := chunk["@alice:test.katrix"].(map[string]any)
-	if mem == nil || mem["membership"] != "join" {
+	if m := membersOf(body); m["@alice:test.katrix"] != "join" {
 		t.Fatalf("creator not joined: %v", body)
 	}
 }
@@ -126,8 +124,8 @@ func TestInviteJoinLeave(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("members: code=%d body=%v", code, body)
 	}
-	chunk, _ := body["chunk"].(map[string]any)
-	if chunk["@frank:test.katrix"] == nil {
+	chunk, _ := body["chunk"].([]any)
+	if len(chunk) == 0 {
 		t.Fatalf("frank not in members: %v", body)
 	}
 	// Frank leaves.
@@ -162,10 +160,24 @@ func a_StoreGetMembership(t *testing.T, srv *httptest.Server, roomID, userID, to
 	if code != 200 {
 		return "", nil
 	}
-	chunk, _ := body["chunk"].(map[string]any)
-	mem, _ := chunk[userID].(map[string]any)
-	ms, _ := mem["membership"].(string)
-	return ms, nil
+	return membersOf(body)[userID], nil
+}
+
+// membersOf maps a /members response body to userID -> membership.
+func membersOf(body map[string]any) map[string]string {
+	out := map[string]string{}
+	chunk, _ := body["chunk"].([]any)
+	for _, item := range chunk {
+		ev, _ := item.(map[string]any)
+		sk, _ := ev["state_key"].(string)
+		if sk == "" {
+			continue
+		}
+		content, _ := ev["content"].(map[string]any)
+		ms, _ := content["membership"].(string)
+		out[sk] = ms
+	}
+	return out
 }
 
 func TestRoomMessagesPagination(t *testing.T) {

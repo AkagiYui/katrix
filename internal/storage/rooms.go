@@ -383,6 +383,19 @@ func (s *Store) Members(ctx context.Context, roomID, membershipFilter string) ([
 	return out, rows.Err()
 }
 
+// EarliestMemberStream returns the stream_ordering of the user's first
+// m.room.member event in the room (e.g. the invite that preceded a join). It
+// is used as the history_visibility="invited" read boundary, which survives a
+// later join overwriting the membership row.
+func (s *Store) EarliestMemberStream(ctx context.Context, roomID, userID string) (int64, error) {
+	var stream int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(MIN(stream_ordering),0) FROM events
+		 WHERE room_id=$1 AND type='m.room.member' AND state_key=$2`,
+		roomID, userID).Scan(&stream)
+	return stream, err
+}
+
 // RoomsForUser returns the room IDs the user is currently a member of.
 func (s *Store) RoomsForUser(ctx context.Context, userID string) ([]string, error) {
 	rows, err := s.pool.Query(ctx,

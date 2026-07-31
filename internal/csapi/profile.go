@@ -5,6 +5,7 @@ import (
 
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/rooms"
 )
 
 // registerProfile wires P1 user-profile (display name / avatar) routes.
@@ -72,6 +73,7 @@ func (a *API) SetDisplayName(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	a.broadcastProfileUpdate(w, r, auth)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
@@ -112,7 +114,33 @@ func (a *API) SetAvatarURL(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	a.broadcastProfileUpdate(w, r, auth)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// broadcastProfileUpdate re-emits an m.room.member(join) state event for the
+// user in every room they are currently joined to, carrying their latest
+// displayname/avatar_url. The spec requires profile changes to be reflected in
+// member events so other users' /sync (and room state) picks them up.
+func (a *API) broadcastProfileUpdate(w http.ResponseWriter, r *http.Request, auth *homeserver.Auth) {
+	roomIDs, err := a.Store.RoomsForUser(r.Context(), auth.UserID)
+	if err != nil {
+		return // profile stored; broadcast is best-effort
+	}
+	u, err := a.Store.GetUser(r.Context(), auth.Localpart)
+	if err != nil {
+		return
+	}
+	content := map[string]any{"membership": rooms.MembershipJoin}
+	if u.DisplayName != "" {
+		content["displayname"] = u.DisplayName
+	}
+	if u.AvatarURL != "" {
+		content["avatar_url"] = u.AvatarURL
+	}
+	for _, roomID := range roomIDs {
+		_ = a.sendMemberEventWithContent(r, auth, roomID, auth.UserID, content)
+	}
 }
 
 // profileLocalpart resolves a {userId} path value to a localpart on this

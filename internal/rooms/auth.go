@@ -209,12 +209,20 @@ func authorizeMember(rules roomver.Rules, sender, stateKey string, content json.
 		return nil
 	case MembershipLeave:
 		// Leave: the target may leave themselves; otherwise the sender must
-		// have kick power and the target's level must be < sender's.
+		// have kick power and the target's level must be < sender's. A kick
+		// additionally requires the target to currently be a joined member:
+		// kicking a user who never joined (or already left) must fail, per
+		// "Users cannot kick users from a room they are not in" /
+		// "Users cannot kick users who have already left a room". The ban
+		// case is the unban path, which only needs ban power.
 		if sender == stateKey {
 			return nil
 		}
 		if senderMembership != MembershipJoin {
 			return fmt.Errorf("rooms: leave sender not joined")
+		}
+		if targetMembership != MembershipJoin && targetMembership != MembershipBan {
+			return fmt.Errorf("rooms: cannot kick user who is not a joined member")
 		}
 		if senderLevel < pl.Kick {
 			return fmt.Errorf("rooms: insufficient power to kick")

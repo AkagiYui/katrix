@@ -18,10 +18,10 @@ func TestValidateEventJSON(t *testing.T) {
 		wantErr bool
 	}{
 		{"empty object", `{}`, false},
-		{"string", `"hello"`, false},
-		{"integer", `42`, false},
-		{"fractional", `1.5`, true}, // canonical JSON forbids non-integers
-		{"array", `[1,2,3]`, false},
+		{"string", `"hello"`, true}, // event content must be an object
+		{"integer", `42`, true},     // event content must be an object
+		{"fractional", `1.5`, true}, // non-object AND canonical JSON forbids fractions
+		{"array", `[1,2,3]`, true},  // event content must be an object
 		{"nested", `{"a":{"b":[1,2,{"c":true}]}}`, false},
 		{"nested fractional", `{"a":{"b":[1,2.5,{"c":true}]}}`, true},
 		{"NaN", `{"v":NaN}`, true},
@@ -29,12 +29,12 @@ func TestValidateEventJSON(t *testing.T) {
 		{"-Infinity", `{"v":-Infinity}`, true},
 		{"trailing data", `{}garbage`, true},
 		{"malformed", `{not json`, true},
-		{"number too large", `{"v":1e400}`, true},          // +Inf
-		{"int at safe limit", `9007199254740991`, false},   // 2^53-1
-		{"int over safe limit", `9007199254740993`, true},  // 2^53+1
-		{"huge int", `1e30`, true},                         // finite but > 2^53
-		{"negative safe int", `-9007199254740991`, false},  // -(2^53-1)
-		{"negative over limit", `-9007199254740993`, true}, // -(2^53+1)
+		{"number too large", `{"v":1e400}`, true},                // +Inf
+		{"int at safe limit", `{"v":9007199254740991}`, false},   // 2^53-1
+		{"int over safe limit", `{"v":9007199254740993}`, true},  // 2^53+1
+		{"huge int", `{"v":1e30}`, true},                         // finite but > 2^53
+		{"negative safe int", `{"v":-9007199254740991}`, false},  // -(2^53-1)
+		{"negative over limit", `{"v":-9007199254740993}`, true}, // -(2^53+1)
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

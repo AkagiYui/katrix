@@ -110,9 +110,15 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	// Rooms the user is invited to (membership=invite).
 	inviteRows, _ := e.store.Members(ctx, "", "")
 	_ = inviteRows // filtered below per-room via a dedicated query path
+	ignored := e.ignoredUsers(ctx, opts.Localpart)
 	invited, err := e.store.InvitedRooms(ctx, opts.UserID)
 	if err == nil {
 		for _, roomID := range invited {
+			if ignored != nil && e.inviteIsFromIgnored(ctx, roomID, opts.UserID, ignored) {
+				// Spec: "Servers must not send room invites from ignored users
+				// to clients." Drop the invite from the sync response.
+				continue
+			}
 			rooms.Invite[roomID] = e.buildInvitedRoom(ctx, roomID)
 		}
 	}
@@ -389,4 +395,40 @@ func isStateTypeSync(eventType string) bool {
 		return true
 	}
 	return false
+}
+
+// ignoredUsers returns the set of user IDs the given user has in their global
+// m.ignored_user_list account data, or nil if none. The set is honoured when
+// filtering room invites out of /sync.
+func (e *Engine) ignoredUsers(ctx context.Context, localpart string) map[string]bool {
+	raw, err := e.store.GetAccountData(ctx, localpart, "", "m.ignored_user_list")
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	var data struct {
+		IgnoredUsers map[string]json.RawMessage `json:"ignored_users"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil || len(data.IgnoredUsers) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(data.IgnoredUsers))
+	for u := range data.IgnoredUsers {
+		out[u] = true
+	}
+	return out
+}
+
+// inviteIsFromIgnored reports whether the invite for roomID targeting userID
+// was sent by a user in the ignored set. The inviter is the sender of the
+// room's m.room.member(invite) event for the target user.
+func (e *Engine) inviteIsFromIgnored(ctx context.Context, roomID, userID string, ignored map[string]bool) bool {
+	id, err := e.store.GetStateEvent(ctx, roomID, "m.room.member", userID)
+	if err != nil {
+		return false
+	}
+	ev, err := e.store.GetEvent(ctx, id)
+	if err != nil {
+		return false
+	}
+	return ignored[ev.Sender]
 }
