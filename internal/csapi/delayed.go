@@ -60,29 +60,52 @@ func (a *API) DelayedEventsList(w http.ResponseWriter, r *http.Request) {
 func (a *API) DelayedEventAction(w http.ResponseWriter, r *http.Request) {
 	delayID := r.PathValue("delayID")
 	action := r.PathValue("action")
+	// The delay_id is an opaque capability token: MSC4140 actions are
+	// authenticated by possession of the delay_id alone, so an unauthenticated
+	// caller with a valid delay ID may send/cancel/restart it. Unknown delay
+	// IDs (and invalid actions) still 404.
 	exists := a.delayedEventExists(r.Context(), delayID)
-	auth, authErr := a.Authenticate(r)
-	if authErr != nil {
-		if !exists {
-			httpx.WriteError(w, httpx.ErrNotFound("delayed event not found"))
-			return
-		}
-		httpx.WriteError(w, authErr)
+	if !exists {
+		httpx.WriteError(w, httpx.ErrNotFound("delayed event not found"))
 		return
+	}
+	localpart := ""
+	if auth, authErr := a.Authenticate(r); authErr == nil {
+		localpart = auth.Localpart
 	}
 	switch action {
 	case "send":
-		if err := a.fireDelayedEvent(r.Context(), auth.Localpart, delayID); err != nil {
+		var err error
+		if localpart != "" {
+			err = a.fireDelayedEvent(r.Context(), localpart, delayID)
+		} else {
+			err = a.fireDelayedEventByID(r.Context(), delayID)
+		}
+		if err != nil {
 			httpx.WriteError(w, httpx.ErrNotFound("delayed event not found"))
 			return
 		}
 	case "cancel":
-		if _, err := a.Store.DeleteDelayedEvent(r.Context(), auth.Localpart, delayID); err != nil {
+		var removed bool
+		var err error
+		if localpart != "" {
+			removed, err = a.Store.DeleteDelayedEvent(r.Context(), localpart, delayID)
+		} else {
+			removed, err = a.Store.DeleteDelayedEventByID(r.Context(), delayID)
+		}
+		if err != nil || !removed {
 			httpx.WriteError(w, httpx.ErrNotFound("delayed event not found"))
 			return
 		}
 	case "restart":
-		if ok, err := a.Store.RestartDelayedEvent(r.Context(), auth.Localpart, delayID, a.Now()); err != nil || !ok {
+		var ok bool
+		var err error
+		if localpart != "" {
+			ok, err = a.Store.RestartDelayedEvent(r.Context(), localpart, delayID, a.Now())
+		} else {
+			ok, err = a.Store.RestartDelayedEventByID(r.Context(), delayID, a.Now())
+		}
+		if err != nil || !ok {
 			httpx.WriteError(w, httpx.ErrNotFound("delayed event not found"))
 			return
 		}
@@ -91,6 +114,18 @@ func (a *API) DelayedEventAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// fireDelayedEventByID fires a delayed event located by delay_id alone
+// (unauthenticated action path).
+func (a *API) fireDelayedEventByID(ctx context.Context, delayID string) error {
+	var localpart string
+	err := a.Store.Pool().QueryRow(ctx,
+		`SELECT user_localpart FROM delayed_events WHERE delay_id=$1`, delayID).Scan(&localpart)
+	if err != nil {
+		return err
+	}
+	return a.fireDelayedEvent(ctx, localpart, delayID)
 }
 
 // delayedEventExists reports whether a delay ID exists for any user (used to
@@ -130,12 +165,25 @@ func (a *API) buildAndPersistMessageCtx(ctx context.Context, auth *homeserver.Au
 		return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
 	}
 	version := roomver.Version(room.Version)
+	// Build with the same prev/depth/auth wiring as the HTTP send path so the
+	// event forms a normal forward chain (see buildAndPersistStateCtx).
+	latest, _ := a.Store.LatestEvent(ctx, roomID)
+	var prev []string
+	depth := int64(0)
+	if latest != nil {
+		prev = []string{latest.EventID}
+		depth = latest.Depth + 1
+	}
+	authIDs := a.authEventIDs(ctx, roomID, auth.UserID)
 	b := events.Builder{
 		Type:           eventType,
 		Sender:         auth.UserID,
 		RoomID:         roomID,
 		Content:        json.RawMessage(content),
+		Depth:          depth,
 		OriginServerTS: a.Now(),
+		PrevEvents:     prev,
+		AuthEvents:     authIDs,
 	}
 	ev, err := b.Build(a.ServerName(), a.Key, version)
 	if err != nil {
@@ -166,12 +214,26 @@ func (a *API) buildAndPersistStateCtx(ctx context.Context, auth *homeserver.Auth
 	if err := rooms.Authorize(rules, eventType, stateKey, auth.UserID, json.RawMessage(content), st); err != nil {
 		return nil, newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
 	}
+	// Build the event with the same prev/depth/auth wiring as the HTTP path
+	// (buildEvent): a state event without prev_events makes SnapshotForEvent
+	// start from an empty base and the state resolution drops the tuple.
+	latest, _ := a.Store.LatestEvent(ctx, roomID)
+	var prev []string
+	depth := int64(0)
+	if latest != nil {
+		prev = []string{latest.EventID}
+		depth = latest.Depth + 1
+	}
+	authIDs := a.authEventIDs(ctx, roomID, auth.UserID)
 	b := events.Builder{
 		Type:           eventType,
 		Sender:         auth.UserID,
 		RoomID:         roomID,
 		Content:        json.RawMessage(content),
+		Depth:          depth,
 		OriginServerTS: a.Now(),
+		PrevEvents:     prev,
+		AuthEvents:     authIDs,
 	}
 	sk := stateKey
 	b.StateKey = &sk
@@ -214,7 +276,9 @@ func (a *API) StartDelayedWorker(ctx context.Context) {
 					continue
 				}
 				for _, d := range due {
-					_ = a.fireDelayedEvent(ctx, d.UserLocalpart, d.DelayID)
+					if err := a.fireDelayedEvent(ctx, d.UserLocalpart, d.DelayID); err != nil {
+					} else {
+					}
 				}
 			}
 		}

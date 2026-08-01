@@ -110,11 +110,33 @@ func (s *Store) DeleteDelayedEvent(ctx context.Context, localpart, delayID strin
 	return tag.RowsAffected() > 0, nil
 }
 
-// RestartDelayedEvent re-arms a delayed event with its original delay.
+// DeleteDelayedEventByID removes a delayed event by delay_id alone (MSC4140
+// actions are authenticated by the delay_id capability).
+func (s *Store) DeleteDelayedEventByID(ctx context.Context, delayID string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM delayed_events WHERE delay_id=$1`, delayID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// RestartDelayedEvent re-arms a delayed event: its fire time is reset to
+// now + the event's original delay (the timer restarts, it does not fire
+// immediately).
 func (s *Store) RestartDelayedEvent(ctx context.Context, localpart, delayID string, now int64) (bool, error) {
 	tag, err := s.pool.Exec(ctx,
-		`UPDATE delayed_events SET fire_at=$3, created_ts=$3
+		`UPDATE delayed_events SET fire_at=$3 + delay_ms, created_ts=$3
 		 WHERE user_localpart=$1 AND delay_id=$2`, localpart, delayID, now)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// RestartDelayedEventByID re-arms a delayed event by delay_id alone.
+func (s *Store) RestartDelayedEventByID(ctx context.Context, delayID string, now int64) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE delayed_events SET fire_at=$2 + delay_ms, created_ts=$2 WHERE delay_id=$1`, delayID, now)
 	if err != nil {
 		return false, err
 	}
