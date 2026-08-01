@@ -22,9 +22,25 @@ import (
 // BroadcastPDUToRoom queues a locally-created event for delivery to every
 // remote server with users in the room. The PDU is delivered in a signed
 // PUT /_matrix/federation/v1/send/{txnID} transaction with retries (the same
-// delivery semantics as the EDU queue).
+// delivery semantics as the EDU queue). For partial-state rooms (MSC3902) the
+// remote membership is not yet known, so the room's recorded servers_in_room
+// list is also consulted: events must reach the servers the room is known to
+// span even before the resync completes.
 func (a *API) BroadcastPDUToRoom(ctx context.Context, roomID string, ev *events.Event) {
 	servers := a.serversForRooms(ctx, []string{roomID})
+	if room, err := a.Store.GetRoom(ctx, roomID); err == nil && len(room.ServersInRoom) > 0 {
+		seen := make(map[string]bool, len(servers))
+		for _, s := range servers {
+			seen[s] = true
+		}
+		for _, s := range room.ServersInRoom {
+			if s == a.ServerName() || seen[s] {
+				continue
+			}
+			seen[s] = true
+			servers = append(servers, s)
+		}
+	}
 	if len(servers) == 0 {
 		return
 	}
