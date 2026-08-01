@@ -139,7 +139,7 @@ func (a *API) broadcastProfileUpdate(w http.ResponseWriter, r *http.Request, aut
 		content["avatar_url"] = u.AvatarURL
 	}
 	for _, roomID := range roomIDs {
-		_ = a.sendMemberEventWithContent(r, auth, roomID, auth.UserID, content)
+		_, _ = a.sendMemberEventWithContent(r, auth, roomID, auth.UserID, content)
 	}
 }
 

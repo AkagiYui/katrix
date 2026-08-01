@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/AkagiYui/katrix/internal/homeserver"
@@ -69,15 +68,17 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 	if f := q.Get("filter"); f != "" {
 		// A filter ID references a stored filter; an inline JSON object is used
 		// directly. Stored filters are per-user; the user may only use their own.
-		if len(f) > 1 && f[0] == '{' {
+		// Filter IDs are random opaque strings (they need not start with 'f'),
+		// so anything that is not an inline JSON object is treated as an ID.
+		if len(f) > 0 && f[0] == '{' {
 			filter = syncpkg.ParseSyncFilter(json.RawMessage(f))
-		} else if strings.HasPrefix(f, "f") {
-			if raw, err := a.Store.GetFilter(r.Context(), auth.Localpart, f); err == nil {
-				filter = syncpkg.ParseSyncFilter(raw)
-			} else {
+		} else {
+			raw, err := a.Store.GetFilter(r.Context(), auth.Localpart, f)
+			if err != nil {
 				httpx.WriteError(w, httpx.ErrNotFound("filter not found"))
 				return
 			}
+			filter = syncpkg.ParseSyncFilter(raw)
 		}
 	}
 

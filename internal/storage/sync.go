@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -203,12 +204,18 @@ func (s *Store) InvitedRooms(ctx context.Context, userID string) ([]string, erro
 
 // LeftRooms returns room IDs the user has left (leave or ban).
 // LeftRooms returns the room IDs the user has left (membership leave/ban).
-// Forgotten rooms are excluded from initial sync (forgotten rooms "do not show
-// up in sync"), but an incremental sync (includeForgotten=true) still reports
-// the leave so other devices learn the room was left before it disappears.
-func (s *Store) LeftRooms(ctx context.Context, userID string, includeForgotten bool) ([]string, error) {
+// On incremental sync (since>0) only rooms left after `since` are reported: a
+// leave already delivered in an earlier sync must not reappear. Forgotten
+// rooms are excluded from initial sync (forgotten rooms "do not show up in
+// sync"), but an incremental sync (includeForgotten=true) still reports the
+// leave so other devices learn the room was left before it disappears.
+func (s *Store) LeftRooms(ctx context.Context, userID string, since int64, includeForgotten bool) ([]string, error) {
 	q := `SELECT room_id FROM room_memberships WHERE user_id=$1 AND membership IN ('leave','ban')`
 	args := []any{userID}
+	if since > 0 {
+		q += ` AND stream_ordering > $` + strconv.Itoa(len(args)+1)
+		args = append(args, since)
+	}
 	if !includeForgotten {
 		q += ` AND NOT forgotten`
 	}

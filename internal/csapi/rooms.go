@@ -190,7 +190,7 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		if isDirect {
 			content["is_direct"] = true
 		}
-		_ = a.sendMemberEventWithContent(r, auth, roomID, invitee, content)
+		_, _ = a.sendMemberEventWithContent(r, auth, roomID, invitee, content)
 	}
 
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"room_id": roomID})
@@ -448,12 +448,12 @@ func (a *API) RoomStatePut(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, httpx.ErrBadJSON(err.Error()))
 			return
 		}
-		if err := a.sendMemberEvent(r, auth, roomID, stateKey, stateKey, mc.Membership, mc.Reason); err != nil {
+		eventID, err := a.sendMemberEventWithContent(r, auth, roomID, stateKey, memberContent(mc))
+		if err != nil {
 			writeRoomErr(w, err)
 			return
 		}
-		// Look up the persisted event ID.
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": ""})
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": eventID})
 		return
 	}
 	ev, err := a.buildAndPersistState(r, auth, roomID, eventType, stateKey, content)
@@ -468,13 +468,13 @@ func (a *API) RoomStatePut(w http.ResponseWriter, r *http.Request) {
 func (a *API) RoomStateGet(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomID := r.PathValue("roomID")
-	if err := a.checkMembership(r.Context(), roomID, auth.UserID, rooms.MembershipJoin); err != nil {
+	if err := a.checkCanReadRoom(r.Context(), roomID, auth.UserID); err != nil {
 		writeRoomErr(w, err)
 		return
 	}
-	stateRows, err := a.Store.GetState(r.Context(), roomID)
+	stateRows, err := a.stateRowsForReader(r.Context(), roomID, auth.UserID)
 	if err != nil {
-		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		writeRoomErr(w, err)
 		return
 	}
 	// Fetch each event's content.
@@ -516,12 +516,23 @@ func (a *API) serveStateContent(w http.ResponseWriter, r *http.Request, stateKey
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomID := r.PathValue("roomID")
 	eventType := r.PathValue("eventType")
-	if err := a.checkMembership(r.Context(), roomID, auth.UserID, rooms.MembershipJoin); err != nil {
+	if err := a.checkCanReadRoom(r.Context(), roomID, auth.UserID); err != nil {
 		writeRoomErr(w, err)
 		return
 	}
-	eventID, err := a.Store.GetStateEvent(r.Context(), roomID, eventType, stateKey)
+	stateRows, err := a.stateRowsForReader(r.Context(), roomID, auth.UserID)
 	if err != nil {
+		writeRoomErr(w, err)
+		return
+	}
+	var eventID string
+	for _, s := range stateRows {
+		if s.Type == eventType && s.StateKey == stateKey {
+			eventID = s.EventID
+			break
+		}
+	}
+	if eventID == "" {
 		httpx.WriteError(w, httpx.ErrNotFound("state event not found"))
 		return
 	}
@@ -537,6 +548,20 @@ func (a *API) serveStateContent(w http.ResponseWriter, r *http.Request, stateKey
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, json.RawMessage(ev.Content))
+}
+
+// stateRowsForReader returns the room state the reader is entitled to see. For
+// a departed user under history_visibility=joined that is the state snapshot
+// at the user's leave event; everyone else sees the current room state.
+func (a *API) stateRowsForReader(ctx context.Context, roomID, userID string) ([]storage.StateRow, error) {
+	if vis := a.historyVisibility(ctx, roomID); vis == "joined" {
+		if m, err := a.Store.GetMembership(ctx, roomID, userID); err == nil && m.Membership == rooms.MembershipLeave && m.EventID != "" {
+			if rows, err := a.Store.GetEventState(ctx, m.EventID); err == nil {
+				return rows, nil
+			}
+		}
+	}
+	return a.Store.GetState(ctx, roomID)
 }
 
 // ---- event / members / messages ----
@@ -619,12 +644,10 @@ func (a *API) canReadEventAt(ctx context.Context, vis string, m *storage.Members
 func (a *API) RoomMembers(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomID := r.PathValue("roomID")
-	if err := a.checkMembership(r.Context(), roomID, auth.UserID, rooms.MembershipJoin); err != nil {
-		// Permitted if the caller is at least invited.
-		if err2 := a.checkMembershipAny(r.Context(), roomID, auth.UserID, rooms.MembershipInvite); err2 != nil {
-			writeRoomErr(w, err)
-			return
-		}
+	// Members are visible to joined, invited and (for history) departed users.
+	if err := a.checkCanReadRoom(r.Context(), roomID, auth.UserID); err != nil {
+		writeRoomErr(w, err)
+		return
 	}
 	q := r.URL.Query()
 	membershipFilter := q.Get("membership")
@@ -663,9 +686,20 @@ func (a *API) RoomMembers(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	// history_visibility=joined: a departed user sees the membership as of
+	// their leave; members who joined later are hidden.
+	var leaveAt int64
+	if vis := a.historyVisibility(r.Context(), roomID); vis == "joined" {
+		if m, err := a.Store.GetMembership(r.Context(), roomID, auth.UserID); err == nil && m.Membership == rooms.MembershipLeave {
+			leaveAt = m.StreamOrdering
+		}
+	}
 	chunk := make([]json.RawMessage, 0, len(rows))
 	for _, m := range rows {
 		if notMembership != "" && m.Membership == notMembership {
+			continue
+		}
+		if leaveAt > 0 && m.StreamOrdering > leaveAt {
 			continue
 		}
 		// If the membership event row is still available, emit the full client
@@ -850,7 +884,7 @@ func contentRelType(content json.RawMessage) string {
 func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomID := r.PathValue("roomID")
-	if err := a.checkMembership(r.Context(), roomID, auth.UserID, rooms.MembershipJoin); err != nil {
+	if err := a.checkCanReadRoom(r.Context(), roomID, auth.UserID); err != nil {
 		writeRoomErr(w, err)
 		return
 	}
@@ -865,6 +899,15 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	if v := q.Get("to"); v != "" {
 		to, _ = parseIntToken(v)
+	}
+	// history_visibility=joined: a departed user may only see events sent
+	// before they left; cap the pagination window at their leave position.
+	if vis := a.historyVisibility(r.Context(), roomID); vis == "joined" {
+		if m, err := a.Store.GetMembership(r.Context(), roomID, auth.UserID); err == nil && m.Membership == rooms.MembershipLeave && m.StreamOrdering > 0 {
+			if to == 0 || m.StreamOrdering < to {
+				to = m.StreamOrdering
+			}
+		}
 	}
 	limit := 30
 	if v := q.Get("limit"); v != "" {
@@ -1408,6 +1451,28 @@ func (a *API) checkMembershipAny(ctx context.Context, roomID, userID, allowed st
 	return nil
 }
 
+// checkCanReadRoom permits joined, invited, knocking and departed users to read
+// a room's state/members/messages (history_visibility governs which events they
+// may actually see). Only banned users, those who never joined, and users who
+// forgot the room are rejected with 403. The spec grants departed members
+// access to the history they were entitled to see while joined, but forgetting
+// a room revokes all access ("forgotten room messages cannot be paginated").
+func (a *API) checkCanReadRoom(ctx context.Context, roomID, userID string) error {
+	m, err := a.Store.GetMembership(ctx, roomID, userID)
+	if err != nil {
+		return newRoomError(http.StatusForbidden, "M_FORBIDDEN", "not a member of the room")
+	}
+	if m.Forgotten {
+		return newRoomError(http.StatusForbidden, "M_FORBIDDEN", "room was forgotten")
+	}
+	switch m.Membership {
+	case rooms.MembershipJoin, rooms.MembershipInvite, rooms.MembershipKnock, rooms.MembershipLeave:
+		return nil
+	default:
+		return newRoomError(http.StatusForbidden, "M_FORBIDDEN", "not permitted to view this room")
+	}
+}
+
 // joinRoom performs a join for the authenticated user: a local join (auth
 // rules + persist the m.room.member(join) event) when the room is known
 // locally, or a federated join against a remote server when it is not.
@@ -1421,7 +1486,7 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 		for k, v := range extra {
 			content[k] = v
 		}
-		if err := a.sendMemberEventWithContent(r, auth, roomID, auth.UserID, content); err != nil {
+		if _, err := a.sendMemberEventWithContent(r, auth, roomID, auth.UserID, content); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -1486,31 +1551,56 @@ func (a *API) sendMemberEvent(r *http.Request, auth *homeserver.Auth, roomID, _s
 	if reason != "" {
 		content["reason"] = reason
 	}
-	return a.sendMemberEventWithContent(r, auth, roomID, target, content)
+	_, err := a.sendMemberEventWithContent(r, auth, roomID, target, content)
+	return err
+}
+
+// memberContent renders a parsed MemberContent as a content map, preserving
+// all spec fields (membership, displayname, avatar_url, reason, is_direct,
+// third_party_invite).
+func memberContent(mc *rooms.MemberContent) map[string]any {
+	m := map[string]any{"membership": mc.Membership}
+	if mc.DisplayName != "" {
+		m["displayname"] = mc.DisplayName
+	}
+	if mc.AvatarURL != "" {
+		m["avatar_url"] = mc.AvatarURL
+	}
+	if mc.Reason != "" {
+		m["reason"] = mc.Reason
+	}
+	if mc.IsDirect != nil {
+		m["is_direct"] = *mc.IsDirect
+	}
+	if len(mc.ThirdParty) > 0 {
+		m["third_party_invite"] = json.RawMessage(mc.ThirdParty)
+	}
+	return m
 }
 
 // sendMemberEventWithContent builds, authorises and persists an m.room.member
-// event with the given content (which must include "membership").
-func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth, roomID, target string, content map[string]any) error {
+// event with the given content (which must include "membership"). It returns
+// the persisted event ID (idempotent repeats return the existing event's ID).
+func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth, roomID, target string, content map[string]any) (string, error) {
 	// Serialise with state writes so the join-idempotency check is atomic.
 	a.stateMu.Lock()
 	defer a.stateMu.Unlock()
 	room, err := a.Store.GetRoom(r.Context(), roomID)
 	if err != nil {
-		return newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
+		return "", newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
 	}
 	version := roomver.Version(room.Version)
 	contentRaw, _ := json.Marshal(content)
 	st, err := a.buildStateSnapshot(r.Context(), roomID, target, auth.UserID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	rules, ok := roomver.Get(version)
 	if !ok {
-		return newRoomError(http.StatusBadRequest, "M_UNSUPPORTED_ROOM_VERSION", "unknown room version")
+		return "", newRoomError(http.StatusBadRequest, "M_UNSUPPORTED_ROOM_VERSION", "unknown room version")
 	}
 	if err := rooms.Authorize(rules, "m.room.member", target, auth.UserID, contentRaw, st); err != nil {
-		return newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
+		return "", newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
 	}
 	// Joining (or re-joining) with identical member content is idempotent: if
 	// the current member state already carries exactly this content, return the
@@ -1518,17 +1608,17 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	if existingID, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.member", target); err == nil && existingID != "" {
 		if existing, err := a.Store.GetEvent(r.Context(), existingID); err == nil && existing != nil {
 			if canonicaljson.Equal(contentRaw, json.RawMessage(existing.Content)) {
-				return nil
+				return existingID, nil
 			}
 		}
 	}
 	ev, err := a.buildEvent(r, auth, roomID, version, "m.room.member", target, ids.RandomTxnSuffix(), true, contentRaw)
 	if err != nil {
-		return err
+		return "", err
 	}
 	stream, err := persistEvent(r.Context(), a.Store, ev, version)
 	if err != nil {
-		return err
+		return "", err
 	}
 	// room_state is maintained by persistEvent (snapshot + recompute).
 	// Update the denormalised membership table.
@@ -1538,7 +1628,7 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 			RoomID: roomID, UserID: target, Membership: mc.Membership,
 			EventID: ev.EventID(), StreamOrdering: stream,
 		}); err != nil {
-			return err
+			return "", err
 		}
 		// A join/leave changes the user's device-list visibility to the room's
 		// other members: their /sync must learn the user in device_lists.changed
@@ -1549,7 +1639,7 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 		}
 	}
 	a.notifyRoomMembers(r.Context(), roomID)
-	return nil
+	return ev.EventID(), nil
 }
 
 // sendStateEvent is a helper used by createRoom for name/topic events.

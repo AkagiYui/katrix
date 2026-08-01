@@ -333,7 +333,10 @@ func (s *Store) UpsertMembership(ctx context.Context, m MembershipRow) error {
 		     event_id=EXCLUDED.event_id,
 		     display_name=EXCLUDED.display_name,
 		     avatar_url=EXCLUDED.avatar_url,
-		     stream_ordering=EXCLUDED.stream_ordering`,
+		     stream_ordering=EXCLUDED.stream_ordering,
+		     -- Re-joining a forgotten room resets the forgotten flag: the user
+		     -- is a member again and regains access.
+		     forgotten = CASE WHEN EXCLUDED.membership='join' THEN FALSE ELSE room_memberships.forgotten END`,
 		m.RoomID, m.UserID, m.Membership, m.EventID,
 		nullString(m.DisplayName), nullString(m.AvatarURL), m.StreamOrdering)
 	return err

@@ -113,6 +113,9 @@ type SyncFilter struct {
 	TimelineSenders    []string
 	TimelineNotSenders []string
 	TimelineLimit      int
+	// TimelineLimitSet distinguishes an explicit `limit: 0` (empty timeline)
+	// from an unset limit (default).
+	TimelineLimitSet bool
 	// Lazy-load members: only include membership state events, and only for
 	// senders present in the timeline.
 	LazyLoadMembers bool
@@ -135,7 +138,7 @@ func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
 				NotTypes   []string `json:"not_types"`
 				Senders    []string `json:"senders"`
 				NotSenders []string `json:"not_senders"`
-				Limit      int      `json:"limit"`
+				Limit      *int     `json:"limit"`
 			} `json:"timeline"`
 			State struct {
 				LazyLoadMembers bool `json:"lazy_load_members"`
@@ -152,10 +155,13 @@ func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
 		TimelineNotTypes:   obj.Room.Timeline.NotTypes,
 		TimelineSenders:    obj.Room.Timeline.Senders,
 		TimelineNotSenders: obj.Room.Timeline.NotSenders,
-		TimelineLimit:      obj.Room.Timeline.Limit,
 		LazyLoadMembers:    obj.Room.State.LazyLoadMembers,
 		IncludeLeave:       obj.Room.IncludeLeave,
 		EventFields:        obj.EventFields,
+	}
+	if obj.Room.Timeline.Limit != nil {
+		f.TimelineLimit = *obj.Room.Timeline.Limit
+		f.TimelineLimitSet = true
 	}
 	// A filter with nothing set behaves like no filter.
 	if !f.anySet() {
@@ -165,7 +171,7 @@ func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
 }
 
 func (f *SyncFilter) anySet() bool {
-	return f.TimelineLimit > 0 || f.LazyLoadMembers || f.IncludeLeave ||
+	return f.TimelineLimitSet || f.TimelineLimit > 0 || f.LazyLoadMembers || f.IncludeLeave ||
 		len(f.TimelineTypes) > 0 || len(f.TimelineNotTypes) > 0 ||
 		len(f.TimelineSenders) > 0 || len(f.TimelineNotSenders) > 0 ||
 		len(f.EventFields) > 0
@@ -276,9 +282,11 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	}
 
 	// Left rooms (membership=leave/ban) - include recent timeline once.
-	// Forgotten rooms are hidden on initial sync but still reported on
-	// incremental sync (other devices must learn the room was left).
-	leftRooms, _ := e.store.LeftRooms(ctx, opts.UserID, opts.Since.Stream > 0)
+	// Only rooms left after the sync token are reported incrementally (a leave
+	// already delivered must not reappear); forgotten rooms are hidden on
+	// initial sync but still reported incrementally so other devices learn the
+	// room was left.
+	leftRooms, _ := e.store.LeftRooms(ctx, opts.UserID, opts.Since.Stream, opts.Since.Stream > 0)
 	if leftRooms != nil {
 		for _, roomID := range leftRooms {
 			lr, err := e.buildLeftRoom(ctx, roomID, opts, maxStream)
@@ -693,23 +701,59 @@ func (e *Engine) buildInvitedRoom(ctx context.Context, roomID string) InvitedRoo
 	return ir
 }
 
-// buildLeftRoom constructs the LeftRoom section.
+// buildLeftRoom constructs the LeftRoom section. The timeline is capped at the
+// user's leave position (archived rooms "only contain history from before the
+// user left") and filtered by the room timeline filter; when the filter yields
+// an empty timeline, `state` carries the leave-time state snapshot so clients
+// still learn the leave (and the pre-leave state) — the spec's archived-room
+// behaviour (cf. element-hq/synapse#16932).
 func (e *Engine) buildLeftRoom(ctx context.Context, roomID string, opts SyncOptions, maxStream int64) (LeftRoom, error) {
 	lr := LeftRoom{}
+	filter := opts.Filter
+	// Where the user left: only events before (and including) the leave are in
+	// the archived timeline.
+	upto := maxStream
+	if m, err := e.store.GetMembership(ctx, roomID, opts.UserID); err == nil && m.Membership == "leave" && m.StreamOrdering > 0 {
+		upto = m.StreamOrdering
+	}
 	from := opts.Since.Stream
+	limit := 50
+	if filter != nil && filter.TimelineLimitSet {
+		limit = filter.TimelineLimit
+	}
 	if from == 0 {
-		from = maxStream - 50
+		from = upto - int64(limit)
 		if from < 0 {
 			from = 0
 		}
 	}
-	evs, err := e.store.EventsForRoom(ctx, roomID, from, maxStream, 50, "f")
+	evs, err := e.store.EventsForRoom(ctx, roomID, from, upto, limit, "f")
 	if err != nil {
 		return lr, err
 	}
 	lr.Timeline.Events = make([]json.RawMessage, 0, len(evs))
 	for _, ev := range evs {
-		lr.Timeline.Events = append(lr.Timeline.Events, ev.RawJSON)
+		if filter != nil && !filter.keepTimeline(&ev) {
+			continue
+		}
+		lr.Timeline.Events = append(lr.Timeline.Events, filter.applyEventFields(clientEvent(&ev)))
+	}
+	// When the timeline is empty, fill `state` with the state as of the leave
+	// event (leave event + pre-leave state) per the spec regression test.
+	if len(lr.Timeline.Events) == 0 {
+		if m, err := e.store.GetMembership(ctx, roomID, opts.UserID); err == nil && m.EventID != "" {
+			if rows, err := e.store.GetEventState(ctx, m.EventID); err == nil {
+				ids := make([]string, 0, len(rows))
+				for _, s := range rows {
+					ids = append(ids, s.EventID)
+				}
+				stateEvs, _ := e.store.EventsByIDs(ctx, ids)
+				lr.State.Events = make([]json.RawMessage, 0, len(stateEvs))
+				for i := range stateEvs {
+					lr.State.Events = append(lr.State.Events, clientEvent(&stateEvs[i]))
+				}
+			}
+		}
 	}
 	return lr, nil
 }
