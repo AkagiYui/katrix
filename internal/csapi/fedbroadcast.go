@@ -3,8 +3,19 @@ package csapi
 import (
 	"context"
 
+	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/storage"
 )
+
+// broadcastPDU queues a locally-created event for delivery to every remote
+// server with users in the room (spec "Transaction delivery": servers must
+// send the events they create to all servers in the room).
+func (a *API) broadcastPDU(ctx context.Context, roomID string, ev *events.Event) {
+	if a.fed == nil {
+		return
+	}
+	a.fed.BroadcastPDUToRoom(ctx, roomID, ev)
+}
 
 // broadcastDeviceListUpdate queues an m.device_list_update EDU for userID to
 // every remote server that shares a room with the user. Called whenever the

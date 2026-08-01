@@ -88,40 +88,10 @@ func indexByte(s string, b byte) int {
 	return -1
 }
 
-// RunEDUWorker delivers queued outbound EDUs until ctx is cancelled. It is
-// started once at server startup and also woken by BroadcastEDUToRooms. Failed
-// deliveries are retried with an exponential backoff cap; a delivery is only
-// acknowledged (destination dropped) after the remote server returns 200, at
-// which point the row is deleted once no destinations remain.
-func (a *API) RunEDUWorker(ctx context.Context) {
-	const baseDelay = 2 * time.Second
-	const maxDelay = 5 * time.Minute
-	delay := baseDelay
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-a.eduWake:
-		case <-time.After(delay):
-		}
-		// Drain the queue in batches; keep the backoff if nothing was left.
-		edus, err := a.Store.PendingOutboundEDUs(ctx, 50)
-		if err != nil || len(edus) == 0 {
-			delay = minDuration(delay*2, maxDelay)
-			continue
-		}
-		delay = baseDelay
-		for _, edu := range edus {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			a.deliverEDU(ctx, edu.ID, edu.TxnID, edu.EduType, edu.Content, edu.Destinations)
-		}
-	}
-}
+// ---- inbound EDU handling (spec "Receiving transactions") ----
 
+// minDuration returns the smaller of two durations (used by the delivery
+// worker's backoff).
 func minDuration(a, b time.Duration) time.Duration {
 	if a < b {
 		return a

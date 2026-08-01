@@ -1114,6 +1114,7 @@ func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 	_ = a.Store.RecordTxnEventID(r.Context(), auth.Localpart, roomID, txnID, ev.EventID(), a.Now())
 	_ = a.Store.SetEventRedacted(r.Context(), eventID)
 	a.notifyRoomMembers(r.Context(), roomID)
+	a.broadcastPDU(r.Context(), roomID, ev)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": ev.EventID()})
 }
 
@@ -1786,6 +1787,7 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 		}
 	}
 	a.notifyRoomMembers(r.Context(), roomID)
+	a.broadcastPDU(r.Context(), roomID, ev)
 	return ev.EventID(), nil
 }
 
@@ -1818,6 +1820,7 @@ func (a *API) buildAndPersistMessage(r *http.Request, auth *homeserver.Auth, roo
 		return nil, err
 	}
 	a.notifyRoomMembers(r.Context(), roomID)
+	a.broadcastPDU(r.Context(), roomID, ev)
 	return ev, nil
 }
 
@@ -1878,6 +1881,7 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	}
 	// room_state is maintained by persistEvent (snapshot + recompute).
 	a.notifyRoomMembers(r.Context(), roomID)
+	a.broadcastPDU(r.Context(), roomID, ev)
 	return ev, nil
 }
 

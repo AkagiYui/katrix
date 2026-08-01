@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/eventstate"
@@ -88,7 +89,7 @@ func (a *API) SendTransaction(w http.ResponseWriter, r *http.Request) {
 	pduResults := map[string]any{}
 	notifyRooms := map[string]bool{}
 	for _, raw := range body.PDUs {
-		evID, accept := a.ingestPDU(r, raw)
+		evID, accept := a.ingestPDU(r, raw, body.Origin)
 		if evID != "" {
 			if accept {
 				pduResults[evID] = map[string]any{}
@@ -127,7 +128,9 @@ func (a *API) SendTransaction(w http.ResponseWriter, r *http.Request) {
 // ingestPDU validates, verifies and persists a single inbound PDU. Each PDU's
 // signature is checked against its origin server's published verify keys before
 // it is trusted; events that fail verification are rejected (not persisted).
-func (a *API) ingestPDU(r *http.Request, raw json.RawMessage) (string, bool) {
+// When an accepted event references prev_events this server does not have, the
+// sending server is asked for them via get_missing_events (spec gap filling).
+func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (string, bool) {
 	var ev struct {
 		EventID    string                       `json:"event_id"`
 		RoomID     string                       `json:"room_id"`
@@ -166,6 +169,16 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage) (string, bool) {
 	evID := ev.EventID
 	if evID == "" {
 		evID = res.EventID
+	}
+	// Gap filling first: if the event's prev_events reference events we do not
+	// have, ask the sending server for them (spec: a server that receives an
+	// event referencing unknown prev_events should request them via
+	// get_missing_events so the room's timeline stays contiguous). The fetched
+	// events must be persisted before this one so stream ordering (and thus the
+	// /sync timeline) reflects the true DAG order. Best-effort: a failure here
+	// must not reject the already-verified event.
+	if origin != "" && a.hasUnknownPrevEvents(r.Context(), raw) {
+		a.fetchMissingEventsFor(r.Context(), ev.RoomID, evID, origin)
 	}
 	row := &storage.EventRow{
 		EventID: evID, RoomID: ev.RoomID, Type: ev.Type, Sender: ev.Sender,
@@ -270,6 +283,12 @@ func (a *API) Backfill(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetMissingEvents handles POST /_matrix/federation/v1/get_missing_events/{roomID}.
+// Per the spec the response must contain the events that connect the room's
+// current state (earliest_events) to the events named in latest_events — i.e.
+// the events strictly between the two sets, in forward order — and the events
+// must be redacted where the requesting server's users are not joined (the
+// requester's event visibility is inferred from the room's history_visibility
+// plus whether it has members in the room).
 func (a *API) GetMissingEvents(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
 	var req struct {
@@ -286,12 +305,107 @@ func (a *API) GetMissingEvents(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = 20
 	}
-	evs, _ := a.Store.EventsForRoom(r.Context(), roomID, 0, 0, limit, "b")
+	// Locate the newest of the earliest_events we have (they anchor the walk);
+	// the response is the events between that anchor and the latest events.
+	anchorDepth := int64(0)
+	haveAnchor := false
+	for _, id := range req.EarliestEvents {
+		if ev, err := a.Store.GetEvent(r.Context(), id); err == nil && ev != nil {
+			if !haveAnchor || ev.Depth > anchorDepth {
+				anchorDepth = ev.Depth
+				haveAnchor = true
+			}
+		}
+	}
+	// Pull the room's recent events in forward (oldest-first) order and filter
+	// down to those strictly after the anchor.
+	evs, err := a.Store.EventsForRoom(r.Context(), roomID, 0, 0, limit, "f")
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
+		return
+	}
+	// Does the requester have any joined users in this room? (Only then may they
+	// see unredacted events that predate the room's history_visibility.)
+	requester := remoteOriginOf(r)
+	joinedRemote := false
+	if requester != "" {
+		members, err := a.Store.Members(r.Context(), roomID, "join")
+		if err == nil {
+			for _, m := range members {
+				if userDomain(m.UserID) == requester {
+					joinedRemote = true
+					break
+				}
+			}
+		}
+	}
+	// history_visibility: "world_readable" and "shared" events predating the
+	// requester's join are visible unredacted; "joined"/"invited" require the
+	// requester to have a member in the room for pre-join events.
+	vis := a.historyVisibility(r.Context(), roomID)
+	needRedaction := (vis == "invited" || vis == "joined") && !joinedRemote
+
 	pdus := make([]json.RawMessage, 0, len(evs))
+	redactRules, haveRules := roomver.Get(roomver.Version(a.roomVersionOf(r.Context(), roomID)))
 	for _, e := range evs {
+		if haveAnchor && e.Depth <= anchorDepth {
+			continue
+		}
+		if len(pdus) >= limit {
+			break
+		}
+		if needRedaction {
+			if haveRules {
+				if red, err := events.Redact(e.RawJSON, redactRules); err == nil {
+					if b, err := json.Marshal(red); err == nil {
+						pdus = append(pdus, b)
+					}
+				}
+			}
+			continue
+		}
 		pdus = append(pdus, e.RawJSON)
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"origin": a.ServerName(), "events": pdus})
+}
+
+// historyVisibility returns the room's current m.room.history_visibility value
+// ("shared" default when absent).
+func (a *API) historyVisibility(ctx context.Context, roomID string) string {
+	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.history_visibility", ""); err == nil {
+		if ev, err := a.Store.GetEvent(ctx, id); err == nil {
+			var c struct {
+				Visibility string `json:"history_visibility"`
+			}
+			if json.Unmarshal(ev.Content, &c) == nil && c.Visibility != "" {
+				return c.Visibility
+			}
+		}
+	}
+	return "shared"
+}
+
+// roomVersionOf returns the version string for a room ("" when unknown).
+func (a *API) roomVersionOf(ctx context.Context, roomID string) string {
+	if room, err := a.Store.GetRoom(ctx, roomID); err == nil {
+		return room.Version
+	}
+	return ""
+}
+
+// remoteOriginOf returns the origin server of the requesting federation
+// request (from the signed X-Matrix Authorization header, falling back to the
+// room-level origin conventions).
+func remoteOriginOf(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	// X-Matrix origin=<name>,key=<id>,destination=<name>,sig=<sig>
+	if i := strings.Index(h, "origin="); i >= 0 {
+		rest := h[i+len("origin="):]
+		if j := strings.IndexByte(rest, ','); j >= 0 {
+			return rest[:j]
+		}
+	}
+	return ""
 }
 
 // MakeJoin handles GET /_matrix/federation/v1/make_join/{roomID}/{userID}.
@@ -428,12 +542,34 @@ func (a *API) SendLeave(w http.ResponseWriter, r *http.Request) { a.ingestRemote
 func (a *API) Invite(w http.ResponseWriter, r *http.Request) { a.ingestRemoteMember(w, r, "invite") }
 
 // EventAuth handles GET /_matrix/federation/v1/event_auth/{roomID}/{eventID}.
+// The response is the auth chain of the requested event only: the transitive
+// closure of its auth_events, excluding the event itself. Returning the whole
+// room's current-state auth chain here is wrong (a former Dendrite bug) — a
+// requesting server uses this to authorise a specific event.
 func (a *API) EventAuth(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
+	eventID := r.PathValue("eventID")
+	if _, err := a.Store.GetEvent(r.Context(), eventID); err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("event not found"))
+		return
+	}
+	chain := a.walkAuthChain(r.Context(), []string{eventID})
+	ids := make([]string, 0, len(chain))
+	for id := range chain {
+		if id != eventID {
+			ids = append(ids, id)
+		}
+	}
+	evs, _ := a.Store.EventsByIDs(r.Context(), ids)
+	out := make([]json.RawMessage, 0, len(evs))
+	for _, e := range evs {
+		out = append(out, e.RawJSON)
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"origin":     a.ServerName(),
-		"auth_chain": a.authChain(r, roomID),
+		"auth_chain": out,
 	})
+	_ = roomID
 }
 
 // QueryDirectory handles GET /_matrix/federation/v1/query/directory/{roomAlias},

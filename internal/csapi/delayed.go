@@ -193,6 +193,7 @@ func (a *API) buildAndPersistMessageCtx(ctx context.Context, auth *homeserver.Au
 		return nil, err
 	}
 	a.notifyRoomMembersCtx(ctx, roomID)
+	a.broadcastPDU(ctx, roomID, ev)
 	return ev, nil
 }
 
