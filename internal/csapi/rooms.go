@@ -1495,6 +1495,42 @@ func (a *API) restrictedJoinAuthorised(ctx context.Context, roomID, joiningUserI
 	return err == nil && m.Membership == rooms.MembershipJoin
 }
 
+// restrictedJoinAuthoriser picks a local joined user of the room who may
+// authorise a restricted join (MSC3083): a joined member with at least invite
+// power. The room creator is preferred (they always qualify); otherwise any
+// qualifying joined member is used.
+func (a *API) restrictedJoinAuthoriser(ctx context.Context, roomID string) string {
+	// Prefer the creator.
+	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.create", ""); err == nil {
+		if ev, err := a.Store.GetEvent(ctx, id); err == nil {
+			var c struct {
+				Creator string `json:"creator"`
+			}
+			_ = json.Unmarshal(ev.Content, &c)
+			if c.Creator != "" && ids.DomainOf(c.Creator) == a.ServerName() {
+				if m, err := a.Store.GetMembership(ctx, roomID, c.Creator); err == nil && m.Membership == rooms.MembershipJoin {
+					return c.Creator
+				}
+			}
+		}
+	}
+	// Fall back to any local joined member (the invite power level defaults to
+	// 50, and room creators hold at least that; a joined member without invite
+	// power cannot authorise).
+	users, err := a.Store.JoinedUserIDs(ctx, roomID)
+	if err != nil {
+		return ""
+	}
+	for _, u := range users {
+		if ids.DomainOf(u) == a.ServerName() {
+			if m, err := a.Store.GetMembership(ctx, roomID, u); err == nil && m.Membership == rooms.MembershipJoin {
+				return u
+			}
+		}
+	}
+	return ""
+}
+
 // checkMembership verifies the user has the given membership in the room.
 func (a *API) checkMembership(ctx context.Context, roomID, userID, want string) error {
 	m, err := a.Store.GetMembership(ctx, roomID, userID)
@@ -1671,11 +1707,21 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 		return "", newRoomError(http.StatusBadRequest, "M_UNSUPPORTED_ROOM_VERSION", "unknown room version")
 	}
 	// Restricted-rule join (MSC3083): the joining user must be a joined member
-	// of one of the allow-listed rooms, and the user named in
-	// join_authorised_via_users_server must be a joined member of this room.
+	// of one of the allow-listed rooms, and the join must name a joined member
+	// of this room as authoriser. When the client omitted
+	// join_authorised_via_users_server, the server selects an eligible local
+	// joined user (with invite power) and injects it into the event content.
 	if rooms.JoinRule(st.JoinRules) == rooms.JoinRuleRestricted || rooms.JoinRule(st.JoinRules) == rooms.JoinRuleKnockRestricted {
 		if mc, err := rooms.ParseMember(contentRaw); err == nil && mc.Membership == rooms.MembershipJoin {
-			st.RestrictedAuthorised = a.restrictedJoinAuthorised(r.Context(), roomID, auth.UserID, mc.JoinAuthorisedViaUsersServer)
+			authorisingUser := mc.JoinAuthorisedViaUsersServer
+			if authorisingUser == "" {
+				authorisingUser = a.restrictedJoinAuthoriser(r.Context(), roomID)
+				if authorisingUser != "" {
+					content["join_authorised_via_users_server"] = authorisingUser
+					contentRaw, _ = json.Marshal(content)
+				}
+			}
+			st.RestrictedAuthorised = a.restrictedJoinAuthorised(r.Context(), roomID, auth.UserID, authorisingUser)
 		}
 	}
 	if err := rooms.Authorize(rules, "m.room.member", target, auth.UserID, contentRaw, st); err != nil {

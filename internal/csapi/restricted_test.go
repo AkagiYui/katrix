@@ -58,9 +58,9 @@ func TestRestrictedRoomJoin(t *testing.T) {
 		t.Fatalf("bob join allowed room: %d %v", code, body)
 	}
 
-	// Now Bob can join the restricted room (Alice authorises the join).
-	code, body = doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/rooms/"+room+"/join", bob,
-		map[string]any{"join_authorised_via_users_server": "@rest-alice:test.katrix"})
+	// Now Bob can join the restricted room. Complement joins without an
+	// explicit authoriser; the server must auto-select Alice (the creator).
+	code, body = doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/rooms/"+room+"/join", bob, map[string]any{})
 	if code != 200 {
 		t.Fatalf("bob join restricted room after allowed room: %d %v", code, body)
 	}
