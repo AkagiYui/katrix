@@ -731,13 +731,16 @@ func (a *API) RoomAliases(w http.ResponseWriter, r *http.Request) {
 // roomEventFilter is the subset of the spec room event filter honoured by
 // /messages: contains_url (only events whose content has a top-level `url`
 // field, i.e. media messages), org.matrix.msc3874.rel_types (only events whose
-// m.relates_to.rel_type matches one of the given values), and
-// org.matrix.msc3874.not_rel_types (only events whose rel_type does NOT match).
-// An absent filter keeps all events.
+// m.relates_to.rel_type matches one of the given values),
+// org.matrix.msc3874.not_rel_types (only events whose rel_type does NOT match),
+// and lazy_load_members (include the membership events of timeline senders in
+// the response `state`, per the spec's lazy-loading-members behaviour). An
+// absent filter keeps all events.
 type roomEventFilter struct {
-	containsURL *bool
-	relTypes    map[string]bool
-	notRelTypes map[string]bool
+	containsURL     *bool
+	relTypes        map[string]bool
+	notRelTypes     map[string]bool
+	lazyLoadMembers bool
 }
 
 // parseRoomEventFilter parses the `filter` query param. The value is a JSON
@@ -750,14 +753,16 @@ func parseRoomEventFilter(raw string) (roomEventFilter, error) {
 		return f, nil
 	}
 	var v struct {
-		ContainsURL *bool    `json:"contains_url"`
-		RelTypes    []string `json:"org.matrix.msc3874.rel_types"`
-		NotRelTypes []string `json:"org.matrix.msc3874.not_rel_types"`
+		ContainsURL     *bool    `json:"contains_url"`
+		RelTypes        []string `json:"org.matrix.msc3874.rel_types"`
+		NotRelTypes     []string `json:"org.matrix.msc3874.not_rel_types"`
+		LazyLoadMembers bool     `json:"lazy_load_members"`
 	}
 	if err := json.Unmarshal([]byte(raw), &v); err != nil {
 		return f, httpx.ErrInvalidParam("invalid filter: " + err.Error())
 	}
 	f.containsURL = v.ContainsURL
+	f.lazyLoadMembers = v.LazyLoadMembers
 	if len(v.RelTypes) > 0 {
 		f.relTypes = make(map[string]bool, len(v.RelTypes))
 		for _, rt := range v.RelTypes {
@@ -863,12 +868,14 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	chunk := make([]json.RawMessage, 0, len(evs))
 	var minTok, maxTok int64
+	senders := map[string]bool{}
 	for i := range evs {
 		e := evs[i]
 		if !flt.keep(&e) {
 			continue
 		}
 		chunk = append(chunk, clientEvent(&e))
+		senders[e.Sender] = true
 		if minTok == 0 || e.StreamOrdering < minTok {
 			minTok = e.StreamOrdering
 		}
@@ -893,7 +900,48 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 		resp["start"] = formatIntToken(startTok)
 		resp["end"] = formatIntToken(endTok)
 	}
+	// Lazy-loading members: with a lazy_load_members filter, the response
+	// carries a `state` list holding the membership events of the timeline
+	// senders (plus the requesting user's own membership), instead of the full
+	// room state (spec: "A list of state events relevant to showing the chunk").
+	if flt.lazyLoadMembers {
+		resp["state"] = a.lazyLoadState(r, roomID, auth.UserID, senders)
+	}
 	httpx.WriteJSON(w, http.StatusOK, resp)
+}
+
+// lazyLoadState returns the m.room.member state events relevant to a
+// lazy_load_members /messages request: membership of every timeline sender
+// plus the requesting user's own membership. Falls back to an empty array if
+// the room's member events cannot be resolved.
+func (a *API) lazyLoadState(r *http.Request, roomID, userID string, senders map[string]bool) []json.RawMessage {
+	stateRows, err := a.Store.GetState(r.Context(), roomID)
+	if err != nil {
+		return []json.RawMessage{}
+	}
+	ids := make([]string, 0, len(stateRows))
+	for _, s := range stateRows {
+		if s.Type == "m.room.member" {
+			ids = append(ids, s.EventID)
+		}
+	}
+	stateEvs, err := a.Store.EventsByIDs(r.Context(), ids)
+	if err != nil {
+		return []json.RawMessage{}
+	}
+	out := make([]json.RawMessage, 0, len(stateEvs))
+	for i := range stateEvs {
+		se := &stateEvs[i]
+		if se.Type != "m.room.member" {
+			continue
+		}
+		// Include member events for timeline senders and the caller's own
+		// membership (the spec requires the requesting user's membership too).
+		if userID == se.StateKey || senders[se.Sender] || senders[se.StateKey] {
+			out = append(out, clientEvent(se))
+		}
+	}
+	return out
 }
 
 // RoomRedact handles PUT /_matrix/client/v3/rooms/{roomID}/redact/{eventID}/{txnID}.

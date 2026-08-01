@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 )
 
@@ -202,6 +203,51 @@ func TestRoomMessagesPagination(t *testing.T) {
 	chunk, _ := body["chunk"].([]any)
 	if len(chunk) < 3 {
 		t.Fatalf("expected >=3 messages, got %d", len(chunk))
+	}
+}
+
+func TestRoomMessagesLazyLoadMembers(t *testing.T) {
+	_, srv := testAPI(t)
+	tok := registerUser(t, srv, "mallory", "pw")
+	roomID := createRoom(t, srv, tok, map[string]any{"preset": "public_chat"})
+	// A second member joins and sends a message, so the timeline has a sender
+	// other than the requesting user.
+	otherTok := registerUser(t, srv, "ned", "pw")
+	doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/join/"+roomID, otherTok, struct{}{})
+	doJSON(t, srv, http.MethodPut,
+		"/_matrix/client/v3/rooms/"+roomID+"/send/m.room.message/m1", otherTok,
+		map[string]any{"body": "hi", "msgtype": "m.text"})
+
+	// Lazy-loading request: the response must carry a `state` list containing
+	// the membership events of the timeline senders (spec lazy-loading members).
+	filter := `{"lazy_load_members":true}`
+	code, body := getJSON(t, srv,
+		"/_matrix/client/v3/rooms/"+roomID+"/messages?dir=b&limit=10&filter="+url.QueryEscape(filter), tok)
+	if code != 200 {
+		t.Fatalf("messages: code=%d body=%v", code, body)
+	}
+	state, ok := body["state"].([]any)
+	if !ok {
+		t.Fatalf("expected a 'state' key in lazy-load response, body=%v", body)
+	}
+	if len(state) == 0 {
+		t.Fatalf("expected member state for timeline senders, got empty state")
+	}
+	// Every entry must be a member event whose state_key is a timeline sender
+	// (or the requesting user).
+	seen := map[string]bool{}
+	for _, raw := range state {
+		ev := raw.(map[string]any)
+		if ev["type"] != "m.room.member" {
+			t.Fatalf("non-member event in lazy-load state: %v", ev)
+		}
+		seen[ev["state_key"].(string)] = true
+	}
+	if !seen["@ned:test.katrix"] {
+		t.Fatalf("expected ned's membership in state, got %v", seen)
+	}
+	if !seen["@mallory:test.katrix"] {
+		t.Fatalf("expected the requesting user's own membership in state, got %v", seen)
 	}
 }
 
