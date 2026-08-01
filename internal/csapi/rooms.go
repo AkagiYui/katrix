@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 
+	"github.com/AkagiYui/katrix/internal/canonicaljson"
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/eventstate"
 	"github.com/AkagiYui/katrix/internal/homeserver"
@@ -163,10 +165,24 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 
 	// Optional name/topic events (state events after creation; override initial_state).
 	if req.Name != "" {
-		a.sendStateEvent(r, auth, roomID, version, "m.room.name", "", map[string]any{"name": req.Name})
+		// Rich text representation: the plain-text name is also exposed as
+		// m.name.m.text for clients that understand MSC1767 extensible events.
+		a.sendStateEvent(r, auth, roomID, version, "m.room.name", "", map[string]any{
+			"name": req.Name,
+			"m.name": map[string]any{
+				"m.text": []any{map[string]any{"body": req.Name}},
+			},
+		})
 	}
 	if req.Topic != "" {
-		a.sendStateEvent(r, auth, roomID, version, "m.room.topic", "", map[string]any{"topic": req.Topic})
+		// Rich text representation: the plain-text topic is also exposed as
+		// m.topic.m.text (body + optional mimetype defaulting to text/plain).
+		a.sendStateEvent(r, auth, roomID, version, "m.room.topic", "", map[string]any{
+			"topic": req.Topic,
+			"m.topic": map[string]any{
+				"m.text": []any{map[string]any{"body": req.Topic}},
+			},
+		})
 	}
 	// Invite listed users.
 	for _, invitee := range req.Invite {
@@ -1385,8 +1401,16 @@ func (a *API) checkMembershipAny(ctx context.Context, roomID, userID, allowed st
 // rules + persist the m.room.member(join) event) when the room is known
 // locally, or a federated join against a remote server when it is not.
 func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, via []string) (*events.Event, error) {
+	// Custom join content: the request body may carry extra fields which are
+	// merged into the m.room.member content (spec: "any additional keys in the
+	// request body are copied into the event content", e.g. `foo: bar`).
+	extra := joinCustomContent(r)
 	if _, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
-		if err := a.sendMemberEvent(r, auth, roomID, "", auth.UserID, rooms.MembershipJoin, ""); err != nil {
+		content := map[string]any{"membership": rooms.MembershipJoin}
+		for k, v := range extra {
+			content[k] = v
+		}
+		if err := a.sendMemberEventWithContent(r, auth, roomID, auth.UserID, content); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -1400,6 +1424,33 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 		return nil, nil
 	}
 	return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
+}
+
+// joinCustomContent extracts arbitrary fields from a join request body,
+// excluding the reserved `membership` and `reason` keys (which the server
+// sets). An empty body yields no extra content.
+func joinCustomContent(r *http.Request) map[string]any {
+	var body map[string]any
+	if r.Body == nil {
+		return nil
+	}
+	data, err := io.ReadAll(r.Body)
+	r.Body = nil
+	if err != nil {
+		return nil
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(data, &body); err != nil {
+		return nil
+	}
+	delete(body, "membership")
+	delete(body, "reason")
+	if len(body) == 0 {
+		return nil
+	}
+	return body
 }
 
 // splitVia parses the server_name query parameter (a comma-separated list of
@@ -1430,6 +1481,9 @@ func (a *API) sendMemberEvent(r *http.Request, auth *homeserver.Auth, roomID, _s
 // sendMemberEventWithContent builds, authorises and persists an m.room.member
 // event with the given content (which must include "membership").
 func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth, roomID, target string, content map[string]any) error {
+	// Serialise with state writes so the join-idempotency check is atomic.
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
 	room, err := a.Store.GetRoom(r.Context(), roomID)
 	if err != nil {
 		return newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
@@ -1446,6 +1500,16 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	}
 	if err := rooms.Authorize(rules, "m.room.member", target, auth.UserID, contentRaw, st); err != nil {
 		return newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
+	}
+	// Joining (or re-joining) with identical member content is idempotent: if
+	// the current member state already carries exactly this content, return the
+	// existing event instead of forking the room with a duplicate join.
+	if existingID, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.member", target); err == nil && existingID != "" {
+		if existing, err := a.Store.GetEvent(r.Context(), existingID); err == nil && existing != nil {
+			if canonicaljson.Equal(contentRaw, json.RawMessage(existing.Content)) {
+				return nil
+			}
+		}
 	}
 	ev, err := a.buildEvent(r, auth, roomID, version, "m.room.member", target, ids.RandomTxnSuffix(), true, contentRaw)
 	if err != nil {
@@ -1511,6 +1575,10 @@ func (a *API) buildAndPersistMessage(r *http.Request, auth *homeserver.Auth, roo
 
 // buildAndPersistState builds, authorises and persists a state event.
 func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomID, eventType, stateKey string, content json.RawMessage) (*events.Event, error) {
+	// Serialise the idempotency check + write so concurrent identical PUTs
+	// yield the same event rather than forking the room.
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
 	room, err := a.Store.GetRoom(r.Context(), roomID)
 	if err != nil {
 		return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
@@ -1529,6 +1597,21 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	}
 	if err := rooms.Authorize(rules, eventType, stateKey, auth.UserID, content, st); err != nil {
 		return nil, newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
+	}
+	// Setting identical state is idempotent: if the current state for this
+	// (type, state_key) has exactly the same content, return the existing
+	// event instead of creating a new one. Clients depend on this (re-sending
+	// state after a network error must not fork the room).
+	if existingID, err := a.Store.GetStateEvent(r.Context(), roomID, eventType, stateKey); err == nil && existingID != "" {
+		if existing, err := a.Store.GetEvent(r.Context(), existingID); err == nil && existing != nil {
+			if canonicaljson.Equal(content, json.RawMessage(existing.Content)) {
+				// Reconstruct an Event from the stored row so callers get a
+				// stable event_id without creating a new event.
+				if ev, err := events.New(existing.RawJSON, version); err == nil {
+					return ev, nil
+				}
+			}
+		}
 	}
 	ev, err := a.buildEvent(r, auth, roomID, version, eventType, stateKey, ids.RandomTxnSuffix(), true, content)
 	if err != nil {

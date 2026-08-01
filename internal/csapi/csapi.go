@@ -4,6 +4,7 @@ package csapi
 
 import (
 	"net/http"
+	"sync"
 
 	"github.com/AkagiYui/katrix/internal/federation"
 	"github.com/AkagiYui/katrix/internal/homeserver"
@@ -17,6 +18,11 @@ type API struct {
 	syncEngine *syncEngine
 	typing     *typingTracker
 	fed        *federation.API
+	// stateMu serialises state-event writes so the idempotency check
+	// (read current state, compare content, write if different) is atomic
+	// under concurrent clients. Without it two identical concurrent PUTs both
+	// pass the check and fork the room with duplicate events.
+	stateMu sync.Mutex
 }
 
 // New constructs the CS API surface.

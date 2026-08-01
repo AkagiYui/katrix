@@ -52,6 +52,21 @@ func Canonical(input []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// Equal reports whether two JSON documents are canonically equal, i.e. their
+// canonical forms are byte-identical (so key order and whitespace do not
+// matter, but 1 and 1.0 are distinct).
+func Equal(a, b []byte) bool {
+	ca, err := Canonical(a)
+	if err != nil {
+		return false
+	}
+	cb, err := Canonical(b)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(ca, cb)
+}
+
 func encode(buf *bytes.Buffer, v any) error {
 	switch val := v.(type) {
 	case nil:
