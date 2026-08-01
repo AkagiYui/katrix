@@ -305,6 +305,15 @@ func (a *API) RoomKick(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
+	// A kick is a forced leave: the target must be a member (join) of the room.
+	// Kicking a user who is not present (never joined) or has already left is
+	// forbidden (403) — the spec says "users cannot kick users who have already
+	// left the room".
+	m, err := a.Store.GetMembership(r.Context(), roomID, req.UserID)
+	if err != nil || m.Membership != rooms.MembershipJoin {
+		httpx.WriteError(w, httpx.ErrForbidden("user is not in the room"))
+		return
+	}
 	if err := a.sendMemberEvent(r, auth, roomID, "", req.UserID, rooms.MembershipLeave, req.Reason); err != nil {
 		writeRoomErr(w, err)
 		return
@@ -1595,6 +1604,14 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	if err := validateCanonicalAlias(r.Context(), a.Store, eventType, roomID, content); err != nil {
 		return nil, err
 	}
+	// Rooms with privileged creators (v12+, MSC4239) forbid the creator from
+	// appearing in the m.room.power_levels `users` map; the creator's power is
+	// implicit. A PUT that lists them is rejected with 400.
+	if eventType == "m.room.power_levels" && rules.CreatorPrivileged {
+		if err := a.rejectCreatorInPowerLevels(r.Context(), roomID, content); err != nil {
+			return nil, err
+		}
+	}
 	if err := rooms.Authorize(rules, eventType, stateKey, auth.UserID, content, st); err != nil {
 		return nil, newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
 	}
@@ -1623,6 +1640,27 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	// room_state is maintained by persistEvent (snapshot + recompute).
 	a.notifyRoomMembers(r.Context(), roomID)
 	return ev, nil
+}
+
+// rejectCreatorInPowerLevels enforces the v12+ (privileged-creator) rule that
+// the room creator must not appear in an m.room.power_levels `users` object:
+// their power is implicit. A PUT that lists the creator is rejected with 400
+// (spec: "the room creator must not be listed in the users object").
+func (a *API) rejectCreatorInPowerLevels(ctx context.Context, roomID string, content json.RawMessage) error {
+	var pl struct {
+		Users map[string]any `json:"users"`
+	}
+	if err := json.Unmarshal(content, &pl); err != nil || len(pl.Users) == 0 {
+		return nil
+	}
+	room, err := a.Store.GetRoom(ctx, roomID)
+	if err != nil || room == nil || room.Creator == "" {
+		return nil
+	}
+	if _, ok := pl.Users[room.Creator]; ok {
+		return newRoomError(http.StatusBadRequest, "M_INVALID_PARAM", "the room creator may not be listed in m.room.power_levels users")
+	}
+	return nil
 }
 
 // validateCanonicalAlias checks that an m.room.canonical_alias event's `alias`

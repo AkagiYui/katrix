@@ -33,9 +33,8 @@ type CreateRequest struct {
 
 // InitialPowerLevels builds the m.room.power_levels content for a new room,
 // honouring the preset and an optional override.
-func InitialPowerLevels(creator string, preset string, override json.RawMessage) (json.RawMessage, error) {
+func InitialPowerLevels(creator string, preset string, override json.RawMessage, privilegedCreator bool) (json.RawMessage, error) {
 	pl := PowerLevels{
-		Users:         map[string]int64{creator: 100},
 		UsersDefault:  0,
 		EventsDefault: 0,
 		StateDefault:  50,
@@ -53,6 +52,15 @@ func InitialPowerLevels(creator string, preset string, override json.RawMessage)
 			"m.room.tombstone":          100,
 			"m.room.encryption":         100,
 		},
+	}
+	// For rooms with privileged creators (v12+, MSC4239) the creator's power is
+	// implicit and the creator is NOT listed in `users`; the map is emitted as
+	// an empty object (never null). For older versions the creator is granted
+	// 100 explicitly.
+	if !privilegedCreator {
+		pl.Users = map[string]int64{creator: 100}
+	} else {
+		pl.Users = map[string]int64{}
 	}
 	switch preset {
 	case PresetPrivateChat, PresetTrustedPrivateChat:
@@ -215,7 +223,7 @@ func BuildInitialEvents(
 	}
 
 	// power_levels
-	plRaw, err := InitialPowerLevels(creator, preset, powerOverride)
+	plRaw, err := InitialPowerLevels(creator, preset, powerOverride, rules.CreatorPrivileged)
 	if err != nil {
 		return nil, err
 	}

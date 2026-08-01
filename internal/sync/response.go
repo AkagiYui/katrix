@@ -276,7 +276,9 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	}
 
 	// Left rooms (membership=leave/ban) - include recent timeline once.
-	leftRooms, _ := e.store.LeftRooms(ctx, opts.UserID)
+	// Forgotten rooms are hidden on initial sync but still reported on
+	// incremental sync (other devices must learn the room was left).
+	leftRooms, _ := e.store.LeftRooms(ctx, opts.UserID, opts.Since.Stream > 0)
 	if leftRooms != nil {
 		for _, roomID := range leftRooms {
 			lr, err := e.buildLeftRoom(ctx, roomID, opts, maxStream)
@@ -537,16 +539,35 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// MSC4115: annotate each timeline event with the syncing user's membership
 	// at the time of the event (unsigned.membership).
 	membershipAt := e.membershipAnnotator(ctx, roomID, opts.UserID, maxStream)
+	earliest := int64(0)
 	for _, ev := range evs {
 		if !filter.keepTimeline(&ev) {
 			continue
 		}
 		timeline.Events = append(timeline.Events, filter.applyEventFields(membershipAt(clientEvent(&ev), &ev)))
 		senders[ev.Sender] = true
+		if earliest == 0 || ev.StreamOrdering < earliest {
+			earliest = ev.StreamOrdering
+		}
 	}
-	if len(evs) >= limit {
-		timeline.Limited = true
-		timeline.PrevBatch = Token{Stream: from}.Encode()
+	// prev_batch is the token a client passes to paginate further back: the
+	// oldest event's position in the window. It is set even when the timeline
+	// is not limited (so clients that page backwards from a full window get an
+	// empty page rather than a missing token), and doubles as the `at` anchor
+	// for /members?at= and /messages back-pagination.
+	// prev_batch is the token a client passes to paginate further back. For an
+	// unlimited timeline it is the sync point itself (maxStream): paginating
+	// with from=prev_batch yields the events before the window, and
+	// /members?at=prev_batch returns the members as of that sync (all of whom
+	// were already members). For a limited timeline it is the oldest visible
+	// event's position so back-pagination resumes where the window ended.
+	if len(evs) > 0 {
+		if len(evs) >= limit {
+			timeline.Limited = true
+			timeline.PrevBatch = Token{Stream: earliest}.Encode()
+		} else {
+			timeline.PrevBatch = Token{Stream: maxStream}.Encode()
+		}
 	}
 	jr.Timeline = timeline
 

@@ -202,9 +202,17 @@ func (s *Store) InvitedRooms(ctx context.Context, userID string) ([]string, erro
 }
 
 // LeftRooms returns room IDs the user has left (leave or ban).
-func (s *Store) LeftRooms(ctx context.Context, userID string) ([]string, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT room_id FROM room_memberships WHERE user_id=$1 AND membership IN ('leave','ban')`, userID)
+// LeftRooms returns the room IDs the user has left (membership leave/ban).
+// Forgotten rooms are excluded from initial sync (forgotten rooms "do not show
+// up in sync"), but an incremental sync (includeForgotten=true) still reports
+// the leave so other devices learn the room was left before it disappears.
+func (s *Store) LeftRooms(ctx context.Context, userID string, includeForgotten bool) ([]string, error) {
+	q := `SELECT room_id FROM room_memberships WHERE user_id=$1 AND membership IN ('leave','ban')`
+	args := []any{userID}
+	if !includeForgotten {
+		q += ` AND NOT forgotten`
+	}
+	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -144,7 +144,8 @@ func TestPowerLevelsUserLevel(t *testing.T) {
 }
 
 func TestInitialPowerLevels(t *testing.T) {
-	raw, err := InitialPowerLevels("@creator:test", PresetPrivateChat, nil)
+	// Pre-v12 (no privileged creator): the creator is listed in `users`.
+	raw, err := InitialPowerLevels("@creator:test", PresetPrivateChat, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
