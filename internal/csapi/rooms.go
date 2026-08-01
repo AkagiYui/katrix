@@ -205,7 +205,7 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 func (a *API) JoinRoom(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomIDOrAlias := r.PathValue("roomIDOrAlias")
-	via := splitVia(r.URL.Query().Get("server_name"))
+	via := joinVia(r)
 	roomID := a.resolveRoomIDOrAlias(r.Context(), roomIDOrAlias)
 	if roomID == "" && strings.HasPrefix(roomIDOrAlias, "#") {
 		// Remote alias: resolve it over federation on the alias's own domain
@@ -235,7 +235,7 @@ func (a *API) JoinRoom(w http.ResponseWriter, r *http.Request) {
 func (a *API) RoomJoin(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomID := r.PathValue("roomID")
-	via := splitVia(r.URL.Query().Get("server_name"))
+	via := joinVia(r)
 	_, err := a.joinRoom(r, auth, roomID, via)
 	if err != nil {
 		writeRoomErr(w, err)
@@ -1698,6 +1698,17 @@ func splitVia(s string) []string {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
 		}
+	}
+	return out
+}
+
+// joinVia collects the via servers from a join request. Per the spec the
+// server_name query parameter may be repeated (each value a candidate server
+// to try in order), so all values are gathered rather than just the first.
+func joinVia(r *http.Request) []string {
+	var out []string
+	for _, v := range r.URL.Query()["server_name"] {
+		out = append(out, splitVia(v)...)
 	}
 	return out
 }

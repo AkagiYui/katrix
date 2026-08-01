@@ -51,11 +51,37 @@ type sendJoinResponse struct {
 // the full state is fetched in the background by ResyncPartialState. The
 // returned bool reports whether the join was partial-state (true), so callers
 // can defer actions that depend on full state (e.g. device-list updates).
+//
+// The via server list is tried in order, falling back to the next server when
+// one refuses the join (e.g. a server that has left the room or a stale
+// directory entry): per the spec a client/server should try each supplied
+// server until one succeeds.
 func (a *API) JoinRemoteRoom(ctx context.Context, userID, roomID string, via []string) (bool, error) {
 	dest := pickJoinDestination(roomID, via)
 	if dest == "" {
 		return false, fmt.Errorf("federation: cannot determine a server to join %s from", roomID)
 	}
+	candidates := append([]string{}, via...)
+	if !containsStr(candidates, dest) {
+		candidates = append(candidates, dest)
+	}
+	var lastErr error
+	for _, cand := range candidates {
+		if cand == "" {
+			continue
+		}
+		ok, err := a.joinRemoteRoomFrom(ctx, userID, roomID, cand)
+		if err == nil {
+			return ok, nil
+		}
+		lastErr = err
+	}
+	return false, lastErr
+}
+
+// joinRemoteRoomFrom performs a single make_join + send_join cycle against one
+// server and ingests the result.
+func (a *API) joinRemoteRoomFrom(ctx context.Context, userID, roomID, dest string) (bool, error) {
 	tpl, err := a.client.makeJoin(ctx, dest, roomID, userID)
 	if err != nil {
 		return false, err
