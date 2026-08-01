@@ -10,6 +10,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/eventstate"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/metrics"
+	"github.com/AkagiYui/katrix/internal/rooms"
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
 )
@@ -46,6 +47,12 @@ func (a *API) registerTransactions(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/federation/v2/send_leave/{roomID}/{userID}", a.MakeSendLeave)
 	mux.HandleFunc("PUT /_matrix/federation/v2/send_leave/{roomID}/{userID}", a.SendLeave)
 	mux.HandleFunc("PUT /_matrix/federation/v2/invite/{roomID}/{eventID}", a.Invite)
+	// v1 send_join/send_leave (legacy): same semantics as v2 but the response
+	// is a 2-element JSON array [code, body].
+	mux.HandleFunc("PUT /_matrix/federation/v1/send_join/{roomID}/{eventID}", a.SendJoinV1)
+	mux.HandleFunc("PUT /_matrix/federation/v1/send_leave/{roomID}/{eventID}", a.SendLeaveV1)
+	// MSC2409 knock: PUT /_matrix/federation/v1/send_knock/{roomID}/{eventID}.
+	mux.HandleFunc("PUT /_matrix/federation/v1/send_knock/{roomID}/{eventID}", a.SendKnock)
 	mux.HandleFunc("GET /_matrix/federation/v1/make_join/{roomID}/{userID}", a.MakeJoin)
 	mux.HandleFunc("GET /_matrix/federation/v1/make_leave/{roomID}/{userID}", a.MakeLeave)
 	mux.HandleFunc("GET /_matrix/federation/v1/event_auth/{roomID}/{eventID}", a.EventAuth)
@@ -318,12 +325,65 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// SendJoinV1 handles PUT /_matrix/federation/v1/send_join/{roomID}/{eventID}
+// (legacy endpoint). Same handling as v2 but the response is the v1
+// [200, body] array form.
+func (a *API) SendJoinV1(w http.ResponseWriter, r *http.Request) {
+	a.sendMembershipV1(w, r, "join")
+}
+
+// SendLeaveV1 handles PUT /_matrix/federation/v1/send_leave/{roomID}/{eventID}.
+func (a *API) SendLeaveV1(w http.ResponseWriter, r *http.Request) {
+	a.sendMembershipV1(w, r, "leave")
+}
+
+// SendKnock handles PUT /_matrix/federation/v1/send_knock/{roomID}/{eventID}
+// (MSC2409). It validates that the event is a self-knock and persists it,
+// returning the resolved state + auth chain.
+func (a *API) SendKnock(w http.ResponseWriter, r *http.Request) {
+	a.sendMembershipV1(w, r, "knock")
+}
+
+// sendMembershipV1 is the shared v1 send_membership handler (legacy array
+// response envelope).
+func (a *API) sendMembershipV1(w http.ResponseWriter, r *http.Request, membership string) {
+	// Reuse the v2 ingest logic but capture the v2 response body so we can
+	// wrap it in the v1 [200, body] array. Buffer via a sub-response writer.
+	rec := &responseRecorder{header: w.Header()}
+	a.ingestRemoteMember(rec, r, membership)
+	if rec.status == 0 {
+		return // already written to w by the inner handler
+	}
+	// The inner handler wrote to rec; replay as [status, body] if it succeeded.
+	if rec.status != http.StatusOK {
+		w.WriteHeader(rec.status)
+		_, _ = w.Write(rec.body)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(append([]byte(`[200,`), append(rec.body, ']')...))
+}
+
+// responseRecorder captures a handler's status + body for re-wrapping.
+type responseRecorder struct {
+	header http.Header
+	status int
+	body   []byte
+}
+
+func (rr *responseRecorder) Header() http.Header       { return rr.header }
+func (rr *responseRecorder) WriteHeader(code int)      { rr.status = code }
+func (rr *responseRecorder) Write(b []byte) (int, error) {
+	rr.body = append(rr.body, b...)
+	return len(b), nil
+}
+
 // MakeSendJoin handles GET /_matrix/federation/v2/send_join/{roomID}/{userID}.
 func (a *API) MakeSendJoin(w http.ResponseWriter, r *http.Request) { a.MakeJoin(w, r) }
 
 // SendJoin handles PUT /_matrix/federation/v2/send_join/{roomID}/{userID}.
 func (a *API) SendJoin(w http.ResponseWriter, r *http.Request) {
-	a.ingestRemoteMember(w, r)
+	a.ingestRemoteMember(w, r, "join")
 }
 
 // MakeLeave handles GET /_matrix/federation/v1/make_leave/{roomID}/{userID}.
@@ -357,10 +417,10 @@ func (a *API) MakeLeave(w http.ResponseWriter, r *http.Request) {
 func (a *API) MakeSendLeave(w http.ResponseWriter, r *http.Request) { a.MakeLeave(w, r) }
 
 // SendLeave handles PUT /_matrix/federation/v2/send_leave/{roomID}/{userID}.
-func (a *API) SendLeave(w http.ResponseWriter, r *http.Request) { a.ingestRemoteMember(w, r) }
+func (a *API) SendLeave(w http.ResponseWriter, r *http.Request) { a.ingestRemoteMember(w, r, "leave") }
 
 // Invite handles PUT /_matrix/federation/v2/invite/{roomID}/{eventID}.
-func (a *API) Invite(w http.ResponseWriter, r *http.Request) { a.ingestRemoteMember(w, r) }
+func (a *API) Invite(w http.ResponseWriter, r *http.Request) { a.ingestRemoteMember(w, r, "invite") }
 
 // EventAuth handles GET /_matrix/federation/v1/event_auth/{roomID}/{eventID}.
 func (a *API) EventAuth(w http.ResponseWriter, r *http.Request) {
@@ -385,8 +445,11 @@ func (a *API) QueryDirectory(w http.ResponseWriter, r *http.Request) {
 
 // ingestRemoteMember persists a remote m.room.member event (join/leave/invite)
 // and returns the resolved room state + auth chain so the remote server can
-// build its view. The event's signature is verified before being trusted.
-func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
+// build its view. The event's signature is verified before being trusted, and
+// the event must be the expected membership type (wantMembership) and pass the
+// room's authorization rules (e.g. a banned user's join is rejected with 403,
+// and a non-join event sent via send_join is rejected with 400, per the spec).
+func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMembership string) {
 	// The v2 send_join/send_leave/invite bodies are the signed event itself.
 	// Some peers (and older katrix) also send {event, room_version, ...}
 	// envelopes; accept both by sniffing for a top-level "event" object.
@@ -433,6 +496,29 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The event must be the expected membership transition (send_join -> join,
+	// send_leave -> leave, invite -> invite); anything else is a 400.
+	if ev.Type != "m.room.member" || ev.StateKey == nil {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM", "send_* event must be an m.room.member with a state_key"))
+		return
+	}
+	var content struct {
+		Membership string `json:"membership"`
+	}
+	_ = json.Unmarshal(ev.Content, &content)
+	if wantMembership != "" && content.Membership != wantMembership {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM",
+			"send_* event membership must be "+wantMembership))
+		return
+	}
+	// A send_join/send_leave must be a self-membership transition: the state
+	// key must equal the sender (a join "for another user" is invalid).
+	if ev.Sender != *ev.StateKey {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM",
+			"send_* event state_key must match the sender"))
+		return
+	}
+
 	// Verify the event signature. For send_join/send_leave the remote server is
 	// vouching for the event; we still must validate its signature before
 	// trusting it locally.
@@ -447,6 +533,15 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
 	}
 	if ev.StateKey != nil {
 		row.StateKey = *ev.StateKey
+	}
+	// Authorization: the event must pass the room's auth rules (e.g. a banned
+	// user's join is rejected). Run before persisting.
+	if rules, ok := roomver.Get(version); ok {
+		st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, *ev.StateKey)
+		if err := rooms.Authorize(rules, ev.Type, *ev.StateKey, ev.Sender, ev.Content, st); err != nil {
+			httpx.WriteError(w, httpx.NewError(http.StatusForbidden, "M_FORBIDDEN", err.Error()))
+			return
+		}
 	}
 	// Persist even unsigned join/leave events that pass verification; the
 	// signature check above establishes authenticity.
@@ -473,6 +568,36 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
 		"auth_chain": a.authChain(r, ev.RoomID),
 		"event":      eventJSON,
 	})
+}
+
+// memberStateSnapshot builds the room state snapshot needed to authorize a
+// remote membership transition: the create/join_rules/power_levels state plus
+// the sender's and target's current member events.
+func (a *API) memberStateSnapshot(r *http.Request, roomID, sender, target string) rooms.StateSnapshot {
+	var st rooms.StateSnapshot
+	for _, tc := range []struct {
+		typ, sk string
+		dst     *json.RawMessage
+	}{
+		{"m.room.create", "", &st.Create},
+		{"m.room.join_rules", "", &st.JoinRules},
+		{"m.room.power_levels", "", &st.PowerLevel},
+		{"m.room.member", sender, &st.SenderMember},
+	} {
+		if id, err := a.Store.GetStateEvent(r.Context(), roomID, tc.typ, tc.sk); err == nil {
+			if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
+				*tc.dst = ev.Content
+			}
+		}
+	}
+	if target != sender && target != "" {
+		if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.member", target); err == nil {
+			if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
+				st.TargetMember = ev.Content
+			}
+		}
+	}
+	return st
 }
 
 // applyRemoteMembership updates the denormalised room_memberships table for an
