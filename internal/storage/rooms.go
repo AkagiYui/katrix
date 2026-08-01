@@ -636,6 +636,20 @@ func (s *Store) GetTxnEventID(ctx context.Context, userLocalpart, roomID, txnID 
 	return eventID, err
 }
 
+// GetEventTxnID returns the client transaction ID that produced an event, if
+// the event was sent via PUT /send/{eventType}/{txnID} (used to render
+// unsigned.transaction_id on GET /event and in /sync, per the spec).
+func (s *Store) GetEventTxnID(ctx context.Context, eventID string) (string, error) {
+	var txnID string
+	err := s.pool.QueryRow(ctx,
+		`SELECT txn_id FROM event_txns WHERE event_id=$1 ORDER BY created_ts ASC LIMIT 1`,
+		eventID).Scan(&txnID)
+	if err == pgx.ErrNoRows {
+		return "", nil
+	}
+	return txnID, err
+}
+
 // RecordTxnEventID remembers the event_id produced for a client transaction so
 // future PUT /send calls with the same txn return the same id. If the txn
 // already exists the existing mapping is kept (ON CONFLICT DO NOTHING).

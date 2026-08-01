@@ -602,7 +602,28 @@ func (a *API) RoomGetEvent(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrNotFound("event not found"))
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, clientEvent(ev))
+	// unsigned.transaction_id: the client transaction ID that produced the
+	// event (spec §"Transaction IDs" — events sent with a txn carry it back on
+	// GET /event and in /sync).
+	httpx.WriteJSON(w, http.StatusOK, a.annotateTxnID(r, ev))
+}
+
+// annotateTxnID renders a client event and attaches unsigned.transaction_id
+// when the event was produced by a client transaction.
+func (a *API) annotateTxnID(r *http.Request, ev *storage.EventRow) json.RawMessage {
+	rendered := clientEvent(ev)
+	txnID, err := a.Store.GetEventTxnID(r.Context(), ev.EventID)
+	if err != nil || txnID == "" {
+		return rendered
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(rendered, &obj); err != nil {
+		return rendered
+	}
+	unsigned, _ := json.Marshal(map[string]any{"transaction_id": txnID})
+	obj["unsigned"] = unsigned
+	b, _ := json.Marshal(obj)
+	return b
 }
 
 // historyVisibility returns the room's m.room.history_visibility, defaulting

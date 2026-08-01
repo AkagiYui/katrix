@@ -573,7 +573,7 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		if !filter.keepTimeline(&ev) {
 			continue
 		}
-		timeline.Events = append(timeline.Events, filter.applyEventFields(membershipAt(clientEvent(&ev), &ev)))
+		timeline.Events = append(timeline.Events, filter.applyEventFields(e.annotateTxn(ctx, membershipAt(clientEvent(&ev), &ev), ev.EventID)))
 		senders[ev.Sender] = true
 		if earliest == 0 || ev.StreamOrdering < earliest {
 			earliest = ev.StreamOrdering
@@ -695,6 +695,24 @@ func (e *Engine) membershipAnnotator(ctx context.Context, roomID, userID string,
 		b, _ := json.Marshal(obj)
 		return b
 	}
+}
+
+// annotateTxn merges unsigned.transaction_id into a rendered timeline event
+// when the event was produced by a client transaction (spec: events sent with a
+// transaction ID carry it in unsigned.transaction_id).
+func (e *Engine) annotateTxn(ctx context.Context, rendered json.RawMessage, eventID string) json.RawMessage {
+	txnID, err := e.store.GetEventTxnID(ctx, eventID)
+	if err != nil || txnID == "" {
+		return rendered
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(rendered, &obj); err != nil {
+		return rendered
+	}
+	unsigned, _ := json.Marshal(map[string]any{"transaction_id": txnID})
+	obj["unsigned"] = unsigned
+	b, _ := json.Marshal(obj)
+	return b
 }
 
 // roomSummary builds the room summary section (member counts + heroes).
