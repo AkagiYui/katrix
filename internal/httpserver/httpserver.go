@@ -63,21 +63,40 @@ func New(hs *homeserver.HS) (*Server, error) {
 		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	// SPA fallback for everything else.
+	// SPA fallback for non-API paths. Registered on a separate mux so it never
+	// shadows the API mux's method-mismatch 405s: Go's ServeMux returns 405
+	// for a known path with an unsupported method only when no catch-all "/"
+	// pattern is registered on the same mux. (The API mux has none.)
 	spa, err := spaHandler()
 	if err != nil {
 		return nil, err
 	}
-	mux.Handle("/", spa)
+	spaMux := http.NewServeMux()
+	spaMux.Handle("/", spa)
 
-	return &Server{Handler: withMiddleware(mux), cs: cs, fed: fed}, nil
+	// Route by prefix: API paths go to the API mux (with the Matrix error-body
+	// interceptor), everything else to the SPA.
+	apiMux := mux
+	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, p := range apiPrefixes {
+			if strings.HasPrefix(r.URL.Path, p) {
+				mw := &matrixErrorWriter{ResponseWriter: w}
+				apiMux.ServeHTTP(mw, r)
+				return
+			}
+		}
+		spaMux.ServeHTTP(w, r)
+	})
+
+	return &Server{Handler: withMiddleware(root), cs: cs, fed: fed}, nil
 }
 
-// apiPrefixes are never served by the SPA fallback.
-var apiPrefixes = []string{"/_matrix", "/_synapse", "/.well-known", "/health"}
+// apiPrefixes route to the API mux; the SPA never sees them.
+var apiPrefixes = []string{"/_matrix", "/_synapse", "/.well-known", "/health", "/metrics"}
 
 // spaHandler serves embedded static assets, falling back to index.html for
-// non-asset, non-API paths so client-side routing works.
+// non-asset paths so client-side routing works. It is only reached for
+// non-API paths (the router sends API prefixes to the API mux).
 func spaHandler() (http.Handler, error) {
 	sub, err := webui.FS()
 	if err != nil {
@@ -90,12 +109,6 @@ func spaHandler() (http.Handler, error) {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		for _, p := range apiPrefixes {
-			if strings.HasPrefix(r.URL.Path, p) {
-				http.NotFound(w, r)
-				return
-			}
-		}
 		// If the requested asset exists, serve it; else serve index.html.
 		p := strings.TrimPrefix(r.URL.Path, "/")
 		if p == "" {
@@ -117,8 +130,17 @@ func serveIndex(w http.ResponseWriter, index []byte) {
 	_, _ = io.Copy(w, strings.NewReader(string(index)))
 }
 
+// writeMatrixNotFound responds with the Matrix error format for an unknown
+// /_matrix/... path (M_UNRECOGNIZED, 404).
+func writeMatrixNotFound(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = w.Write([]byte(`{"errcode":"M_UNRECOGNIZED","error":"Unrecognized request"}`))
+}
+
 // withMiddleware applies the r0->v3 path rewrite, CORS and server-header
-// middleware globally.
+// middleware globally. The Matrix error-body rewriting for /_matrix paths is
+// done by the root router (matrixErrorWriter), not here.
 func withMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Server", "Katrix/"+homeserver.Version)
@@ -140,4 +162,50 @@ func withMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// matrixErrorWriter replaces the router's plain-text 404/405 error bodies for
+// unknown /_matrix paths with the Matrix JSON error format. Go's ServeMux
+// always writes the status before the body for these errors, so only the
+// tiny error response is held; every other status (and every handler-written
+// response, including large /sync payloads) passes straight through without
+// buffering.
+type matrixErrorWriter struct {
+	http.ResponseWriter
+	status         int // the pending 404/405 status, when pendingRewrite
+	pendingRewrite bool
+}
+
+func (m *matrixErrorWriter) WriteHeader(status int) {
+	switch status {
+	case http.StatusNotFound, http.StatusMethodNotAllowed:
+		// Only hold when the router produced its plain-text error. A handler's
+		// real Matrix error (httpx.WriteError sets application/json before
+		// WriteHeader) must pass through untouched.
+		if strings.HasPrefix(m.Header().Get("Content-Type"), "application/json") {
+			m.ResponseWriter.WriteHeader(status)
+			return
+		}
+		m.status = status
+		m.pendingRewrite = true
+		return
+	default:
+		m.ResponseWriter.WriteHeader(status)
+	}
+}
+
+func (m *matrixErrorWriter) Write(p []byte) (int, error) {
+	if m.pendingRewrite {
+		m.pendingRewrite = false
+		status := m.status
+		if status == 0 {
+			status = http.StatusNotFound
+		}
+		m.Header().Set("Content-Type", "application/json")
+		m.ResponseWriter.WriteHeader(status)
+		body := []byte(`{"errcode":"M_UNRECOGNIZED","error":"Unrecognized request"}`)
+		_, _ = m.ResponseWriter.Write(body)
+		return len(p), nil
+	}
+	return m.ResponseWriter.Write(p)
 }
