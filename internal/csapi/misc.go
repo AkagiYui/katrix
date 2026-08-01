@@ -468,7 +468,9 @@ func (a *API) GetFilter(w http.ResponseWriter, r *http.Request) {
 }
 
 // PublicRooms handles GET/POST /_matrix/client/v3/publicRooms. Lists rooms
-// flagged is_public.
+// flagged is_public with the fields the spec requires each entry to carry:
+// room_id, creator, num_joined_members, world_readable, guest_can_join, plus
+// (when present) canonical_alias, name, topic and avatar_url.
 func (a *API) PublicRooms(w http.ResponseWriter, r *http.Request) {
 	// Scan rooms table for is_public rows. Simpler than a dedicated query.
 	rows, err := a.Store.Pool().Query(r.Context(),
@@ -483,14 +485,94 @@ func (a *API) PublicRooms(w http.ResponseWriter, r *http.Request) {
 		var roomID, creator string
 		var ts int64
 		_ = rows.Scan(&roomID, &creator, &ts)
-		chunk = append(chunk, map[string]any{
-			"room_id": roomID, "creator": creator, "num_joined_members": 0,
-		})
+		entry := map[string]any{
+			"room_id":            roomID,
+			"creator":            creator,
+			"num_joined_members": a.publicRoomMemberCount(r, roomID),
+		}
+		// world_readable: history_visibility == world_readable.
+		entry["world_readable"] = a.historyVisibility(r.Context(), roomID) == "world_readable"
+		// guest_can_join: m.room.guest_access allows guests to join.
+		entry["guest_can_join"] = a.guestCanJoin(r.Context(), roomID)
+		// Optional fields from room state.
+		canonicalAlias := ""
+		if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.canonical_alias", ""); err == nil {
+			if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
+				canonicalAlias = stateStringField(ev.Content, "alias")
+			}
+		}
+		// Fall back to the room's first alias when no canonical_alias state
+		// event exists (createRoom with room_alias_name publishes the alias but
+		// may not write the state event).
+		if canonicalAlias == "" {
+			if aliases, err := a.Store.AliasesForRoom(r.Context(), roomID); err == nil && len(aliases) > 0 {
+				canonicalAlias = aliases[0]
+			}
+		}
+		if canonicalAlias != "" {
+			entry["canonical_alias"] = canonicalAlias
+		}
+		if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.name", ""); err == nil {
+			if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
+				entry["name"] = stateStringField(ev.Content, "name")
+			}
+		}
+		if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.topic", ""); err == nil {
+			if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
+				entry["topic"] = stateStringField(ev.Content, "topic")
+			}
+		}
+		if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.avatar", ""); err == nil {
+			if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
+				entry["avatar_url"] = stateStringField(ev.Content, "url")
+			}
+		}
+		chunk = append(chunk, entry)
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"chunk":                     chunk,
 		"total_room_count_estimate": len(chunk),
 	})
+}
+
+// publicRoomMemberCount returns the number of joined members in a room.
+func (a *API) publicRoomMemberCount(r *http.Request, roomID string) int {
+	users, err := a.Store.JoinedUserIDs(r.Context(), roomID)
+	if err != nil {
+		return 0
+	}
+	return len(users)
+}
+
+// guestCanJoin reports whether the room's m.room.guest_access state allows
+// guests to join.
+func (a *API) guestCanJoin(ctx context.Context, roomID string) bool {
+	id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.guest_access", "")
+	if err != nil {
+		return false
+	}
+	ev, err := a.Store.GetEvent(ctx, id)
+	if err != nil {
+		return false
+	}
+	return stateStringField(ev.Content, "guest_access") == "can_join"
+}
+
+// stateStringField extracts a string field from a state event's content.
+func stateStringField(content []byte, key string) string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(content, &m); err != nil {
+		return ""
+	}
+	raw, ok := m[key]
+	if !ok {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return ""
+	}
+	return s
 }
 
 // PreviewURL handles GET /_matrix/.../preview_url. Fetches the target URL,
