@@ -175,12 +175,14 @@ type RemoteProfile struct {
 }
 
 // DownloadMedia fetches a media blob from a remote server over federation
-// (GET /_matrix/media/v3/download/{serverName}/{mediaId}). The body is the raw
-// blob; the content type comes from the response headers. Used to lazily fetch
-// remote media when a local client requests it.
+// (GET /_matrix/federation/v1/media/download/{serverName}/{mediaId}). The body
+// is the raw blob; the content type comes from the response headers. Used to
+// lazily fetch remote media when a local client requests it. The server-server
+// endpoint is used (not the client-server /_matrix/media path, which requires
+// an access token) and the request is signed like any other federation call.
 func (c *Client) DownloadMedia(ctx context.Context, serverName, mediaID string) (body []byte, contentType string, err error) {
 	base := c.serverBaseURL(serverName)
-	url := base + "/_matrix/media/v3/download/" + serverName + "/" + mediaID
+	url := base + "/_matrix/federation/v1/media/download/" + serverName + "/" + mediaID
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, "", err

@@ -50,7 +50,12 @@ func New(hs *homeserver.HS, remote RemoteFetcher) *API {
 	return &API{HS: hs, backend: backend, remote: remote}
 }
 
-// Register wires media routes.
+// Register wires the media routes: the client-server content repository plus
+// the server-server (federation) media endpoints (GET /_matrix/federation/v1/
+// media/download|thumbnail/...). The federation endpoints are unauthenticated
+// at the HTTP layer (like the rest of the Server-Server API); the serverName
+// path segment must match this server or the request is rejected, so a peer
+// can only retrieve media this server hosts.
 func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v1/media/config", a.RequireAuth(a.Config_))
 	mux.HandleFunc("GET /_matrix/media/v3/config", a.RequireAuth(a.Config_))
@@ -66,6 +71,17 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /_matrix/media/v1/create", a.RequireAuth(a.CreateMedia))
 	mux.HandleFunc("PUT /_matrix/media/v3/upload/{serverName}/{mediaID}", a.RequireAuth(a.UploadAsync))
 	mux.HandleFunc("PUT /_matrix/media/v3/upload/{serverName}/{mediaID}/{fileName}", a.RequireAuth(a.UploadAsync))
+
+	// Server-Server media endpoints (spec v1.19 §Server-Server API /media).
+	// Register both the {serverName}-prefixed form and the legacy no-serverName
+	// form (used by some clients when the media is local to the requested
+	// server).
+	mux.HandleFunc("GET /_matrix/federation/v1/media/download/{serverName}/{mediaID}", a.FedDownload)
+	mux.HandleFunc("GET /_matrix/federation/v1/media/download/{serverName}/{mediaID}/{fileName}", a.FedDownload)
+	mux.HandleFunc("GET /_matrix/federation/v1/media/download/{mediaID}", a.FedDownload)
+	mux.HandleFunc("GET /_matrix/federation/v1/media/thumbnail/{serverName}/{mediaID}", a.FedThumbnail)
+	mux.HandleFunc("GET /_matrix/federation/v1/media/thumbnail/{serverName}/{mediaID}/{fileName}", a.FedThumbnail)
+	mux.HandleFunc("GET /_matrix/federation/v1/media/thumbnail/{mediaID}", a.FedThumbnail)
 }
 
 // Config_ handles GET /_matrix/.../config.
@@ -163,10 +179,35 @@ func (a *API) UploadAsync(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"content_uri": mxc})
 }
 
-// Download handles GET /_matrix/.../download/{serverName}/{mediaID}.
+// Download handles GET /_matrix/.../download/{serverName}/{mediaID}[/{fileName}].
 func (a *API) Download(w http.ResponseWriter, r *http.Request) {
-	mediaID := r.PathValue("mediaID")
+	a.serveDownload(w, r, r.PathValue("serverName"), r.PathValue("mediaID"), r.PathValue("fileName"), true)
+}
+
+// FedDownload handles GET /_matrix/federation/v1/media/download/... (the
+// server-server media endpoint). The media must belong to this server: a
+// request whose serverName names another server is rejected with 404 (the
+// requesting server is expected to fetch it from the origin itself). Unlike
+// the client endpoint there is no lazy remote fetch, and the legacy
+// no-serverName form is treated as local media.
+func (a *API) FedDownload(w http.ResponseWriter, r *http.Request) {
 	serverName := r.PathValue("serverName")
+	if serverName == "" {
+		serverName = a.ServerName()
+	}
+	if serverName != a.ServerName() {
+		httpx.WriteError(w, httpx.ErrNotFound("media not found"))
+		return
+	}
+	a.serveDownload(w, r, serverName, r.PathValue("mediaID"), r.PathValue("fileName"), false)
+}
+
+// serveDownload is the shared download path for the client and federation
+// endpoints. allowRemoteFetch controls whether a miss on a media belonging to
+// another server triggers a lazy federation fetch (client endpoints only). Per
+// the spec, when the request path carries a file name it takes precedence over
+// the original upload file name in the Content-Disposition header.
+func (a *API) serveDownload(w http.ResponseWriter, r *http.Request, serverName, mediaID, fileName string, allowRemoteFetch bool) {
 	// A media ID that was reserved but not yet uploaded returns
 	// M_NOT_YET_UPLOADED (MSC2246).
 	if _, err := a.Store.PendingMedia(r.Context(), mediaID); err == nil {
@@ -177,7 +218,7 @@ func (a *API) Download(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Local miss: if the media belongs to a remote server, lazily fetch it
 		// over federation and cache it.
-		if serverName != a.ServerName() && a.remote != nil {
+		if serverName != a.ServerName() && a.remote != nil && allowRemoteFetch {
 			if err := a.cacheRemote(r.Context(), serverName, mediaID); err != nil {
 				httpx.WriteError(w, httpx.NewError(http.StatusNotFound, "M_NOT_FOUND", "remote media not available: "+err.Error()))
 				return
@@ -190,21 +231,45 @@ func (a *API) Download(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	defer f.Close()
+	name := meta.UploadName
+	if fileName != "" {
+		name = fileName
+	}
 	w.Header().Set("Content-Type", meta.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
-	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", meta.UploadName))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", name))
 	w.Header().Set("Cache-Control", "public,max-age=86400")
 	_, _ = io.Copy(w, f)
 }
 
 // Thumbnail handles GET /_matrix/.../thumbnail/{serverName}/{mediaID}.
 func (a *API) Thumbnail(w http.ResponseWriter, r *http.Request) {
-	mediaID := r.PathValue("mediaID")
+	a.serveThumbnail(w, r, r.PathValue("serverName"), r.PathValue("mediaID"), true)
+}
+
+// FedThumbnail handles GET /_matrix/federation/v1/media/thumbnail/... (the
+// server-server media thumbnail endpoint). As with FedDownload the media must
+// be local to this server; the legacy no-serverName form is treated as local.
+func (a *API) FedThumbnail(w http.ResponseWriter, r *http.Request) {
 	serverName := r.PathValue("serverName")
+	if serverName == "" {
+		serverName = a.ServerName()
+	}
+	if serverName != a.ServerName() {
+		httpx.WriteError(w, httpx.ErrNotFound("media not found"))
+		return
+	}
+	a.serveThumbnail(w, r, serverName, r.PathValue("mediaID"), false)
+}
+
+// serveThumbnail is the shared thumbnail path for the client and federation
+// endpoints. allowRemoteFetch controls lazy federation fetching on a remote
+// miss (client endpoints only).
+func (a *API) serveThumbnail(w http.ResponseWriter, r *http.Request, serverName, mediaID string, allowRemoteFetch bool) {
 	if serverName != a.ServerName() {
 		// Ensure remote media is cached before generating a thumbnail.
 		if _, _, err := a.backend.Download(r.Context(), mediaID); err != nil {
-			if a.remote == nil {
+			if a.remote == nil || !allowRemoteFetch {
 				httpx.WriteError(w, httpx.NewError(http.StatusNotFound, "M_NOT_FOUND", "remote media not supported"))
 				return
 			}
