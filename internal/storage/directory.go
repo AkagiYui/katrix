@@ -86,15 +86,16 @@ type SearchResult struct {
 // The term is tokenised on whitespace and every token must appear in the
 // event's content (case-insensitive substring per token), mirroring how
 // clients expect /search to behave ("Message 4" matches "Message number 4").
-// Results are restricted to the given rooms, ordered by stream_ordering
-// descending, capped at limit. from (a next_batch token) excludes events at or
-// after that stream position for back-pagination. It returns the results and
-// the next_batch token of the oldest returned stream position (empty when no
-// further pages).
-func (s *Store) SearchRoomEvents(ctx context.Context, term string, rooms []string, from int64, limit int) ([]SearchResult, string, error) {
+// Redacted events are excluded. Results are restricted to the given rooms,
+// ordered by stream_ordering descending, capped at limit. from (a next_batch
+// token) excludes events at or after that stream position for back-pagination.
+// It returns the results, the next_batch token of the oldest returned stream
+// position (emitted whenever the page is full, matching Synapse), and the
+// total number of matches.
+func (s *Store) SearchRoomEvents(ctx context.Context, term string, rooms []string, from int64, limit int) ([]SearchResult, string, int64, error) {
 	tokens := tokenizeSearch(term)
 	if len(tokens) == 0 {
-		return nil, "", nil
+		return nil, "", 0, nil
 	}
 	if limit <= 0 {
 		limit = 10
@@ -102,17 +103,20 @@ func (s *Store) SearchRoomEvents(ctx context.Context, term string, rooms []strin
 	q := `SELECT event_id, room_id, content, type, sender, origin_server_ts, stream_ordering
 	      FROM events
 	      WHERE LOWER(content::text) LIKE ALL($1)
-	        AND room_id = ANY($2)`
+	        AND room_id = ANY($2)
+	        AND redacted = FALSE`
 	args := []any{tokens, rooms}
+	n := 3
 	if from > 0 {
-		q += ` AND stream_ordering<$3`
+		q += ` AND stream_ordering<$` + itoa(n)
 		args = append(args, from)
+		n++
 	}
-	q += ` ORDER BY stream_ordering DESC LIMIT $` + itoa(len(args)+1)
-	args = append(args, limit+1)
+	q += ` ORDER BY stream_ordering DESC LIMIT $` + itoa(n)
+	args = append(args, limit)
 	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
-		return nil, "", err
+		return nil, "", 0, err
 	}
 	defer rows.Close()
 	var results []SearchResult
@@ -120,21 +124,26 @@ func (s *Store) SearchRoomEvents(ctx context.Context, term string, rooms []strin
 		var sr SearchResult
 		var stream int64
 		if err := rows.Scan(&sr.EventID, &sr.RoomID, &sr.Content, &sr.Type, &sr.Sender, &sr.OriginServerTS, &stream); err != nil {
-			return nil, "", err
+			return nil, "", 0, err
 		}
 		results = append(results, sr)
 	}
-	hasMore := len(results) > limit
-	if hasMore {
-		results = results[:limit]
-	}
+	// A full page always carries a next_batch token (the last result's stream
+	// position); the following page then continues strictly below it. An empty
+	// or partial page is the last one.
 	nextBatch := ""
-	if hasMore && len(results) > 0 {
+	if len(results) >= limit && len(results) > 0 {
 		var st int64
 		_ = s.pool.QueryRow(ctx, `SELECT stream_ordering FROM events WHERE event_id=$1`, results[len(results)-1].EventID).Scan(&st)
 		nextBatch = "s" + formatInt64(st)
 	}
-	return results, nextBatch, rows.Err()
+	// Total matches across all pages, for the search count field.
+	var total int64
+	_ = s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM events
+		 WHERE LOWER(content::text) LIKE ALL($1) AND room_id = ANY($2) AND redacted = FALSE`,
+		tokens, rooms).Scan(&total)
+	return results, nextBatch, total, rows.Err()
 }
 
 // tokenizeSearch splits a search term into lowercased substring patterns

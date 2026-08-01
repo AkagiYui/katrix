@@ -56,7 +56,16 @@ func (a *API) Relations(w http.ResponseWriter, r *http.Request) {
 			from = tok.Stream
 		}
 	}
-	rows, edge, err := a.Store.RelationsSince(r.Context(), roomID, eventID, relType, eventType, from, 0, limit+1, dir)
+	// Backward pagination pages strictly below the from token (stream < from);
+	// forward pagination continues strictly above it (stream > from). Fetch one
+	// extra row to learn whether another page exists.
+	var rows []storage.RelationRow
+	var err error
+	if dir == "b" && from > 0 {
+		rows, _, err = a.Store.RelationsSince(r.Context(), roomID, eventID, relType, eventType, 0, from, limit+1, dir)
+	} else {
+		rows, _, err = a.Store.RelationsSince(r.Context(), roomID, eventID, relType, eventType, from, 0, limit+1, dir)
+	}
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
@@ -68,7 +77,10 @@ func (a *API) Relations(w http.ResponseWriter, r *http.Request) {
 	chunk := a.relationChunk(r, rows)
 	out := map[string]any{"chunk": chunk}
 	if hasMore {
-		out["next_batch"] = syncpkg.Token{Stream: edge}.Encode()
+		// The next page resumes from the last delivered relation, so the token
+		// encodes its stream position (the extra fetched row only tells us there
+		// is more).
+		out["next_batch"] = syncpkg.Token{Stream: rows[len(rows)-1].StreamOrdering}.Encode()
 	}
 	httpx.WriteJSON(w, http.StatusOK, out)
 }

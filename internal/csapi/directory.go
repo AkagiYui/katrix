@@ -50,11 +50,14 @@ func (a *API) UserDirectorySearch(w http.ResponseWriter, r *http.Request) {
 type searchRequest struct {
 	SearchCategories struct {
 		RoomEvents struct {
-			Keys         []string        `json:"keys"`
-			SearchTerm   string          `json:"search_term"`
-			OrderBy      string          `json:"order_by"`
-			EventContext json.RawMessage `json:"event_context"`
-			Filter       struct {
+			Keys         []string `json:"keys"`
+			SearchTerm   string   `json:"search_term"`
+			OrderBy      string   `json:"order_by"`
+			EventContext struct {
+				BeforeLimit int `json:"before_limit"`
+				AfterLimit  int `json:"after_limit"`
+			} `json:"event_context"`
+			Filter struct {
 				Rooms []string `json:"rooms"`
 				Limit int      `json:"limit"`
 			} `json:"filter"`
@@ -81,11 +84,12 @@ func (a *API) Search(w http.ResponseWriter, r *http.Request) {
 		// No room filter: search the user's joined rooms.
 		rooms, _ = a.Store.RoomsForUser(r.Context(), auth.UserID)
 	}
-	results, nextBatch, err := a.Store.SearchRoomEvents(r.Context(), req.SearchCategories.RoomEvents.SearchTerm, rooms, searchFrom(r), limit)
+	results, nextBatch, total, err := a.Store.SearchRoomEvents(r.Context(), req.SearchCategories.RoomEvents.SearchTerm, rooms, searchFrom(r), limit)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	ec := req.SearchCategories.RoomEvents.EventContext
 	// Attach event context (before/after) to each result.
 	items := make([]map[string]any, 0, len(results))
 	for _, sr := range results {
@@ -97,38 +101,51 @@ func (a *API) Search(w http.ResponseWriter, r *http.Request) {
 			"sender":           sr.Sender,
 			"origin_server_ts": sr.OriginServerTS,
 		}
-		before, after := a.searchContext(r, sr.RoomID, sr.EventID)
+		before, after := a.searchContext(r, sr.RoomID, sr.EventID, ec.BeforeLimit, ec.AfterLimit)
 		items = append(items, map[string]any{
 			"rank":    0,
 			"result":  ev,
 			"context": map[string]any{"events_before": before, "events_after": after},
 		})
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"search_categories": map[string]any{
 			"room_events": map[string]any{
-				"count":      len(items),
-				"results":    items,
-				"next_batch": nextBatch,
+				"count":   total,
+				"results": items,
 			},
 		},
-	})
+	}
+	if nextBatch != "" {
+		out["search_categories"].(map[string]any)["room_events"].(map[string]any)["next_batch"] = nextBatch
+	}
+	httpx.WriteJSON(w, http.StatusOK, out)
 }
 
 // searchContext returns the events immediately before and after a matching
-// event in a room (the two events around it by stream_ordering).
-func (a *API) searchContext(r *http.Request, roomID, eventID string) (before, after []json.RawMessage) {
+// event in a room, honouring the event_context before_limit and after_limit
+// (default 5 per the spec). The matched event itself is excluded from both
+// windows; events_before is ordered newest-first (closest to the match first)
+// and events_after oldest-first, matching Complement's expectations.
+func (a *API) searchContext(r *http.Request, roomID, eventID string, beforeLimit, afterLimit int) (before, after []json.RawMessage) {
+	if beforeLimit <= 0 {
+		beforeLimit = 5
+	}
+	if afterLimit <= 0 {
+		afterLimit = 5
+	}
 	var stream int64
 	if err := a.Store.Pool().QueryRow(r.Context(),
 		`SELECT stream_ordering FROM events WHERE event_id=$1`, eventID).Scan(&stream); err != nil {
 		return nil, nil
 	}
-	// Two events before (lower stream ordering) and two after.
-	evs, _ := a.Store.EventsForRoom(r.Context(), roomID, stream-3, stream, 3, "f")
+	// Events strictly before the match, newest first (closest to the match).
+	evs, _ := a.Store.EventsForRoom(r.Context(), roomID, 0, stream-1, beforeLimit, "b")
 	for i := range evs {
 		before = append(before, clientEvent(&evs[i]))
 	}
-	afterEvs, _ := a.Store.EventsForRoom(r.Context(), roomID, stream, stream+4, 3, "f")
+	// Events strictly after the match, oldest first (closest to the match).
+	afterEvs, _ := a.Store.EventsForRoom(r.Context(), roomID, stream, 0, afterLimit, "f")
 	for i := range afterEvs {
 		after = append(after, clientEvent(&afterEvs[i]))
 	}
