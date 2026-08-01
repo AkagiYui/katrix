@@ -30,27 +30,35 @@ type makeJoinResponse struct {
 
 // sendJoinResponse is the PUT /send_join response: the room state and auth
 // chain as seen by the remote server once the join event is applied, plus the
-// (echoed) join event.
+// (echoed) join event. For a partial-state join (omit_members=true) the state
+// is limited to the critical state events and members_omitted is true.
 type sendJoinResponse struct {
-	Origin    string            `json:"origin"`
-	State     []json.RawMessage `json:"state"`
-	AuthChain []json.RawMessage `json:"auth_chain"`
-	Event     json.RawMessage   `json:"event"`
+	Origin         string            `json:"origin"`
+	State          []json.RawMessage `json:"state"`
+	AuthChain      []json.RawMessage `json:"auth_chain"`
+	Event          json.RawMessage   `json:"event"`
+	MembersOmitted bool              `json:"members_omitted,omitempty"`
+	ServersInRoom  []string          `json:"servers_in_room,omitempty"`
 }
 
 // JoinRemoteRoom joins userID to roomID by federating with the server(s) in
 // via (falling back to the room ID's domain when none is given). It performs
 // GET make_join for an unsigned template, signs it with our own key, PUTs it
 // as send_join, then persists the returned state + auth chain locally so the
-// room becomes usable.
-func (a *API) JoinRemoteRoom(ctx context.Context, userID, roomID string, via []string) error {
+// room becomes usable. For room versions that support partial-state joins
+// (v2+, MSC3706/MSC3902) the send_join requests omit_members=true: the remote
+// server returns only the critical state, the room is usable immediately, and
+// the full state is fetched in the background by ResyncPartialState. The
+// returned bool reports whether the join was partial-state (true), so callers
+// can defer actions that depend on full state (e.g. device-list updates).
+func (a *API) JoinRemoteRoom(ctx context.Context, userID, roomID string, via []string) (bool, error) {
 	dest := pickJoinDestination(roomID, via)
 	if dest == "" {
-		return fmt.Errorf("federation: cannot determine a server to join %s from", roomID)
+		return false, fmt.Errorf("federation: cannot determine a server to join %s from", roomID)
 	}
 	tpl, err := a.client.makeJoin(ctx, dest, roomID, userID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	version := roomver.Version(tpl.RoomVersion)
 	if version == "" {
@@ -58,17 +66,30 @@ func (a *API) JoinRemoteRoom(ctx context.Context, userID, roomID string, via []s
 	}
 	rules, ok := roomver.Get(version)
 	if !ok {
-		return fmt.Errorf("federation: unsupported room version %q from %s", version, dest)
+		return false, fmt.Errorf("federation: unsupported room version %q from %s", version, dest)
 	}
 	ev, err := buildJoinEvent(tpl, userID, roomID, a.Now(), version, rules, a.Key, a.ServerName())
 	if err != nil {
-		return err
+		return false, err
 	}
-	sj, err := a.client.sendJoin(ctx, dest, roomID, userID, ev)
+	// Partial-state join is only meaningful for room versions with the
+	// join-rule auth changes (v2+); the remote server must agree to omit
+	// members (else it 500s on a send_join expecting the flag).
+	partial := rules.PartialStateAllowed
+	sj, err := a.client.sendJoin(ctx, dest, roomID, userID, ev, partial)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return a.ingestRemoteJoin(ctx, roomID, version, rules, ev, sj)
+	if partial && sj.MembersOmitted {
+		if err := a.ingestPartialJoin(ctx, roomID, version, rules, ev, sj, dest); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if err := a.ingestRemoteJoin(ctx, roomID, version, rules, ev, sj); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // ResolveRemoteAlias resolves a remote room alias (#alias:domain) to a room ID
@@ -250,9 +271,13 @@ func (c *Client) makeJoin(ctx context.Context, dest, roomID, userID string) (*ma
 // against dest with the signed join event, returning the delivered room state.
 // Per the spec the request body is the signed join event itself (the remote
 // server already knows our origin from the signed request), not an envelope
-// wrapping it.
-func (c *Client) sendJoin(ctx context.Context, dest, roomID, userID string, ev *events.Event) (*sendJoinResponse, error) {
+// wrapping it. partial requests omit_members=true (MSC3706), signalling that
+// only the critical room state is required.
+func (c *Client) sendJoin(ctx context.Context, dest, roomID, userID string, ev *events.Event, partial bool) (*sendJoinResponse, error) {
 	url := c.serverBaseURL(dest) + "/_matrix/federation/v2/send_join/" + roomID + "/" + userID
+	if partial {
+		url += "?omit_members=true"
+	}
 	body := ev.Raw()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
 	if err != nil {

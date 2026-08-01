@@ -76,6 +76,11 @@ type Rules struct {
 	// EnforceKeyValidity: signatures must be checked against key validity
 	// windows (room version 5+).
 	EnforceKeyValidity bool
+
+	// PartialStateAllowed: the room version's joins can be performed as
+	// partial-state joins (omit_members=true, MSC3706/MSC3902). Enabled from
+	// v2 (when member events stopped being required in send_join state).
+	PartialStateAllowed bool
 }
 
 var table = map[Version]Rules{}
@@ -96,6 +101,7 @@ func init() {
 	v2 := base
 	v2.Version = "2"
 	v2.StateResVersion = StateResV2
+	v2.PartialStateAllowed = true
 	register(v2)
 
 	v3 := v2

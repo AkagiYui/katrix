@@ -1612,14 +1612,19 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 	// Not a local room: federated join (make_join/send_join against a remote
 	// server, then persist the delivered room state).
 	if a.fed != nil {
-		if err := a.fed.JoinRemoteRoom(r.Context(), auth.UserID, roomID, via); err != nil {
+		partial, err := a.fed.JoinRemoteRoom(r.Context(), auth.UserID, roomID, via)
+		if err != nil {
 			return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", err.Error())
 		}
 		// The join makes the user's device list newly visible to the room's
 		// remote servers: send them m.device_list_update EDUs (spec: servers
 		// must send device-list updates to every server sharing a room with a
-		// local user, including when the user joins a room).
-		a.broadcastDeviceListForUser(r.Context(), auth.UserID)
+		// local user, including when the user joins a room). A partial-state
+		// join defers these until the background resync completes (the full
+		// membership is unknown while the room is partial).
+		if !partial {
+			a.broadcastDeviceListForUser(r.Context(), auth.UserID)
+		}
 		return nil, nil
 	}
 	return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")

@@ -263,6 +263,15 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 		return nil, err
 	}
 	for _, roomID := range joinedRoomIDs {
+		// A partial-state room (MSC3902) is omitted from eager /sync responses
+		// until its background resync completes: the full room state is not
+		// available yet. Lazy-loading syncs (which only need the joining user's
+		// own membership from the critical state) include it immediately.
+		if room, err := e.store.GetRoom(ctx, roomID); err == nil && room.PartialState {
+			if opts.Filter == nil || !opts.Filter.LazyLoadMembers {
+				continue
+			}
+		}
 		jr, err := e.buildJoinedRoom(ctx, roomID, opts, maxStream)
 		if err != nil {
 			return nil, err

@@ -12,36 +12,64 @@ import (
 
 // Room is a room row.
 type Room struct {
-	RoomID    string
-	Version   string
-	Creator   string
-	IsPublic  bool
-	CreatedTS int64
+	RoomID       string
+	Version      string
+	Creator      string
+	IsPublic     bool
+	CreatedTS    int64
+	PartialState bool
+	// ServersInRoom is the server list delivered in a partial-state send_join
+	// response (empty for normal rooms).
+	ServersInRoom []string
 }
 
 // CreateRoom inserts a room record.
 func (s *Store) CreateRoom(ctx context.Context, r Room) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO rooms(room_id, version, creator, is_public, created_ts)
-		 VALUES ($1,$2,$3,$4,$5)`,
-		r.RoomID, r.Version, r.Creator, r.IsPublic, r.CreatedTS)
+		`INSERT INTO rooms(room_id, version, creator, is_public, created_ts, partial_state, servers_in_room)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		r.RoomID, r.Version, r.Creator, r.IsPublic, r.CreatedTS, r.PartialState, jsonBOrNull(r.ServersInRoom))
 	return err
 }
 
 // GetRoom fetches a room by ID.
 func (s *Store) GetRoom(ctx context.Context, roomID string) (*Room, error) {
 	var r Room
+	var servers []byte
 	err := s.pool.QueryRow(ctx,
-		`SELECT room_id, version, creator, is_public, created_ts
+		`SELECT room_id, version, creator, is_public, created_ts, partial_state, COALESCE(servers_in_room,'[]')
 		 FROM rooms WHERE room_id=$1`, roomID,
-	).Scan(&r.RoomID, &r.Version, &r.Creator, &r.IsPublic, &r.CreatedTS)
+	).Scan(&r.RoomID, &r.Version, &r.Creator, &r.IsPublic, &r.CreatedTS, &r.PartialState, &servers)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
+	_ = json.Unmarshal(servers, &r.ServersInRoom)
 	return &r, nil
+}
+
+// SetRoomPartialState marks a room as partial-state (or clears the flag once
+// the background resync completes).
+func (s *Store) SetRoomPartialState(ctx context.Context, roomID string, partial bool) error {
+	_, err := s.pool.Exec(ctx, `UPDATE rooms SET partial_state=$2 WHERE room_id=$1`, roomID, partial)
+	return err
+}
+
+// SetRoomServersInRoom records the servers-in-room list for a partial room.
+func (s *Store) SetRoomServersInRoom(ctx context.Context, roomID string, servers []string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE rooms SET servers_in_room=$2 WHERE room_id=$1`, roomID, jsonBOrNull(servers))
+	return err
+}
+
+// jsonBOrNull encodes a string slice as a JSON array (or NULL when empty).
+func jsonBOrNull(v []string) any {
+	if len(v) == 0 {
+		return nil
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
 // SetRoomVisibility updates a room's is_public flag (public room directory).
