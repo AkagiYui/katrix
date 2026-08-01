@@ -180,6 +180,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: complement-crypto/rust-sdk
+          # matrix-rust-sdk main's Cargo.lock drifts (ruma fork patch unused),
+          # so cached build artifacts go stale: on a fresh runner image cargo
+          # skips rebuilding them (fingerprint mismatch) and dependents fail
+          # with E0463 "can't find crate for X". Only cache the registry
+          # (sources), never the compiled target, so every build is coherent.
+          cache-targets: false
 
       # complement-crypto vendorises the JS SDK into its own tree via yarn.
       # matrix-js-sdk's active branch is "develop" (it has no "main"), which is
@@ -196,21 +202,6 @@ jobs:
         run: |
           cd complement-crypto
           ./install_uniffi_bindgen_go.sh
-      # matrix-rust-sdk main's Cargo.lock has drifted (ruma fork patch unused),
-      # but the rust-cache still holds build artifacts compiled against the
-      # fork. On a fresh runner image cargo then skips rebuilding those crates
-      # (fingerprint mismatch) and dependents fail with E0463 "can't find crate
-      # for X". Force a clean rebuild of every git-source crate before the FFI
-      # build. Re-resolving via cargo update -p ruma is NOT a fix: the fork is
-      # stale and no longer compiles against sdk main.
-      - name: clean stale git-source artifacts
-        run: |
-          cd complement-crypto/rust-sdk
-          cargo tree -p matrix-sdk-ffi --prefix none 2>/dev/null \
-            | grep -E '\(https://github|\(git\+' \
-            | grep -oE '^\S+' | sort -u \
-            | xargs -I{} cargo clean -p {} || true
-
       - name: build Rust FFI bindings
         run: |
           cd complement-crypto
