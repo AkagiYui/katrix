@@ -337,3 +337,31 @@ func (s *Store) PresenceChangesSince(ctx context.Context, since int64) ([]string
 	}
 	return out, rows.Err()
 }
+
+// NewRoomPeersSince returns the user IDs who (re)joined any of the given rooms
+// after `since`. These are newly-visible peers: on incremental sync their
+// presence must be delivered even when their presence row predates the sync
+// token, because the shared-room relationship (and thus visibility) is new
+// (spec: presence is delivered to the users who share a room).
+func (s *Store) NewRoomPeersSince(ctx context.Context, roomIDs []string, since int64) ([]string, error) {
+	if len(roomIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT user_id FROM room_memberships
+		 WHERE room_id = ANY($1) AND membership='join' AND stream_ordering > $2`,
+		roomIDs, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var userID string
+		if err := rows.Scan(&userID); err != nil {
+			return nil, err
+		}
+		out = append(out, userID)
+	}
+	return out, rows.Err()
+}

@@ -40,9 +40,16 @@ type JoinedRoom struct {
 	Timeline    Timeline          `json:"timeline"`
 	State       StateSet          `json:"state"`
 	AccountData StateSet          `json:"account_data,omitempty"`
-	Ephemeral   []json.RawMessage `json:"ephemeral,omitempty"`
+	Ephemeral   *EphemeralSection `json:"ephemeral,omitempty"`
 	Summary     *RoomSummary      `json:"summary,omitempty"`
 	// UnreadNotifications omitted (P8).
+}
+
+// EphemeralSection holds the ephemeral events for a joined room. The spec
+// nests them under an `events` array (rooms.join.<room_id>.ephemeral.events),
+// so the section is an object rather than a bare array.
+type EphemeralSection struct {
+	Events []json.RawMessage `json:"events"`
 }
 
 // RoomSummary carries the room's member counts (joined + invited).
@@ -321,10 +328,14 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 		}
 	}
 
-	// Ephemeral: typing + receipts.
+	// Ephemeral: typing + receipts. Collected as a section object whose
+	// `events` array carries the ephemeral events (spec shape
+	// rooms.join.<room_id>.ephemeral.events).
 	for roomID := range rooms.Join {
 		jr := rooms.Join[roomID]
-		// Typing ephemeral.
+		var ephEvents []json.RawMessage
+		// Typing ephemeral. A stop-typing leaves an empty user_ids list, which
+		// is itself a notification (spec + clients expect the empty EDU).
 		typingUsers := e.typing.TypingUsers(roomID)
 		if len(typingUsers) > 0 {
 			users := make([]string, len(typingUsers))
@@ -333,7 +344,13 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 				"type":    "m.typing",
 				"content": map[string]any{"user_ids": users},
 			})
-			jr.Ephemeral = append(jr.Ephemeral, eph)
+			ephEvents = append(ephEvents, eph)
+		} else if e.typing.RecentStop(roomID) {
+			eph, _ := json.Marshal(map[string]any{
+				"type":    "m.typing",
+				"content": map[string]any{"user_ids": []string{}},
+			})
+			ephEvents = append(ephEvents, eph)
 		}
 		// Receipts ephemeral (since-based). Include all users' receipts for
 		// rooms the syncer is joined to.
@@ -358,8 +375,11 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 					"type":    "m.receipt",
 					"content": evMap,
 				})
-				jr.Ephemeral = append(jr.Ephemeral, eph)
+				ephEvents = append(ephEvents, eph)
 			}
+		}
+		if len(ephEvents) > 0 {
+			jr.Ephemeral = &EphemeralSection{Events: ephEvents}
 		}
 		rooms.Join[roomID] = jr
 	}
@@ -405,15 +425,26 @@ func (e *Engine) appendPresence(ctx context.Context, resp *Response, opts SyncOp
 
 	var userIDs []string
 	if opts.Since.Stream > 0 {
-		// Incremental: only peers whose presence changed since the token.
+		// Incremental: peers whose presence changed since the token, plus peers
+		// who newly share a room (they joined one of the syncer's rooms after
+		// the token) — the shared-room relationship is new so their presence is
+		// newly visible even if their presence row predates the token.
 		changed, err := e.store.PresenceChangesSince(ctx, opts.Since.Stream)
 		if err != nil {
 			changed = nil
 		}
-		for _, u := range changed {
-			if peers[u] && u != opts.UserID {
-				userIDs = append(userIDs, u)
+		roomIDs, _ := e.store.RoomsForUser(ctx, opts.UserID)
+		newPeers, err := e.store.NewRoomPeersSince(ctx, roomIDs, opts.Since.Stream)
+		if err != nil {
+			newPeers = nil
+		}
+		seen := map[string]bool{}
+		for _, u := range append(changed, newPeers...) {
+			if u == opts.UserID || seen[u] || !peers[u] {
+				continue
 			}
+			seen[u] = true
+			userIDs = append(userIDs, u)
 		}
 	} else {
 		for u := range peers {

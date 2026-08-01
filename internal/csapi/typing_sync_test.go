@@ -55,8 +55,13 @@ func TestTypingInSync(t *testing.T) {
 		rooms, _ := body["rooms"].(map[string]any)
 		join, _ := rooms["join"].(map[string]any)
 		jr, _ := join[roomID].(map[string]any)
-		if eph, ok := jr["ephemeral"].([]any); ok && len(eph) > 0 {
-			raw, _ := json.Marshal(eph[0])
+		// Ephemeral is a section object: {events: [...]}.
+		var ephEvents []any
+		if sec, ok := jr["ephemeral"].(map[string]any); ok {
+			ephEvents, _ = sec["events"].([]any)
+		}
+		if len(ephEvents) > 0 {
+			raw, _ := json.Marshal(ephEvents[0])
 			if string(raw) != "" {
 				t.Logf("got ephemeral: %s", raw)
 				return // pass

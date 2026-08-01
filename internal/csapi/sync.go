@@ -247,10 +247,18 @@ func (a *API) ReadMarkers(w http.ResponseWriter, r *http.Request) {
 			RoomID: roomID, UserID: auth.UserID, ReceiptType: "m.read", EventID: *req.ReadReceipt, TS: now,
 		})
 	}
+	// m.fully_read is room account data (spec: "read markers are stored as
+	// room account data"); clients receive it in the room's account_data sync
+	// section. m.read is a receipt and goes through the ephemeral section.
 	if req.FullyRead != nil {
-		_, _ = a.Store.SetReceipt(r.Context(), storage.ReceiptRow{
-			RoomID: roomID, UserID: auth.UserID, ReceiptType: "m.fully_read", EventID: *req.FullyRead, TS: now,
-		})
+		content, _ := json.Marshal(map[string]any{"event_id": *req.FullyRead})
+		if _, err := a.Store.SetAccountData(r.Context(), auth.Localpart, roomID, "m.fully_read", content); err == nil {
+			a.Notifier.NotifyUser(auth.UserID)
+		}
+	}
+	// Read receipts are visible to the room's other members, so wake them.
+	if req.ReadReceipt != nil {
+		a.notifyRoomMembers(r.Context(), roomID)
 	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }

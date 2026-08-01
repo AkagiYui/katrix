@@ -170,7 +170,10 @@ func TestSyncTypingEphemeral(t *testing.T) {
 	rooms, _ := resp["rooms"].(map[string]any)
 	join, _ := rooms["join"].(map[string]any)
 	jr, _ := join[roomID].(map[string]any)
-	eph, _ := jr["ephemeral"].([]any)
+	var eph []any
+	if sec, ok := jr["ephemeral"].(map[string]any); ok {
+		eph, _ = sec["events"].([]any)
+	}
 	found := false
 	for _, e := range eph {
 		em, _ := e.(map[string]any)
