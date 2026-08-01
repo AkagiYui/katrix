@@ -83,13 +83,14 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	opts := syncpkg.SyncOptions{
-		UserID:    auth.UserID,
-		Localpart: auth.Localpart,
-		DeviceID:  auth.DeviceID,
-		Since:     since,
-		Timeout:   timeout,
-		FullState: fullState,
-		Filter:    filter,
+		UserID:        auth.UserID,
+		Localpart:     auth.Localpart,
+		DeviceID:      auth.DeviceID,
+		Since:         since,
+		Timeout:       timeout,
+		FullState:     fullState,
+		UseStateAfter: q.Get("use_state_after") == "true" || q.Get("org.matrix.msc4222.use_state_after") == "true",
+		Filter:        filter,
 	}
 	// set_presence lets a client declare its presence as part of /sync (spec
 	// "Presence can be set from sync").

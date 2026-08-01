@@ -39,6 +39,7 @@ type RoomsResp struct {
 type JoinedRoom struct {
 	Timeline    Timeline          `json:"timeline"`
 	State       StateSet          `json:"state"`
+	StateAfter  *StateSet         `json:"state_after,omitempty"`
 	AccountData StateSet          `json:"account_data,omitempty"`
 	Ephemeral   *EphemeralSection `json:"ephemeral,omitempty"`
 	Summary     *RoomSummary      `json:"summary,omitempty"`
@@ -79,7 +80,10 @@ type Timeline struct {
 
 // StateSet is a set of state events.
 type StateSet struct {
-	Events []json.RawMessage `json:"events,omitempty"`
+	// Events is rendered unconditionally (even empty): clients rely on the
+	// `state.events` / `account_data.events` arrays existing in every joined
+	// room, and Complement's JSONArrayEach matches require the key present.
+	Events []json.RawMessage `json:"events"`
 }
 
 // EventsSection is a generic list of events.
@@ -94,14 +98,15 @@ type PresenceResp struct {
 
 // SyncOptions controls a single /sync computation.
 type SyncOptions struct {
-	UserID      string
-	Localpart   string
-	DeviceID    string
-	Since       Token
-	Timeout     time.Duration
-	FullState   bool
-	SetPresence string
-	Filter      *SyncFilter
+	UserID        string
+	Localpart     string
+	DeviceID      string
+	Since         Token
+	Timeout       time.Duration
+	FullState     bool
+	UseStateAfter bool
+	SetPresence   string
+	Filter        *SyncFilter
 }
 
 // SyncFilter is the subset of the filter object that /sync honours. Unknown
@@ -302,16 +307,32 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	// Account data (global + per-room).
 	adRows, err := e.store.AccountDataSince(ctx, opts.Localpart, opts.Since.Stream)
 	if err == nil {
-		globalAD := StateSet{}
+		globalAD := StateSet{Events: []json.RawMessage{}}
 		roomAD := map[string]StateSet{}
 		for _, a := range adRows {
+			// A deleted entry is a tombstone (empty content). It must appear in
+			// incremental sync (as the delete signal, MSC3391) but never in an
+			// initial sync — a freshly-syncing client must not see deleted types.
+			if opts.Since.Stream == 0 && storage.IsAccountDataDeleted(a.Content) {
+				continue
+			}
 			ev := mustMarshalEvent(a.Type, "", "", a.Content, 0, "")
 			if a.RoomID == "" {
 				globalAD.Events = append(globalAD.Events, ev)
 			} else {
 				r := roomAD[a.RoomID]
+				if r.Events == nil {
+					r.Events = []json.RawMessage{}
+				}
 				r.Events = append(r.Events, ev)
 				roomAD[a.RoomID] = r
+			}
+		}
+		// A joined room always carries an account_data section (empty when no
+		// account data is set): clients rely on the array existing.
+		for roomID := range rooms.Join {
+			if _, ok := roomAD[roomID]; !ok {
+				roomAD[roomID] = StateSet{Events: []json.RawMessage{}}
 			}
 		}
 		if len(globalAD.Events) > 0 {
@@ -599,6 +620,30 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 			}
 			jr.State.Events = append(jr.State.Events, filter.applyEventFields(clientEvent(&se)))
 		}
+	}
+	// MSC4222 use_state_after: the client asks for the room state as of the end
+	// of the timeline instead of the state at the start (state). On an initial
+	// sync both coincide with the room's current state; populate state_after
+	// with the same (filtered) state set. Clients (incl. matrix-rust-sdk) rely
+	// on this when syncing with use_state_after=true.
+	if opts.UseStateAfter {
+		stateRows, err := e.store.GetState(ctx, roomID)
+		if err != nil {
+			return jr, err
+		}
+		ids := make([]string, 0, len(stateRows))
+		for _, s := range stateRows {
+			ids = append(ids, s.EventID)
+		}
+		stateEvs, _ := e.store.EventsByIDs(ctx, ids)
+		sa := StateSet{Events: make([]json.RawMessage, 0, len(stateEvs))}
+		for _, se := range stateEvs {
+			if filter.lazyLoadMembers() && !lazyLoadMemberEvent(&se, senders) {
+				continue
+			}
+			sa.Events = append(sa.Events, filter.applyEventFields(clientEvent(&se)))
+		}
+		jr.StateAfter = &sa
 	}
 
 	// Room summary: joined/invited member counts (spec m.joined_member_count /
