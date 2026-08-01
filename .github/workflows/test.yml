@@ -196,15 +196,16 @@ jobs:
         run: |
           cd complement-crypto
           ./install_uniffi_bindgen_go.sh
-      # matrix-rust-sdk main's Cargo.lock drifts out of sync with its
-      # [patch.crates-io] section (the ruma fork patch goes unused, which
-      # breaks clean builds with E0463 "can't find crate for ruma"). Re-resolve
-      # ruma so the patch takes effect again; a pinned image previously masked
-      # this by reusing stale build artifacts from the rust-cache.
-      - name: re-resolve rust-sdk deps
+      # matrix-rust-sdk main's Cargo.lock has drifted: the ruma fork patch in
+      # [patch.crates-io] is unused, but the rust-cache still holds build
+      # artifacts compiled against the fork. On a fresh runner image cargo
+      # then skips rebuilding ruma (fingerprint mismatch) and matrix-sdk-common
+      # fails with E0463 "can't find crate for ruma". Force a clean rebuild of
+      # the ruma crates before building the FFI bindings.
+      - name: clean stale ruma artifacts
         run: |
           cd complement-crypto/rust-sdk
-          cargo update -p ruma
+          cargo clean -p ruma -p ruma-common -p ruma-events -p ruma-client-api -p ruma-federation-api -p ruma-macros -p ruma-identifiers-validation -p ruma-html -p ruma-signatures -p matrix-sdk-common -p matrix-sdk-store-encryption -p matrix-sdk-test-macros -p matrix-sdk-search
 
       - name: build Rust FFI bindings
         run: |
