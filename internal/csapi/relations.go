@@ -166,7 +166,6 @@ type eventRelationshipsRequest struct {
 	MaxDepth           int    `json:"max_depth"`
 	TerminatingEventID string `json:"terminating_event_id"`
 }
-
 // EventRelationships handles POST /_matrix/client/unstable/event_relationships
 // (MSC2836). It walks the aggregation tree from event_id — following
 // m.reference links either up (the event's own parent) or down (its children)
@@ -179,9 +178,19 @@ func (a *API) EventRelationships(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	if req.EventID == "" || req.RoomID == "" {
-		httpx.WriteError(w, httpx.ErrBadJSON("event_id and room_id are required"))
+	if req.EventID == "" {
+		httpx.WriteError(w, httpx.ErrBadJSON("event_id is required"))
 		return
+	}
+	// room_id is optional (MSC2836): when omitted it is resolved from the
+	// event itself. The event must exist locally for the walk to proceed.
+	if req.RoomID == "" {
+		ev, err := a.Store.GetEvent(r.Context(), req.EventID)
+		if err != nil {
+			httpx.WriteError(w, httpx.ErrNotFound("event not found"))
+			return
+		}
+		req.RoomID = ev.RoomID
 	}
 	if err := a.checkMembership(r.Context(), req.RoomID, auth.UserID, "join"); err != nil {
 		writeRoomErr(w, err)
