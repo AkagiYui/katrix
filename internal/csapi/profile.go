@@ -3,7 +3,9 @@ package csapi
 import (
 	"net/http"
 
+	"github.com/AkagiYui/katrix/internal/federation"
 	"github.com/AkagiYui/katrix/internal/homeserver"
+	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/rooms"
 )
@@ -22,6 +24,14 @@ func (a *API) GetProfile(w http.ResponseWriter, r *http.Request) {
 	userID := r.PathValue("userId")
 	localpart := a.profileLocalpart(userID)
 	if localpart == "" {
+		// Remote user: query their server's profile over federation.
+		if p, err := a.remoteProfile(r, userID); err == nil {
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{
+				"displayname": p.DisplayName,
+				"avatar_url":  p.AvatarURL,
+			})
+			return
+		}
 		httpx.WriteError(w, httpx.ErrNotFound("user not found"))
 		return
 	}
@@ -36,11 +46,35 @@ func (a *API) GetProfile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// remoteProfile fetches a remote user's profile via the outbound federation
+// client (GET /_matrix/federation/v1/query/profile).
+func (a *API) remoteProfile(r *http.Request, userID string) (*federation.RemoteProfile, error) {
+	if a.fed == nil {
+		return nil, errNoFederation
+	}
+	dom := ids.DomainOf(userID)
+	if dom == "" {
+		return nil, errNoFederation
+	}
+	return a.fed.Client().QueryProfile(r.Context(), dom, userID)
+}
+
+var errNoFederation = &noFederationError{}
+
+type noFederationError struct{}
+
+func (*noFederationError) Error() string { return "federation not enabled" }
+
 // GetDisplayName handles GET /_matrix/client/v3/profile/{userId}/displayname.
 func (a *API) GetDisplayName(w http.ResponseWriter, r *http.Request) {
 	userID := r.PathValue("userId")
 	localpart := a.profileLocalpart(userID)
 	if localpart == "" {
+		// Remote user: query their server's profile over federation.
+		if p, err := a.remoteProfile(r, userID); err == nil {
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"displayname": p.DisplayName})
+			return
+		}
 		httpx.WriteError(w, httpx.ErrNotFound("user not found"))
 		return
 	}
@@ -82,6 +116,11 @@ func (a *API) GetAvatarURL(w http.ResponseWriter, r *http.Request) {
 	userID := r.PathValue("userId")
 	localpart := a.profileLocalpart(userID)
 	if localpart == "" {
+		// Remote user: query their server's profile over federation.
+		if p, err := a.remoteProfile(r, userID); err == nil {
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"avatar_url": p.AvatarURL})
+			return
+		}
 		httpx.WriteError(w, httpx.ErrNotFound("user not found"))
 		return
 	}

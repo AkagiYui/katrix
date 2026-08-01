@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -132,6 +133,45 @@ func (c *Client) serverBaseURL(serverName string) string {
 		host = host + ":8448"
 	}
 	return "https://" + host
+}
+
+// QueryProfile fetches a remote user's profile over federation
+// (GET /_matrix/federation/v1/query/profile?user_id=...). Used by the
+// client-server profile handlers when the target user is on another server.
+func (c *Client) QueryProfile(ctx context.Context, serverName, userID string) (*RemoteProfile, error) {
+	base := c.serverBaseURL(serverName)
+	url := base + "/_matrix/federation/v1/query/profile?user_id=" + url.QueryEscape(userID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Host = serverName
+	if err := signRequestWith(req, c.originName(), c.key); err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("federation: query profile for %s: %w", userID, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("federation: query profile for %s: HTTP %d", userID, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	var p RemoteProfile
+	if err := json.Unmarshal(body, &p); err != nil {
+		return nil, fmt.Errorf("federation: decode profile for %s: %w", userID, err)
+	}
+	return &p, nil
+}
+
+// RemoteProfile is a remote user's profile data from /query/profile.
+type RemoteProfile struct {
+	DisplayName string `json:"displayname"`
+	AvatarURL   string `json:"avatar_url"`
 }
 
 // DownloadMedia fetches a media blob from a remote server over federation

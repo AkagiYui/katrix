@@ -57,6 +57,7 @@ func (a *API) registerTransactions(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/federation/v1/make_leave/{roomID}/{userID}", a.MakeLeave)
 	mux.HandleFunc("GET /_matrix/federation/v1/event_auth/{roomID}/{eventID}", a.EventAuth)
 	mux.HandleFunc("GET /_matrix/federation/v1/query/directory/{roomAlias}", a.QueryDirectory)
+	mux.HandleFunc("GET /_matrix/federation/v1/query/profile", a.QueryProfile)
 }
 
 // txnBody is the PUT /send/{txnId} request body.
@@ -441,6 +442,42 @@ func (a *API) QueryDirectory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"room_id": roomID})
+}
+
+// QueryProfile handles GET /_matrix/federation/v1/query/profile?user_id=...
+// (inbound federation profile lookup). The user_id must be a local user with a
+// valid domain; a malformed server name is rejected with 400.
+func (a *API) QueryProfile(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON", "user_id is required"))
+		return
+	}
+	if !a.IsLocalUser(userID) {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM", "user_id is not a local user"))
+		return
+	}
+	localpart := a.LocalpartOf(userID)
+	u, err := a.Store.GetUser(r.Context(), localpart)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("user not found"))
+		return
+	}
+	field := r.URL.Query().Get("field")
+	out := map[string]any{}
+	switch field {
+	case "displayname":
+		out["displayname"] = u.DisplayName
+	case "avatar_url":
+		out["avatar_url"] = u.AvatarURL
+	case "":
+		out["displayname"] = u.DisplayName
+		out["avatar_url"] = u.AvatarURL
+	default:
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM", "unknown field"))
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, out)
 }
 
 // ingestRemoteMember persists a remote m.room.member event (join/leave/invite)
