@@ -196,16 +196,20 @@ jobs:
         run: |
           cd complement-crypto
           ./install_uniffi_bindgen_go.sh
-      # matrix-rust-sdk main's Cargo.lock has drifted: the ruma fork patch in
-      # [patch.crates-io] is unused, but the rust-cache still holds build
-      # artifacts compiled against the fork. On a fresh runner image cargo
-      # then skips rebuilding ruma (fingerprint mismatch) and matrix-sdk-common
-      # fails with E0463 "can't find crate for ruma". Force a clean rebuild of
-      # the ruma crates before building the FFI bindings.
-      - name: clean stale ruma artifacts
+      # matrix-rust-sdk main's Cargo.lock has drifted (ruma fork patch unused),
+      # but the rust-cache still holds build artifacts compiled against the
+      # fork. On a fresh runner image cargo then skips rebuilding those crates
+      # (fingerprint mismatch) and dependents fail with E0463 "can't find crate
+      # for X". Force a clean rebuild of every git-source crate before the FFI
+      # build. Re-resolving via cargo update -p ruma is NOT a fix: the fork is
+      # stale and no longer compiles against sdk main.
+      - name: clean stale git-source artifacts
         run: |
           cd complement-crypto/rust-sdk
-          cargo clean -p ruma -p ruma-common -p ruma-events -p ruma-client-api -p ruma-federation-api -p ruma-macros -p ruma-identifiers-validation -p ruma-html -p ruma-signatures -p matrix-sdk-common -p matrix-sdk-store-encryption -p matrix-sdk-test-macros -p matrix-sdk-search
+          cargo tree -p matrix-sdk-ffi --prefix none 2>/dev/null \
+            | grep -E '\(https://github|\(git\+' \
+            | grep -oE '^\S+' | sort -u \
+            | xargs -I{} cargo clean -p {} || true
 
       - name: build Rust FFI bindings
         run: |
