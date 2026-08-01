@@ -16,20 +16,42 @@ type UserDirectoryEntry struct {
 
 // SearchUserDirectory returns local users whose display name, localpart or
 // full user ID matches term (case-insensitive substring match). Only users
-// with a display name, or whose localpart matches, are returned.
-func (s *Store) SearchUserDirectory(ctx context.Context, serverName, term string) ([]UserDirectoryEntry, error) {
+// with a display name, or whose localpart matches, are returned, and only if
+// the user is visible to the searcher: a user is visible when they are a
+// joined member of a public room, or when they share a non-public room with
+// the searcher (mirroring Synapse's directory visibility rules, which
+// Complement asserts). users is the full user ID of the searching user.
+func (s *Store) SearchUserDirectory(ctx context.Context, serverName, term, searcherUserID string) ([]UserDirectoryEntry, error) {
 	term = strings.ToLower(strings.TrimSpace(term))
 	if term == "" {
 		return nil, nil
 	}
 	rows, err := s.pool.Query(ctx,
-		`SELECT localpart, COALESCE(display_name,''), COALESCE(avatar_url,'')
-		 FROM users
-		 WHERE deactivated=FALSE AND is_guest=FALSE
-		   AND (LOWER(COALESCE(display_name,'')) LIKE '%'||$1||'%'
-		        OR LOWER(localpart) LIKE '%'||$1||'%'
-		        OR LOWER('@'||localpart||':'||$2) LIKE '%'||$1||'%')
-		 ORDER BY localpart ASC LIMIT 50`, term, serverName)
+		`SELECT u.localpart, COALESCE(u.display_name,''), COALESCE(u.avatar_url,'')
+		 FROM users u
+		 WHERE u.deactivated=FALSE AND u.is_guest=FALSE
+		   AND (LOWER(COALESCE(u.display_name,'')) LIKE '%'||$1||'%'
+		        OR LOWER(u.localpart) LIKE '%'||$1||'%'
+		        OR LOWER('@'||u.localpart||':'||$2) LIKE '%'||$1||'%')
+		   AND (
+		        -- Joined member of a public room: visible to everyone.
+		        EXISTS (
+		            SELECT 1 FROM room_memberships rm JOIN rooms r ON r.room_id = rm.room_id
+		            WHERE rm.user_id = '@'||u.localpart||':'||$2
+		              AND rm.membership = 'join' AND r.is_public = TRUE
+		        )
+		        OR
+		        -- Shares a non-public room with the searcher.
+		        EXISTS (
+		            SELECT 1 FROM room_memberships rm1
+		            JOIN room_memberships rm2 ON rm1.room_id = rm2.room_id
+		            JOIN rooms r ON r.room_id = rm1.room_id
+		            WHERE rm1.user_id = $3 AND rm1.membership = 'join'
+		              AND rm2.user_id = '@'||u.localpart||':'||$2 AND rm2.membership = 'join'
+		              AND r.is_public = FALSE
+		        )
+		   )
+		 ORDER BY u.localpart ASC LIMIT 50`, term, serverName, searcherUserID)
 	if err != nil {
 		return nil, err
 	}

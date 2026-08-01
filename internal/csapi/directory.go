@@ -18,6 +18,7 @@ func (a *API) registerDirectory(mux *http.ServeMux) {
 // UserDirectorySearch handles POST /_matrix/client/v3/user_directory/search.
 // It searches the local directory by display name, localpart or user ID.
 func (a *API) UserDirectorySearch(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
 	var req struct {
 		SearchTerm string `json:"search_term"`
 		Limit      int    `json:"limit"`
@@ -26,7 +27,7 @@ func (a *API) UserDirectorySearch(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	entries, err := a.Store.SearchUserDirectory(r.Context(), a.ServerName(), req.SearchTerm)
+	entries, err := a.Store.SearchUserDirectory(r.Context(), a.ServerName(), req.SearchTerm, auth.UserID)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return

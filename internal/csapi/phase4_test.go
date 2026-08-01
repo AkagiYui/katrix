@@ -97,10 +97,13 @@ func TestRelationsEndpoint(t *testing.T) {
 }
 
 // TestUserDirectorySearch verifies the directory search returns users by
-// display name.
+// display name. The target must be visible to the searcher: here Alice joins
+// a public room, making her directory entry visible to everyone.
 func TestUserDirectorySearch(t *testing.T) {
 	_, srv := testAPI(t)
 	alice := registerUser(t, srv, "dir-alice", "pw")
+	// Alice joins a public room so she is discoverable via the directory.
+	createRoom(t, srv, alice, map[string]any{"preset": "public_chat", "visibility": "public"})
 	// Set a display name.
 	code, _ := doJSON(t, srv, http.MethodPut,
 		"/_matrix/client/v3/profile/@dir-alice:test.katrix/displayname", alice,
@@ -362,10 +365,12 @@ func TestAsyncMediaUpload(t *testing.T) {
 }
 
 // TestUserDirectorySearchByMxid verifies directory search matches a user ID
-// prefix (Complement searches by the mxid up to the first '-').
+// prefix (Complement searches by the mxid up to the first '-'). A user is only
+// returned when visible: Alice joins a public room, so she is findable.
 func TestUserDirectorySearchByMxid(t *testing.T) {
 	_, srv := testAPI(t)
 	alice := registerUser(t, srv, "user-1-alice", "pw")
+	createRoom(t, srv, alice, map[string]any{"preset": "public_chat", "visibility": "public"})
 	code, _ := doJSON(t, srv, http.MethodPut,
 		"/_matrix/client/v3/profile/@user-1-alice:test.katrix/displayname", alice,
 		map[string]any{"displayname": "Alice Cooper"})
@@ -379,7 +384,13 @@ func TestUserDirectorySearchByMxid(t *testing.T) {
 		t.Fatalf("directory search: %d", code)
 	}
 	results, _ := resp["results"].([]any)
-	if len(results) == 0 {
-		t.Fatalf("mxid-prefix search returned no results: %v", resp)
+	if len(results) != 1 {
+		t.Fatalf("expected exactly Alice, got %d results: %v", len(results), resp)
 	}
+	r := results[0].(map[string]any)
+	if r["user_id"] != "@user-1-alice:test.katrix" {
+		t.Fatalf("result = %v, want @user-1-alice:test.katrix", r)
+	}
+	// Bob is not in a public room and shares no room with Alice, so his
+	// matching localpart must not be returned.
 }
