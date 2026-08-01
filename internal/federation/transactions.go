@@ -3,6 +3,7 @@ package federation
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 
 	"github.com/AkagiYui/katrix/internal/events"
@@ -386,14 +387,28 @@ func (a *API) QueryDirectory(w http.ResponseWriter, r *http.Request) {
 // and returns the resolved room state + auth chain so the remote server can
 // build its view. The event's signature is verified before being trusted.
 func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
+	// The v2 send_join/send_leave/invite bodies are the signed event itself.
+	// Some peers (and older katrix) also send {event, room_version, ...}
+	// envelopes; accept both by sniffing for a top-level "event" object.
 	var req struct {
 		Event       json.RawMessage `json:"event"`
 		State       json.RawMessage `json:"state,omitempty"`
 		RoomVersion string          `json:"room_version,omitempty"`
 	}
-	if err := httpx.DecodeJSON(w, r, &req); err != nil {
-		httpx.WriteError(w, err)
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown("read body"))
 		return
+	}
+	var envelope bool
+	if json.Unmarshal(raw, &req) == nil && len(req.Event) > 0 && req.Event[0] == '{' {
+		envelope = true
+	}
+	eventJSON := raw
+	roomVersion := ""
+	if envelope {
+		eventJSON = req.Event
+		roomVersion = req.RoomVersion
 	}
 	var ev struct {
 		EventID  string          `json:"event_id"`
@@ -405,11 +420,11 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
 		Depth    int64           `json:"depth"`
 		OSTS     int64           `json:"origin_server_ts"`
 	}
-	_ = json.Unmarshal(req.Event, &ev)
+	_ = json.Unmarshal(eventJSON, &ev)
 
 	// Resolve room version: prefer the request's room_version, else the stored
 	// room's version, else the default.
-	version := roomver.Version(req.RoomVersion)
+	version := roomver.Version(roomVersion)
 	if version == "" {
 		if room, err := a.Store.GetRoom(r.Context(), ev.RoomID); err == nil {
 			version = roomver.Version(room.Version)
@@ -421,14 +436,14 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
 	// Verify the event signature. For send_join/send_leave the remote server is
 	// vouching for the event; we still must validate its signature before
 	// trusting it locally.
-	vres := a.verifier.Verify(r.Context(), req.Event, version)
+	vres := a.verifier.Verify(r.Context(), eventJSON, version)
 	evID := ev.EventID
 	if evID == "" {
 		evID = vres.EventID
 	}
 	row := &storage.EventRow{
 		EventID: evID, RoomID: ev.RoomID, Type: ev.Type, Sender: ev.Sender,
-		Depth: ev.Depth, OriginServerTS: ev.OSTS, Content: ev.Content, RawJSON: req.Event,
+		Depth: ev.Depth, OriginServerTS: ev.OSTS, Content: ev.Content, RawJSON: eventJSON,
 	}
 	if ev.StateKey != nil {
 		row.StateKey = *ev.StateKey
@@ -456,7 +471,7 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
 		"origin":     a.ServerName(),
 		"state":      statePDUs,
 		"auth_chain": a.authChain(r, ev.RoomID),
-		"event":      req.Event,
+		"event":      eventJSON,
 	})
 }
 
