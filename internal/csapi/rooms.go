@@ -620,8 +620,18 @@ func (a *API) annotateTxnID(r *http.Request, ev *storage.EventRow) json.RawMessa
 	if err := json.Unmarshal(rendered, &obj); err != nil {
 		return rendered
 	}
-	unsigned, _ := json.Marshal(map[string]any{"transaction_id": txnID})
-	obj["unsigned"] = unsigned
+	// Merge into any existing unsigned object rather than replacing it.
+	unsigned := map[string]any{"transaction_id": txnID}
+	if existing, ok := obj["unsigned"]; ok {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(existing, &m); err == nil {
+			for k, v := range m {
+				unsigned[k] = v
+			}
+		}
+	}
+	unsignedJSON, _ := json.Marshal(unsigned)
+	obj["unsigned"] = unsignedJSON
 	b, _ := json.Marshal(obj)
 	return b
 }
