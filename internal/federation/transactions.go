@@ -371,8 +371,8 @@ type responseRecorder struct {
 	body   []byte
 }
 
-func (rr *responseRecorder) Header() http.Header       { return rr.header }
-func (rr *responseRecorder) WriteHeader(code int)      { rr.status = code }
+func (rr *responseRecorder) Header() http.Header  { return rr.header }
+func (rr *responseRecorder) WriteHeader(code int) { rr.status = code }
 func (rr *responseRecorder) Write(b []byte) (int, error) {
 	rr.body = append(rr.body, b...)
 	return len(b), nil

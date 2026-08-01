@@ -1,6 +1,8 @@
 package homeserver
 
-import "sync"
+import (
+	"sync"
+)
 
 // Notifier wakes up parked /sync requests when new data is available for a
 // user. It is deliberately coarse: any event that could affect a user's sync
