@@ -266,10 +266,19 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 		// A partial-state room (MSC3902) is omitted from eager /sync responses
 		// until its background resync completes: the full room state is not
 		// available yet. Lazy-loading syncs (which only need the joining user's
-		// own membership from the critical state) include it immediately.
+		// own membership from the critical state) include it immediately. An
+		// eager sync waits briefly for an in-flight resync to complete (the
+		// resync is usually a few state/event fetches away) so a client that
+		// syncs right after a partial join sees the room once the state is
+		// there; a room whose resync is still blocked is omitted after the
+		// short wait.
 		if room, err := e.store.GetRoom(ctx, roomID); err == nil && room.PartialState {
 			if opts.Filter == nil || !opts.Filter.LazyLoadMembers {
-				continue
+				if e.waitForResync(ctx, roomID, 500*time.Millisecond) {
+					// resync completed while we waited; include the room
+				} else {
+					continue
+				}
 			}
 		}
 		jr, err := e.buildJoinedRoom(ctx, roomID, opts, maxStream)
@@ -847,6 +856,30 @@ func (e *Engine) buildLeftRoom(ctx context.Context, roomID string, opts SyncOpti
 		}
 	}
 	return lr, nil
+}
+
+// waitForResync polls the room's partial_state flag for up to timeout,
+// reporting whether the background resync completed within the window. It is
+// used by eager /sync to include a room as soon as its partial-state resync
+// finishes (instead of dropping the room entirely when the resync lands a
+// moment after the sync request starts).
+func (e *Engine) waitForResync(ctx context.Context, roomID string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		room, err := e.store.GetRoom(ctx, roomID)
+		if err != nil {
+			return false
+		}
+		if !room.PartialState {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	return false
 }
 
 // mustMarshalEvent builds a minimal client event JSON for account_data/ephemeral

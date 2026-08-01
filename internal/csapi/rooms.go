@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/AkagiYui/katrix/internal/canonicaljson"
 	"github.com/AkagiYui/katrix/internal/events"
@@ -682,6 +683,10 @@ func (a *API) RoomMembers(w http.ResponseWriter, r *http.Request) {
 		writeRoomErr(w, err)
 		return
 	}
+	// A partial-state room's membership is incomplete until the background
+	// resync finishes; wait for it (MSC3902: /members blocks until the state
+	// resync completes).
+	a.waitForResync(r.Context(), roomID)
 	q := r.URL.Query()
 	membershipFilter := q.Get("membership")
 	notMembership := q.Get("not_membership")
@@ -772,6 +777,10 @@ func (a *API) RoomJoinedMembers(w http.ResponseWriter, r *http.Request) {
 		writeRoomErr(w, err)
 		return
 	}
+	// A partial-state room's membership is incomplete until the background
+	// resync finishes; wait for it so the response is authoritative (MSC3902:
+	// /joined_members blocks until the state resync completes).
+	a.waitForResync(r.Context(), roomID)
 	rows, err := a.Store.Members(r.Context(), roomID, rooms.MembershipJoin)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
@@ -818,6 +827,25 @@ func (a *API) RoomAliases(w http.ResponseWriter, r *http.Request) {
 		aliases = []string{}
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"aliases": aliases})
+}
+
+// waitForResync blocks until the room's partial-state resync completes
+// (or the request context is cancelled / a cap is reached). Used by
+// membership endpoints, whose answers depend on the full room state
+// (MSC3902: /joined_members and /members block until the resync finishes).
+func (a *API) waitForResync(ctx context.Context, roomID string) {
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		room, err := a.Store.GetRoom(ctx, roomID)
+		if err != nil || !room.PartialState {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
 }
 
 // roomEventFilter is the subset of the spec room event filter honoured by
