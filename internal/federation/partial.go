@@ -120,11 +120,17 @@ func (a *API) resyncPartialState(ctx context.Context, roomID string, version roo
 // fetched via /event and persisted (best-effort — a missing event does not
 // abort the resync).
 func (a *API) resyncFromServer(ctx context.Context, roomID string, version roomver.Version, rules roomver.Rules, server string) bool {
-	// The join event is the room's sole forward extremity (seeded above); its
-	// prev_events anchor the room's previous timeline.
+	// The join event is the room's sole forward extremity (seeded by
+	// ingestPartialJoin); use it, not LatestEvent (which returns the highest
+	// stream_ordering — the critical state events are inserted after the join).
 	joinID := ""
-	if latest, err := a.Store.LatestEvent(ctx, roomID); err == nil && latest != nil {
-		joinID = latest.EventID
+	if exts, err := a.Store.ForwardExtremities(ctx, roomID); err == nil && len(exts) == 1 {
+		joinID = exts[0].EventID
+	}
+	if joinID == "" {
+		if latest, err := a.Store.LatestEvent(ctx, roomID); err == nil && latest != nil {
+			joinID = latest.EventID
+		}
 	}
 	if joinID == "" {
 		return false
