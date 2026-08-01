@@ -173,6 +173,12 @@ const accessTokenTTL = 5 * 60 * 1000 // 5 minutes
 // device record and access token before returning.
 func (a *API) issueLogin(r *http.Request, localpart, deviceID, displayName string, withRefresh bool) (loginResult, error) {
 	now := a.Now()
+	userID := a.HS.UserID(localpart)
+	// A new device changes the user's device list; the user's other devices
+	// (and, via federation, remote servers sharing a room) must learn about it.
+	// Record the change in the shared sync stream so /sync emits
+	// device_lists.changed.
+	_, _ = a.Store.RecordDeviceListChange(r.Context(), userID, false)
 	// Persist the device row (idempotent on conflict).
 	if err := a.Store.UpsertDevice(r.Context(), storage.Device{
 		UserLocalpart: localpart,

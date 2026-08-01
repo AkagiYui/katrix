@@ -57,9 +57,13 @@ type VerifyResult struct {
 //
 // The verification steps:
 //  1. Parse origin and signatures from raw.
-//  2. For each (keyID, signature) under signatures[origin], fetch the
+//  2. Compute the event's redacted form. The spec requires signatures to be
+//     computed over (and verified against) the redacted event, so the
+//     signature stays valid if the event is later redacted. The redacted form
+//     still carries the original "signatures" key (it survives redaction).
+//  3. For each (keyID, signature) under signatures[origin], fetch the
 //     matching verify key and run crypto.VerifyJSON over the redacted form.
-//  3. The event is Valid iff at least one origin signature verifies.
+//  4. The event is Valid iff at least one origin signature verifies.
 //
 // For legacy (v1) events the event_id is an explicit field and is returned
 // verbatim. For v3+ the event id is derived from the reference hash.
@@ -98,6 +102,22 @@ func (v *Verifier) Verify(ctx context.Context, raw []byte, version roomver.Versi
 		}
 	}
 
+	// The signature is over the redacted event: redact before verifying so
+	// events signed against their redacted form (as gomatrixserverlib and
+	// Synapse do) verify correctly. Without this step, unsigned fields that
+	// redaction strips (e.g. hashes) break the canonical JSON the signature
+	// covers.
+	redacted, err := events.Redact(raw, rules)
+	if err != nil {
+		res.Err = fmt.Errorf("fedverify: redact: %w", err)
+		return res
+	}
+	redactedBytes, err := json.Marshal(redacted)
+	if err != nil {
+		res.Err = fmt.Errorf("fedverify: marshal redacted: %w", err)
+		return res
+	}
+
 	if res.Origin == "" {
 		res.Err = fmt.Errorf("fedverify: event has no origin and no sender domain")
 		return res
@@ -119,7 +139,7 @@ func (v *Verifier) Verify(ctx context.Context, raw []byte, version roomver.Versi
 			lastErr = err
 			continue
 		}
-		if err := crypto.VerifyJSONWith(sig, res.Origin, crypto.KeyID(keyID), pub, raw); err != nil {
+		if err := crypto.VerifyJSONWith(sig, res.Origin, crypto.KeyID(keyID), pub, redactedBytes); err != nil {
 			lastErr = err
 			continue
 		}

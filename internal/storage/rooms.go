@@ -87,6 +87,13 @@ type EventRow struct {
 // becomes a new extremity. This keeps /sync's incremental delta correct without
 // a per-request re-scan.
 func (s *Store) InsertEvent(ctx context.Context, e *EventRow) (int64, error) {
+	// Try the insert first. If the event already exists (federation replay /
+	// duplicate delivery), the conflict path must not burn a sequence value:
+	// ON CONFLICT DO UPDATE would still evaluate the INSERT's default
+	// nextval('sync_stream') and advance the shared sync stream even though
+	// nothing changed, which makes every client's since-token race ahead and
+	// re-deliver (or silently skip) deltas. The conflict handler below reads
+	// the existing stream_ordering instead.
 	var stateKey *string
 	if e.StateKey != "" {
 		sk := e.StateKey
@@ -103,7 +110,8 @@ func (s *Store) InsertEvent(ctx context.Context, e *EventRow) (int64, error) {
 		                    origin_server_ts, content, json, redacts, redacted, outlier)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		 ON CONFLICT (event_id) DO UPDATE SET event_id=events.event_id
-		 RETURNING stream_ordering`,
+		 RETURNING CASE WHEN xmax = 0 THEN stream_ordering
+		                ELSE (SELECT stream_ordering FROM events WHERE event_id = $1) END`,
 		e.EventID, e.RoomID, e.Type, stateKey, e.Sender, e.Depth,
 		e.OriginServerTS, e.Content, e.RawJSON, redacts, e.Redacted, e.Outlier,
 	).Scan(&stream)

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
+	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/roomver"
 )
 
@@ -21,7 +22,9 @@ func (s *stubResolver) VerifyKeyFor(ctx context.Context, serverName, keyID strin
 	return s.key.Public, nil
 }
 
-// buildEvent builds a minimal signed m.room.message PDU for "test" origin.
+// buildEvent builds a minimal signed m.room.message PDU for "test" origin. The
+// event is signed over its REDACTED form, as the spec requires (the signature
+// must survive redaction); gomatrixserverlib and Synapse do the same.
 func buildEvent(t *testing.T, key *crypto.SigningKey, origin string) []byte {
 	t.Helper()
 	obj := map[string]any{
@@ -39,7 +42,16 @@ func buildEvent(t *testing.T, key *crypto.SigningKey, origin string) []byte {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	signed, err := crypto.SignJSON(origin, key, raw)
+	rules, _ := roomver.Get(roomver.Default)
+	redacted, err := events.Redact(raw, rules)
+	if err != nil {
+		t.Fatalf("redact: %v", err)
+	}
+	redactedRaw, err := json.Marshal(redacted)
+	if err != nil {
+		t.Fatalf("marshal redacted: %v", err)
+	}
+	signed, err := crypto.SignJSON(origin, key, redactedRaw)
 	if err != nil {
 		t.Fatalf("SignJSON: %v", err)
 	}
@@ -78,8 +90,11 @@ func TestVerifyTamperedSignature(t *testing.T) {
 	}
 	v := New(&stubResolver{key: key})
 	raw := buildEvent(t, key, "test")
-	// Tamper with the body so the signature no longer matches.
-	tampered := bytes.Replace(raw, []byte(`"hello"`), []byte(`"goodbye"`), 1)
+	// Tamper with a field that redaction preserves (the sender), so the
+	// signature no longer covers the tampered form. (Tampering with fields
+	// redaction strips, e.g. message content, leaves the signature valid — the
+	// point of signing the redacted form.)
+	tampered := bytes.Replace(raw, []byte(`"@alice:test"`), []byte(`"@mallory:test"`), 1)
 	res := v.Verify(context.Background(), tampered, roomver.Default)
 	// Tampered event still carries a signatures blob, so Signed is true, but the
 	// signature must not verify.
@@ -131,7 +146,16 @@ func TestVerifyLegacyEventID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	signed, err := crypto.SignJSON("test", key, raw)
+	rules, _ := roomver.Get(roomver.Version("1"))
+	redacted, err := events.Redact(raw, rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	redactedRaw, err := json.Marshal(redacted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed, err := crypto.SignJSON("test", key, redactedRaw)
 	if err != nil {
 		t.Fatal(err)
 	}

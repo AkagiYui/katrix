@@ -77,15 +77,34 @@ func (a *API) SendTransaction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pduResults := map[string]any{}
+	notifyRooms := map[string]bool{}
 	for _, raw := range body.PDUs {
 		evID, accept := a.ingestPDU(r, raw)
 		if evID != "" {
 			if accept {
 				pduResults[evID] = map[string]any{}
+				// Any accepted PDU (not just membership state) changes the room
+				// for its local members: wake their long-polling /sync requests
+				// so the new event is delivered promptly. Without this, remote
+				// messages sit in the timeline until a member's next explicit
+				// sync (a long-poll parks on a stable token and never re-queries).
+				var roomID string
+				var ev struct {
+					RoomID string `json:"room_id"`
+				}
+				if json.Unmarshal(raw, &ev) == nil && ev.RoomID != "" {
+					roomID = ev.RoomID
+				}
+				if roomID != "" {
+					notifyRooms[roomID] = true
+				}
 			} else {
 				pduResults[evID] = map[string]string{"error": "rejected"}
 			}
 		}
+	}
+	for roomID := range notifyRooms {
+		a.notifyRoomMembers(r.Context(), roomID)
 	}
 	_ = body.EDUs
 	_ = a.Store.RecordFederationTxn(r.Context(), body.Origin, txnID, nil, a.Now())
@@ -444,7 +463,10 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request) {
 // applyRemoteMembership updates the denormalised room_memberships table for an
 // inbound remote m.room.member event. This is the federation-side mirror of
 // the client-side sendMemberEvent path; it keeps /sync membership correct for
-// locally-joined users.
+// locally-joined users. The row's stream_ordering must be the event's real
+// stream position (not the event's depth): /sync deltas are stream-based, and
+// using depth would mis-order (or drop) membership changes relative to the
+// shared sync stream.
 func (a *API) applyRemoteMembership(ctx context.Context, roomID, userID string, content json.RawMessage, eventID string, depth int64) {
 	var mc struct {
 		Membership  string `json:"membership"`
@@ -454,10 +476,14 @@ func (a *API) applyRemoteMembership(ctx context.Context, roomID, userID string, 
 	if err := json.Unmarshal(content, &mc); err != nil || mc.Membership == "" {
 		return
 	}
+	stream := depth
+	if ev, err := a.Store.GetEvent(ctx, eventID); err == nil {
+		stream = ev.StreamOrdering
+	}
 	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
 		RoomID: roomID, UserID: userID, Membership: mc.Membership,
 		EventID: eventID, DisplayName: mc.DisplayName, AvatarURL: mc.AvatarURL,
-		StreamOrdering: depth,
+		StreamOrdering: stream,
 	})
 	if mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban" {
 		a.notifyRoomMembers(ctx, roomID)

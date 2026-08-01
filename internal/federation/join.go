@@ -124,7 +124,10 @@ func buildJoinEvent(tpl *makeJoinResponse, userID, roomID string, now int64, ver
 	if rules.EventFormatV1 {
 		return b.BuildLegacy(serverName, key, version, ids.RandomTxnSuffix())
 	}
-	return b.Build(serverName, key, version)
+	ev, err := b.Build(serverName, key, version)
+	if err == nil {
+	}
+	return ev, err
 }
 
 // tplEventRefs extracts prev_events/auth_events IDs from a make_join template
@@ -206,12 +209,12 @@ func tplEventTS(raw json.RawMessage, now int64) int64 {
 	return ts
 }
 
-// makeJoin performs GET /_matrix/federation/v2/send_join/{roomID}/{userID}
-// against dest — per the spec the v2 "make_join" step is a GET on the
-// send_join endpoint (the make_join path is v1 only). It returns the unsigned
-// template event + room version.
+// makeJoin performs GET /_matrix/federation/v1/make_join/{roomID}/{userID}
+// against dest, returning the unsigned template event + room version. The
+// make_join step is always a GET on the v1 make_join path; the v2 send_join
+// path is PUT-only (it submits the signed join and returns room state).
 func (c *Client) makeJoin(ctx context.Context, dest, roomID, userID string) (*makeJoinResponse, error) {
-	url := c.serverBaseURL(dest) + "/_matrix/federation/v2/send_join/" + roomID + "/" + userID
+	url := c.serverBaseURL(dest) + "/_matrix/federation/v1/make_join/" + roomID + "/" + userID
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -245,16 +248,12 @@ func (c *Client) makeJoin(ctx context.Context, dest, roomID, userID string) (*ma
 
 // sendJoin performs PUT /_matrix/federation/v2/send_join/{roomID}/{userID}
 // against dest with the signed join event, returning the delivered room state.
+// Per the spec the request body is the signed join event itself (the remote
+// server already knows our origin from the signed request), not an envelope
+// wrapping it.
 func (c *Client) sendJoin(ctx context.Context, dest, roomID, userID string, ev *events.Event) (*sendJoinResponse, error) {
 	url := c.serverBaseURL(dest) + "/_matrix/federation/v2/send_join/" + roomID + "/" + userID
-	body, err := json.Marshal(map[string]any{
-		"origin":       c.originName(),
-		"room_version": string(ev.Version()),
-		"event":        ev.Raw(),
-	})
-	if err != nil {
-		return nil, err
-	}
+	body := ev.Raw()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err

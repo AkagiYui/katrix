@@ -1,7 +1,10 @@
 package federation
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -11,7 +14,10 @@ import (
 
 // SignRequest signs an outbound federation request with the local server's
 // signing key, adding the X-Matrix Authorization header. The signed payload is
-// the canonical JSON of {method, uri, origin, destination}.
+// the canonical JSON of {method, uri, origin, destination} plus the request
+// body (content) when present — the spec's request-authentication scheme, and
+// the form remote servers (incl. gomatrixserverlib) verify. Signing over an
+// empty content key would be a signature mismatch for requests with a body.
 func signRequestWith(req *http.Request, origin string, key *crypto.SigningKey) error {
 	if key == nil {
 		return nil
@@ -22,6 +28,14 @@ func signRequestWith(req *http.Request, origin string, key *crypto.SigningKey) e
 		"uri":         req.URL.RequestURI(),
 		"origin":      origin,
 		"destination": destination,
+	}
+	if req.Body != nil {
+		// The body may already have been read (e.g. by an earlier marshalling
+		// step in the caller); snapshot the bytes to sign, then hand them back.
+		if body, err := io.ReadAll(req.Body); err == nil && len(body) > 0 {
+			signable["content"] = json.RawMessage(body)
+			req.Body = io.NopCloser(bytes.NewReader(body))
+		}
 	}
 	canonical, err := canonicaljson.Marshal(signable)
 	if err != nil {
