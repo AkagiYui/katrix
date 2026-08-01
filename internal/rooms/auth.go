@@ -22,6 +22,11 @@ type StateSnapshot struct {
 	// ThirdPartyInvite content for a matching third_party_invite token, if the
 	// member event references one.
 	ThirdPartyInvite json.RawMessage
+	// RestrictedAuthorised records that the user named in the join event's
+	// join_authorised_via_users_server is a joined member of this room and of
+	// one of the rooms in the join_rules allow list (MSC3083). It is computed
+	// by the caller (which has store access) and enforced by the auth rules.
+	RestrictedAuthorised bool
 }
 
 // Authorize determines whether an event passes the Matrix authorization rules
@@ -180,7 +185,17 @@ func authorizeMember(rules roomver.Rules, sender, stateKey string, content json.
 				// (rare); typically reject.
 				return fmt.Errorf("rooms: cannot join for another user")
 			}
-			if joinRule != JoinRulePublic {
+			switch joinRule {
+			case JoinRulePublic:
+				// Public rooms accept anyone.
+			case JoinRuleRestricted, JoinRuleKnockRestricted:
+				// Restricted: only when the join is authorised via a joined
+				// member of an allowed room (MSC3083). The caller computes this
+				// against current membership.
+				if !st.RestrictedAuthorised {
+					return fmt.Errorf("rooms: join not authorised via an allowed room")
+				}
+			default:
 				return fmt.Errorf("rooms: room is not publicly joinable")
 			}
 		case MembershipBan:

@@ -92,6 +92,34 @@ func JoinRule(raw json.RawMessage) string {
 	return c.JoinRule
 }
 
+// AllowEntry is one entry in m.room.join_rules.content.allow (MSC3083). Only
+// "m.room_membership" entries with a room_id count as valid; anything else is
+// filtered out when evaluating a restricted join.
+type AllowEntry struct {
+	Type   string   `json:"type"`
+	RoomID string   `json:"room_id"`
+	Via    []string `json:"via,omitempty"`
+}
+
+// AllowRooms returns the valid allowed room IDs from m.room.join_rules content.
+// A malformed allow key (wrong shape, e.g. a string or a list of strings)
+// yields no valid entries, which means restricted joins are not authorised.
+func AllowRooms(raw json.RawMessage) []string {
+	var c struct {
+		Allow []AllowEntry `json:"allow"`
+	}
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range c.Allow {
+		if e.Type == "m.room_membership" && e.RoomID != "" {
+			out = append(out, e.RoomID)
+		}
+	}
+	return out
+}
+
 // HistoryVisibility extracts the history_visibility (default "shared").
 func HistoryVisibility(raw json.RawMessage) string {
 	var c struct {
@@ -136,6 +164,9 @@ type MemberContent struct {
 	Reason      string          `json:"reason,omitempty"`
 	ThirdParty  json.RawMessage `json:"third_party_invite,omitempty"`
 	IsDirect    *bool           `json:"is_direct,omitempty"`
+	// JoinAuthorisedViaUsersServer (MSC3083): the sender of a restricted-rule
+	// join, naming a joined user who authorised the join.
+	JoinAuthorisedViaUsersServer string `json:"join_authorised_via_users_server,omitempty"`
 }
 
 // ParseMember decodes m.room.member content.

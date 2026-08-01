@@ -1458,6 +1458,43 @@ func (a *API) resolveRoomIDOrAlias(ctx context.Context, idOrAlias string) string
 	return ""
 }
 
+// restrictedJoinAuthorised reports whether a restricted-rule join (MSC3083)
+// is authorised: the joining user must be a joined member of one of the
+// rooms in the m.room.join_rules allow list, and the user named in
+// join_authorised_via_users_server must be a joined member of the room being
+// joined (on the local server).
+func (a *API) restrictedJoinAuthorised(ctx context.Context, roomID, joiningUserID, authorisingUserID string) bool {
+	id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.join_rules", "")
+	if err != nil {
+		return false
+	}
+	ev, err := a.Store.GetEvent(ctx, id)
+	if err != nil {
+		return false
+	}
+	allowedRooms := rooms.AllowRooms(ev.Content)
+	if len(allowedRooms) == 0 {
+		return false
+	}
+	// The joining user must be joined to at least one allow-listed room.
+	inAllowed := false
+	for _, allowedRoom := range allowedRooms {
+		if m, err := a.Store.GetMembership(ctx, allowedRoom, joiningUserID); err == nil && m.Membership == rooms.MembershipJoin {
+			inAllowed = true
+			break
+		}
+	}
+	if !inAllowed {
+		return false
+	}
+	// The authorising user must be a joined member of the room being joined.
+	if authorisingUserID == "" || ids.DomainOf(authorisingUserID) != a.ServerName() {
+		return false
+	}
+	m, err := a.Store.GetMembership(ctx, roomID, authorisingUserID)
+	return err == nil && m.Membership == rooms.MembershipJoin
+}
+
 // checkMembership verifies the user has the given membership in the room.
 func (a *API) checkMembership(ctx context.Context, roomID, userID, want string) error {
 	m, err := a.Store.GetMembership(ctx, roomID, userID)
@@ -1588,7 +1625,7 @@ func (a *API) sendMemberEvent(r *http.Request, auth *homeserver.Auth, roomID, _s
 
 // memberContent renders a parsed MemberContent as a content map, preserving
 // all spec fields (membership, displayname, avatar_url, reason, is_direct,
-// third_party_invite).
+// third_party_invite, join_authorised_via_users_server).
 func memberContent(mc *rooms.MemberContent) map[string]any {
 	m := map[string]any{"membership": mc.Membership}
 	if mc.DisplayName != "" {
@@ -1605,6 +1642,9 @@ func memberContent(mc *rooms.MemberContent) map[string]any {
 	}
 	if len(mc.ThirdParty) > 0 {
 		m["third_party_invite"] = json.RawMessage(mc.ThirdParty)
+	}
+	if mc.JoinAuthorisedViaUsersServer != "" {
+		m["join_authorised_via_users_server"] = mc.JoinAuthorisedViaUsersServer
 	}
 	return m
 }
@@ -1629,6 +1669,14 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	rules, ok := roomver.Get(version)
 	if !ok {
 		return "", newRoomError(http.StatusBadRequest, "M_UNSUPPORTED_ROOM_VERSION", "unknown room version")
+	}
+	// Restricted-rule join (MSC3083): the joining user must be a joined member
+	// of one of the allow-listed rooms, and the user named in
+	// join_authorised_via_users_server must be a joined member of this room.
+	if rooms.JoinRule(st.JoinRules) == rooms.JoinRuleRestricted || rooms.JoinRule(st.JoinRules) == rooms.JoinRuleKnockRestricted {
+		if mc, err := rooms.ParseMember(contentRaw); err == nil && mc.Membership == rooms.MembershipJoin {
+			st.RestrictedAuthorised = a.restrictedJoinAuthorised(r.Context(), roomID, auth.UserID, mc.JoinAuthorisedViaUsersServer)
+		}
 	}
 	if err := rooms.Authorize(rules, "m.room.member", target, auth.UserID, contentRaw, st); err != nil {
 		return "", newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
