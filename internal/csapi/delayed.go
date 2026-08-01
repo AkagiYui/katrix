@@ -174,7 +174,7 @@ func (a *API) buildAndPersistMessageCtx(ctx context.Context, auth *homeserver.Au
 		prev = []string{latest.EventID}
 		depth = latest.Depth + 1
 	}
-	authIDs := a.authEventIDs(ctx, roomID, auth.UserID)
+	authIDs := a.authEventIDs(ctx, roomID, auth.UserID, "")
 	b := events.Builder{
 		Type:           eventType,
 		Sender:         auth.UserID,
@@ -225,7 +225,7 @@ func (a *API) buildAndPersistStateCtx(ctx context.Context, auth *homeserver.Auth
 		prev = []string{latest.EventID}
 		depth = latest.Depth + 1
 	}
-	authIDs := a.authEventIDs(ctx, roomID, auth.UserID)
+	authIDs := a.authEventIDs(ctx, roomID, auth.UserID, "")
 	b := events.Builder{
 		Type:           eventType,
 		Sender:         auth.UserID,

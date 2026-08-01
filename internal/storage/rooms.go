@@ -6,6 +6,7 @@ import (
 	"errors"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ---- Rooms ----
@@ -160,6 +161,111 @@ func (s *Store) InsertEvent(ctx context.Context, e *EventRow) (int64, error) {
 	return stream, nil
 }
 
+// InsertEventWithMembership atomically inserts an event and its denormalised
+// membership row (when m is non-nil) in a single transaction. This closes the
+// race where a concurrent /sync computes the shared stream position (which the
+// event insert just advanced) before the membership upsert commits: the sync
+// would otherwise mint a token past the membership change without ever
+// delivering it. It returns the event's stream_ordering.
+func (s *Store) InsertEventWithMembership(ctx context.Context, e *EventRow, m *MembershipRow) (int64, error) {
+	var stateKey *string
+	if e.StateKey != "" {
+		sk := e.StateKey
+		stateKey = &sk
+	}
+	var redacts *string
+	if e.Redacts != "" {
+		r := e.Redacts
+		redacts = &r
+	}
+	var stream int64
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx,
+			`INSERT INTO events(event_id, room_id, type, state_key, sender, depth,
+			                    origin_server_ts, content, json, redacts, redacted, outlier)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+			 ON CONFLICT (event_id) DO UPDATE SET event_id=events.event_id
+			 RETURNING CASE WHEN xmax = 0 THEN stream_ordering
+			                ELSE (SELECT stream_ordering FROM events WHERE event_id = $1) END`,
+			e.EventID, e.RoomID, e.Type, stateKey, e.Sender, e.Depth,
+			e.OriginServerTS, e.Content, e.RawJSON, redacts, e.Redacted, e.Outlier,
+		).Scan(&stream); err != nil {
+			return err
+		}
+		if m != nil {
+			// The membership row must carry the event's actual stream position
+			// (the monotonic tiebreak compares against it), not the caller's
+			// depth heuristic. The causal Depth field is left untouched.
+			m.StreamOrdering = stream
+			if err := upsertMembershipTx(ctx, tx, m); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	e.StreamOrdering = stream
+	prevs := e.PrevEvents
+	if prevs == nil {
+		prevs = parsePrevEvents(e.RawJSON)
+	}
+	if err := s.UpdateExtremitiesForEvent(ctx, e.RoomID, e.EventID, prevs, e.Depth); err != nil {
+		_ = err
+	}
+	return stream, nil
+}
+
+// execer is the subset of pgx.Tx / *pgxpool.Pool used by the upsert helpers.
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// upsertMembershipTx is the SQL body of UpsertMembership, usable inside a
+// transaction. The update is monotonic in causal order (the event's DAG depth):
+// a write whose depth is older than the row's current value is ignored, so a
+// stale invite PDU arriving after the leave that rescinds it (causally newer
+// but with a lower local stream on this server) cannot overwrite the leave.
+// Equal depths fall back to stream_ordering as a tiebreak.
+func upsertMembershipTx(ctx context.Context, ex execer, m *MembershipRow) error {
+_, err := ex.Exec(ctx,
+		`INSERT INTO room_memberships(room_id, user_id, membership, event_id,
+		                              display_name, avatar_url, forgotten, stream_ordering, depth)
+		 VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$8)
+		 ON CONFLICT (room_id, user_id) DO UPDATE SET
+		     membership=CASE WHEN EXCLUDED.depth > room_memberships.depth
+		                      OR (EXCLUDED.depth = room_memberships.depth
+		                          AND EXCLUDED.stream_ordering >= room_memberships.stream_ordering)
+		                     THEN EXCLUDED.membership ELSE room_memberships.membership END,
+		     event_id=CASE WHEN EXCLUDED.depth > room_memberships.depth
+		                     OR (EXCLUDED.depth = room_memberships.depth
+		                         AND EXCLUDED.stream_ordering >= room_memberships.stream_ordering)
+		                   THEN EXCLUDED.event_id ELSE room_memberships.event_id END,
+		     display_name=CASE WHEN EXCLUDED.depth > room_memberships.depth
+		                     OR (EXCLUDED.depth = room_memberships.depth
+		                         AND EXCLUDED.stream_ordering >= room_memberships.stream_ordering)
+		                       THEN EXCLUDED.display_name ELSE room_memberships.display_name END,
+		     avatar_url=CASE WHEN EXCLUDED.depth > room_memberships.depth
+		                     OR (EXCLUDED.depth = room_memberships.depth
+		                         AND EXCLUDED.stream_ordering >= room_memberships.stream_ordering)
+		                     THEN EXCLUDED.avatar_url ELSE room_memberships.avatar_url END,
+		     stream_ordering=CASE WHEN EXCLUDED.depth > room_memberships.depth
+		                     OR (EXCLUDED.depth = room_memberships.depth
+		                         AND EXCLUDED.stream_ordering >= room_memberships.stream_ordering)
+		                          THEN EXCLUDED.stream_ordering ELSE room_memberships.stream_ordering END,
+		     depth=CASE WHEN EXCLUDED.depth > room_memberships.depth
+		                     OR (EXCLUDED.depth = room_memberships.depth
+		                         AND EXCLUDED.stream_ordering >= room_memberships.stream_ordering)
+		                 THEN EXCLUDED.depth ELSE room_memberships.depth END,
+		     -- Re-joining a forgotten room resets the forgotten flag: the user
+		     -- is a member again and regains access.
+		     forgotten = CASE WHEN EXCLUDED.membership='join' THEN FALSE ELSE room_memberships.forgotten END`,
+		m.RoomID, m.UserID, m.Membership, m.EventID,
+		nullString(m.DisplayName), nullString(m.AvatarURL), m.StreamOrdering, m.Depth)
+	return err
+}
+
 // parsePrevEvents extracts prev_events IDs from a raw event JSON for the
 // extremity update. Returns nil for legacy [id, hash] pairs (flattened to IDs).
 func parsePrevEvents(raw []byte) []string {
@@ -179,6 +285,38 @@ func (s *Store) GetEvent(ctx context.Context, eventID string) (*EventRow, error)
 		        origin_server_ts, stream_ordering, content, json,
 		        COALESCE(redacts,''), redacted, outlier
 		 FROM events WHERE event_id=$1`, eventID))
+}
+
+// UpdateEventRaw replaces an event's stored JSON and content with new bytes
+// (same event ID). Used when a remote server returns a doubly-signed invite
+// event that supersedes our locally-signed copy: the room must keep the
+// version carrying both parties' signatures.
+func (s *Store) UpdateEventRaw(ctx context.Context, eventID string, raw []byte) error {
+	var ev struct {
+		RoomID     string          `json:"room_id"`
+		Type       string          `json:"type"`
+		Sender     string          `json:"sender"`
+		Depth      int64           `json:"depth"`
+		OSTS       int64           `json:"origin_server_ts"`
+		Content    json.RawMessage `json:"content"`
+		StateKey   *string         `json:"state_key"`
+		PrevEvents []string        `json:"prev_events"`
+		AuthEvents []string        `json:"auth_events"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return err
+	}
+	var stateKey *string
+	if ev.StateKey != nil {
+		sk := *ev.StateKey
+		stateKey = &sk
+	}
+	_, err := s.pool.Exec(ctx,
+		`UPDATE events SET json=$2, content=$3, room_id=$4, type=$5, sender=$6,
+		                   depth=$7, origin_server_ts=$8, state_key=$9
+		 WHERE event_id=$1`,
+		eventID, raw, ev.Content, ev.RoomID, ev.Type, ev.Sender, ev.Depth, ev.OSTS, stateKey)
+	return err
 }
 
 // EventsForRoom returns events in a room ordered by stream_ordering within the
@@ -356,26 +494,17 @@ type MembershipRow struct {
 	AvatarURL      string
 	Forgotten      bool
 	StreamOrdering int64
+	// Depth is the event's DAG depth from the origin server. It provides the
+	// causal ordering that decides whether a membership update wins: a
+	// delayed/replayed event (e.g. an invite arriving after the leave that
+	// rescinds it) is causally older regardless of its local stream position.
+	Depth int64
 }
 
-// UpsertMembership inserts or updates a membership row.
+// UpsertMembership inserts or updates a membership row. The update is
+// monotonic in causal order (the event's DAG depth); see upsertMembershipTx.
 func (s *Store) UpsertMembership(ctx context.Context, m MembershipRow) error {
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO room_memberships(room_id, user_id, membership, event_id,
-		                              display_name, avatar_url, forgotten, stream_ordering)
-		 VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7)
-		 ON CONFLICT (room_id, user_id) DO UPDATE SET
-		     membership=EXCLUDED.membership,
-		     event_id=EXCLUDED.event_id,
-		     display_name=EXCLUDED.display_name,
-		     avatar_url=EXCLUDED.avatar_url,
-		     stream_ordering=EXCLUDED.stream_ordering,
-		     -- Re-joining a forgotten room resets the forgotten flag: the user
-		     -- is a member again and regains access.
-		     forgotten = CASE WHEN EXCLUDED.membership='join' THEN FALSE ELSE room_memberships.forgotten END`,
-		m.RoomID, m.UserID, m.Membership, m.EventID,
-		nullString(m.DisplayName), nullString(m.AvatarURL), m.StreamOrdering)
-	return err
+	return upsertMembershipTx(ctx, s.pool, &m)
 }
 
 // GetMembership returns a single membership row.
@@ -383,9 +512,9 @@ func (s *Store) GetMembership(ctx context.Context, roomID, userID string) (*Memb
 	var m MembershipRow
 	var dn, av *string
 	err := s.pool.QueryRow(ctx,
-		`SELECT room_id, user_id, membership, event_id, display_name, avatar_url, forgotten, COALESCE(stream_ordering,0)
+		`SELECT room_id, user_id, membership, event_id, display_name, avatar_url, forgotten, COALESCE(stream_ordering,0), COALESCE(depth,0)
 		 FROM room_memberships WHERE room_id=$1 AND user_id=$2`, roomID, userID,
-	).Scan(&m.RoomID, &m.UserID, &m.Membership, &m.EventID, &dn, &av, &m.Forgotten, &m.StreamOrdering)
+	).Scan(&m.RoomID, &m.UserID, &m.Membership, &m.EventID, &dn, &av, &m.Forgotten, &m.StreamOrdering, &m.Depth)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -401,10 +530,34 @@ func (s *Store) GetMembership(ctx context.Context, roomID, userID string) (*Memb
 	return &m, nil
 }
 
+// LatestMembershipEvent returns the most recent m.room.member event (by stream
+// ordering) for a user in a room. Unlike GetMembership (the denormalised
+// table, which can briefly lag behind the events table while a concurrent
+// ingest applies a membership PDU), this reads the authoritative event stream:
+// the events table insert commits before any denormalised state is updated.
+// It returns ErrNotFound when the user has no member event in the room.
+func (s *Store) LatestMembershipEvent(ctx context.Context, roomID, userID string) (*EventRow, error) {
+	row := s.pool.QueryRow(ctx,
+		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
+		        origin_server_ts, stream_ordering, content, json,
+		        COALESCE(redacts,''), redacted, outlier
+		 FROM events
+		 WHERE room_id=$1 AND type='m.room.member' AND state_key=$2
+		 ORDER BY stream_ordering DESC LIMIT 1`, roomID, userID)
+	ev, err := scanEvent(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return ev, nil
+}
+
 // Members returns membership rows for a room. membershipFilter ("join","invite",
 // "leave","ban","") filters; "" returns all.
 func (s *Store) Members(ctx context.Context, roomID, membershipFilter string) ([]MembershipRow, error) {
-	q := `SELECT room_id, user_id, membership, event_id, COALESCE(display_name,''), COALESCE(avatar_url,''), forgotten, COALESCE(stream_ordering,0)
+	q := `SELECT room_id, user_id, membership, event_id, COALESCE(display_name,''), COALESCE(avatar_url,''), forgotten, COALESCE(stream_ordering,0), COALESCE(depth,0)
 	      FROM room_memberships WHERE room_id=$1`
 	args := []any{roomID}
 	if membershipFilter != "" {
@@ -420,7 +573,7 @@ func (s *Store) Members(ctx context.Context, roomID, membershipFilter string) ([
 	var out []MembershipRow
 	for rows.Next() {
 		var m MembershipRow
-		if err := rows.Scan(&m.RoomID, &m.UserID, &m.Membership, &m.EventID, &m.DisplayName, &m.AvatarURL, &m.Forgotten, &m.StreamOrdering); err != nil {
+		if err := rows.Scan(&m.RoomID, &m.UserID, &m.Membership, &m.EventID, &m.DisplayName, &m.AvatarURL, &m.Forgotten, &m.StreamOrdering, &m.Depth); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -433,6 +586,43 @@ type MemberHistoryRow struct {
 	UserID         string
 	Membership     string
 	StreamOrdering int64
+}
+
+// MemberEventRow is a historical m.room.member event with enough detail to
+// render unsigned.prev_content / prev_sender for a later member event of the
+// same state_key.
+type MemberEventRow struct {
+	UserID         string
+	Sender         string
+	Content        json.RawMessage
+	StreamOrdering int64
+}
+
+// MemberEvents returns every m.room.member event in a room up to (and
+// including) a stream position, ordered by stream. The sync engine walks it to
+// attach each member event's previous membership (unsigned.prev_content and
+// unsigned.prev_sender, per the spec: "Previous membership can be retrieved
+// from the prev_content object on an event").
+func (s *Store) MemberEvents(ctx context.Context, roomID string, upto int64) ([]MemberEventRow, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT state_key, sender, content, stream_ordering
+		 FROM events
+		 WHERE room_id=$1 AND type='m.room.member' AND state_key IS NOT NULL
+		   AND stream_ordering<=$2
+		 ORDER BY stream_ordering ASC`, roomID, upto)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MemberEventRow
+	for rows.Next() {
+		var h MemberEventRow
+		if err := rows.Scan(&h.UserID, &h.Sender, &h.Content, &h.StreamOrdering); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }
 
 // MemberHistory returns the m.room.member events for a room up to (and

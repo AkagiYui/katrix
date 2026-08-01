@@ -267,14 +267,17 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 		// until its background resync completes: the full room state is not
 		// available yet. Lazy-loading syncs (which only need the joining user's
 		// own membership from the critical state) include it immediately. An
-		// eager sync waits briefly for an in-flight resync to complete (the
-		// resync is usually a few state/event fetches away) so a client that
-		// syncs right after a partial join sees the room once the state is
-		// there; a room whose resync is still blocked is omitted after the
-		// short wait.
+		// eager sync waits for an in-flight resync to complete (the resync is a
+		// few state/event fetches away) so a client that syncs right after a
+		// partial join sees the room once the state is there; a room whose
+		// resync is still blocked after the wait is omitted. The wait is
+		// generous because the resync is a network round-trip that is routinely
+		// slow under load — a fixed 500ms routinely drops the room for clients
+		// that sync within the first second of a partial join, which is exactly
+		// when they are most likely to sync (the join just completed).
 		if room, err := e.store.GetRoom(ctx, roomID); err == nil && room.PartialState {
 			if opts.Filter == nil || !opts.Filter.LazyLoadMembers {
-				if e.waitForResync(ctx, roomID, 500*time.Millisecond) {
+				if e.waitForResync(ctx, roomID, 5*time.Second) {
 					// resync completed while we waited; include the room
 				} else {
 					continue
@@ -580,18 +583,23 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	if err != nil {
 		return jr, err
 	}
+
 	// Track senders for lazy-load members.
 	senders := map[string]bool{}
 	timeline := Timeline{Events: make([]json.RawMessage, 0, len(evs))}
 	// MSC4115: annotate each timeline event with the syncing user's membership
 	// at the time of the event (unsigned.membership).
 	membershipAt := e.membershipAnnotator(ctx, roomID, opts.UserID, maxStream)
+	// Spec: membership changes carry the previous membership in
+	// unsigned.prev_content (and unsigned.prev_sender) so clients can render
+	// transitions (e.g. invite -> join, join -> leave).
+	prevContent := e.prevContentAnnotator(ctx, roomID, maxStream)
 	earliest := int64(0)
 	for _, ev := range evs {
 		if !filter.keepTimeline(&ev) {
 			continue
 		}
-		timeline.Events = append(timeline.Events, filter.applyEventFields(e.annotateTxn(ctx, membershipAt(clientEvent(&ev), &ev), ev.EventID)))
+		timeline.Events = append(timeline.Events, filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(clientEvent(&ev), &ev), &ev), ev.EventID)))
 		senders[ev.Sender] = true
 		if earliest == 0 || ev.StreamOrdering < earliest {
 			earliest = ev.StreamOrdering
@@ -636,7 +644,7 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 			if filter.lazyLoadMembers() && !lazyLoadMemberEvent(&se, senders) {
 				continue
 			}
-			jr.State.Events = append(jr.State.Events, filter.applyEventFields(clientEvent(&se)))
+			jr.State.Events = append(jr.State.Events, filter.applyEventFields(prevContent(clientEvent(&se), &se)))
 		}
 	} else if jr.State.Events == nil {
 		// An incremental sync with no full_state still renders `state.events` as
@@ -714,6 +722,61 @@ func (e *Engine) membershipAnnotator(ctx context.Context, roomID, userID string,
 		}
 		unsigned, _ := json.Marshal(map[string]any{"membership": membership})
 		obj["unsigned"] = unsigned
+		b, _ := json.Marshal(obj)
+		return b
+	}
+}
+
+// prevContentAnnotator returns a function that attaches unsigned.prev_content
+// and unsigned.prev_sender to a rendered m.room.member event: the content (and
+// sender) of the previous member event for the same state_key. Per the spec,
+// "Previous membership can be retrieved from the prev_content object on an
+// event"; it lets clients render transitions (invite -> join, join -> leave).
+// Only member events with an earlier member event for the same user are
+// annotated.
+func (e *Engine) prevContentAnnotator(ctx context.Context, roomID string, upto int64) func(ev json.RawMessage, row *storage.EventRow) json.RawMessage {
+	history, err := e.store.MemberEvents(ctx, roomID, upto)
+	if err != nil {
+		return func(ev json.RawMessage, _ *storage.EventRow) json.RawMessage { return ev }
+	}
+	return func(ev json.RawMessage, row *storage.EventRow) json.RawMessage {
+		if row == nil || row.Type != "m.room.member" {
+			return ev
+		}
+		// Find the most recent earlier member event for the same user.
+		var prev *storage.MemberEventRow
+		for i := range history {
+			h := &history[i]
+			if h.UserID == row.StateKey && h.StreamOrdering < row.StreamOrdering {
+				if prev == nil || h.StreamOrdering > prev.StreamOrdering {
+					prev = h
+				}
+			}
+		}
+		if prev == nil {
+			return ev
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(ev, &obj); err != nil {
+			return ev
+		}
+		unsigned := map[string]any{}
+		if existing, ok := obj["unsigned"]; ok {
+			var m map[string]json.RawMessage
+			if err := json.Unmarshal(existing, &m); err == nil {
+				for k, v := range m {
+					unsigned[k] = v
+				}
+			}
+		}
+		var prevContent map[string]any
+		if err := json.Unmarshal(prev.Content, &prevContent); err != nil {
+			return ev
+		}
+		unsigned["prev_content"] = prevContent
+		unsigned["prev_sender"] = prev.Sender
+		unsignedJSON, _ := json.Marshal(unsigned)
+		obj["unsigned"] = unsignedJSON
 		b, _ := json.Marshal(obj)
 		return b
 	}

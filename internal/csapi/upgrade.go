@@ -246,7 +246,7 @@ func (a *API) persistNewRoom(r *http.Request, auth *homeserver.Auth, oldRoomID, 
 				_ = a.Store.UpsertMembership(r.Context(), storage.MembershipRow{
 					RoomID: newRoomID, UserID: sk, Membership: mc.Membership,
 					EventID: ev.EventID(), DisplayName: mc.DisplayName, AvatarURL: mc.AvatarURL,
-					StreamOrdering: stream,
+					StreamOrdering: stream, Depth: ev.Depth(),
 				})
 			}
 		}
@@ -342,7 +342,7 @@ func (a *API) buildAndPersistMemberJoin(ctx context.Context, roomID string, vers
 		Depth:          depth,
 		OriginServerTS: a.Now(),
 		PrevEvents:     prev,
-		AuthEvents:     a.authEventIDs(ctx, roomID, userID),
+		AuthEvents:     a.authEventIDs(ctx, roomID, userID, userID),
 	}
 	sk := userID
 	b.StateKey = &sk
@@ -356,7 +356,7 @@ func (a *API) buildAndPersistMemberJoin(ctx context.Context, roomID string, vers
 	}
 	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
 		RoomID: roomID, UserID: userID, Membership: "join",
-		EventID: ev.EventID(), StreamOrdering: stream,
+		EventID: ev.EventID(), StreamOrdering: stream, Depth: ev.Depth(),
 	})
 	a.notifyRoomMembers(ctx, roomID)
 	a.broadcastPDU(ctx, roomID, ev)

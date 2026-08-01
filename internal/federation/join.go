@@ -102,6 +102,89 @@ func (a *API) ResolveRemoteAlias(ctx context.Context, alias string) (string, err
 	return a.client.queryRemoteDirectory(ctx, dom, alias)
 }
 
+// SendRemoteInvite delivers a local invite to the invitee's server via
+// PUT /_matrix/federation/v2/invite/{roomID}/{eventID}, per the spec's
+// "inviting a user to a room" flow. The v2 body is an envelope carrying the
+// signed invite event plus the room's stripped state (invite_room_state) so
+// the receiving server can create its view of the room. The remote server
+// adds its signature and returns the doubly-signed event, which we persist in
+// place of our own (the room's other servers then see the invite signed by
+// both parties).
+func (a *API) SendRemoteInvite(ctx context.Context, roomID, invitee string, ev *events.Event, version roomver.Version) error {
+	dom := userDomain(invitee)
+	if dom == "" || dom == a.ServerName() {
+		return nil
+	}
+	// Stripped state: the room's current state (create, power_levels,
+	// join_rules, member events, etc.) is what the receiving server seeds its
+	// invite view from.
+	stripped := a.roomStatePDUsFor(ctx, roomID)
+	body := map[string]any{
+		"room_version":      string(version),
+		"event":             json.RawMessage(ev.Raw()),
+		"invite_room_state": stripped,
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	url := a.client.serverBaseURL(dom) + "/_matrix/federation/v2/invite/" + urlPathEscape(roomID) + "/" + urlPathEscape(ev.EventID())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = dom
+	if err := signRequestWith(req, a.client.originName(), a.client.key); err != nil {
+		return err
+	}
+	metrics.Counters.FedOutboundRequests.Add(1)
+	resp, err := a.client.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("federation: invite %s: %w", dom, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("federation: invite %s: HTTP %d: %s", dom, resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	// The remote server returns the invite event signed by both parties.
+	// Persist it over our copy so the room's stored invite carries both
+	// signatures (matters when other servers receive it via transactions).
+	var out struct {
+		Event json.RawMessage `json:"event"`
+	}
+	respBody, rerr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if rerr == nil && json.Unmarshal(respBody, &out) == nil && len(out.Event) > 0 {
+		if signedEv, err := events.New(out.Event, version); err == nil && signedEv.EventID() == ev.EventID() {
+			_ = a.Store.UpdateEventRaw(ctx, ev.EventID(), out.Event)
+		}
+	}
+	return nil
+}
+
+// roomStatePDUsFor returns the room's current state as raw PDUs (the state
+// section delivered to a remote server that needs to learn the room).
+func (a *API) roomStatePDUsFor(ctx context.Context, roomID string) []json.RawMessage {
+	stateRows, err := a.Store.GetState(ctx, roomID)
+	if err != nil {
+		return nil
+	}
+	ids := make([]string, 0, len(stateRows))
+	for _, s := range stateRows {
+		ids = append(ids, s.EventID)
+	}
+	evs, err := a.Store.EventsByIDs(ctx, ids)
+	if err != nil {
+		return nil
+	}
+	out := make([]json.RawMessage, 0, len(evs))
+	for _, e := range evs {
+		out = append(out, e.RawJSON)
+	}
+	return out
+}
+
 // pickJoinDestination chooses the server to contact for a join: the first
 // non-empty via hint, else the domain embedded in the room ID (absent for v12
 // room IDs, which always need a via hint).
@@ -405,7 +488,7 @@ func (a *API) ingestRemoteJoin(ctx context.Context, roomID string, version roomv
 	// Mark the joining user as joined.
 	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
 		RoomID: roomID, UserID: ev.Sender(), Membership: "join",
-		EventID: ev.EventID(), StreamOrdering: joinRow.StreamOrdering,
+		EventID: ev.EventID(), StreamOrdering: joinRow.StreamOrdering, Depth: ev.Depth(),
 	})
 	a.notifyRoomMembers(ctx, roomID)
 	return nil

@@ -145,7 +145,7 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 					_ = a.Store.UpsertMembership(r.Context(), storage.MembershipRow{
 						RoomID: roomID, UserID: sk, Membership: mc.Membership,
 						EventID: ev.EventID(), DisplayName: mc.DisplayName, AvatarURL: mc.AvatarURL,
-						StreamOrdering: stream,
+						StreamOrdering: stream, Depth: ev.Depth(),
 					})
 				}
 			}
@@ -308,12 +308,13 @@ func (a *API) RoomKick(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	// A kick is a forced leave: the target must be a member (join) of the room.
-	// Kicking a user who is not present (never joined) or has already left is
-	// forbidden (403) — the spec says "users cannot kick users who have already
-	// left the room".
+	// A kick is a forced leave: the target must be a member (join) of the room,
+	// or an invited user whose invite is being rescinded (per the spec, kicking
+	// a user who has only been invited is how an inviter rescinds the invite).
+	// Kicking a user who has already left is forbidden (403) — the spec says
+	// "users cannot kick users who have already left the room".
 	m, err := a.Store.GetMembership(r.Context(), roomID, req.UserID)
-	if err != nil || m.Membership != rooms.MembershipJoin {
+	if err != nil || (m.Membership != rooms.MembershipJoin && m.Membership != rooms.MembershipInvite) {
 		httpx.WriteError(w, httpx.ErrForbidden("user is not in the room"))
 		return
 	}
@@ -1781,12 +1782,14 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	}
 	// Joining (or re-joining) with identical member content is idempotent: if
 	// the current member state already carries exactly this content, return the
-	// existing event instead of forking the room with a duplicate join.
-	if existingID, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.member", target); err == nil && existingID != "" {
-		if existing, err := a.Store.GetEvent(r.Context(), existingID); err == nil && existing != nil {
-			if canonicaljson.Equal(contentRaw, json.RawMessage(existing.Content)) {
-				return existingID, nil
-			}
+	// existing event instead of forking the room with a duplicate join. The
+	// comparison is against the latest member event in the event stream (the
+	// authoritative source): the denormalised membership table / room_state can
+	// lag behind a concurrent remote membership PDU, which would wrongly make a
+	// re-invite (after the target left) look idempotent.
+	if ev, err := a.Store.LatestMembershipEvent(r.Context(), roomID, target); err == nil && ev != nil {
+		if canonicaljson.Equal(contentRaw, json.RawMessage(ev.Content)) {
+			return ev.EventID, nil
 		}
 	}
 	ev, err := a.buildEvent(r, auth, roomID, version, "m.room.member", target, ids.RandomTxnSuffix(), true, contentRaw)
@@ -1803,7 +1806,7 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	if mc != nil {
 		if err := a.Store.UpsertMembership(r.Context(), storage.MembershipRow{
 			RoomID: roomID, UserID: target, Membership: mc.Membership,
-			EventID: ev.EventID(), StreamOrdering: stream,
+			EventID: ev.EventID(), StreamOrdering: stream, Depth: ev.Depth(),
 		}); err != nil {
 			return "", err
 		}
@@ -1825,6 +1828,17 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	}
 	a.notifyRoomMembers(r.Context(), roomID)
 	a.broadcastPDU(r.Context(), roomID, ev)
+	// A remote invite must also be delivered directly to the invitee's server
+	// via PUT /_matrix/federation/v2/invite/{roomID}/{eventID} (spec "inviting
+	// a user to a room"). Generic PDU broadcast cannot reach the invitee's
+	// server before it knows the room exists — the invite endpoint creates the
+	// room view there. Best-effort: a delivery failure (server unreachable,
+	// invite rejected) does not fail the client's invite call.
+	if mc != nil && mc.Membership == "invite" && a.fed != nil && !a.IsLocalUser(target) {
+		if err := a.fed.SendRemoteInvite(r.Context(), roomID, target, ev, version); err != nil {
+			_ = err
+		}
+	}
 	return ev.EventID(), nil
 }
 
@@ -2002,8 +2016,8 @@ func (a *API) buildEvent(r *http.Request, auth *homeserver.Auth, roomID string, 
 		prev = []string{latest.EventID}
 		depth = latest.Depth + 1
 	}
-	// auth_events = [create, sender_member, power_levels, join_rules] per spec.
-	authIDs := a.authEventIDs(r.Context(), roomID, auth.UserID)
+	// auth_events = [create, sender_member, power_levels, join_rules, target_member] per spec.
+	authIDs := a.authEventIDs(r.Context(), roomID, auth.UserID, stateKey)
 	b := events.Builder{
 		Type:           eventType,
 		Sender:         auth.UserID,
@@ -2022,8 +2036,13 @@ func (a *API) buildEvent(r *http.Request, auth *homeserver.Auth, roomID string, 
 }
 
 // authEventIDs returns the create + sender's m.room.member + power_levels +
-// join_rules event IDs for use as a new event's auth_events.
-func (a *API) authEventIDs(ctx context.Context, roomID, sender string) []string {
+// join_rules + target's m.room.member event IDs for use as a new event's
+// auth_events. Per the spec, an m.room.member event's auth_events are the
+// m.room.create, m.room.power_levels, m.room.join_rules and m.room.member
+// events for the sender and for the state_key. The target's member event is
+// what lets a receiving server recognise an invite rescission (the leave
+// references the invite it revokes).
+func (a *API) authEventIDs(ctx context.Context, roomID, sender, stateKey string) []string {
 	var out []string
 	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.create", ""); err == nil {
 		out = append(out, id)
@@ -2036,6 +2055,11 @@ func (a *API) authEventIDs(ctx context.Context, roomID, sender string) []string 
 	}
 	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.join_rules", ""); err == nil {
 		out = append(out, id)
+	}
+	if stateKey != sender {
+		if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.member", stateKey); err == nil {
+			out = append(out, id)
+		}
 	}
 	return out
 }

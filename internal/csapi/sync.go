@@ -110,6 +110,20 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 	if since.Stream > 0 && resp.NextBatch == since.Encode() && timeout > 0 {
 		wait, cancel := a.Notifier.Wait(auth.UserID)
 		defer cancel()
+		// Re-check after registering the waiter: a notify that fired between
+		// the first Sync() computation and Notifier.Wait() would otherwise be
+		// missed and the request would park the full timeout despite new data
+		// being available (the classic lost-wakeup race).
+		opts.Since = since
+		resp, err = a.syncEngine.Sync(r.Context(), opts)
+		if err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+		if resp.NextBatch != since.Encode() {
+			httpx.WriteJSON(w, http.StatusOK, resp)
+			return
+		}
 		select {
 		case <-wait:
 		case <-time.After(timeout):

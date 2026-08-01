@@ -72,7 +72,7 @@ func (a *API) ingestPartialJoin(ctx context.Context, roomID string, version room
 	// Mark the joining user as joined.
 	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
 		RoomID: roomID, UserID: ev.Sender(), Membership: "join",
-		EventID: ev.EventID(), StreamOrdering: joinRow.StreamOrdering,
+		EventID: ev.EventID(), StreamOrdering: joinRow.StreamOrdering, Depth: ev.Depth(),
 	})
 	a.notifyRoomMembers(ctx, roomID)
 

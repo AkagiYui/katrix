@@ -41,6 +41,52 @@ func (a *API) BroadcastPDUToRoom(ctx context.Context, roomID string, ev *events.
 			servers = append(servers, s)
 		}
 	}
+	// A membership event must reach the target user's server even when the
+	// membership change itself removes the user from the room: serversForRooms
+	// is computed after the denormalised membership table was updated (the
+	// caller applies the row before broadcasting), so a kick/leave/ban would
+	// otherwise drop the leaving user's server from the destination list. The
+	// leaving user's server needs the event to update its own membership view.
+	//
+	// An invite event is the exception: the invitee's server is delivered the
+	// invite via PUT /_matrix/federation/v2/invite (which creates its room
+	// view), NOT via a transaction — it does not know the room yet, and a
+	// broadcast PDU it can't ingest would be retried by the EDU worker and
+	// re-applied later (overwriting a newer leave). So the invitee's server is
+	// excluded from the broadcast for invite events.
+	if sk, ok := ev.StateKey(); ok && ev.Type() == "m.room.member" {
+		if dom := userDomain(sk); dom != "" && dom != a.ServerName() {
+			isInvite := false
+			var mc struct {
+				Membership string `json:"membership"`
+			}
+			_ = json.Unmarshal(ev.Content(), &mc)
+			if mc.Membership == "invite" {
+				isInvite = true
+			}
+			if !isInvite {
+				found := false
+				for _, s := range servers {
+					if s == dom {
+						found = true
+						break
+					}
+				}
+				if !found {
+					servers = append(servers, dom)
+				}
+			} else {
+				// Drop the invitee's server from the broadcast destination list.
+				out := servers[:0]
+				for _, s := range servers {
+					if s != dom {
+						out = append(out, s)
+					}
+				}
+				servers = out
+			}
+		}
+	}
 	if len(servers) == 0 {
 		return
 	}

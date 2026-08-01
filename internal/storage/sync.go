@@ -171,12 +171,32 @@ func (s *Store) ReceiptsSince(ctx context.Context, userID string, since int64) (
 	return out, rows.Err()
 }
 
-// MaxStreamOrdering returns the current position of the shared sync stream.
-// This is what /sync reports as next_batch; every sync-relevant write (events,
-// account data, receipts, device-list changes, presence changes) advances it.
+// MaxStreamOrdering returns the current committed position of the shared sync
+// stream. This is what /sync reports as next_batch; every sync-relevant write
+// (events, account data, receipts, device-list changes, presence changes)
+// advances it.
+//
+// The position is computed as the MAX over the committed stream_ordering /
+// stream_id columns of every table that draws from sync_stream, rather than
+// reading the sequence's last_value. A sequence value is allocated with
+// nextval() *before* the surrounding transaction commits, so last_value can be
+// ahead of the rows that are visible: a concurrent /sync would then mint a
+// next_batch past a just-inserted-but-uncommitted event and never deliver it
+// (the next sync uses strict > on its since token, so the event is skipped
+// forever). Taking the committed max means next_batch never advances past a
+// row a client cannot yet see.
 func (s *Store) MaxStreamOrdering(ctx context.Context) (int64, error) {
 	var n int64
-	err := s.pool.QueryRow(ctx, `SELECT last_value FROM sync_stream`).Scan(&n)
+	err := s.pool.QueryRow(ctx, `
+		SELECT GREATEST(
+			COALESCE((SELECT MAX(stream_ordering) FROM events), 0),
+			COALESCE((SELECT MAX(stream_ordering) FROM room_memberships), 0),
+			COALESCE((SELECT MAX(stream_id) FROM account_data), 0),
+			COALESCE((SELECT MAX(stream_id) FROM receipts), 0),
+			COALESCE((SELECT MAX(stream_id) FROM device_list_updates), 0),
+			COALESCE((SELECT MAX(stream_id) FROM presence_changes), 0),
+			0
+		)`).Scan(&n)
 	if err != nil {
 		return 0, err
 	}

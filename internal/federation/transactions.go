@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/eventstate"
 	"github.com/AkagiYui/katrix/internal/httpx"
@@ -147,7 +148,7 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	}
 	exists, err := a.Store.RoomExists(r.Context(), ev.RoomID)
 	if err != nil || !exists {
-		return "", false
+			return "", false
 	}
 	room, err := a.Store.GetRoom(r.Context(), ev.RoomID)
 	if err != nil {
@@ -180,6 +181,40 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	if origin != "" && a.hasUnknownPrevEvents(r.Context(), raw) {
 		a.fetchMissingEventsFor(r.Context(), ev.RoomID, evID, origin)
 	}
+	// Invite rescission (spec / Synapse #18823): a leave event sent by someone
+	// other than the target (a kick) can only revoke an invite when it is sent
+	// by the original inviter — the protocol cannot fully auth such events, so
+	// the receiving server accepts the rescission only when the leave's sender
+	// matches the invite's sender. A room-admin kick of an invited user is
+	// otherwise dropped. The leave must reference the invite it revokes via its
+	// auth_events for the check to apply.
+	if ev.Type == "m.room.member" && ev.StateKey != nil && *ev.StateKey != ev.Sender && a.IsLocalUser(*ev.StateKey) {
+		var mc struct {
+			Membership string `json:"membership"`
+		}
+		_ = json.Unmarshal(ev.Content, &mc)
+		if mc.Membership == "leave" {
+			if m, err := a.Store.GetMembership(r.Context(), ev.RoomID, *ev.StateKey); err == nil && m.Membership == "invite" {
+				authIDs := authEventIDsFromRaw(raw)
+				inviteID, ierr := a.Store.GetStateEvent(r.Context(), ev.RoomID, "m.room.member", *ev.StateKey)
+				if ierr != nil || !containsStr(authIDs, inviteID) {
+					// The leave does not reference the invite; not a rescission.
+					return "", false
+				}
+				if inv, err := a.Store.GetEvent(r.Context(), inviteID); err == nil {
+					var ic struct {
+						Sender string `json:"sender"`
+					}
+					_ = json.Unmarshal(inv.RawJSON, &ic)
+					if ic.Sender != ev.Sender {
+						// Non-inviter kicking an invited user cannot be authed;
+						// drop it (the invitee must not see the rescission).
+						return "", false
+					}
+				}
+			}
+		}
+	}
 	row := &storage.EventRow{
 		EventID: evID, RoomID: ev.RoomID, Type: ev.Type, Sender: ev.Sender,
 		Depth: ev.Depth, OriginServerTS: ev.OSTS, Content: ev.Content, RawJSON: raw,
@@ -187,7 +222,18 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	if ev.StateKey != nil {
 		row.StateKey = *ev.StateKey
 	}
-	if _, err := a.Store.InsertEvent(r.Context(), row); err != nil {
+	// For membership events, persist the event and its denormalised membership
+	// row atomically: a concurrent /sync must never observe the shared stream
+	// position advancing (the event insert) without the membership row already
+	// reflecting it. Otherwise a sync could mint a token past a leave without
+	// ever delivering the membership transition.
+	var membershipRow *storage.MembershipRow
+	if ev.StateKey != nil && ev.Type == "m.room.member" {
+		if mr, ok := membershipRowFromContent(ev.RoomID, *ev.StateKey, ev.Content, evID, ev.Depth); ok {
+			membershipRow = mr
+		}
+	}
+	if _, err := a.Store.InsertEventWithMembership(r.Context(), row, membershipRow); err != nil {
 		return evID, false
 	}
 	metrics.Counters.FedInboundPDUs.Add(1)
@@ -204,12 +250,74 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 		}
 	}
 	if ev.StateKey != nil {
-		// For membership state events, update the denormalised membership table.
+		// For membership state events, wake syncs for the change (the row was
+		// already written atomically above).
 		if ev.Type == "m.room.member" {
-			a.applyRemoteMembership(r.Context(), ev.RoomID, *ev.StateKey, ev.Content, evID, ev.Depth)
+			var mc struct {
+				Membership string `json:"membership"`
+			}
+			_ = json.Unmarshal(ev.Content, &mc)
+			a.applyRemoteMembershipNotify(r.Context(), ev.RoomID, *ev.StateKey, mc.Membership)
 		}
 	}
 	return evID, true
+}
+
+// membershipRowFromContent builds the denormalised membership row for a member
+// event's content, reporting whether the content parses to a valid membership.
+func membershipRowFromContent(roomID, userID string, content json.RawMessage, eventID string, depth int64) (*storage.MembershipRow, bool) {
+	var mc struct {
+		Membership  string `json:"membership"`
+		DisplayName string `json:"displayname"`
+		AvatarURL   string `json:"avatar_url"`
+	}
+	if err := json.Unmarshal(content, &mc); err != nil || mc.Membership == "" {
+		return nil, false
+	}
+	return &storage.MembershipRow{
+		RoomID: roomID, UserID: userID, Membership: mc.Membership,
+		EventID: eventID, DisplayName: mc.DisplayName, AvatarURL: mc.AvatarURL,
+		StreamOrdering: depth, Depth: depth,
+	}, true
+}
+
+// authEventIDsFromRaw extracts the auth_events IDs from a raw PDU, handling
+// both the plain-array (v3+) and [id, hash] pair (v1/v2) forms.
+func authEventIDsFromRaw(raw json.RawMessage) []string {
+	var obj struct {
+		AuthEvents json.RawMessage `json:"auth_events"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil || len(obj.AuthEvents) == 0 {
+		return nil
+	}
+	var idsArr []string
+	if json.Unmarshal(obj.AuthEvents, &idsArr) == nil {
+		return idsArr
+	}
+	var pairs [][]json.RawMessage
+	if err := json.Unmarshal(obj.AuthEvents, &pairs); err != nil {
+		return nil
+	}
+	var out []string
+	for _, p := range pairs {
+		if len(p) > 0 {
+			var id string
+			if json.Unmarshal(p[0], &id) == nil {
+				out = append(out, id)
+			}
+		}
+	}
+	return out
+}
+
+// containsStr reports whether v is present in the list.
+func containsStr(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }
 
 // GetEvent handles GET /_matrix/federation/v1/event/{eventID}.
@@ -539,7 +647,248 @@ func (a *API) MakeSendLeave(w http.ResponseWriter, r *http.Request) { a.MakeLeav
 func (a *API) SendLeave(w http.ResponseWriter, r *http.Request) { a.ingestRemoteMember(w, r, "leave") }
 
 // Invite handles PUT /_matrix/federation/v2/invite/{roomID}/{eventID}.
-func (a *API) Invite(w http.ResponseWriter, r *http.Request) { a.ingestRemoteMember(w, r, "invite") }
+//
+// Per the spec the v2 invite body is an envelope:
+//
+//	{ "room_version": "...", "event": <signed invite event>,
+//	  "invite_room_state": [<stripped state events>] }
+//
+// The receiving server validates the invite (type m.room.member, membership
+// invite, sender on the origin server, state_key a local user), persists the
+// invite + invite_room_state so the invitee's /sync shows the room, adds its
+// own signature and returns the doubly-signed event.
+func (a *API) Invite(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RoomVersion     string            `json:"room_version"`
+		Event           json.RawMessage   `json:"event"`
+		InviteRoomState []json.RawMessage `json:"invite_room_state"`
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown("read body"))
+		return
+	}
+	// The v2 body is the envelope above; accept a bare signed event too (some
+	// peers send the event directly).
+	if json.Unmarshal(raw, &req) != nil || len(req.Event) == 0 {
+		req.Event = raw
+	}
+	if len(req.Event) == 0 {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON", "invite body must contain an event"))
+		return
+	}
+
+	var ev struct {
+		EventID  string          `json:"event_id"`
+		RoomID   string          `json:"room_id"`
+		Type     string          `json:"type"`
+		StateKey *string         `json:"state_key"`
+		Sender   string          `json:"sender"`
+		Content  json.RawMessage `json:"content"`
+		Depth    int64           `json:"depth"`
+		OSTS     int64           `json:"origin_server_ts"`
+	}
+	_ = json.Unmarshal(req.Event, &ev)
+
+	// The event must be an m.room.member with membership=invite. Unlike
+	// send_join/send_leave, the sender (inviter) and state_key (invitee) differ.
+	if ev.Type != "m.room.member" || ev.StateKey == nil {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM", "invite event must be an m.room.member with a state_key"))
+		return
+	}
+	var content struct {
+		Membership string `json:"membership"`
+	}
+	_ = json.Unmarshal(ev.Content, &content)
+	if content.Membership != "invite" {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM", "invite event membership must be invite"))
+		return
+	}
+	// The sender must be on the origin server; the invitee (state_key) must be
+	// a local user.
+	if !a.IsLocalUser(*ev.StateKey) {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM", "invite state_key must be a local user"))
+		return
+	}
+
+	// Resolve the room version: prefer the request's room_version, else the
+	// stored room's version, else the default.
+	version := roomver.Version(req.RoomVersion)
+	if version == "" {
+		if room, err := a.Store.GetRoom(r.Context(), ev.RoomID); err == nil {
+			version = roomver.Version(room.Version)
+		} else {
+			version = roomver.Default
+		}
+	}
+	rules, ok := roomver.Get(version)
+	if !ok {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_UNSUPPORTED_ROOM_VERSION", "unsupported room version"))
+		return
+	}
+
+	// Verify the invite event's signature against its origin server's keys.
+	vres := a.verifier.Verify(r.Context(), req.Event, version)
+	if vres.Err != nil || (vres.Signed && !vres.Valid) {
+		httpx.WriteError(w, httpx.NewError(http.StatusForbidden, "M_FORBIDDEN", "invite event failed signature verification"))
+		return
+	}
+	evID := ev.EventID
+	if evID == "" {
+		evID = vres.EventID
+	}
+	if evID == "" {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM", "could not derive invite event ID"))
+		return
+	}
+
+	// A server first learns a room exists via an invite: create the room view
+	// when it is unknown, seeded from the delivered invite_room_state.
+	exists, _ := a.Store.RoomExists(r.Context(), ev.RoomID)
+	if !exists {
+		_ = a.Store.CreateRoom(r.Context(), storage.Room{
+			RoomID: ev.RoomID, Version: string(version), CreatedTS: a.Now(),
+		})
+	}
+
+	row := &storage.EventRow{
+		EventID: evID, RoomID: ev.RoomID, Type: ev.Type, Sender: ev.Sender,
+		Depth: ev.Depth, OriginServerTS: ev.OSTS, Content: ev.Content, RawJSON: req.Event,
+	}
+	if ev.StateKey != nil {
+		row.StateKey = *ev.StateKey
+	}
+	if _, err := a.Store.InsertEvent(r.Context(), row); err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown("persist invite event"))
+		return
+	}
+	metrics.Counters.FedInboundPDUs.Add(1)
+
+	// Persist the delivered invite_room_state (stripped state) so the invitee's
+	// sync and /state have something to render. Best-effort: malformed entries
+	// are skipped.
+	var stateRows []storage.StateRow
+	for _, sraw := range req.InviteRoomState {
+		if sr, ok := a.persistStrippedState(r.Context(), ev.RoomID, version, rules, sraw); ok {
+			stateRows = append(stateRows, sr)
+		}
+	}
+
+	// Seed the invitee's membership and wake their /sync. The membership
+	// upsert is monotonic in causal depth, so a stale invite (e.g. one whose
+	// rescinding leave was delivered first) is automatically rejected even
+	// though this invite's local stream is newer.
+	_ = a.Store.UpsertMembership(r.Context(), storage.MembershipRow{
+		RoomID: ev.RoomID, UserID: *ev.StateKey, Membership: "invite",
+		EventID: evID, StreamOrdering: row.StreamOrdering, Depth: ev.Depth,
+	})
+	a.Notifier.NotifyUsers(*ev.StateKey)
+
+	// Seed room_state with the invite event + stripped state (if the room was
+	// created by this invite; a known room's state is maintained normally).
+	if !exists {
+		if err := a.seedRoomStateFromInvite(r.Context(), ev.RoomID, rules, row, stateRows); err != nil {
+			_ = err
+		}
+	}
+
+	// Sign the invite event with our own key and return the doubly-signed
+	// event per the v2 spec.
+	signed, err := crypto.SignJSON(a.ServerName(), a.Key, req.Event)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown("sign invite event"))
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"origin": a.ServerName(),
+		"event":  json.RawMessage(signed),
+	})
+}
+
+// persistStrippedState verifies and persists a single invite_room_state entry,
+// returning its state row. Unsigned/malformed entries are skipped.
+func (a *API) persistStrippedState(ctx context.Context, roomID string, version roomver.Version, rules roomver.Rules, sraw json.RawMessage) (storage.StateRow, bool) {
+	var se struct {
+		EventID  string          `json:"event_id"`
+		RoomID   string          `json:"room_id"`
+		Type     string          `json:"type"`
+		StateKey *string         `json:"state_key"`
+		Sender   string          `json:"sender"`
+		Content  json.RawMessage `json:"content"`
+		Depth    int64           `json:"depth"`
+		OSTS     int64           `json:"origin_server_ts"`
+	}
+	if json.Unmarshal(sraw, &se) != nil || se.Type == "" || se.StateKey == nil {
+		return storage.StateRow{}, false
+	}
+	if se.RoomID != "" && se.RoomID != roomID {
+		return storage.StateRow{}, false
+	}
+	vres := a.verifier.Verify(ctx, sraw, version)
+	if vres.Err != nil || (vres.Signed && !vres.Valid) {
+		return storage.StateRow{}, false
+	}
+	id := se.EventID
+	if id == "" {
+		id = vres.EventID
+	}
+	if id == "" {
+		return storage.StateRow{}, false
+	}
+	srow := &storage.EventRow{
+		EventID: id, RoomID: roomID, Type: se.Type, Sender: se.Sender,
+		Depth: se.Depth, OriginServerTS: se.OSTS, Content: se.Content, RawJSON: sraw,
+	}
+	if se.StateKey != nil {
+		srow.StateKey = *se.StateKey
+	}
+	if _, err := a.Store.InsertEvent(ctx, srow); err != nil {
+		return storage.StateRow{}, false
+	}
+	// Member events in the stripped state belong in the denormalised membership
+	// table too, so /sync and serversForRooms (outbound PDU broadcast) see the
+	// room's remote members. Without this, an invited server never learns which
+	// servers are in the room and cannot deliver the leave/rejection back.
+	if se.Type == "m.room.member" {
+		a.applyRemoteMembership(ctx, roomID, *se.StateKey, se.Content, id, se.Depth)
+	}
+	if err := eventstate.Maintain(ctx, a.Store, srow, rules); err != nil {
+		_ = err
+	}
+	return storage.StateRow{RoomID: roomID, Type: se.Type, StateKey: *se.StateKey, EventID: id}, true
+}
+
+// seedRoomStateFromInvite seeds room_state for a room that was created by an
+// inbound invite: the room has no history, so its current state is the invite
+// event itself plus the stripped state delivered in the v2 invite body. The
+// invite event becomes the sole forward extremity (its prev_events are
+// unknown), and its state-at-event snapshot is set accordingly so sync
+// deltas and state queries behave.
+func (a *API) seedRoomStateFromInvite(ctx context.Context, roomID string, rules roomver.Rules, inviteRow *storage.EventRow, stateRows []storage.StateRow) error {
+	base := map[string]string{}
+	for _, sr := range stateRows {
+		base[sr.Type+"\x00"+sr.StateKey] = sr.EventID
+	}
+	base[inviteRow.Type+"\x00"+inviteRow.StateKey] = inviteRow.EventID
+	snap := make([]storage.StateRow, 0, len(base))
+	for key, id := range base {
+		for i := 0; i < len(key); i++ {
+			if key[i] == 0 {
+				snap = append(snap, storage.StateRow{RoomID: roomID, Type: key[:i], StateKey: key[i+1:], EventID: id})
+				break
+			}
+		}
+	}
+	if err := a.Store.SaveEventState(ctx, inviteRow.EventID, roomID, snap); err != nil {
+		return err
+	}
+	if err := a.Store.SetForwardExtremities(ctx, roomID, []storage.ForwardExtremity{
+		{RoomID: roomID, EventID: inviteRow.EventID, Depth: inviteRow.Depth},
+	}); err != nil {
+		return err
+	}
+	return a.Store.SetRoomState(ctx, roomID, snap)
+}
 
 // EventAuth handles GET /_matrix/federation/v1/event_auth/{roomID}/{eventID}.
 // The response is the auth chain of the requested event only: the transitive
@@ -843,9 +1192,20 @@ func (a *API) applyRemoteMembership(ctx context.Context, roomID, userID string, 
 	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
 		RoomID: roomID, UserID: userID, Membership: mc.Membership,
 		EventID: eventID, DisplayName: mc.DisplayName, AvatarURL: mc.AvatarURL,
-		StreamOrdering: stream,
+		StreamOrdering: stream, Depth: depth,
 	})
-	if mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban" {
+	a.applyRemoteMembershipNotify(ctx, roomID, userID, mc.Membership)
+}
+
+// applyRemoteMembershipNotify performs the sync-wake side effects of an applied
+// remote membership event (the row itself was already written, atomically with
+// the event insert, by the PDU ingest path). The affected user's own /sync is
+// always woken: notifyRoomMembers only wakes *joined* users, so an invited
+// user whose invite is rescinded (or who leaves) would otherwise have their
+// long-poll sit un-woken until the timeout.
+func (a *API) applyRemoteMembershipNotify(ctx context.Context, roomID, userID, membership string) {
+	a.Notifier.NotifyUsers(userID)
+	if membership == "join" || membership == "leave" || membership == "ban" {
 		a.notifyRoomMembers(ctx, roomID)
 	}
 }
