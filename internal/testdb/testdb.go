@@ -81,7 +81,8 @@ func Truncate(ctx context.Context, pool pgxConn) error {
 			event_state_snapshots,
 			events, rooms, registration_tokens,
 			media_thumbnails, media,
-			access_tokens, devices, users
+			access_tokens, devices, users,
+			delayed_events
 		CASCADE`)
 	return err
 }

@@ -221,6 +221,67 @@ func TestDelayedEventSchedulesAndFires(t *testing.T) {
 	t.Fatalf("delayed event never fired; still %d pending", len(delayed))
 }
 
+// TestDelayedStateEventsDistinctKeys verifies multiple delayed state events on
+// distinct state keys stay separate (MSC4140), and that a new delayed state
+// event on an existing key supersedes the previous one. Regression test for the
+// dedup-by-txn collapse that merged every state delayed event into one row
+// (state events carry no txn, so txn could never be their dedup key).
+func TestDelayedStateEventsDistinctKeys(t *testing.T) {
+	api, srv := testAPI(t)
+	ctx, cancel := contextWithCancelBackground()
+	defer cancel()
+	api.StartDelayedWorker(ctx)
+	tok := registerUser(t, srv, "delay-state-alice", "pw")
+	roomID := createRoom(t, srv, tok, map[string]any{"preset": "public_chat"})
+
+	const delay = "?org.matrix.msc4140.delay=60000"
+	for _, sk := range []string{"k1", "k2", "k3"} {
+		code, body := doJSON(t, srv, http.MethodPut,
+			"/_matrix/client/v3/rooms/"+roomID+"/state/com.example.test/"+sk+delay, tok,
+			map[string]any{"v": sk})
+		if code != 200 {
+			t.Fatalf("delayed state %s: %d %v", sk, code, body)
+		}
+		if _, ok := body["delay_id"].(string); !ok {
+			t.Fatalf("no delay_id for %s: %v", sk, body)
+		}
+	}
+
+	code, body := getJSON(t, srv, "/_matrix/client/unstable/org.matrix.msc4140/delayed_events", tok)
+	if code != 200 {
+		t.Fatalf("list delayed: %d", code)
+	}
+	delayed, _ := body["delayed_events"].([]any)
+	if len(delayed) != 3 {
+		t.Fatalf("expected 3 delayed state events, got %d: %v", len(delayed), body)
+	}
+
+	// Re-scheduling on k2 supersedes the earlier k2 event: still 3 in total.
+	code, body = doJSON(t, srv, http.MethodPut,
+		"/_matrix/client/v3/rooms/"+roomID+"/state/com.example.test/k2"+delay, tok,
+		map[string]any{"v": "k2-new"})
+	if code != 200 {
+		t.Fatalf("delayed state k2 again: %d %v", code, body)
+	}
+	code, body = getJSON(t, srv, "/_matrix/client/unstable/org.matrix.msc4140/delayed_events", tok)
+	delayed, _ = body["delayed_events"].([]any)
+	if len(delayed) != 3 {
+		t.Fatalf("expected 3 delayed state events after supersede, got %d: %v", len(delayed), body)
+	}
+	foundNew := false
+	for _, ev := range delayed {
+		em := ev.(map[string]any)
+		if em["state_key"] == "k2" {
+			if c, ok := em["content"].(map[string]any); ok && c["v"] == "k2-new" {
+				foundNew = true
+			}
+		}
+	}
+	if !foundNew {
+		t.Fatalf("superseded k2 delayed event not replaced: %v", body)
+	}
+}
+
 // TestRoomUpgrade verifies POST /rooms/{id}/upgrade creates a replacement room
 // and a tombstone in the old room.
 func TestRoomUpgrade(t *testing.T) {

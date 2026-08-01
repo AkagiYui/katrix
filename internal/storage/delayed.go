@@ -25,8 +25,11 @@ type DelayedEvent struct {
 	IsState        bool
 }
 
-// InsertDelayedEvent schedules a delayed event, keyed by the sending txn so a
-// re-request with the same txn returns the same delay_id.
+// InsertDelayedEvent schedules a delayed event. Delayed message events are
+// keyed by their sending txn, so a re-request with the same txn returns the
+// same delay_id (MSC4140). Delayed state events carry no txn; they are keyed
+// by (room, event_type, state_key) and a new one supersedes any existing
+// delayed event on the same key.
 func (s *Store) InsertDelayedEvent(ctx context.Context, d DelayedEvent) (string, bool, error) {
 	if d.DelayID == "" {
 		d.DelayID = randomFilterID()
@@ -36,18 +39,31 @@ func (s *Store) InsertDelayedEvent(ctx context.Context, d DelayedEvent) (string,
 		sk := d.StateKey
 		stateKey = &sk
 	}
-	// If a delayed event for this (user, room, txn) already exists, return it.
-	var existing string
-	err := s.pool.QueryRow(ctx,
-		`SELECT delay_id FROM delayed_events WHERE user_localpart=$1 AND room_id=$2 AND txn_id=$3`,
-		d.UserLocalpart, d.RoomID, d.TxnID).Scan(&existing)
-	if err == nil {
-		return existing, false, nil
+	if d.IsState {
+		// A delayed state event on the same key cancels the previous one (the
+		// txn_id is always empty for state events, so it cannot be the dedup key).
+		if _, err := s.pool.Exec(ctx,
+			`DELETE FROM delayed_events
+			 WHERE user_localpart=$1 AND room_id=$2 AND event_type=$3
+			   AND state_key IS NOT DISTINCT FROM $4 AND is_state=true`,
+			d.UserLocalpart, d.RoomID, d.EventType, stateKey); err != nil {
+			return "", false, err
+		}
+	} else if d.TxnID != "" {
+		// If a delayed message event for this (user, room, txn) already exists,
+		// return its delay_id.
+		var existing string
+		err := s.pool.QueryRow(ctx,
+			`SELECT delay_id FROM delayed_events WHERE user_localpart=$1 AND room_id=$2 AND txn_id=$3`,
+			d.UserLocalpart, d.RoomID, d.TxnID).Scan(&existing)
+		if err == nil {
+			return existing, false, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return "", false, err
+		}
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", false, err
-	}
-	_, err = s.pool.Exec(ctx,
+	_, err := s.pool.Exec(ctx,
 		`INSERT INTO delayed_events(delay_id, user_localpart, room_id, event_type, state_key,
 		                            content, txn_id, delay_ms, origin_server_ts, fire_at, created_ts, is_state)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
