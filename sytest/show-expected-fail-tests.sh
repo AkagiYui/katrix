@@ -60,10 +60,13 @@ while read -r test_name; do
 	# Ignore empty lines
 	[ "${test_name}" = "" ] && continue
 
-	grep "^${test_name}" "${whitelist_file}" > /dev/null 2>&1
+	grep -F -q -- "${test_name}" "${whitelist_file}" > /dev/null 2>&1
 	if [ "$?" != "0" ]; then
-		# Check if this test name is blacklisted
-		if printf '%s\n' "${blacklisted_tests[@]}" | grep -q -P "^${test_name}$"; then
+		# Check if this test name is blacklisted. Use fixed-string matching
+		# (grep -F): test names often contain regex metacharacters such as
+		# parentheses, e.g. "(SYN-662)", which would otherwise never match and
+		# falsely flag the test as missing from the whitelist.
+		if printf '%s\n' "${blacklisted_tests[@]}" | grep -F -q -x -- "${test_name}"; then
 			# Don't notify about this test
 			continue
 		fi
