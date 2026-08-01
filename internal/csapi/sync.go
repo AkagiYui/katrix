@@ -320,6 +320,14 @@ func (a *API) PresencePut(w http.ResponseWriter, r *http.Request) {
 	// and pick up the presence event. The set is small in practice (room peers);
 	// the self-notify covers the user's own other devices.
 	a.Notifier.NotifyUser(userID)
+	// Broadcast the change to remote servers sharing a room with the user
+	// (m.presence EDU, spec "Presence in the federation API").
+	a.broadcastPresence(r.Context(), userID, &storage.PresenceRow{
+		UserID:       userID,
+		Presence:     req.Presence,
+		StatusMsg:    req.StatusMsg,
+		LastActiveTS: a.Now(),
+	})
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 

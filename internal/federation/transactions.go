@@ -115,7 +115,11 @@ func (a *API) SendTransaction(w http.ResponseWriter, r *http.Request) {
 	for roomID := range notifyRooms {
 		a.notifyRoomMembers(r.Context(), roomID)
 	}
-	_ = body.EDUs
+	// Ingest the EDUs carried in the transaction (m.device_list_update,
+	// m.presence, m.typing). EDUs are best-effort: an unknown type is ignored.
+	for _, raw := range body.EDUs {
+		a.handleEDU(r.Context(), body.Origin, raw)
+	}
 	_ = a.Store.RecordFederationTxn(r.Context(), body.Origin, txnID, nil, a.Now())
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"pdus": pduResults})
 }
@@ -599,12 +603,55 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 		}
 	}
 	statePDUs, _ := a.roomStatePDUs(r, ev.RoomID)
+	// A newly-joined remote user makes the room's local users' device lists
+	// visible to the joining server: send them m.device_list_update EDUs so the
+	// remote server can sync device lists for its users sharing this room.
+	if wantMembership == "join" {
+		a.broadcastLocalDeviceListsToRoom(r.Context(), ev.RoomID)
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"origin":     a.ServerName(),
 		"state":      statePDUs,
 		"auth_chain": a.authChain(r, ev.RoomID),
 		"event":      eventJSON,
 	})
+}
+
+// broadcastLocalDeviceListsToRoom sends an m.device_list_update EDU to every
+// remote server sharing the room for each local user joined to it. Called when
+// a remote user joins the room, so the joining server (and other remote
+// servers) learn the device lists of the room's local members.
+func (a *API) broadcastLocalDeviceListsToRoom(ctx context.Context, roomID string) {
+	members, err := a.Store.Members(ctx, roomID, "join")
+	if err != nil {
+		return
+	}
+	for _, m := range members {
+		if !a.IsLocalUser(m.UserID) {
+			continue
+		}
+		devices, err := a.Store.ListDevices(ctx, a.LocalpartOf(m.UserID))
+		if err != nil {
+			continue
+		}
+		for _, d := range devices {
+			content := map[string]any{
+				"user_id":   m.UserID,
+				"device_id": d.DeviceID,
+				"deleted":   false,
+				"stream_id": a.Now(),
+			}
+			if keys, err := a.Store.DeviceKeysForUsers(ctx, []string{m.UserID}); err == nil {
+				for _, k := range keys {
+					if k.DeviceID == d.DeviceID {
+						content["keys"] = k.KeyJSON
+						break
+					}
+				}
+			}
+			a.BroadcastEDUToRooms(ctx, eduDeviceListUpdate, content, []string{roomID})
+		}
+	}
 }
 
 // memberStateSnapshot builds the room state snapshot needed to authorize a

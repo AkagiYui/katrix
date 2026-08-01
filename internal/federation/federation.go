@@ -18,13 +18,20 @@ type API struct {
 	*homeserver.HS
 	client   *Client
 	verifier *fedverify.Verifier
+	// eduWake wakes the outbound EDU delivery worker when a new EDU is queued.
+	eduWake chan struct{}
 }
 
 // New constructs the federation API surface with an outbound client for key
 // fetching and a per-event PDU signature verifier backed by that client.
 func New(hs *homeserver.HS) *API {
 	client := NewClient(hs.Store, hs.Key, hs.ServerName())
-	return &API{HS: hs, client: client, verifier: fedverify.New(client)}
+	return &API{
+		HS:       hs,
+		client:   client,
+		verifier: fedverify.New(client),
+		eduWake:  make(chan struct{}, 1),
+	}
 }
 
 // Client exposes the outbound federation client for other subsystems (e.g. the

@@ -16,7 +16,6 @@ type API struct {
 	*homeserver.HS
 	uia        *uiaStore
 	syncEngine *syncEngine
-	typing     *typingTracker
 	fed        *federation.API
 	// stateMu serialises state-event writes so the idempotency check
 	// (read current state, compare content, write if different) is atomic
@@ -27,8 +26,7 @@ type API struct {
 
 // New constructs the CS API surface.
 func New(hs *homeserver.HS) *API {
-	typing := newTypingTracker()
-	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, typing), typing: typing}
+	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, hs.Typing)}
 	return api
 }
 

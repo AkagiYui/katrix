@@ -13,6 +13,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/storage"
+	syncpkg "github.com/AkagiYui/katrix/internal/sync"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -22,11 +23,21 @@ type HS struct {
 	Store    *storage.Store
 	Key      *crypto.SigningKey
 	Notifier *Notifier
+	// Typing holds ephemeral per-room typing state. It lives on the HS (rather
+	// than inside one API surface) because both the client-server handlers and
+	// the federation EDU ingest path need to read and write it.
+	Typing *syncpkg.TypingTracker
 }
 
 // New constructs an HS and its notifier.
 func New(cfg *config.Config, store *storage.Store, key *crypto.SigningKey) *HS {
-	return &HS{Config: cfg, Store: store, Key: key, Notifier: NewNotifier()}
+	return &HS{
+		Config:   cfg,
+		Store:    store,
+		Key:      key,
+		Notifier: NewNotifier(),
+		Typing:   syncpkg.NewTypingTracker(30 * time.Second),
+	}
 }
 
 // ServerName returns the configured homeserver name.

@@ -84,6 +84,7 @@ func (a *API) KeysUpload(w http.ResponseWriter, r *http.Request) {
 		// Record a device-list change so /sync delivers device_lists.changed to
 		// the user's other devices (and /keys/changes to federating servers).
 		_, _ = a.Store.RecordDeviceListChange(r.Context(), auth.UserID, false)
+		a.broadcastDeviceListUpdate(r.Context(), auth.UserID, auth.DeviceID, false)
 		a.Notifier.NotifyUsers(auth.UserID)
 	}
 	// Persist one-time keys.

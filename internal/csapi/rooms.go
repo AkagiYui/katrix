@@ -1132,7 +1132,8 @@ func (a *API) roomPowerLevels(ctx context.Context, roomID string) *rooms.PowerLe
 
 // RoomTyping handles PUT /_matrix/client/v3/rooms/{roomID}/typing/{userID}.
 // Typing state is ephemeral, held in the in-memory TypingTracker and surfaced
-// to other users via /sync ephemeral events.
+// to other users via /sync ephemeral events, and broadcast to remote servers
+// sharing the room as an m.typing EDU so their members see it too.
 func (a *API) RoomTyping(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomID := r.PathValue("roomID")
@@ -1150,9 +1151,17 @@ func (a *API) RoomTyping(w http.ResponseWriter, r *http.Request) {
 		Timeout int  `json:"timeout"`
 	}
 	_ = httpx.DecodeJSON(w, r, &req)
-	a.typing.SetTyping(roomID, auth.UserID, req.Typing)
+	a.Typing.SetTyping(roomID, auth.UserID, req.Typing)
 	// Wake other joined users so their /sync picks up the ephemeral change.
 	a.notifyRoomMembers(r.Context(), roomID)
+	// Notify remote servers that share the room (m.typing EDU).
+	if a.fed != nil {
+		a.fed.BroadcastEDUToRooms(r.Context(), "m.typing", map[string]any{
+			"room_id": roomID,
+			"user_id": auth.UserID,
+			"typing":  req.Typing,
+		}, []string{roomID})
+	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
@@ -1601,6 +1610,11 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 		if err := a.fed.JoinRemoteRoom(r.Context(), auth.UserID, roomID, via); err != nil {
 			return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", err.Error())
 		}
+		// The join makes the user's device list newly visible to the room's
+		// remote servers: send them m.device_list_update EDUs (spec: servers
+		// must send device-list updates to every server sharing a room with a
+		// local user, including when the user joins a room).
+		a.broadcastDeviceListForUser(r.Context(), auth.UserID)
 		return nil, nil
 	}
 	return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
@@ -1759,8 +1773,16 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 		// other members: their /sync must learn the user in device_lists.changed
 		// (join) or device_lists.left (leave/ban). The change advances the shared
 		// sync stream; notifyRoomMembers below wakes the room's syncing users.
+		// Federating servers sharing the room also need the device list of a
+		// newly-joined local user (spec: m.device_list_update to every server
+		// sharing a room with a local user, including on join).
 		if mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban" {
 			_, _ = a.Store.RecordDeviceListChange(r.Context(), target, mc.Membership != "join")
+			if mc.Membership == "join" {
+				a.broadcastDeviceListForUser(r.Context(), target)
+			} else {
+				a.broadcastDeviceListUpdate(r.Context(), target, "", true)
+			}
 		}
 	}
 	a.notifyRoomMembers(r.Context(), roomID)

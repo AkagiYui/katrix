@@ -19,15 +19,20 @@ import (
 	"github.com/AkagiYui/katrix/internal/webui"
 )
 
-// Server is the assembled HTTP handler with access to the constructed CS API
-// (for background workers started by cmd/katrix, e.g. the delayed-event worker).
+// Server is the assembled HTTP handler with access to the constructed CS and
+// federation APIs (for background workers started by cmd/katrix, e.g. the
+// delayed-event worker and the outbound EDU delivery worker).
 type Server struct {
 	http.Handler
-	cs *csapi.API
+	cs  *csapi.API
+	fed *federation.API
 }
 
 // CSAPI returns the constructed CS API.
 func (s *Server) CSAPI() *csapi.API { return s.cs }
+
+// Federation returns the constructed federation API.
+func (s *Server) Federation() *federation.API { return s.fed }
 
 // New builds the top-level HTTP handler.
 func New(hs *homeserver.HS) (*Server, error) {
@@ -65,7 +70,7 @@ func New(hs *homeserver.HS) (*Server, error) {
 	}
 	mux.Handle("/", spa)
 
-	return &Server{Handler: withMiddleware(mux), cs: cs}, nil
+	return &Server{Handler: withMiddleware(mux), cs: cs, fed: fed}, nil
 }
 
 // apiPrefixes are never served by the SPA fallback.

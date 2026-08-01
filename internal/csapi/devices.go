@@ -148,8 +148,10 @@ func (a *API) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	// settings account data (org.matrix.msc3890.local_notification_settings.<device>).
 	_, _ = a.Store.DeleteAccountData(r.Context(), auth.Localpart, "", "org.matrix.msc3890.local_notification_settings."+deviceID)
 	// Record a device-list change (delete) so other devices and federating
-	// servers learn the device is gone (device_lists.left in /sync).
+	// servers learn the device is gone (device_lists.left in /sync, and an
+	// m.device_list_update EDU with deleted=true over federation).
 	_, _ = a.Store.RecordDeviceListChange(r.Context(), auth.UserID, true)
+	a.broadcastDeviceListUpdate(r.Context(), auth.UserID, deviceID, true)
 	a.Notifier.NotifyUsers(auth.UserID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }

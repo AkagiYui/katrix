@@ -177,8 +177,9 @@ func (a *API) issueLogin(r *http.Request, localpart, deviceID, displayName strin
 	// A new device changes the user's device list; the user's other devices
 	// (and, via federation, remote servers sharing a room) must learn about it.
 	// Record the change in the shared sync stream so /sync emits
-	// device_lists.changed.
+	// device_lists.changed, and queue a federation m.device_list_update EDU.
 	_, _ = a.Store.RecordDeviceListChange(r.Context(), userID, false)
+	a.broadcastDeviceListUpdate(r.Context(), userID, deviceID, false)
 	// Persist the device row (idempotent on conflict).
 	if err := a.Store.UpsertDevice(r.Context(), storage.Device{
 		UserLocalpart: localpart,
