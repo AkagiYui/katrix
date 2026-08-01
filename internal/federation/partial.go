@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sync"
 
@@ -149,6 +150,7 @@ func (a *API) resyncFromServer(ctx context.Context, roomID string, version roomv
 	}
 	stateIDs, authIDs, err := a.fetchStateIDs(ctx, server, roomID, anchorID)
 	if err != nil {
+		log.Printf("katrix: resync %s from %s: state_ids failed: %v", roomID, server, err)
 		return false
 	}
 	known := map[string]bool{}
@@ -192,11 +194,14 @@ func (a *API) resyncFromServer(ctx context.Context, roomID string, version roomv
 	// from "critical state only" to "full state".
 	joinRow, err := a.Store.GetEvent(ctx, joinID)
 	if err != nil || joinRow == nil {
+		log.Printf("katrix: resync %s from %s: join event %s not found", roomID, server, joinID)
 		return false
 	}
 	if err := eventstate.SeedRemoteJoin(ctx, a.Store, roomID, rules, joinRow, rows); err != nil {
+		log.Printf("katrix: resync %s from %s: seed failed (%d state rows): %v", roomID, server, len(rows), err)
 		return false
 	}
+	log.Printf("katrix: resync %s from %s: completed with %d state events", roomID, server, len(rows))
 	return true
 }
 
@@ -306,6 +311,11 @@ func (a *API) persistVerifiedPDUWithRow(ctx context.Context, roomID string, vers
 		return storage.StateRow{}, false
 	}
 	if ev.StateKey != nil {
+		// Update the denormalised membership table for remote member state
+		// events so /joined_members, /members and lazy-loading syncs see them.
+		if ev.Type == "m.room.member" {
+			a.applyRemoteMembership(ctx, roomID, *ev.StateKey, ev.Content, id, ev.Depth)
+		}
 		if err := eventstate.Maintain(ctx, a.Store, row, rules); err != nil {
 			_ = err
 		}

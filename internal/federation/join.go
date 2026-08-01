@@ -502,6 +502,12 @@ func (a *API) persistRemotePDUs(ctx context.Context, roomID string, rules roomve
 			continue
 		}
 		metrics.Counters.FedInboundPDUs.Add(1)
+		// Update the denormalised membership table for remote member state
+		// events so /joined_members, /members and lazy-loading syncs see them
+		// (without this, remote members never appear as joined locally).
+		if ev.StateKey != nil && ev.Type == "m.room.member" {
+			a.applyRemoteMembership(ctx, roomID, *ev.StateKey, ev.Content, id, ev.Depth)
+		}
 		if ev.StateKey != nil {
 			rows = append(rows, storage.StateRow{RoomID: roomID, Type: ev.Type, StateKey: *ev.StateKey, EventID: id})
 		}
