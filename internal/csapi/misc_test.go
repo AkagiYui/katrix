@@ -103,6 +103,13 @@ func TestPublicRooms(t *testing.T) {
 	if len(chunk) < 2 {
 		t.Fatalf("expected >=2 public rooms, got %d", len(chunk))
 	}
+	// Each entry carries the spec-required join_rule (public_chat preset = public).
+	for _, c := range chunk {
+		entry := c.(map[string]any)
+		if jr, ok := entry["join_rule"].(string); !ok || jr != "public" {
+			t.Fatalf("public room entry missing join_rule 'public': %v", entry)
+		}
+	}
 }
 
 // testAdminAPI is reserved for future use; the admin flow is tested directly

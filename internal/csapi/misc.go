@@ -494,6 +494,9 @@ func (a *API) PublicRooms(w http.ResponseWriter, r *http.Request) {
 		entry["world_readable"] = a.historyVisibility(r.Context(), roomID) == "world_readable"
 		// guest_can_join: m.room.guest_access allows guests to join.
 		entry["guest_can_join"] = a.guestCanJoin(r.Context(), roomID)
+		// join_rule: required by the spec. Defaults to "invite" when no
+		// m.room.join_rules state event exists.
+		entry["join_rule"] = a.joinRule(r.Context(), roomID)
 		// Optional fields from room state.
 		canonicalAlias := ""
 		if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.canonical_alias", ""); err == nil {
@@ -556,6 +559,23 @@ func (a *API) guestCanJoin(ctx context.Context, roomID string) bool {
 		return false
 	}
 	return stateStringField(ev.Content, "guest_access") == "can_join"
+}
+
+// joinRule returns the room's join rule from m.room.join_rules state,
+// defaulting to "invite" per the spec when no such state event exists.
+func (a *API) joinRule(ctx context.Context, roomID string) string {
+	id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.join_rules", "")
+	if err != nil {
+		return "invite"
+	}
+	ev, err := a.Store.GetEvent(ctx, id)
+	if err != nil {
+		return "invite"
+	}
+	if r := stateStringField(ev.Content, "join_rule"); r != "" {
+		return r
+	}
+	return "invite"
 }
 
 // stateStringField extracts a string field from a state event's content.
