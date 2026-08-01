@@ -620,6 +620,10 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 			}
 			jr.State.Events = append(jr.State.Events, filter.applyEventFields(clientEvent(&se)))
 		}
+	} else if jr.State.Events == nil {
+		// An incremental sync with no full_state still renders `state.events` as
+		// an empty array (spec + clients expect the key to exist).
+		jr.State.Events = []json.RawMessage{}
 	}
 	// MSC4222 use_state_after: the client asks for the room state as of the end
 	// of the timeline instead of the state at the start (state). On an initial
@@ -812,6 +816,10 @@ func (e *Engine) buildLeftRoom(ctx context.Context, roomID string, opts SyncOpti
 		}
 		lr.Timeline.Events = append(lr.Timeline.Events, filter.applyEventFields(clientEvent(&ev)))
 	}
+	// `state` must always be an array: it holds the state as of the leave when
+	// the timeline is empty (the leave event + pre-leave state), and is empty
+	// otherwise (spec regression test).
+	lr.State.Events = []json.RawMessage{}
 	// When the timeline is empty, fill `state` with the state as of the leave
 	// event (leave event + pre-leave state) per the spec regression test.
 	if len(lr.Timeline.Events) == 0 {

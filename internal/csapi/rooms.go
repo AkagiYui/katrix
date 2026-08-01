@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/AkagiYui/katrix/internal/canonicaljson"
@@ -46,6 +47,7 @@ func (a *API) registerRooms(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/joined_rooms", a.RequireAuth(a.JoinedRooms))
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/aliases", a.RequireAuth(a.RoomAliases))
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/messages", a.RequireAuth(a.RoomMessages))
+	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/context/{eventID}", a.RequireAuth(a.RoomContext))
 	mux.HandleFunc("PUT /_matrix/client/v3/rooms/{roomID}/redact/{eventID}/{txnID}", a.RequireAuth(a.RoomRedact))
 	mux.HandleFunc("PUT /_matrix/client/v3/rooms/{roomID}/typing/{userID}", a.RequireAuth(a.RoomTyping))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/forget", a.RequireAuth(a.RoomForget))
@@ -1005,6 +1007,115 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	// room state (spec: "A list of state events relevant to showing the chunk").
 	if flt.lazyLoadMembers {
 		resp["state"] = a.lazyLoadState(r, roomID, auth.UserID, senders)
+	}
+	httpx.WriteJSON(w, http.StatusOK, resp)
+}
+
+// RoomContext handles GET /_matrix/client/v3/rooms/{roomID}/context/{eventID}.
+// It returns the events immediately before and after the requested event, the
+// event itself, and the room state as of that event (spec §Context). Access is
+// gated on the same event-visibility rules as GET /event: a user who cannot
+// see the event (e.g. a non-member of a non-world-readable room) gets 403.
+func (a *API) RoomContext(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	roomID := r.PathValue("roomID")
+	eventID := r.PathValue("eventID")
+	ev, err := a.Store.GetEvent(r.Context(), eventID)
+	if err != nil || ev.RoomID != roomID {
+		httpx.WriteError(w, httpx.ErrNotFound("event not found"))
+		return
+	}
+	vis := a.historyVisibility(r.Context(), roomID)
+	m, err := a.Store.GetMembership(r.Context(), roomID, auth.UserID)
+	if err != nil {
+		// Not a member: only world_readable rooms allow context fetches.
+		if vis != "world_readable" {
+			httpx.WriteError(w, httpx.ErrForbidden("not permitted to view the event"))
+			return
+		}
+	} else if !a.canReadEventAt(r.Context(), vis, m, ev) {
+		httpx.WriteError(w, httpx.ErrForbidden("not permitted to view the event"))
+		return
+	}
+	q := r.URL.Query()
+	limit := 10
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 100 {
+			limit = n
+		}
+	}
+	// events_before: up to limit events strictly older than the target,
+	// returned in chronological order (newest last). events_after: up to limit
+	// events strictly newer, in chronological order (newest last).
+	beforeDesc, err := a.Store.EventsForRoom(r.Context(), roomID, 0, ev.StreamOrdering-1, limit, "b")
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	afterAsc, err := a.Store.EventsForRoom(r.Context(), roomID, ev.StreamOrdering, 0, limit, "f")
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	flt, err := parseRoomEventFilter(q.Get("filter"))
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	// Reverse the before-window (store returns newest first) and filter both.
+	before := make([]json.RawMessage, 0, len(beforeDesc))
+	for i := len(beforeDesc) - 1; i >= 0; i-- {
+		e := &beforeDesc[i]
+		if !flt.keep(e) {
+			continue
+		}
+		before = append(before, clientEvent(e))
+	}
+	after := make([]json.RawMessage, 0, len(afterAsc))
+	for i := range afterAsc {
+		e := &afterAsc[i]
+		if !flt.keep(e) {
+			continue
+		}
+		after = append(after, clientEvent(e))
+	}
+	// State as of the event: the state-at-event snapshot captured when the
+	// event was persisted. Lazy-load members narrows it to the membership
+	// events of the timeline senders (the target event's sender), matching the
+	// /messages lazy-load behaviour.
+	state := []json.RawMessage{}
+	if rows, err := a.Store.GetEventState(r.Context(), eventID); err == nil {
+		ids := make([]string, 0, len(rows))
+		for _, s := range rows {
+			ids = append(ids, s.EventID)
+		}
+		stateEvs, _ := a.Store.EventsByIDs(r.Context(), ids)
+		for i := range stateEvs {
+			se := &stateEvs[i]
+			if flt.lazyLoadMembers && !(se.Type == "m.room.member" && (se.StateKey == ev.Sender || se.StateKey == auth.UserID)) {
+				continue
+			}
+			state = append(state, clientEvent(se))
+		}
+	}
+	// Pagination tokens: `start` resumes events_before (the oldest returned
+	// event), `end` resumes events_after (the newest returned event).
+	resp := map[string]any{
+		"event":         a.annotateTxnID(r, ev),
+		"events_before": before,
+		"events_after":  after,
+		"state":         state,
+		"limited":       len(before) == limit || len(after) == limit,
+	}
+	if len(before) > 0 {
+		resp["start"] = formatIntToken(beforeDesc[len(beforeDesc)-1].StreamOrdering)
+	} else {
+		resp["start"] = formatIntToken(ev.StreamOrdering)
+	}
+	if len(afterAsc) > 0 {
+		resp["end"] = formatIntToken(afterAsc[len(afterAsc)-1].StreamOrdering)
+	} else {
+		resp["end"] = formatIntToken(ev.StreamOrdering)
 	}
 	httpx.WriteJSON(w, http.StatusOK, resp)
 }
