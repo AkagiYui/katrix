@@ -1,0 +1,493 @@
+package csapi
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+
+	"github.com/AkagiYui/katrix/internal/events"
+	"github.com/AkagiYui/katrix/internal/homeserver"
+	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/ids"
+	"github.com/AkagiYui/katrix/internal/rooms"
+	"github.com/AkagiYui/katrix/internal/roomver"
+	"github.com/AkagiYui/katrix/internal/storage"
+)
+
+// RoomUpgrade handles POST /_matrix/client/v3/rooms/{roomID}/upgrade. It
+// creates a new room (with the requested version) whose create event names the
+// old room as its predecessor, sends an m.room.tombstone into the old room,
+// and carries over the old room's state, membership, aliases, power levels and
+// local users' push rules. The old room's power levels are restricted so
+// regular users can no longer speak in it. The flow mirrors the spec's
+// server-behaviour notes and Synapse's upgrade_room:
+//
+//  1. validate (404 unknown room, 403 not joined, 400 bad version)
+//  2. create the new room: for v12+ the room ID is derived from the create
+//     event's reference hash, so the create (with predecessor, no event_id) is
+//     built first; for older versions the tombstone is sent first so the
+//     create's predecessor can name its event_id
+//  3. copy important state (join_rules, name, topic, guest_access,
+//     history_visibility, avatar, encryption, server_acl, power_levels)
+//  4. copy member bans and auto-join the old room's local members
+//  5. move the room's aliases (and canonical alias) to the new room
+//  6. restrict the old room's power levels (invite/events_default)
+//  7. copy per-room push rules for every local user, and update m.direct
+func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	roomID := r.PathValue("roomID")
+	var req struct {
+		NewVersion string `json:"new_version"`
+	}
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	// The old room must exist (404, before any membership check so a bogus room
+	// fails gracefully).
+	oldRoom, err := a.Store.GetRoom(r.Context(), roomID)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("unknown room"))
+		return
+	}
+	version := roomver.Version(req.NewVersion)
+	if version == "" {
+		version = roomver.Default
+	}
+	if !roomver.IsSupported(version) {
+		httpx.WriteError(w, httpx.ErrUnknownRoomVersion("unsupported room version"))
+		return
+	}
+	rules, ok := roomver.Get(version)
+	if !ok {
+		httpx.WriteError(w, httpx.ErrUnknownRoomVersion("unsupported room version"))
+		return
+	}
+	if err := a.checkMembership(r.Context(), roomID, auth.UserID, rooms.MembershipJoin); err != nil {
+		writeRoomErr(w, err)
+		return
+	}
+
+	oldCreate := a.stateContent(r.Context(), roomID, "m.room.create", "")
+	creationContent := map[string]any{}
+	// Preserve non-federatability (m.federate: false) and the room type.
+	if oldCreate != nil {
+		var oc struct {
+			Federate *bool  `json:"m.federate"`
+			Type     string `json:"type"`
+		}
+		_ = json.Unmarshal(oldCreate, &oc)
+		if oc.Federate != nil && !*oc.Federate {
+			creationContent["m.federate"] = false
+		}
+		if oc.Type != "" {
+			creationContent["type"] = oc.Type
+		}
+	}
+
+	var initRes *rooms.InitialEventsResult
+	var newRoomID string
+	var tombstoneEventID string
+	powerOverride := a.upgradePowerLevels(r, auth, roomID, version, rules)
+
+	if rules.RoomIDIsCreateHash {
+		// v12+ (MSC4291): the room ID is derived from the create event's
+		// reference hash. Build the create first (predecessor carries only the
+		// room_id — the tombstone does not exist yet), derive the ID, persist
+		// the room, then send the tombstone referencing it.
+		creationContent["predecessor"] = map[string]any{"room_id": roomID}
+		ccRaw, _ := json.Marshal(creationContent)
+		initRes, err = rooms.BuildInitialEvents(ids.NewRoomID(a.ServerName()), version, auth.UserID, "", powerOverride, ccRaw, false, a.ServerName(), a.Key, a.Now())
+		if err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+		newRoomID = initRes.RoomID
+		if err := a.persistNewRoom(r, auth, roomID, newRoomID, version, oldRoom.IsPublic, initRes); err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+		tombstoneEventID, err = a.sendTombstone(r, auth, roomID, newRoomID)
+		if err != nil {
+			writeRoomErr(w, err)
+			return
+		}
+	} else {
+		// v1-v11: generate a random room ID, send the tombstone first, then
+		// build the new room whose create names the tombstone as the
+		// predecessor's event_id.
+		newRoomID = ids.NewRoomID(a.ServerName())
+		tombstoneEventID, err = a.sendTombstone(r, auth, roomID, newRoomID)
+		if err != nil {
+			writeRoomErr(w, err)
+			return
+		}
+		creationContent["predecessor"] = map[string]any{
+			"room_id":  roomID,
+			"event_id": tombstoneEventID,
+		}
+		ccRaw, _ := json.Marshal(creationContent)
+		initRes, err = rooms.BuildInitialEvents(newRoomID, version, auth.UserID, "", powerOverride, ccRaw, false, a.ServerName(), a.Key, a.Now())
+		if err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+		if err := a.persistNewRoom(r, auth, roomID, newRoomID, version, oldRoom.IsPublic, initRes); err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+	}
+
+	// Copy important state from the old room into the new one (the initial
+	// power levels already carried the old room's PL so the upgrader can send
+	// the remaining copied events).
+	a.copyStateToNewRoom(r, auth, roomID, newRoomID, version)
+	// Copy member bans + auto-join the old room's local members.
+	a.copyMembersToNewRoom(r, auth, roomID, newRoomID, version)
+	// Move aliases + canonical alias state to the new room.
+	a.moveAliasesToNewRoom(r, auth, roomID, newRoomID, version)
+	// Restrict the old room's power levels (spec: stop regular users from
+	// speaking after an upgrade).
+	a.restrictOldRoomPowerLevels(r, auth, roomID)
+	// Copy per-room push rules for every local user in the old room.
+	a.copyPushRulesForAllLocalUsers(r.Context(), roomID, newRoomID)
+	// Update the upgrading user's m.direct account data.
+	a.updateDirectRoom(ctx(r), auth.Localpart, roomID, newRoomID)
+
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"replacement_room": newRoomID})
+}
+
+// ctx is a small alias to keep the upgrade flow readable.
+func ctx(r *http.Request) context.Context { return r.Context() }
+
+// stateContent returns the current content of a state event in a room, or nil.
+func (a *API) stateContent(ctx context.Context, roomID, eventType, stateKey string) json.RawMessage {
+	if id, err := a.Store.GetStateEvent(ctx, roomID, eventType, stateKey); err == nil {
+		if ev, err := a.Store.GetEvent(ctx, id); err == nil {
+			return ev.Content
+		}
+	}
+	return nil
+}
+
+// upgradePowerLevels builds the initial power-levels content for the new room:
+// a copy of the old room's current PL (so per-user levels survive the upgrade),
+// with the upgrader elevated to the minimum level needed to send the copied
+// state events when their current level is too low, and the creator removed
+// from the users map for v12+ (privileged-creator) rooms.
+func (a *API) upgradePowerLevels(r *http.Request, auth *homeserver.Auth, roomID string, version roomver.Version, rules roomver.Rules) json.RawMessage {
+	oldPL := a.stateContent(r.Context(), roomID, "m.room.power_levels", "")
+	if oldPL == nil {
+		return nil
+	}
+	var pl map[string]any
+	if err := json.Unmarshal(oldPL, &pl); err != nil {
+		return nil
+	}
+	// Minimum power level needed to send any of the copied state events.
+	needed := 0
+	if s, ok := pl["state_default"].(float64); ok && int(s) > needed {
+		needed = int(s)
+	}
+	if b, ok := pl["ban"].(float64); ok && int(b) > needed {
+		needed = int(b)
+	}
+	if events, ok := pl["events"].(map[string]any); ok {
+		for _, v := range events {
+			if n, ok := v.(float64); ok && int(n) > needed {
+				needed = int(n)
+			}
+		}
+	}
+	current := 0
+	users, _ := pl["users"].(map[string]any)
+	if lvl, ok := users[auth.UserID].(float64); ok {
+		current = int(lvl)
+	} else if d, ok := pl["users_default"].(float64); ok {
+		current = int(d)
+	}
+	if current < needed {
+		if users == nil {
+			users = map[string]any{}
+			pl["users"] = users
+		}
+		users[auth.UserID] = float64(needed)
+	}
+	// v12+ privileged creators must not be listed in the users map.
+	if rules.CreatorPrivileged {
+		delete(users, auth.UserID)
+	}
+	out, err := json.Marshal(pl)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+// persistNewRoom persists the room row + the initial events (create, creator
+// join, power levels, join rules, history visibility), recording the creator's
+// membership.
+func (a *API) persistNewRoom(r *http.Request, auth *homeserver.Auth, oldRoomID, newRoomID string, version roomver.Version, isPublic bool, initRes *rooms.InitialEventsResult) error {
+	now := a.Now()
+	if err := a.Store.CreateRoom(r.Context(), storage.Room{
+		RoomID: newRoomID, Version: string(version), Creator: auth.UserID, IsPublic: isPublic, CreatedTS: now,
+	}); err != nil {
+		return err
+	}
+	for _, ev := range initRes.Events {
+		stream, err := persistEventInRoom(r.Context(), a.Store, ev, version, newRoomID)
+		if err != nil {
+			return err
+		}
+		if ev.Type() == "m.room.member" {
+			sk, _ := ev.StateKey()
+			mc, _ := rooms.ParseMember(ev.Content())
+			if mc != nil {
+				_ = a.Store.UpsertMembership(r.Context(), storage.MembershipRow{
+					RoomID: newRoomID, UserID: sk, Membership: mc.Membership,
+					EventID: ev.EventID(), DisplayName: mc.DisplayName, AvatarURL: mc.AvatarURL,
+					StreamOrdering: stream,
+				})
+			}
+		}
+	}
+	a.broadcastPDU(r.Context(), newRoomID, initRes.Create)
+	_ = oldRoomID
+	return nil
+}
+
+// sendTombstone sends an m.room.tombstone state event into the old room
+// pointing at the replacement room, returning its event ID.
+func (a *API) sendTombstone(r *http.Request, auth *homeserver.Auth, oldRoomID, newRoomID string) (string, error) {
+	content, _ := json.Marshal(map[string]any{
+		"body":             "This room has been replaced",
+		"replacement_room": newRoomID,
+	})
+	ev, err := a.buildAndPersistState(r, auth, oldRoomID, "m.room.tombstone", "", content)
+	if err != nil {
+		return "", err
+	}
+	return ev.EventID(), nil
+}
+
+// copyStateToNewRoom copies the state events a new room must inherit from its
+// predecessor: join_rules, name, topic, guest_access, history_visibility,
+// avatar, encryption, server_acl, and power_levels (which may already have been
+// carried in as the initial PL — the copy is then an idempotent no-op).
+func (a *API) copyStateToNewRoom(r *http.Request, auth *homeserver.Auth, oldRoomID, newRoomID string, version roomver.Version) {
+	types := []string{
+		"m.room.join_rules", "m.room.name", "m.room.topic", "m.room.guest_access",
+		"m.room.history_visibility", "m.room.avatar", "m.room.encryption",
+		"m.room.server_acl", "m.room.power_levels",
+	}
+	for _, t := range types {
+		content := a.stateContent(r.Context(), oldRoomID, t, "")
+		if content == nil {
+			continue
+		}
+		a.sendStateEvent(r, auth, newRoomID, version, t, "", content)
+	}
+}
+
+// copyMembersToNewRoom copies member bans from the old room into the new one
+// and auto-joins the old room's local members (per the spec's server
+// behaviour: "the homeserver may choose to automatically join all local users
+// to the new room" — Synapse sends an invite + join for each local member).
+func (a *API) copyMembersToNewRoom(r *http.Request, auth *homeserver.Auth, oldRoomID, newRoomID string, version roomver.Version) {
+	members, err := a.Store.Members(r.Context(), oldRoomID, "")
+	if err != nil {
+		return
+	}
+	for _, m := range members {
+		switch m.Membership {
+		case "ban":
+			if m.UserID == auth.UserID {
+				continue
+			}
+			a.sendStateEvent(r, auth, newRoomID, version, "m.room.member", m.UserID, map[string]any{
+				"membership": "ban",
+			})
+		case "join":
+			if m.UserID == auth.UserID {
+				continue // already the creator/owner of the new room
+			}
+			if !a.IsLocalUser(m.UserID) {
+				continue // remote members re-join via the tombstone themselves
+			}
+			// Invite (from the upgrader) then join (from the member) so the
+			// join passes the auth rules regardless of join_rules.
+			a.sendStateEvent(r, auth, newRoomID, version, "m.room.member", m.UserID, map[string]any{
+				"membership": "invite",
+			})
+			a.buildAndPersistMemberJoin(r.Context(), newRoomID, version, m.UserID)
+		}
+	}
+}
+
+// buildAndPersistMemberJoin builds, persists and broadcasts an m.room.member
+// join event for a local user in a room (used by the upgrade auto-join path).
+func (a *API) buildAndPersistMemberJoin(ctx context.Context, roomID string, version roomver.Version, userID string) error {
+	latest, _ := a.Store.LatestEvent(ctx, roomID)
+	var prev []string
+	depth := int64(1)
+	if latest != nil {
+		prev = []string{latest.EventID}
+		depth = latest.Depth + 1
+	}
+	b := events.Builder{
+		Type:           "m.room.member",
+		Sender:         userID,
+		RoomID:         roomID,
+		Content:        json.RawMessage(`{"membership":"join"}`),
+		Depth:          depth,
+		OriginServerTS: a.Now(),
+		PrevEvents:     prev,
+		AuthEvents:     a.authEventIDs(ctx, roomID, userID),
+	}
+	sk := userID
+	b.StateKey = &sk
+	ev, err := b.Build(a.ServerName(), a.Key, version)
+	if err != nil {
+		return err
+	}
+	stream, err := persistEvent(ctx, a.Store, ev, version)
+	if err != nil {
+		return err
+	}
+	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
+		RoomID: roomID, UserID: userID, Membership: "join",
+		EventID: ev.EventID(), StreamOrdering: stream,
+	})
+	a.notifyRoomMembers(ctx, roomID)
+	a.broadcastPDU(ctx, roomID, ev)
+	return nil
+}
+
+// moveAliasesToNewRoom repoints the old room's aliases at the new room,
+// copies the canonical alias state across, and clears it in the old room.
+func (a *API) moveAliasesToNewRoom(r *http.Request, auth *homeserver.Auth, oldRoomID, newRoomID string, version roomver.Version) {
+	aliases, err := a.Store.AliasesForRoom(r.Context(), oldRoomID)
+	if err == nil {
+		for _, alias := range aliases {
+			_ = a.Store.DeleteAlias(r.Context(), alias)
+			_ = a.Store.CreateAlias(r.Context(), alias, newRoomID, auth.UserID, a.Now())
+		}
+	}
+	canonical := a.stateContent(r.Context(), oldRoomID, "m.room.canonical_alias", "")
+	if canonical != nil {
+		a.sendStateEvent(r, auth, newRoomID, version, "m.room.canonical_alias", "", canonical)
+		// Clear the canonical alias in the old room.
+		a.sendStateEvent(r, auth, oldRoomID, version, "m.room.canonical_alias", "", map[string]any{})
+	}
+}
+
+// restrictOldRoomPowerLevels raises the old room's invite and events_default
+// power levels to the moderator level (max(users_default+1, 50)) so regular
+// users can no longer send events or invite after the upgrade.
+func (a *API) restrictOldRoomPowerLevels(r *http.Request, auth *homeserver.Auth, roomID string) {
+	content := a.stateContent(r.Context(), roomID, "m.room.power_levels", "")
+	if content == nil {
+		return
+	}
+	var pl map[string]any
+	if err := json.Unmarshal(content, &pl); err != nil {
+		return
+	}
+	usersDefault := 0
+	if d, ok := pl["users_default"].(float64); ok {
+		usersDefault = int(d)
+	}
+	restricted := usersDefault + 1
+	if restricted < 50 {
+		restricted = 50
+	}
+	updated := false
+	for _, k := range []string{"invite", "events_default"} {
+		if cur, ok := pl[k].(float64); !ok || int(cur) < restricted {
+			pl[k] = float64(restricted)
+			updated = true
+		}
+	}
+	if !updated {
+		return
+	}
+	room, err := a.Store.GetRoom(r.Context(), roomID)
+	if err != nil {
+		return
+	}
+	out, _ := json.Marshal(pl)
+	a.sendStateEvent(r, auth, roomID, roomver.Version(room.Version), "m.room.power_levels", "", out)
+}
+
+// copyPushRulesForAllLocalUsers clones each local user's per-room push rules
+// for the old room to the new room (spec server behaviour; Synapse/Dendrite do
+// this for all local users in the room, not just the upgrader).
+func (a *API) copyPushRulesForAllLocalUsers(ctx context.Context, oldRoomID, newRoomID string) {
+	members, err := a.Store.Members(ctx, oldRoomID, "join")
+	if err != nil {
+		return
+	}
+	for _, m := range members {
+		if !a.IsLocalUser(m.UserID) {
+			continue
+		}
+		a.copyPushRulesForRoom(a.LocalpartOf(m.UserID), oldRoomID, newRoomID)
+	}
+}
+
+// copyPushRulesForRoom clones a user's room-specific push rules from oldRoomID
+// to newRoomID (used by room upgrade so local users keep their per-room
+// notification settings in the replacement room).
+func (a *API) copyPushRulesForRoom(localpart, oldRoomID, newRoomID string) {
+	rules := a.loadRules(localpart)
+	global, _ := rules["global"].(map[string]any)
+	list, _ := global["room"].([]any)
+	for _, e := range list {
+		em, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		if em["rule_id"] != oldRoomID {
+			continue
+		}
+		clone := map[string]any{}
+		for k, v := range em {
+			clone[k] = v
+		}
+		clone["rule_id"] = newRoomID
+		global["room"] = append(list, clone)
+	}
+	rules["global"] = global
+	_ = a.savePushRules(localpart, rules)
+}
+
+// updateDirectRoom replaces the old room ID with the new one in the user's
+// m.direct account data (spec server behaviour on upgrade).
+func (a *API) updateDirectRoom(ctx context.Context, localpart, oldRoomID, newRoomID string) {
+	raw, err := a.Store.GetAccountData(ctx, localpart, "", "m.direct")
+	if err != nil || len(raw) == 0 {
+		return
+	}
+	var direct map[string]any
+	if json.Unmarshal(raw, &direct) != nil {
+		return
+	}
+	updated := false
+	for _, v := range direct {
+		ids, ok := v.([]any)
+		if !ok {
+			continue
+		}
+		for i, id := range ids {
+			if id == oldRoomID {
+				ids[i] = newRoomID
+				updated = true
+			}
+		}
+	}
+	if !updated {
+		return
+	}
+	out, _ := json.Marshal(direct)
+	_, _ = a.Store.SetAccountData(ctx, localpart, "", "m.direct", out)
+}
