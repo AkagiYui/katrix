@@ -130,8 +130,16 @@ func (a *API) resyncFromServer(ctx context.Context, roomID string, version roomv
 		return false
 	}
 	anchorID := joinID
-	if jr, err := a.Store.GetEvent(ctx, joinID); err == nil && jr != nil && len(jr.PrevEvents) > 0 {
-		anchorID = jr.PrevEvents[0]
+	// GetEvent does not return the parsed prev_events column (it is not
+	// persisted); parse them from the raw event JSON.
+	if jr, err := a.Store.GetEvent(ctx, joinID); err == nil && jr != nil {
+		var prev struct {
+			PrevEvents []string `json:"prev_events"`
+		}
+		_ = json.Unmarshal(jr.RawJSON, &prev)
+		if len(prev.PrevEvents) > 0 {
+			anchorID = prev.PrevEvents[0]
+		}
 	}
 	stateIDs, authIDs, err := a.fetchStateIDs(ctx, server, roomID, anchorID)
 	if err != nil {
