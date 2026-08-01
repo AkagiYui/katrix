@@ -152,10 +152,11 @@ func runServe(args []string) error {
 		return err
 	}
 	// Start background workers: the MSC4140 delayed-event firing worker and the
-	// outbound federation EDU delivery worker (device-list updates, presence,
-	// typing — spec transaction delivery with retries).
+	// outbound federation EDU/PDU delivery worker (device-list updates, presence,
+	// typing, room events — spec transaction delivery with retries). Both run
+	// on goroutines so the HTTP servers below can start immediately.
 	handler.CSAPI().StartDelayedWorker(ctx)
-	handler.Federation().RunEDUWorker(ctx)
+	go handler.Federation().RunEDUWorker(ctx)
 
 	clientSrv := &http.Server{Addr: cfg.Listen.Client, Handler: handler, ReadHeaderTimeout: 30 * time.Second}
 	fedSrv := &http.Server{Addr: cfg.Listen.Federation, Handler: handler, ReadHeaderTimeout: 30 * time.Second}
