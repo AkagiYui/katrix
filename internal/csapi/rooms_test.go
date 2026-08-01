@@ -233,8 +233,8 @@ func TestRoomMessagesLazyLoadMembers(t *testing.T) {
 	if len(state) == 0 {
 		t.Fatalf("expected member state for timeline senders, got empty state")
 	}
-	// Every entry must be a member event whose state_key is a timeline sender
-	// (or the requesting user).
+	// Every entry must be a member event for a timeline sender: the chunk's
+	// senders (from the messages above) must each have their membership here.
 	seen := map[string]bool{}
 	for _, raw := range state {
 		ev := raw.(map[string]any)
@@ -245,9 +245,6 @@ func TestRoomMessagesLazyLoadMembers(t *testing.T) {
 	}
 	if !seen["@ned:test.katrix"] {
 		t.Fatalf("expected ned's membership in state, got %v", seen)
-	}
-	if !seen["@mallory:test.katrix"] {
-		t.Fatalf("expected the requesting user's own membership in state, got %v", seen)
 	}
 }
 

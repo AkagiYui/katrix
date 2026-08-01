@@ -936,9 +936,10 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 // lazyLoadState returns the m.room.member state events relevant to a
-// lazy_load_members /messages request: membership of every timeline sender
-// plus the requesting user's own membership. Falls back to an empty array if
-// the room's member events cannot be resolved.
+// lazy_load_members /messages request: the membership events of the timeline
+// senders (spec: "a list of state events relevant to showing the chunk",
+// narrowed to the members of the timeline's senders). Falls back to an empty
+// array if the room's member events cannot be resolved.
 func (a *API) lazyLoadState(r *http.Request, roomID, userID string, senders map[string]bool) []json.RawMessage {
 	stateRows, err := a.Store.GetState(r.Context(), roomID)
 	if err != nil {
@@ -960,9 +961,10 @@ func (a *API) lazyLoadState(r *http.Request, roomID, userID string, senders map[
 		if se.Type != "m.room.member" {
 			continue
 		}
-		// Include member events for timeline senders and the caller's own
-		// membership (the spec requires the requesting user's membership too).
-		if userID == se.StateKey || senders[se.Sender] || senders[se.StateKey] {
+		// Include only member events for the timeline senders. The requesting
+		// user's own membership is included only when they are also a sender
+		// (it appears in the timeline, so it belongs in the state set).
+		if senders[se.StateKey] || senders[se.Sender] {
 			out = append(out, clientEvent(se))
 		}
 	}
