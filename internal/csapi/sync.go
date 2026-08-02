@@ -1,6 +1,7 @@
 package csapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -297,7 +298,28 @@ func (a *API) Receipt(w http.ResponseWriter, r *http.Request) {
 		RoomID: roomID, UserID: auth.UserID, ReceiptType: receiptType, EventID: eventID, TS: a.Now(),
 	})
 	a.notifyRoomMembers(r.Context(), roomID)
+	// Federation: receipts are delivered to the room's remote servers as an
+	// m.receipt EDU (spec receipt federation). The EDU content is the same shape
+	// /sync emits per room: {event_id: {receipt_type: {user_id: {ts, thread_id?}}}}.
+	a.broadcastReceiptEDU(r.Context(), roomID, auth.UserID, receiptType, eventID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// broadcastReceiptEDU queues an m.receipt EDU for the room's remote servers so
+// their syncing users see the receipt. Best-effort: a missing federation client
+// (monolith without federation) simply skips the broadcast.
+func (a *API) broadcastReceiptEDU(ctx context.Context, roomID, userID, receiptType, eventID string) {
+	if a.fed == nil {
+		return
+	}
+	content := map[string]any{
+		eventID: map[string]any{
+			receiptType: map[string]any{
+				userID: map[string]any{"ts": a.Now()},
+			},
+		},
+	}
+	a.fed.BroadcastEDUToRooms(ctx, "m.receipt", content, []string{roomID})
 }
 
 // PresenceGet handles GET /_matrix/client/v3/presence/{userID}/status.

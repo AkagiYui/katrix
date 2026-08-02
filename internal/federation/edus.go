@@ -21,6 +21,7 @@ const (
 	eduPresence         = "m.presence"
 	eduTyping           = "m.typing"
 	eduDirectToDevice   = "m.direct_to_device"
+	eduReceipt          = "m.receipt"
 )
 
 // BroadcastEDUToRooms queues an EDU for delivery to every remote server that
@@ -200,6 +201,11 @@ func (a *API) handleEDU(ctx context.Context, origin string, edu json.RawMessage)
 		// to-device queues so the target devices receive them on their next
 		// /sync. The server never decrypts.
 		a.applyDirectToDeviceEDU(ctx, e.Content)
+	case eduReceipt:
+		// Read receipts from a remote server (spec receipt federation). They are
+		// persisted in the local receipts store so local users in shared rooms
+		// see them in the ephemeral /sync section.
+		a.applyReceiptEDU(ctx, e.Content)
 	}
 }
 
@@ -319,6 +325,46 @@ func (a *API) applyDirectToDeviceEDU(ctx context.Context, content json.RawMessag
 		if !seen[m.TargetUser] {
 			seen[m.TargetUser] = true
 			a.Notifier.NotifyUser(m.TargetUser)
+		}
+	}
+	return nil
+}
+
+// applyReceiptEDU applies an inbound m.receipt EDU (spec receipt federation).
+// The content is the same shape /sync emits per room:
+//
+//	{ <event_id>: { <receipt_type>: { <user_id>: { "ts": <ts> } } } }
+//
+// Each entry is persisted via SetReceipt so local users in the room see the
+// remote user's receipt in the ephemeral /sync section, and the room's local
+// members are woken.
+func (a *API) applyReceiptEDU(ctx context.Context, content json.RawMessage) error {
+	var byEvent map[string]map[string]map[string]struct {
+		TS int64 `json:"ts"`
+	}
+	if err := json.Unmarshal(content, &byEvent); err != nil {
+		return fmt.Errorf("m.receipt: bad content: %w", err)
+	}
+	now := a.Now()
+	for eventID, byType := range byEvent {
+		for receiptType, byUser := range byType {
+			for userID, rc := range byUser {
+				// The room is not in the EDU envelope; derive it from the event.
+				ev, err := a.Store.GetEvent(ctx, eventID)
+				if err != nil || ev == nil {
+					continue
+				}
+				ts := rc.TS
+				if ts == 0 {
+					ts = now
+				}
+				if _, err := a.Store.SetReceipt(ctx, storage.ReceiptRow{
+					RoomID: ev.RoomID, UserID: userID, ReceiptType: receiptType,
+					EventID: eventID, TS: ts,
+				}); err == nil {
+					a.notifyRoomMembers(ctx, ev.RoomID)
+				}
+			}
 		}
 	}
 	return nil
