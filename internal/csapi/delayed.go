@@ -185,7 +185,7 @@ func (a *API) buildAndPersistMessageCtx(ctx context.Context, auth *homeserver.Au
 		PrevEvents:     prev,
 		AuthEvents:     authIDs,
 	}
-	ev, err := b.Build(a.ServerName(), a.Key, version)
+	ev, err := b.BuildForVersion(a.ServerName(), a.Key, version)
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +238,7 @@ func (a *API) buildAndPersistStateCtx(ctx context.Context, auth *homeserver.Auth
 	}
 	sk := stateKey
 	b.StateKey = &sk
-	ev, err := b.Build(a.ServerName(), a.Key, version)
+	ev, err := b.BuildForVersion(a.ServerName(), a.Key, version)
 	if err != nil {
 		return nil, err
 	}

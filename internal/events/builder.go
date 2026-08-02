@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
+	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/roomver"
 )
 
@@ -155,6 +156,21 @@ func (b *Builder) BuildLegacy(serverName string, key *crypto.SigningKey, version
 	}
 	ev.SetEventID(eventID)
 	return ev, nil
+}
+
+// BuildForVersion produces a signed Event for the given room version, routing
+// to BuildLegacy for legacy (v1/v2) room versions whose events carry an
+// explicit event_id and [id, hash] prev/auth refs, and to Build otherwise. It
+// is the version-aware replacement for calling Build directly.
+func (b *Builder) BuildForVersion(serverName string, key *crypto.SigningKey, version roomver.Version) (*Event, error) {
+	rules, ok := roomver.Get(version)
+	if !ok {
+		return nil, fmt.Errorf("events: unknown room version %q", version)
+	}
+	if rules.EventFormatV1 {
+		return b.BuildLegacy(serverName, key, version, ids.RandomTxnSuffix())
+	}
+	return b.Build(serverName, key, version)
 }
 
 // legacyRefs converts a list of event IDs to the legacy [id, hash] pair form

@@ -351,13 +351,7 @@ func buildJoinEvent(tpl *makeJoinResponse, userID, roomID string, now int64, ver
 	}
 	sk := userID
 	b.StateKey = &sk
-	if rules.EventFormatV1 {
-		return b.BuildLegacy(serverName, key, version, ids.RandomTxnSuffix())
-	}
-	ev, err := b.Build(serverName, key, version)
-	if err == nil {
-	}
-	return ev, err
+	return b.BuildForVersion(serverName, key, version)
 }
 
 // buildKnockEvent fills in and signs a make_knock template, mirroring
@@ -384,10 +378,11 @@ func buildKnockEvent(tpl *makeJoinResponse, userID, roomID string, now int64, ve
 	if rules.EventFormatV1 {
 		return b.BuildLegacy(serverName, key, version, ids.RandomTxnSuffix())
 	}
-	return b.Build(serverName, key, version)
+	return b.BuildForVersion(serverName, key, version)
 }
 
-// tplEventRefs extracts prev_events/auth_events IDs from a make_join template// event, handling both the plain-array (v3+) and [id, hash] pair (v1/v2) forms.
+// tplEventRefs extracts prev_events/auth_events IDs from a make_join template
+// event, handling both the plain-array (v3+) and [id, hash] pair (v1/v2) forms.
 func tplEventRefs(raw json.RawMessage) (prev, auth []string) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil {

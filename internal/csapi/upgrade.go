@@ -383,7 +383,7 @@ func (a *API) buildAndPersistMemberJoin(ctx context.Context, roomID string, vers
 	}
 	sk := userID
 	b.StateKey = &sk
-	ev, err := b.Build(a.ServerName(), a.Key, version)
+	ev, err := b.BuildForVersion(a.ServerName(), a.Key, version)
 	if err != nil {
 		return err
 	}

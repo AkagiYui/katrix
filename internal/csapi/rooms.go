@@ -2342,7 +2342,7 @@ func (a *API) buildEvent(r *http.Request, auth *homeserver.Auth, roomID string, 
 		sk := stateKey
 		b.StateKey = &sk
 	}
-	return b.Build(a.ServerName(), a.Key, version)
+	return b.BuildForVersion(a.ServerName(), a.Key, version)
 }
 
 // authEventIDs returns the create + sender's m.room.member + power_levels +
