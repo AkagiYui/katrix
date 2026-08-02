@@ -185,8 +185,16 @@ func (a *API) handleEDU(ctx context.Context, origin string, edu json.RawMessage)
 	if err := json.Unmarshal(edu, &e); err != nil {
 		return
 	}
+	// Server ACLs (spec "Server Access Control Lists"): EDUs bound to a room —
+	// typing and read receipts — from a server denied by the room's
+	// m.room.server_acl must be dropped, exactly like PDUs from a banned server.
+	// Presence/device-list/direct-to-device EDUs are not room-scoped and are not
+	// governed by room ACLs.
 	switch e.EduType {
 	case eduTyping:
+		if a.aclDeniesEDURoom(ctx, e.Content, origin) {
+			return
+		}
 		a.applyTypingEDU(ctx, e.Content)
 	case eduPresence:
 		a.applyPresenceEDU(ctx, e.Content)
@@ -205,8 +213,43 @@ func (a *API) handleEDU(ctx context.Context, origin string, edu json.RawMessage)
 		// Read receipts from a remote server (spec receipt federation). They are
 		// persisted in the local receipts store so local users in shared rooms
 		// see them in the ephemeral /sync section.
+		if a.aclDeniesReceiptEDU(ctx, e.Content, origin) {
+			return
+		}
 		a.applyReceiptEDU(ctx, e.Content)
 	}
+}
+
+// aclDeniesEDURoom reports whether an m.typing EDU (which names its room in
+// content) originates from a server banned by that room's server ACL.
+func (a *API) aclDeniesEDURoom(ctx context.Context, content json.RawMessage, origin string) bool {
+	var c struct {
+		RoomID string `json:"room_id"`
+	}
+	if err := json.Unmarshal(content, &c); err != nil || c.RoomID == "" {
+		return false
+	}
+	acl := a.serverACLForRoom(ctx, c.RoomID)
+	return acl != nil && !acl.allows(origin)
+}
+
+// aclDeniesReceiptEDU reports whether an m.receipt EDU (whose rooms are the
+// top-level keys of content) originates from a server banned by any of those
+// rooms' server ACLs. The receipt EDU shape is
+// {room_id: {receipt_type: {user_id: {ts, ...}}}}, so each top-level key is a
+// room.
+func (a *API) aclDeniesReceiptEDU(ctx context.Context, content json.RawMessage, origin string) bool {
+	var rooms map[string]json.RawMessage
+	if err := json.Unmarshal(content, &rooms); err != nil {
+		return false
+	}
+	for roomID := range rooms {
+		acl := a.serverACLForRoom(ctx, roomID)
+		if acl != nil && !acl.allows(origin) {
+			return true
+		}
+	}
+	return false
 }
 
 // applyTypingEDU applies an inbound m.typing EDU to the in-memory typing
