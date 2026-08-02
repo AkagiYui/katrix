@@ -23,11 +23,18 @@ type API struct {
 	// under concurrent clients. Without it two identical concurrent PUTs both
 	// pass the check and fork the room with duplicate events.
 	stateMu sync.Mutex
+	// ssConns tracks per (user, conn_id) sliding-sync connection state: which
+	// rooms have been delivered with initial=true and the subscription config
+	// each room was delivered with. When a client adds a room_subscription for
+	// a room it already saw through a list (or ups its timeline_limit), the
+	// room must be re-delivered with initial=true and the new config so the
+	// client can replace its local copy.
+	ssConns *ssConnStore
 }
 
 // New constructs the CS API surface.
 func New(hs *homeserver.HS) *API {
-	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, hs.Typing)}
+	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, hs.Typing), ssConns: newSSConnStore()}
 	return api
 }
 

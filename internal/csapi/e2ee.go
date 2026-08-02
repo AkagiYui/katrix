@@ -85,7 +85,7 @@ func (a *API) KeysUpload(w http.ResponseWriter, r *http.Request) {
 		// the user's other devices (and /keys/changes to federating servers).
 		_, _ = a.Store.RecordDeviceListChange(r.Context(), auth.UserID, false)
 		a.broadcastDeviceListUpdate(r.Context(), auth.UserID, auth.DeviceID, false)
-		a.Notifier.NotifyUsers(auth.UserID)
+		a.notifyDeviceListPeers(r.Context(), auth.UserID)
 	}
 	// Persist one-time keys.
 	if len(req.OneTimeKeys) > 0 {

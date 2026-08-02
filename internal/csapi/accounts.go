@@ -422,12 +422,7 @@ func (a *API) Logout(w http.ResponseWriter, r *http.Request) {
 		// MSC3890: deleting a device clears its per-device local notification
 		// settings account data (org.matrix.msc3890.local_notification_settings.<device>).
 		_, _ = a.Store.DeleteAccountData(r.Context(), auth.Localpart, "", "org.matrix.msc3890.local_notification_settings."+deviceID)
-		// Record a device-list change (delete) so other devices and federating
-		// servers learn the device is gone (device_lists.left in /sync, and an
-		// m.device_list_update EDU with deleted=true over federation).
-		_, _ = a.Store.RecordDeviceListChange(r.Context(), auth.UserID, true)
-		a.broadcastDeviceListUpdate(r.Context(), auth.UserID, deviceID, true)
-		a.Notifier.NotifyUsers(auth.UserID)
+		a.recordDeviceRemoval(r.Context(), auth.UserID, auth.Localpart, deviceID)
 	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }

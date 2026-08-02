@@ -95,6 +95,58 @@ func (a *API) broadcastDeviceListDelete(ctx context.Context, userID, roomID stri
 	a.fed.BroadcastEDUToRooms(ctx, "m.device_list_update", content, []string{roomID})
 }
 
+// notifyDeviceListPeers wakes the /sync requests of every local user who
+// shares a room with userID. When a user's device list changes (key upload,
+// new login, logout, device deletion), all of their room peers must be told,
+// so the e2ee extension can emit device_lists.changed/left and they re-query
+// /keys/query for the new device set. Without this, a peer with a long-polled
+// sync parked on the notifier would never learn about the change and would
+// keep sharing room keys only with the stale device set (a brand-new device
+// of the changed user would then be left unable to decrypt).
+func (a *API) notifyDeviceListPeers(ctx context.Context, userID string) {
+	rooms, err := a.Store.RoomsForUser(ctx, userID)
+	if err != nil {
+		return
+	}
+	users := map[string]bool{userID: true} // the user's own other devices too
+	for _, roomID := range rooms {
+		members, err := a.Store.JoinedUserIDs(ctx, roomID)
+		if err != nil {
+			continue
+		}
+		for _, u := range members {
+			if !a.IsLocalUser(u) {
+				continue
+			}
+			users[u] = true
+		}
+	}
+	for u := range users {
+		a.Notifier.NotifyUser(u)
+	}
+}
+
+// recordDeviceRemoval records a device-list change after a device is deleted
+// (logout, delete-device). Per the spec, `device_lists.left` in /sync reports
+// users who "no longer share rooms or have stopped uploading device keys" —
+// i.e. users whose whole device list is gone. Deleting one device while the
+// user retains other devices must be reported as `changed`, or clients would
+// (incorrectly) drop the user entirely and stop sharing room keys with the
+// remaining devices. Only when the deletion leaves the user with no devices at
+// all is it reported as `left`.
+func (a *API) recordDeviceRemoval(ctx context.Context, userID, localpart, deviceID string) {
+	devices, err := a.Store.ListDevices(ctx, localpart)
+	if err != nil {
+		return
+	}
+	// DeleteDevice was already called: if the user has no remaining devices,
+	// their whole device list is gone.
+	isDelete := len(devices) == 0
+	_, _ = a.Store.RecordDeviceListChange(ctx, userID, isDelete)
+	a.broadcastDeviceListUpdate(ctx, userID, deviceID, isDelete)
+	a.notifyDeviceListPeers(ctx, userID)
+}
+
 // broadcastPresence queues an m.presence EDU for userID to every remote server
 // sharing a room with the user.
 func (a *API) broadcastPresence(ctx context.Context, userID string, p *storage.PresenceRow) {
