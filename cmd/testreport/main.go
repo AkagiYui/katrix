@@ -348,7 +348,7 @@ type tapFail struct {
 
 func reportTAP(data []byte) {
 	sc := newScanner(data)
-	var ok, notOk int
+	var ok, notOk, expectedFail int
 	var fails []*tapFail
 	var inFail *tapFail
 	for sc.Scan() {
@@ -360,6 +360,13 @@ func reportTAP(data []byte) {
 				inFail = nil
 			} else {
 				notOk++
+				// SyTest tags blacklisted / non-whitelisted tests with
+				// "(expected fail)" in the name and "# TODO expected fail"
+				// after it. Those are known gaps, not regressions; surface
+				// them separately so unexpected failures stand out.
+				if strings.Contains(line, "expected fail") {
+					expectedFail++
+				}
 				name := strings.TrimSpace(strings.Replace(rest, "(expected fail) ", "", 1))
 				if mm := tapNoteRe.FindStringSubmatch(name); mm != nil {
 					name = strings.TrimSpace(mm[1])
@@ -384,15 +391,20 @@ func reportTAP(data []byte) {
 		}
 	}
 	total := ok + notOk
+	unexpected := notOk - expectedFail
 	rate := 0.0
 	if total > 0 {
 		rate = float64(ok) * 100 / float64(total)
 	}
 	fmt.Println("## SyTest results")
 	fmt.Println()
-	fmt.Println("| ok | not ok | total | Pass rate |")
-	fmt.Println("|---|---|---|---|")
-	fmt.Printf("| %d | %d | %d | %.1f%% |\n", ok, notOk, total, rate)
+	// expected-fail rows come from the blacklist / non-whitelist marking in
+	// run-tests.pl; they are known gaps. unexpected failures are the signal.
+	fmt.Println("_not ok = expected fail (known gap) + unexpected fail (regression / new breakage)._")
+	fmt.Println()
+	fmt.Println("| ok | not ok | expected fail | unexpected fail | Pass rate |")
+	fmt.Println("|---|---|---|---|---|")
+	fmt.Printf("| %d | %d | %d | %d | %.1f%% |\n", ok, notOk, expectedFail, unexpected, rate)
 	fmt.Println()
 	printFailTable("Failed tests", failsToDetails(fails))
 }
