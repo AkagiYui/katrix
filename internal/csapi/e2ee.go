@@ -276,6 +276,14 @@ func (a *API) KeysClaim(w http.ResponseWriter, r *http.Request) {
 			if e == nil {
 				claimed = append(claimed, ks...)
 			}
+			// No one-time key left: fall back to the device's unused fallback
+			// key (spec: servers may hand out the fallback key when OTKs run
+			// out so clients can still establish sessions).
+			if len(ks) == 0 {
+				if fk, e := a.Store.ClaimFallbackKey(r.Context(), rq.uid, rq.did, rq.algo); e == nil {
+					claimed = append(claimed, fk...)
+				}
+			}
 		}
 	}
 	out := map[string]map[string]map[string]json.RawMessage{}

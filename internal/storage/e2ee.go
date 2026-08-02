@@ -97,6 +97,35 @@ func (s *Store) ClaimOneTimeKeyByAlgo(ctx context.Context, userID, deviceID, alg
 	}}, nil
 }
 
+// ClaimFallbackKey claims the unused fallback key for a device, if any. Per
+// the spec, when a server has run out of one-time keys for a device it may
+// hand out the fallback key in response to /keys/claim so clients can keep
+// establishing sessions (the fallback key is then re-uploaded by the device).
+func (s *Store) ClaimFallbackKey(ctx context.Context, userID, deviceID, algorithm string) ([]OneTimeKey, error) {
+	var keyID string
+	var keyJSON json.RawMessage
+	err := s.pool.QueryRow(ctx,
+		`UPDATE one_time_keys SET used=TRUE
+		 WHERE ctid IN (
+		   SELECT ctid FROM one_time_keys
+		   WHERE user_id=$1 AND device_id=$2 AND algorithm=$3 AND used=FALSE AND is_fallback=TRUE
+		   ORDER BY ctid ASC
+		   LIMIT 1 FOR UPDATE SKIP LOCKED
+		 )
+		 RETURNING key_id, key_json`,
+		userID, deviceID, algorithm,
+	).Scan(&keyID, &keyJSON)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return []OneTimeKey{{
+		UserID: userID, DeviceID: deviceID, Algorithm: algorithm, KeyID: keyID, KeyJSON: keyJSON,
+	}}, nil
+}
+
 func (s *Store) ClaimOneTimeKeys(ctx context.Context, requests []OneTimeKey) ([]OneTimeKey, error) {
 	var out []OneTimeKey
 	for _, req := range requests {
