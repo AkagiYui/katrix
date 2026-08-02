@@ -50,6 +50,9 @@ jobs:
       - name: run complement
         env:
           COMPLEMENT_SHARE_ENV_PREFIX: PASS_
+          # Optional: comma-separated MSC suite numbers to skip, e.g. "3902"
+          # when a suite is known-broken and should not pollute the baseline.
+          COMPLEMENT_EXCLUDE: ''
         shell: bash
         run: |
           set -o pipefail
@@ -61,7 +64,17 @@ jobs:
           # and the msc2946/msc3030 suites have since been deleted upstream.
           # ./tests/... runs every package regardless, so all current MSC
           # suites (msc2836 ... msc4306) are exercised automatically.
-          go test -json -tags="katrix_blacklist" ./tests/... 2>&1 \
+          # Resolve the package list explicitly because ./tests/... offers no
+          # way to skip a single suite; COMPLEMENT_EXCLUDE (comma-separated
+          # suite numbers) filters the msc*/ directories out of the run.
+          pkgs=$(find ./tests -mindepth 1 -maxdepth 1 -type d | sort)
+          if [ -n "${COMPLEMENT_EXCLUDE}" ]; then
+            for suite in $(echo "${COMPLEMENT_EXCLUDE}" | tr ',' ' '); do
+              pkgs=$(printf '%s\n' "$pkgs" | grep -vE "/msc${suite}$") || true
+            done
+          fi
+          # shellcheck disable=SC2086  # pkgs is word-split on purpose
+          go test -json -tags="katrix_blacklist" $pkgs ./tests 2>&1 \
             | tee /tmp/complement.log
       - name: summary
         if: always()
