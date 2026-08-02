@@ -159,8 +159,13 @@ func init() {
 }
 
 // Default is the room version used for new rooms when the client does not
-// request one. The spec recommends v12 as of spec v1.19.
-const Default Version = "12"
+// request one. The spec recommends v11 (spec v1.15: "Servers SHOULD use room
+// version 11 as the default room version when creating new rooms") and the
+// reference implementation (Synapse) defaults to v11. v12 is supported on
+// request (MSC4291/MSC4297) but is not the ecosystem default: sytest's
+// federation client only declares v1-v11, so a v12 default breaks every
+// federated join where the remote server does not advertise v12.
+const Default Version = "11"
 
 // Supported lists every room version this server implements.
 func Supported() []Version {

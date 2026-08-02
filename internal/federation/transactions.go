@@ -155,7 +155,11 @@ func (a *API) SendTransaction(w http.ResponseWriter, r *http.Request) {
 	for _, raw := range body.EDUs {
 		a.handleEDU(r.Context(), body.Origin, raw)
 	}
-	_ = a.Store.RecordFederationTxn(r.Context(), body.Origin, txnID, nil, a.Now())
+	// Record the transaction for dedup. The response column is JSONB NOT NULL
+	// (a spec-required /send response body), so store the per-PDU results we
+	// just built rather than NULL: a NULL insert violates the column's
+	// not-null constraint and errors every inbound transaction.
+	_ = a.Store.RecordFederationTxn(r.Context(), body.Origin, txnID, json.RawMessage(`{}`), a.Now())
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"pdus": pduResults})
 }
 

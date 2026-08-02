@@ -9,6 +9,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/federation"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/roomver"
 )
 
 // API bundles the Client-Server handlers.
@@ -74,7 +75,7 @@ func (a *API) Capabilities(w http.ResponseWriter, r *http.Request) {
 			"m.set_avatar_url":  map[string]any{"enabled": true},
 			"m.3pid_changes":    map[string]any{"enabled": false},
 			"m.room_versions": map[string]any{
-				"default":   "12",
+				"default":   string(roomver.Default),
 				"available": roomVersionCapabilities(),
 			},
 		},
