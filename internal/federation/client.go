@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strings"
@@ -174,40 +176,136 @@ type RemoteProfile struct {
 	AvatarURL   string `json:"avatar_url"`
 }
 
-// DownloadMedia fetches a media blob from a remote server over federation
-// (GET /_matrix/federation/v1/media/download/{serverName}/{mediaId}). The body
-// is the raw blob; the content type comes from the response headers. Used to
-// lazily fetch remote media when a local client requests it. The server-server
-// endpoint is used (not the client-server /_matrix/media path, which requires
-// an access token) and the request is signed like any other federation call.
-func (c *Client) DownloadMedia(ctx context.Context, serverName, mediaID string) (body []byte, contentType string, err error) {
+// DownloadMedia fetches a media blob from a remote server over federation.
+// Per the server-server spec the media endpoints respond with multipart/mixed
+// (metadata JSON part + media bytes part); we try the /_matrix/media/v3
+// download path first (what most servers and Complement serve), falling back
+// to the legacy /_matrix/federation/v1/media/download path. The body is the
+// media bytes; the content type and upload filename come from the media part's
+// headers. Used to lazily fetch remote media when a local client requests it.
+func (c *Client) DownloadMedia(ctx context.Context, serverName, mediaID string) (body []byte, contentType string, uploadName string, err error) {
 	base := c.serverBaseURL(serverName)
-	url := base + "/_matrix/federation/v1/media/download/" + serverName + "/" + mediaID
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, "", err
+	var lastErr error
+	for _, path := range []string{
+		"/_matrix/media/v3/download/" + url.PathEscape(serverName) + "/" + mediaID,
+		"/_matrix/federation/v1/media/download/" + url.PathEscape(serverName) + "/" + mediaID,
+	} {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+		if err != nil {
+			return nil, "", "", err
+		}
+		// Federation requests are signed; the remote server verifies our signature.
+		// req.Host carries the logical destination server name used in the signature.
+		req.Host = serverName
+		if err := signRequestWith(req, c.originName(), c.key); err != nil {
+			return nil, "", "", err
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		blob, ct, name, perr := parseMediaResponse(resp)
+		resp.Body.Close()
+		if perr != nil {
+			lastErr = perr
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("federation: media from %s: HTTP %d", serverName, resp.StatusCode)
+			continue
+		}
+		return blob, ct, name, nil
 	}
-	// Federation requests are signed; the remote server verifies our signature.
-	// req.Host carries the logical destination server name used in the signature.
-	req.Host = serverName
-	if err := signRequestWith(req, c.originName(), c.key); err != nil {
-		return nil, "", err
+	if lastErr == nil {
+		lastErr = fmt.Errorf("federation: no media endpoint reachable for %s", serverName)
 	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("federation: download media from %s: %w", serverName, err)
-	}
-	defer resp.Body.Close()
+	return nil, "", "", lastErr
+}
+
+// parseMediaResponse extracts the media bytes (and the Content-Type /
+// Content-Disposition filename) from a federation media response. A
+// multipart/mixed body (the server-server spec shape) yields the second part's
+// bytes; a plain body is returned as-is. A non-200 status returns an error.
+func parseMediaResponse(resp *http.Response) (body []byte, contentType, uploadName string, err error) {
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("federation: media from %s: HTTP %d", serverName, resp.StatusCode)
+		return nil, "", "", fmt.Errorf("media: HTTP %d", resp.StatusCode)
 	}
-	body, err = io.ReadAll(io.LimitReader(resp.Body, 50<<20))
-	if err != nil {
-		return nil, "", err
+	ct := resp.Header.Get("Content-Type")
+	if strings.HasPrefix(ct, "multipart/") {
+		// Find the boundary from the Content-Type header.
+		boundary := ""
+		if _, params, perr := mime.ParseMediaType(ct); perr == nil {
+			boundary = params["boundary"]
+		}
+		if boundary == "" {
+			return nil, "", "", fmt.Errorf("media: multipart response without boundary")
+		}
+		mr := multipart.NewReader(resp.Body, boundary)
+		var blob []byte
+		var metaContentType, metaUploadName string
+		for {
+			part, perr := mr.NextPart()
+			if perr == io.EOF {
+				break
+			}
+			if perr != nil {
+				return nil, "", "", perr
+			}
+			pct := part.Header.Get("Content-Type")
+			if strings.HasPrefix(pct, "application/json") {
+				_, _ = io.Copy(io.Discard, part)
+				continue
+			}
+			b, rerr := io.ReadAll(io.LimitReader(part, 50<<20))
+			if rerr != nil {
+				return nil, "", "", rerr
+			}
+			if len(b) == 0 {
+				continue
+			}
+			blob = b
+			metaContentType = pct
+			metaUploadName = filenameFromContentDisposition(part.Header.Get("Content-Disposition"))
+			if metaContentType == "" {
+				metaContentType = "application/octet-stream"
+			}
+		}
+		if len(blob) == 0 {
+			return nil, "", "", fmt.Errorf("media: empty multipart media part")
+		}
+		return blob, metaContentType, metaUploadName, nil
+	}
+	blob, rerr := io.ReadAll(io.LimitReader(resp.Body, 50<<20))
+	if rerr != nil {
+		return nil, "", "", rerr
 	}
 	contentType = resp.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	return body, contentType, nil
+	uploadName = filenameFromContentDisposition(resp.Header.Get("Content-Disposition"))
+	return blob, contentType, uploadName, nil
+}
+
+// filenameFromContentDisposition extracts the filename parameter from a
+// Content-Disposition header (inline; filename="..." / filename*=UTF-8”...).
+func filenameFromContentDisposition(cd string) string {
+	if cd == "" {
+		return ""
+	}
+	for _, part := range strings.Split(cd, ";") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "filename*=UTF-8''") {
+			if dec, err := url.QueryUnescape(strings.TrimPrefix(part, "filename*=UTF-8''")); err == nil {
+				return dec
+			}
+		}
+		if strings.HasPrefix(part, "filename=") {
+			name := strings.TrimPrefix(part, "filename=")
+			name = strings.Trim(name, `"`)
+			return name
+		}
+	}
+	return ""
 }

@@ -12,7 +12,9 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"strconv"
 	"strings"
 
@@ -27,9 +29,11 @@ import (
 
 // RemoteFetcher fetches a media blob from a remote server over federation.
 // The federation Client implements this; the interface decouples media from
-// federation.
+// federation. uploadName is the filename the remote server attached (from its
+// Content-Disposition), preserved so a cached copy serves the same download
+// name.
 type RemoteFetcher interface {
-	DownloadMedia(ctx context.Context, serverName, mediaID string) (body []byte, contentType string, err error)
+	DownloadMedia(ctx context.Context, serverName, mediaID string) (body []byte, contentType string, uploadName string, err error)
 }
 
 // API bundles the content-repository handlers.
@@ -61,12 +65,18 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/media/v3/config", a.RequireAuth(a.Config_))
 	mux.HandleFunc("POST /_matrix/media/v3/upload", a.RequireAuth(a.Upload))
 	mux.HandleFunc("POST /_matrix/client/v1/media/upload", a.RequireAuth(a.Upload))
+	// The client/v1 download/thumbnail endpoints are authenticated. The legacy
+	// /_matrix/media/v3 variants are unauthenticated per the spec (the v3 route
+	// is the older, open content-repository path; the client/v1 route is its
+	// authenticated replacement). The v3 routes must stay open so servers can
+	// also fetch each other's media over the client path with a federation
+	// signature.
 	mux.HandleFunc("GET /_matrix/client/v1/media/download/{serverName}/{mediaID}", a.RequireAuth(a.Download))
-	mux.HandleFunc("GET /_matrix/media/v3/download/{serverName}/{mediaID}", a.RequireAuth(a.Download))
+	mux.HandleFunc("GET /_matrix/media/v3/download/{serverName}/{mediaID}", a.Download)
 	mux.HandleFunc("GET /_matrix/client/v1/media/download/{serverName}/{mediaID}/{fileName}", a.RequireAuth(a.Download))
-	mux.HandleFunc("GET /_matrix/media/v3/download/{serverName}/{mediaID}/{fileName}", a.RequireAuth(a.Download))
+	mux.HandleFunc("GET /_matrix/media/v3/download/{serverName}/{mediaID}/{fileName}", a.Download)
 	mux.HandleFunc("GET /_matrix/client/v1/media/thumbnail/{serverName}/{mediaID}", a.RequireAuth(a.Thumbnail))
-	mux.HandleFunc("GET /_matrix/media/v3/thumbnail/{serverName}/{mediaID}", a.RequireAuth(a.Thumbnail))
+	mux.HandleFunc("GET /_matrix/media/v3/thumbnail/{serverName}/{mediaID}", a.Thumbnail)
 	// Async upload (MSC2246): reserve a media ID, then upload the blob to it.
 	mux.HandleFunc("POST /_matrix/media/v1/create", a.RequireAuth(a.CreateMedia))
 	mux.HandleFunc("PUT /_matrix/media/v3/upload/{serverName}/{mediaID}", a.RequireAuth(a.UploadAsync))
@@ -189,7 +199,8 @@ func (a *API) Download(w http.ResponseWriter, r *http.Request) {
 // request whose serverName names another server is rejected with 404 (the
 // requesting server is expected to fetch it from the origin itself). Unlike
 // the client endpoint there is no lazy remote fetch, and the legacy
-// no-serverName form is treated as local media.
+// no-serverName form is treated as local media. Per the spec the response is
+// multipart/mixed: a metadata JSON part followed by the media bytes part.
 func (a *API) FedDownload(w http.ResponseWriter, r *http.Request) {
 	serverName := r.PathValue("serverName")
 	if serverName == "" {
@@ -199,7 +210,50 @@ func (a *API) FedDownload(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrNotFound("media not found"))
 		return
 	}
-	a.serveDownload(w, r, serverName, r.PathValue("mediaID"), r.PathValue("fileName"), false)
+	a.serveFedMedia(w, r, r.PathValue("mediaID"), r.PathValue("fileName"))
+}
+
+// serveFedMedia writes a federation media response (download or thumbnail) as
+// multipart/mixed per the server-server spec: the first part is an
+// application/json metadata object (currently empty), the second part carries
+// the media bytes with its Content-Type and Content-Disposition. A media that
+// was reserved but not yet uploaded returns M_NOT_YET_UPLOADED.
+func (a *API) serveFedMedia(w http.ResponseWriter, r *http.Request, mediaID, fileName string) {
+	if _, err := a.Store.PendingMedia(r.Context(), mediaID); err == nil {
+		httpx.WriteError(w, httpx.NewError(http.StatusGatewayTimeout, "M_NOT_YET_UPLOADED", "the media has not yet been uploaded"))
+		return
+	}
+	f, meta, err := a.backend.Download(r.Context(), mediaID)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("media not found"))
+		return
+	}
+	defer f.Close()
+	name := meta.UploadName
+	if fileName != "" {
+		name = fileName
+	}
+	w.Header().Set("Cache-Control", "public,max-age=86400")
+	mw := multipart.NewWriter(w)
+	w.Header().Set("Content-Type", "multipart/mixed; boundary="+mw.Boundary())
+	// Part 1: metadata (spec: an empty JSON object today).
+	metaPart, err := mw.CreatePart(textproto.MIMEHeader{"Content-Type": {"application/json"}})
+	if err != nil {
+		return
+	}
+	if _, err := metaPart.Write([]byte(`{}`)); err != nil {
+		return
+	}
+	// Part 2: the media bytes.
+	part, err := mw.CreatePart(textproto.MIMEHeader{
+		"Content-Type":        {meta.ContentType},
+		"Content-Disposition": {fmt.Sprintf("inline; filename=%q", name)},
+	})
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(part, f)
+	_ = mw.Close()
 }
 
 // serveDownload is the shared download path for the client and federation
@@ -250,6 +304,8 @@ func (a *API) Thumbnail(w http.ResponseWriter, r *http.Request) {
 // FedThumbnail handles GET /_matrix/federation/v1/media/thumbnail/... (the
 // server-server media thumbnail endpoint). As with FedDownload the media must
 // be local to this server; the legacy no-serverName form is treated as local.
+// The response is multipart/mixed (metadata JSON part + thumbnail part) per the
+// server-server spec.
 func (a *API) FedThumbnail(w http.ResponseWriter, r *http.Request) {
 	serverName := r.PathValue("serverName")
 	if serverName == "" {
@@ -259,7 +315,61 @@ func (a *API) FedThumbnail(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrNotFound("media not found"))
 		return
 	}
-	a.serveThumbnail(w, r, serverName, r.PathValue("mediaID"), false)
+	a.serveFedThumbnail(w, r, r.PathValue("mediaID"))
+}
+
+// serveFedThumbnail serves a federation thumbnail as multipart/mixed: the
+// metadata part (empty JSON) followed by the thumbnail bytes part.
+func (a *API) serveFedThumbnail(w http.ResponseWriter, r *http.Request, mediaID string) {
+	if _, err := a.Store.PendingMedia(r.Context(), mediaID); err == nil {
+		httpx.WriteError(w, httpx.NewError(http.StatusGatewayTimeout, "M_NOT_YET_UPLOADED", "the media has not yet been uploaded"))
+		return
+	}
+	q := r.URL.Query()
+	width, _ := strconv.Atoi(q.Get("width"))
+	height, _ := strconv.Atoi(q.Get("height"))
+	method := q.Get("method")
+	if method == "" {
+		method = "scale"
+	}
+	if width <= 0 || height <= 0 {
+		httpx.WriteError(w, httpx.ErrMissingParam("width and height required"))
+		return
+	}
+	// Resolve the thumbnail (cached or freshly generated).
+	var out *thumbResult
+	if t, err := a.backend.GetThumbnail(r.Context(), mediaID, width, height, method); err == nil {
+		out = &thumbResult{data: t.Data, contentType: t.ContentType}
+	} else {
+		gen, err := a.generateThumbnail(r.Context(), mediaID, width, height, method)
+		if err != nil {
+			httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_UNKNOWN", "cannot generate thumbnail: "+err.Error()))
+			return
+		}
+		_ = a.backend.SaveThumbnail(r.Context(), storage.ThumbnailRow{
+			MediaID: mediaID, Width: width, Height: height, Method: method,
+			ContentType: gen.contentType, Size: int64(len(gen.data)), Data: gen.data,
+		})
+		out = &gen
+	}
+	w.Header().Set("Cache-Control", "public,max-age=86400")
+	mw := multipart.NewWriter(w)
+	w.Header().Set("Content-Type", "multipart/mixed; boundary="+mw.Boundary())
+	metaPart, err := mw.CreatePart(textproto.MIMEHeader{"Content-Type": {"application/json"}})
+	if err != nil {
+		return
+	}
+	if _, err := metaPart.Write([]byte(`{}`)); err != nil {
+		return
+	}
+	part, err := mw.CreatePart(textproto.MIMEHeader{
+		"Content-Type": {out.contentType},
+	})
+	if err != nil {
+		return
+	}
+	_, _ = part.Write(out.data)
+	_ = mw.Close()
 }
 
 // serveThumbnail is the shared thumbnail path for the client and federation
@@ -320,14 +430,14 @@ func (a *API) cacheRemote(ctx context.Context, serverName, mediaID string) error
 		return fmt.Errorf("remote media fetching disabled")
 	}
 	metrics.Counters.MediaRemoteFetch.Add(1)
-	body, contentType, err := a.remote.DownloadMedia(ctx, serverName, mediaID)
+	body, contentType, uploadName, err := a.remote.DownloadMedia(ctx, serverName, mediaID)
 	if err != nil {
 		metrics.Counters.MediaRemoteFetchErrors.Add(1)
 		return err
 	}
 	now := a.Now()
 	// Store the blob via the backend's Upload path with the remote origin set.
-	if _, err := a.backend.UploadRemote(ctx, bytes.NewReader(body), contentType, "", serverName, mediaID, now); err != nil {
+	if _, err := a.backend.UploadRemote(ctx, bytes.NewReader(body), contentType, uploadName, serverName, mediaID, now); err != nil {
 		return err
 	}
 	return nil

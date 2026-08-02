@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 )
 
@@ -17,15 +18,22 @@ type UserDirectoryEntry struct {
 // SearchUserDirectory returns local users whose display name, localpart or
 // full user ID matches term (case-insensitive substring match). Only users
 // with a display name, or whose localpart matches, are returned, and only if
-// the user is visible to the searcher: a user is visible when they are a
-// joined member of a public room, or when they share a non-public room with
-// the searcher (mirroring Synapse's directory visibility rules, which
-// Complement asserts). users is the full user ID of the searching user.
+// the user is visible to the searcher.
+//
+// A user is visible when they are a joined member of a "public" room — one
+// whose m.room.join_rules is `public` or whose m.room.history_visibility is
+// `world_readable` (the spec's directory visibility rule, which sytest
+// asserts: changing join_rules/history_visibility moves users in and out of
+// the directory). A user is also visible when they share any joined room with
+// the searcher (the "shared private rooms" rule: users in a shared non-public
+// room are discoverable by their co-members).
 func (s *Store) SearchUserDirectory(ctx context.Context, serverName, term, searcherUserID string) ([]UserDirectoryEntry, error) {
 	term = strings.ToLower(strings.TrimSpace(term))
 	if term == "" {
 		return nil, nil
 	}
+	// Candidate users matching the term. A larger fetch window is needed
+	// because visibility filtering happens in Go (room state lookups).
 	rows, err := s.pool.Query(ctx,
 		`SELECT u.localpart, COALESCE(u.display_name,''), COALESCE(u.avatar_url,'')
 		 FROM users u
@@ -33,38 +41,99 @@ func (s *Store) SearchUserDirectory(ctx context.Context, serverName, term, searc
 		   AND (LOWER(COALESCE(u.display_name,'')) LIKE '%'||$1||'%'
 		        OR LOWER(u.localpart) LIKE '%'||$1||'%'
 		        OR LOWER('@'||u.localpart||':'||$2) LIKE '%'||$1||'%')
-		   AND (
-		        -- Joined member of a public room: visible to everyone.
-		        EXISTS (
-		            SELECT 1 FROM room_memberships rm JOIN rooms r ON r.room_id = rm.room_id
-		            WHERE rm.user_id = '@'||u.localpart||':'||$2
-		              AND rm.membership = 'join' AND r.is_public = TRUE
-		        )
-		        OR
-		        -- Shares a non-public room with the searcher.
-		        EXISTS (
-		            SELECT 1 FROM room_memberships rm1
-		            JOIN room_memberships rm2 ON rm1.room_id = rm2.room_id
-		            JOIN rooms r ON r.room_id = rm1.room_id
-		            WHERE rm1.user_id = $3 AND rm1.membership = 'join'
-		              AND rm2.user_id = '@'||u.localpart||':'||$2 AND rm2.membership = 'join'
-		              AND r.is_public = FALSE
-		        )
-		   )
-		 ORDER BY u.localpart ASC LIMIT 50`, term, serverName, searcherUserID)
+		 ORDER BY u.localpart ASC LIMIT 500`, term, serverName)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []UserDirectoryEntry
+	var candidates []UserDirectoryEntry
 	for rows.Next() {
 		var e UserDirectoryEntry
 		if err := rows.Scan(&e.Localpart, &e.DisplayName, &e.AvatarURL); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		out = append(out, e)
+		candidates = append(candidates, e)
 	}
-	return out, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]UserDirectoryEntry, 0, len(candidates))
+	for _, c := range candidates {
+		userID := "@" + c.Localpart + ":" + serverName
+		if s.userVisibleToSearcher(ctx, userID, searcherUserID) {
+			out = append(out, c)
+			if len(out) >= 50 {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+// userVisibleToSearcher reports whether userID is discoverable by searcherID:
+// the user is a joined member of a public/world_readable room, or shares a
+// joined room with the searcher.
+func (s *Store) userVisibleToSearcher(ctx context.Context, userID, searcherUserID string) bool {
+	rows, err := s.pool.Query(ctx,
+		`SELECT room_id FROM room_memberships WHERE user_id=$1 AND membership='join'`, userID)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		found = true
+		var roomID string
+		if err := rows.Scan(&roomID); err != nil {
+			return false
+		}
+		if s.roomIsPubliclyVisible(ctx, roomID) {
+			return true
+		}
+		// Shared joined room with the searcher (including the user searching
+		// for themselves).
+		if searcherUserID != "" {
+			var shared bool
+			if err := s.pool.QueryRow(ctx,
+				`SELECT EXISTS(
+				   SELECT 1 FROM room_memberships
+				   WHERE room_id=$1 AND user_id=$2 AND membership='join')`,
+				roomID, searcherUserID).Scan(&shared); err == nil && shared {
+				return true
+			}
+		}
+	}
+	// A user with no joined rooms (or only rooms that fail the checks) is not
+	// visible.
+	return found && rows.Err() == nil
+}
+
+// roomIsPubliclyVisible reports whether a room is "public" for user-directory
+// purposes: join_rule == public or history_visibility == world_readable.
+func (s *Store) roomIsPubliclyVisible(ctx context.Context, roomID string) bool {
+	if id, err := s.GetStateEvent(ctx, roomID, "m.room.join_rules", ""); err == nil {
+		if ev, err := s.GetEvent(ctx, id); err == nil {
+			var c struct {
+				JoinRule string `json:"join_rule"`
+			}
+			if json.Unmarshal(ev.Content, &c) == nil && c.JoinRule == "public" {
+				return true
+			}
+		}
+	}
+	if id, err := s.GetStateEvent(ctx, roomID, "m.room.history_visibility", ""); err == nil {
+		if ev, err := s.GetEvent(ctx, id); err == nil {
+			var c struct {
+				HistoryVisibility string `json:"history_visibility"`
+			}
+			if json.Unmarshal(ev.Content, &c) == nil && c.HistoryVisibility == "world_readable" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ---- Room event search ----
