@@ -128,6 +128,106 @@ func (a *API) ResolveRemoteAlias(ctx context.Context, alias string) (string, err
 	return a.client.queryRemoteDirectory(ctx, dom, alias)
 }
 
+// KnockRemoteRoom knocks userID on roomID by federating with the server(s) in
+// via (falling back to the room ID's domain when none is given), per the
+// MSC2409 knock flow: GET make_knock for an unsigned template, sign it with
+// our own key, PUT it as send_knock, then persist the returned room state
+// locally so the user's /sync shows the knocked room. The via server list is
+// tried in order, falling back to the next server when one refuses.
+func (a *API) KnockRemoteRoom(ctx context.Context, userID, roomID string, via []string) error {
+	dest := pickJoinDestination(roomID, via)
+	if dest == "" {
+		return fmt.Errorf("federation: cannot determine a server to knock %s from", roomID)
+	}
+	candidates := append([]string{}, via...)
+	if !containsStr(candidates, dest) {
+		candidates = append(candidates, dest)
+	}
+	var lastErr error
+	for _, cand := range candidates {
+		if cand == "" {
+			continue
+		}
+		if err := a.knockRemoteRoomFrom(ctx, userID, roomID, cand); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+// knockRemoteRoomFrom performs a single make_knock + send_knock cycle against
+// one server and ingests the resulting room view.
+func (a *API) knockRemoteRoomFrom(ctx context.Context, userID, roomID, dest string) error {
+	tpl, err := a.client.makeKnock(ctx, dest, roomID, userID)
+	if err != nil {
+		return err
+	}
+	version := roomver.Version(tpl.RoomVersion)
+	if version == "" {
+		version = roomver.Default
+	}
+	rules, ok := roomver.Get(version)
+	if !ok {
+		return fmt.Errorf("federation: unsupported room version %q from %s", version, dest)
+	}
+	ev, err := buildKnockEvent(tpl, userID, roomID, a.Now(), version, rules, a.Key, a.ServerName())
+	if err != nil {
+		return err
+	}
+	state, err := a.client.sendKnock(ctx, dest, roomID, userID, ev)
+	if err != nil {
+		return err
+	}
+	return a.ingestRemoteKnock(ctx, roomID, version, rules, ev, state)
+}
+
+// ingestRemoteKnock persists the room view returned by send_knock: the room
+// row, the delivered knock_room_state PDUs and the knock event itself, marking
+// the knocking user as knocking so their /sync (and the room's other servers)
+// reflect the pending request.
+func (a *API) ingestRemoteKnock(ctx context.Context, roomID string, version roomver.Version, rules roomver.Rules, ev *events.Event, state []json.RawMessage) error {
+	// The create event anchors the room; refuse to build a room view on an
+	// unverifiable create event.
+	if !a.stateContainsVerifiableCreate(ctx, state, rules) {
+		return fmt.Errorf("federation: could not verify m.room.create in send_knock state")
+	}
+	exists, _ := a.Store.RoomExists(ctx, roomID)
+	if !exists {
+		_ = a.Store.CreateRoom(ctx, storage.Room{
+			RoomID: roomID, Version: string(version),
+			Creator: creatorFromState(state), CreatedTS: a.Now(),
+		})
+	}
+	// Insert the knock event first so its forward-extremity bookkeeping runs on
+	// a clean slate; the delivered state PDUs are inserted afterwards (their
+	// extremities are reset by SeedRemoteJoin).
+	knockRow := &storage.EventRow{
+		EventID: ev.EventID(), RoomID: roomID, Type: ev.Type(), Sender: ev.Sender(),
+		Depth: ev.Depth(), OriginServerTS: ev.OriginServerTS(),
+		Content: ev.Content(), RawJSON: ev.Raw(),
+		AuthEvents: ev.AuthEvents(), PrevEvents: ev.PrevEvents(),
+	}
+	if sk, ok := ev.StateKey(); ok {
+		knockRow.StateKey = sk
+	}
+	if _, err := a.Store.InsertEvent(ctx, knockRow); err != nil {
+		return fmt.Errorf("federation: persist knock event: %w", err)
+	}
+	stateRows := a.persistRemotePDUs(ctx, roomID, rules, state)
+	if err := eventstate.SeedRemoteJoin(ctx, a.Store, roomID, rules, knockRow, stateRows); err != nil {
+		return fmt.Errorf("federation: seed remote room state: %w", err)
+	}
+	// Mark the knocking user as knocking.
+	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
+		RoomID: roomID, UserID: ev.Sender(), Membership: "knock",
+		EventID: ev.EventID(), StreamOrdering: knockRow.StreamOrdering, Depth: ev.Depth(),
+	})
+	a.notifyRoomMembers(ctx, roomID)
+	return nil
+}
+
 // SendRemoteInvite delivers a local invite to the invitee's server via
 // PUT /_matrix/federation/v2/invite/{roomID}/{eventID}, per the spec's
 // "inviting a user to a room" flow. The v2 body is an envelope carrying the
@@ -260,8 +360,34 @@ func buildJoinEvent(tpl *makeJoinResponse, userID, roomID string, now int64, ver
 	return ev, err
 }
 
-// tplEventRefs extracts prev_events/auth_events IDs from a make_join template
-// event, handling both the plain-array (v3+) and [id, hash] pair (v1/v2) forms.
+// buildKnockEvent fills in and signs a make_knock template, mirroring
+// buildJoinEvent but producing an m.room.member(knock) event (MSC2409).
+func buildKnockEvent(tpl *makeJoinResponse, userID, roomID string, now int64, version roomver.Version, rules roomver.Rules, key *crypto.SigningKey, serverName string) (*events.Event, error) {
+	prev, auth := tplEventRefs(tpl.Event)
+	content := tplEventContent(tpl.Event)
+	if len(content) == 0 {
+		content = json.RawMessage(`{"membership":"knock"}`)
+	}
+	b := events.Builder{
+		Type:           "m.room.member",
+		Sender:         userID,
+		RoomID:         roomID,
+		Content:        content,
+		Depth:          tplEventDepth(tpl.Event),
+		OriginServerTS: tplEventTS(tpl.Event, now),
+		PrevEvents:     prev,
+		AuthEvents:     auth,
+		Origin:         serverName,
+	}
+	sk := userID
+	b.StateKey = &sk
+	if rules.EventFormatV1 {
+		return b.BuildLegacy(serverName, key, version, ids.RandomTxnSuffix())
+	}
+	return b.Build(serverName, key, version)
+}
+
+// tplEventRefs extracts prev_events/auth_events IDs from a make_join template// event, handling both the plain-array (v3+) and [id, hash] pair (v1/v2) forms.
 func tplEventRefs(raw json.RawMessage) (prev, auth []string) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil {
@@ -417,6 +543,79 @@ func (c *Client) sendJoin(ctx context.Context, dest, roomID, userID string, ev *
 		return nil, fmt.Errorf("federation: decode send_join from %s: %w", dest, err)
 	}
 	return &out, nil
+}
+
+// makeKnock performs GET /_matrix/federation/v1/make_knock/{roomID}/{userID}
+// against dest, returning the unsigned knock template event + room version
+// (MSC2409). Same response shape as make_join.
+func (c *Client) makeKnock(ctx context.Context, dest, roomID, userID string) (*makeJoinResponse, error) {
+	url := c.serverBaseURL(dest) + "/_matrix/federation/v1/make_knock/" + roomID + "/" + userID
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Host = dest
+	if err := signRequestWith(req, c.originName(), c.key); err != nil {
+		return nil, err
+	}
+	metrics.Counters.FedOutboundRequests.Add(1)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("federation: make_knock %s: %w", dest, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("federation: make_knock %s: HTTP %d", dest, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, err
+	}
+	var out makeJoinResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("federation: decode make_knock from %s: %w", dest, err)
+	}
+	if len(out.Event) == 0 {
+		return nil, fmt.Errorf("federation: make_knock from %s returned no event", dest)
+	}
+	return &out, nil
+}
+
+// sendKnock performs PUT /_matrix/federation/v1/send_knock/{roomID}/{eventID}
+// against dest with the signed knock event, returning the delivered room state
+// (the `knock_room_state` list, which must contain the m.room.create event).
+func (c *Client) sendKnock(ctx context.Context, dest, roomID, userID string, ev *events.Event) ([]json.RawMessage, error) {
+	url := c.serverBaseURL(dest) + "/_matrix/federation/v1/send_knock/" + roomID + "/" + urlPathEscape(ev.EventID())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(ev.Raw()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = dest
+	if err := signRequestWith(req, c.originName(), c.key); err != nil {
+		return nil, err
+	}
+	metrics.Counters.FedOutboundRequests.Add(1)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("federation: send_knock %s: %w", dest, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("federation: send_knock %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		KnockRoomState []json.RawMessage `json:"knock_room_state"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("federation: decode send_knock from %s: %w", dest, err)
+	}
+	return out.KnockRoomState, nil
 }
 
 // queryRemoteDirectory resolves a room alias on a remote server via GET

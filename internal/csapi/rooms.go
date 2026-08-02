@@ -25,6 +25,7 @@ import (
 func (a *API) registerRooms(mux *http.ServeMux) {
 	mux.HandleFunc("POST /_matrix/client/v3/createRoom", a.RequireUserAuth(a.CreateRoom))
 	mux.HandleFunc("POST /_matrix/client/v3/join/{roomIDOrAlias}", a.RequireAuth(a.JoinRoom))
+	mux.HandleFunc("POST /_matrix/client/v3/knock/{roomIDOrAlias}", a.RequireAuth(a.KnockRoom))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/join", a.RequireAuth(a.RoomJoin))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/leave", a.RequireAuth(a.RoomLeave))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/invite", a.RequireAuth(a.RoomInvite))
@@ -243,6 +244,67 @@ func (a *API) JoinRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"room_id": roomID})
+}
+
+// KnockRoom handles POST /_matrix/client/v3/knock/{roomIDOrAlias}. A knock is a
+// membership request to a room with join_rule knock/knock_restricted: the user
+// does not join, they request entry (spec "Knocking on rooms"). The knock is
+// delivered to the room's servers like any membership event. For a remote room
+// the knock is performed via the make_knock/send_knock federation flow. The
+// response echoes the knocked room (the room_version is not part of the CS
+// response body; a 200 with `{"room_id": ...}` is the success shape).
+func (a *API) KnockRoom(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	roomIDOrAlias := r.PathValue("roomIDOrAlias")
+	via := joinVia(r)
+	roomID := a.resolveRoomIDOrAlias(r.Context(), roomIDOrAlias)
+	if roomID == "" && strings.HasPrefix(roomIDOrAlias, "#") {
+		// Remote alias: resolve it over federation on the alias's own domain
+		// server, then knock the resolved room via that server.
+		if a.fed != nil {
+			if id, err := a.fed.ResolveRemoteAlias(r.Context(), roomIDOrAlias); err == nil && id != "" {
+				roomID = id
+				if dom := ids.DomainOf(roomIDOrAlias); dom != "" && (len(via) == 0 || via[0] == "") {
+					via = append([]string{dom}, via...)
+				}
+			}
+		}
+	}
+	if roomID == "" {
+		httpx.WriteError(w, httpx.ErrNotFound("unknown room"))
+		return
+	}
+	if err := a.knockRoom(r, auth, roomID, via); err != nil {
+		writeRoomErr(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"room_id": roomID})
+}
+
+// knockRoom performs a knock for the authenticated user: a local knock (auth
+// rules + persist the m.room.member(knock) event) when the room is known
+// locally, or a federated knock (make_knock/send_knock against a remote server,
+// MSC2409) when it is not. The knock's reason (and any other custom content)
+// is carried in the member event content.
+func (a *API) knockRoom(r *http.Request, auth *homeserver.Auth, roomID string, via []string) error {
+	extra := joinCustomContent(r)
+	if _, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
+		content := map[string]any{"membership": rooms.MembershipKnock}
+		for k, v := range extra {
+			content[k] = v
+		}
+		_, err := a.sendMemberEventWithContent(r, auth, roomID, auth.UserID, content)
+		return err
+	}
+	// Not a local room: federated knock (make_knock/send_knock against a remote
+	// server, then persist the delivered room view as a knock).
+	if a.fed != nil {
+		if err := a.fed.KnockRemoteRoom(r.Context(), auth.UserID, roomID, via); err != nil {
+			return newRoomError(http.StatusNotFound, "M_NOT_FOUND", err.Error())
+		}
+		return nil
+	}
+	return newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
 }
 
 // RoomJoin handles POST /_matrix/client/v3/rooms/{roomID}/join.

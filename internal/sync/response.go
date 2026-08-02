@@ -89,7 +89,10 @@ type DeviceLists struct {
 type RoomsResp struct {
 	Join   map[string]JoinedRoom  `json:"join,omitempty"`
 	Invite map[string]InvitedRoom `json:"invite,omitempty"`
-	Leave  map[string]LeftRoom    `json:"leave,omitempty"`
+	// Knock (MSC2409): rooms the user has knocked on. The knock is delivered
+	// like an invite but under `knock_state` (the room's stripped state).
+	Knock map[string]KnockedRoom `json:"knock,omitempty"`
+	Leave map[string]LeftRoom    `json:"leave,omitempty"`
 	// Peek (MSC2753): rooms the calling device has peeks into without joining
 	// (world_readable only). Peeked rooms appear only in the sync of the device
 	// that peeked them, never in other devices' or users' syncs.
@@ -124,6 +127,12 @@ type RoomSummary struct {
 // InvitedRoom is a room the user is invited to.
 type InvitedRoom struct {
 	InviteState StateSet `json:"invite_state"`
+}
+
+// KnockedRoom is a room the user has knocked on (MSC2409). The state is
+// delivered under `knock_state` (mirroring the invite section's `invite_state`).
+type KnockedRoom struct {
+	KnockState StateSet `json:"knock_state"`
 }
 
 // LeftRoom is a room the user has left/been banned from.
@@ -319,6 +328,7 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	rooms := RoomsResp{
 		Join:   map[string]JoinedRoom{},
 		Invite: map[string]InvitedRoom{},
+		Knock:  map[string]KnockedRoom{},
 		Leave:  map[string]LeftRoom{},
 		Peek:   map[string]JoinedRoom{},
 	}
@@ -369,6 +379,15 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 				continue
 			}
 			rooms.Invite[roomID] = e.buildInvitedRoom(ctx, roomID)
+		}
+	}
+
+	// Rooms the user has knocked on (membership=knock, MSC2409). Knock rooms are
+	// delivered like invites but under `knock` with a `knock_state` section.
+	knocked, err := e.store.KnockedRooms(ctx, opts.UserID)
+	if err == nil {
+		for _, roomID := range knocked {
+			rooms.Knock[roomID] = e.buildKnockedRoom(ctx, roomID)
 		}
 	}
 
@@ -974,6 +993,28 @@ func (e *Engine) buildInvitedRoom(ctx context.Context, roomID string) InvitedRoo
 		ir.InviteState.Events = append(ir.InviteState.Events, se.RawJSON)
 	}
 	return ir
+}
+
+// buildKnockedRoom constructs the KnockedRoom section for a room the user has
+// knocked on (MSC2409): the room's current state events under `knock_state`
+// (mirroring the invite section's `invite_state`).
+func (e *Engine) buildKnockedRoom(ctx context.Context, roomID string) KnockedRoom {
+	kr := KnockedRoom{}
+	stateRows, err := e.store.GetState(ctx, roomID)
+	if err == nil {
+		ids := make([]string, 0, len(stateRows))
+		for _, s := range stateRows {
+			ids = append(ids, s.EventID)
+		}
+		evs, _ := e.store.EventsByIDs(ctx, ids)
+		for _, se := range evs {
+			kr.KnockState.Events = append(kr.KnockState.Events, se.RawJSON)
+		}
+	}
+	if kr.KnockState.Events == nil {
+		kr.KnockState.Events = []json.RawMessage{}
+	}
+	return kr
 }
 
 // buildLeftRoom constructs the LeftRoom section. The timeline is capped at the

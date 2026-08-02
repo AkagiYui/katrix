@@ -59,6 +59,7 @@ func (a *API) registerTransactions(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /_matrix/federation/v1/send_leave/{roomID}/{eventID}", a.SendLeaveV1)
 	// MSC2409 knock: PUT /_matrix/federation/v1/send_knock/{roomID}/{eventID}.
 	mux.HandleFunc("PUT /_matrix/federation/v1/send_knock/{roomID}/{eventID}", a.SendKnock)
+	mux.HandleFunc("GET /_matrix/federation/v1/make_knock/{roomID}/{userID}", a.MakeKnock)
 	mux.HandleFunc("GET /_matrix/federation/v1/make_join/{roomID}/{userID}", a.MakeJoin)
 	mux.HandleFunc("GET /_matrix/federation/v1/make_leave/{roomID}/{userID}", a.MakeLeave)
 	mux.HandleFunc("GET /_matrix/federation/v1/event_auth/{roomID}/{eventID}", a.EventAuth)
@@ -570,9 +571,50 @@ func (a *API) SendLeaveV1(w http.ResponseWriter, r *http.Request) {
 
 // SendKnock handles PUT /_matrix/federation/v1/send_knock/{roomID}/{eventID}
 // (MSC2409). It validates that the event is a self-knock and persists it,
-// returning the resolved state + auth chain.
+// returning the room's state as `knock_room_state` (which must include the
+// m.room.create event). Unlike the v1 send_join/send_leave endpoints the
+// send_knock response is a plain JSON object (not the [code, body] array).
 func (a *API) SendKnock(w http.ResponseWriter, r *http.Request) {
-	a.sendMembershipV1(w, r, "knock")
+	a.ingestRemoteMember(w, r, "knock")
+}
+
+// MakeKnock handles GET /_matrix/federation/v1/make_knock/{roomID}/{userID}
+// (MSC2409). It returns an unsigned m.room.member(knock) template event (with
+// prev_events/auth_events/depth anchored at the room's current DAG tip) that
+// the knocking server signs and submits via send_knock.
+func (a *API) MakeKnock(w http.ResponseWriter, r *http.Request) {
+	roomID := r.PathValue("roomID")
+	userID := r.PathValue("userID")
+	room, err := a.Store.GetRoom(r.Context(), roomID)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
+		return
+	}
+	latest, _ := a.Store.LatestEvent(r.Context(), roomID)
+	var prev []string
+	depth := int64(1)
+	if latest != nil {
+		prev = []string{latest.EventID}
+		depth = latest.Depth + 1
+	}
+	authIDs := a.memberAuthIDs(r, roomID, userID)
+	template := map[string]any{
+		"type":             "m.room.member",
+		"state_key":        userID,
+		"sender":           userID,
+		"room_id":          roomID,
+		"origin":           a.ServerName(),
+		"origin_server_ts": a.Now(),
+		"depth":            depth,
+		"prev_events":      prev,
+		"auth_events":      authIDs,
+		"content":          map[string]string{"membership": "knock"},
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"origin":       a.ServerName(),
+		"room_version": room.Version,
+		"event":        template,
+	})
 }
 
 // sendMembershipV1 is the shared v1 send_membership handler (legacy array
@@ -1106,6 +1148,26 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 	// remote server can sync device lists for its users sharing this room.
 	if wantMembership == "join" {
 		a.broadcastLocalDeviceListsToRoom(r.Context(), ev.RoomID)
+	}
+	// Re-broadcast the accepted membership event to the room's other servers
+	// (spec transaction delivery: a server that receives an event must forward
+	// it to every server with users in the room). The send_knock/send_join
+	// handshake reaches only this server; the room's remaining servers (e.g. a
+	// third server whose user is joined) must still learn of the membership
+	// change so their syncing users see it.
+	if ev.Type == "m.room.member" && ev.StateKey != nil {
+		if e, err := events.New(eventJSON, version); err == nil {
+			a.BroadcastPDUToRoom(r.Context(), ev.RoomID, e)
+		}
+	}
+	// Per the spec (MSC2409) the send_knock response carries the room's state
+	// as `knock_room_state` (MUST include m.room.create) rather than the
+	// send_join `state`/`auth_chain` shape.
+	if wantMembership == "knock" {
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{
+			"knock_room_state": statePDUs,
+		})
+		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"origin":     a.ServerName(),

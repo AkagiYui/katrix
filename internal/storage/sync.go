@@ -222,6 +222,25 @@ func (s *Store) InvitedRooms(ctx context.Context, userID string) ([]string, erro
 	return out, rows.Err()
 }
 
+// KnockedRooms returns room IDs the user has knocked on (MSC2409).
+func (s *Store) KnockedRooms(ctx context.Context, userID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT room_id FROM room_memberships WHERE user_id=$1 AND membership='knock'`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // LeftRooms returns room IDs the user has left (leave or ban).
 // LeftRooms returns the room IDs the user has left (membership leave/ban).
 // On incremental sync (since>0) only rooms left after `since` are reported: a

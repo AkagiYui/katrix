@@ -273,6 +273,11 @@ func authorizeMember(rules roomver.Rules, sender, stateKey string, content json.
 		}
 		return nil
 	case MembershipKnock:
+		// Per the spec (room v7 auth rules): a knock is allowed only when the
+		// room version supports knocking, the join_rule is knock (or
+		// knock_restricted), the sender knocks for themself, and the sender's
+		// current membership is not ban, invite or join. A user who is already
+		// joined, invited or banned cannot knock.
 		if !rules.KnockingAllowed {
 			return fmt.Errorf("rooms: knocking not allowed in this room version")
 		}
@@ -283,7 +288,10 @@ func authorizeMember(rules roomver.Rules, sender, stateKey string, content json.
 		if sender != stateKey {
 			return fmt.Errorf("rooms: only self may knock")
 		}
-		if targetMembership == MembershipBan {
+		switch targetMembership {
+		case MembershipJoin, MembershipInvite:
+			return fmt.Errorf("rooms: cannot knock when already a member of the room")
+		case MembershipBan:
 			return fmt.Errorf("rooms: banned user cannot knock")
 		}
 		return nil
