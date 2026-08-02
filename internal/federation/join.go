@@ -41,6 +41,25 @@ type sendJoinResponse struct {
 	ServersInRoom  []string          `json:"servers_in_room,omitempty"`
 }
 
+// fedHTTPError is a federation request failure carrying the remote server's
+// HTTP status, so callers can distinguish a rejection (403) from a not-found
+// (404). A remote server refusing a join/membership transition (e.g. a room
+// with join_rule knock) should surface to the client as the same 403.
+type fedHTTPError struct {
+	code int
+	msg  string
+}
+
+func (e *fedHTTPError) Error() string { return e.msg }
+
+// HTTPCode returns the remote server's HTTP status code.
+func (e *fedHTTPError) HTTPCode() int { return e.code }
+
+// newFedHTTPError builds a fedHTTPError for a non-2xx federation response.
+func newFedHTTPError(code int, msg string) error {
+	return &fedHTTPError{code: code, msg: msg}
+}
+
 // JoinRemoteRoom joins userID to roomID by federating with the server(s) in
 // via (falling back to the room ID's domain when none is given). It performs
 // GET make_join for an unsigned template, signs it with our own key, PUTs it
@@ -132,9 +151,10 @@ func (a *API) ResolveRemoteAlias(ctx context.Context, alias string) (string, err
 // via (falling back to the room ID's domain when none is given), per the
 // MSC2409 knock flow: GET make_knock for an unsigned template, sign it with
 // our own key, PUT it as send_knock, then persist the returned room state
-// locally so the user's /sync shows the knocked room. The via server list is
+// locally so the user's /sync shows the knocked room. reason (when non-empty)
+// is merged into the member event content per the spec. The via server list is
 // tried in order, falling back to the next server when one refuses.
-func (a *API) KnockRemoteRoom(ctx context.Context, userID, roomID string, via []string) error {
+func (a *API) KnockRemoteRoom(ctx context.Context, userID, roomID string, via []string, reason string) error {
 	dest := pickJoinDestination(roomID, via)
 	if dest == "" {
 		return fmt.Errorf("federation: cannot determine a server to knock %s from", roomID)
@@ -148,7 +168,7 @@ func (a *API) KnockRemoteRoom(ctx context.Context, userID, roomID string, via []
 		if cand == "" {
 			continue
 		}
-		if err := a.knockRemoteRoomFrom(ctx, userID, roomID, cand); err == nil {
+		if err := a.knockRemoteRoomFrom(ctx, userID, roomID, cand, reason); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -159,7 +179,7 @@ func (a *API) KnockRemoteRoom(ctx context.Context, userID, roomID string, via []
 
 // knockRemoteRoomFrom performs a single make_knock + send_knock cycle against
 // one server and ingests the resulting room view.
-func (a *API) knockRemoteRoomFrom(ctx context.Context, userID, roomID, dest string) error {
+func (a *API) knockRemoteRoomFrom(ctx context.Context, userID, roomID, dest, reason string) error {
 	tpl, err := a.client.makeKnock(ctx, dest, roomID, userID)
 	if err != nil {
 		return err
@@ -172,7 +192,7 @@ func (a *API) knockRemoteRoomFrom(ctx context.Context, userID, roomID, dest stri
 	if !ok {
 		return fmt.Errorf("federation: unsupported room version %q from %s", version, dest)
 	}
-	ev, err := buildKnockEvent(tpl, userID, roomID, a.Now(), version, rules, a.Key, a.ServerName())
+	ev, err := buildKnockEvent(tpl, userID, roomID, a.Now(), version, rules, a.Key, a.ServerName(), reason)
 	if err != nil {
 		return err
 	}
@@ -355,12 +375,23 @@ func buildJoinEvent(tpl *makeJoinResponse, userID, roomID string, now int64, ver
 }
 
 // buildKnockEvent fills in and signs a make_knock template, mirroring
-// buildJoinEvent but producing an m.room.member(knock) event (MSC2409).
-func buildKnockEvent(tpl *makeJoinResponse, userID, roomID string, now int64, version roomver.Version, rules roomver.Rules, key *crypto.SigningKey, serverName string) (*events.Event, error) {
+// buildJoinEvent but producing an m.room.member(knock) event (MSC2409). A
+// non-empty reason (a defined knock request field) is merged into the member
+// content.
+func buildKnockEvent(tpl *makeJoinResponse, userID, roomID string, now int64, version roomver.Version, rules roomver.Rules, key *crypto.SigningKey, serverName string, reason string) (*events.Event, error) {
 	prev, auth := tplEventRefs(tpl.Event)
 	content := tplEventContent(tpl.Event)
 	if len(content) == 0 {
 		content = json.RawMessage(`{"membership":"knock"}`)
+	}
+	if reason != "" {
+		var c map[string]any
+		if json.Unmarshal(content, &c) == nil {
+			c["reason"] = reason
+			if merged, err := json.Marshal(c); err == nil {
+				content = merged
+			}
+		}
 	}
 	b := events.Builder{
 		Type:           "m.room.member",
@@ -481,7 +512,8 @@ func (c *Client) makeJoin(ctx context.Context, dest, roomID, userID string) (*ma
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("federation: make_join %s: HTTP %d", dest, resp.StatusCode)
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: make_join %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))))
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
@@ -527,7 +559,7 @@ func (c *Client) sendJoin(ctx context.Context, dest, roomID, userID string, ev *
 	if resp.StatusCode != http.StatusOK {
 		// Surface the remote error body when the server returned one.
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("federation: send_join %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg)))
+		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: send_join %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))))
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {

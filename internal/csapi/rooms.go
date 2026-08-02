@@ -312,12 +312,28 @@ func (a *API) KnockRoom(w http.ResponseWriter, r *http.Request) {
 // knockRoom performs a knock for the authenticated user: a local knock (auth
 // rules + persist the m.room.member(knock) event) when the room is known
 // locally, or a federated knock (make_knock/send_knock against a remote server,
-// MSC2409) when it is not. The knock's reason (and any other custom content)
-// is carried in the member event content.
+// MSC2409) when it is not. The knock's reason (a defined top-level request
+// field, per the spec) and any other custom content are carried in the member
+// event content.
 func (a *API) knockRoom(r *http.Request, auth *homeserver.Auth, roomID string, via []string) error {
+	// The knock reason is a defined request field (unlike a join's, which is
+	// arbitrary custom content): read it before joinCustomContent consumes the
+	// body, then carry it into the member content so the room's members see why
+	// the user knocked.
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if r.Body != nil {
+		if data, err := io.ReadAll(r.Body); err == nil && len(data) > 0 {
+			_ = json.Unmarshal(data, &body)
+		}
+	}
 	extra := joinCustomContent(r)
 	if _, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
 		content := map[string]any{"membership": rooms.MembershipKnock}
+		if body.Reason != "" {
+			content["reason"] = body.Reason
+		}
 		for k, v := range extra {
 			content[k] = v
 		}
@@ -327,7 +343,7 @@ func (a *API) knockRoom(r *http.Request, auth *homeserver.Auth, roomID string, v
 	// Not a local room: federated knock (make_knock/send_knock against a remote
 	// server, then persist the delivered room view as a knock).
 	if a.fed != nil {
-		if err := a.fed.KnockRemoteRoom(r.Context(), auth.UserID, roomID, via); err != nil {
+		if err := a.fed.KnockRemoteRoom(r.Context(), auth.UserID, roomID, via, body.Reason); err != nil {
 			return newRoomError(http.StatusNotFound, "M_NOT_FOUND", err.Error())
 		}
 		return nil
@@ -461,12 +477,13 @@ func (a *API) RoomKick(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A kick is a forced leave: the target must be a member (join) of the room,
-	// or an invited user whose invite is being rescinded (per the spec, kicking
-	// a user who has only been invited is how an inviter rescinds the invite).
-	// Kicking a user who has already left is forbidden (403) — the spec says
-	// "users cannot kick users who have already left the room".
+	// an invited user whose invite is being rescinded (per the spec, kicking
+	// a user who has only been invited is how an inviter rescinds the invite),
+	// or a knocking user whose knock is being rejected. Kicking a user who has
+	// already left is forbidden (403) — the spec says "users cannot kick users
+	// who have already left the room".
 	m, err := a.Store.GetMembership(r.Context(), roomID, req.UserID)
-	if err != nil || (m.Membership != rooms.MembershipJoin && m.Membership != rooms.MembershipInvite) {
+	if err != nil || (m.Membership != rooms.MembershipJoin && m.Membership != rooms.MembershipInvite && m.Membership != rooms.MembershipKnock) {
 		httpx.WriteError(w, httpx.ErrForbidden("user is not in the room"))
 		return
 	}
@@ -1815,6 +1832,12 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 	if a.fed != nil {
 		partial, err := a.fed.JoinRemoteRoom(r.Context(), auth.UserID, roomID, via)
 		if err != nil {
+			// A remote rejection (e.g. the room's join_rule is knock, or the
+			// user is banned) surfaces as the remote's 403; an unreachable or
+			// unknown room is a 404.
+			if code := fedHTTPStatusCode(err); code == http.StatusForbidden {
+				return nil, newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
+			}
 			return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", err.Error())
 		}
 		// The join makes the user's device list newly visible to the room's
@@ -1829,6 +1852,16 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 		return nil, nil
 	}
 	return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
+}
+
+// fedHTTPStatusCode extracts the HTTP status from a federation error, returning
+// 0 when the error does not carry one.
+func fedHTTPStatusCode(err error) int {
+	var ferr interface{ HTTPCode() int }
+	if errors.As(err, &ferr) {
+		return ferr.HTTPCode()
+	}
+	return 0
 }
 
 // joinCustomContent extracts arbitrary fields from a join request body,
