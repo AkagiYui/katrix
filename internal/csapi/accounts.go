@@ -43,8 +43,16 @@ type registerRequest struct {
 }
 
 // wellKnown returns the m.homeserver well_known object injected into
-// register/login success responses so clients can discover their base URL.
+// register/login success responses so clients can discover their base URL. It
+// returns nil (and is therefore omitted) when the server is not configured to
+// serve the client well-known (ServeClientWellKnown): an implicitly-defaulted
+// public_base_url is not guaranteed reachable, and advertising it would redirect
+// well-known-respecting clients (e.g. the matrix-rust-sdk with
+// respect_login_well_known) to a broken URL.
 func (a *API) wellKnown() map[string]any {
+	if !a.Config.ServeClientWellKnown {
+		return nil
+	}
 	return map[string]any{
 		"m.homeserver": map[string]string{"base_url": a.Config.PublicBaseURL},
 	}
@@ -170,13 +178,16 @@ func (a *API) upgradeGuestAccount(w http.ResponseWriter, r *http.Request, body [
 		httpx.WriteError(w, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"user_id":      a.UserID(localpart),
 		"home_server":  a.ServerName(),
-		"well_known":   a.wellKnown(),
 		"device_id":    deviceID,
 		"access_token": login.AccessToken,
-	})
+	}
+	if wk := a.wellKnown(); wk != nil {
+		resp["well_known"] = wk
+	}
+	httpx.WriteJSON(w, http.StatusOK, resp)
 }
 
 func (a *API) completeRegistration(w http.ResponseWriter, r *http.Request, localpart string, req registerRequest) {
@@ -206,7 +217,9 @@ func (a *API) completeRegistration(w http.ResponseWriter, r *http.Request, local
 	resp := map[string]any{
 		"user_id":     a.UserID(localpart),
 		"home_server": a.ServerName(),
-		"well_known":  a.wellKnown(),
+	}
+	if wk := a.wellKnown(); wk != nil {
+		resp["well_known"] = wk
 	}
 	if !req.InhibitLogin {
 		deviceID := req.DeviceID
@@ -242,13 +255,16 @@ func (a *API) completeGuestRegistration(w http.ResponseWriter, r *http.Request, 
 		httpx.WriteError(w, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"user_id":      a.UserID(localpart),
 		"home_server":  a.ServerName(),
-		"well_known":   a.wellKnown(),
 		"device_id":    deviceID,
 		"access_token": login.AccessToken,
-	})
+	}
+	if wk := a.wellKnown(); wk != nil {
+		resp["well_known"] = wk
+	}
+	httpx.WriteJSON(w, http.StatusOK, resp)
 }
 
 // RegisterAvailable handles GET /_matrix/client/v3/register/available.
@@ -363,9 +379,11 @@ func (a *API) Login(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"user_id":      a.UserID(localpart),
 		"home_server":  a.ServerName(),
-		"well_known":   a.wellKnown(),
 		"device_id":    deviceID,
 		"access_token": login.AccessToken,
+	}
+	if wk := a.wellKnown(); wk != nil {
+		resp["well_known"] = wk
 	}
 	if login.RefreshToken != "" {
 		resp["refresh_token"] = login.RefreshToken

@@ -52,7 +52,13 @@ export KATRIX_SERVER_NAME="$SERVER_NAME"
 export KATRIX_DATABASE_DSN="postgres://postgres@localhost/katrix?host=$SOCKDIR&sslmode=disable"
 export KATRIX_SIGNING_KEY_PATH="$KATRIX_DIR/signing.key"
 export KATRIX_MEDIA_STORE_PATH="$KATRIX_DIR/media"
-export KATRIX_PUBLIC_BASE_URL="https://$SERVER_NAME"
+# Public base URL is deliberately NOT set: Complement runs the homeserver
+# behind a mitmproxy reverse proxy, so the reachable client URL is the proxy's
+# host port, not "https://$SERVER_NAME". Without public_base_url, katrix (like
+# Synapse's complement image) serves no client well-known, and clients keep
+# their working proxy URL instead of being redirected to an unreachable one
+# (the matrix-rust-sdk's respect_login_well_known would switch homeserver URLs
+# and fail every request).
 export KATRIX_LISTEN_CLIENT=":8008"
 export KATRIX_LISTEN_FEDERATION=":8448"
 export KATRIX_FEDERATION_ENABLED="${KATRIX_FEDERATION_ENABLED:-true}"

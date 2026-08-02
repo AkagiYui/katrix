@@ -59,8 +59,15 @@ func (a *API) Versions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// WellKnownClient handles GET /.well-known/matrix/client.
+// WellKnownClient handles GET /.well-known/matrix/client. Per Synapse's
+// serve_client_wellknown semantics, the well-known is only served when
+// public_base_url was configured explicitly; otherwise /.well-known returns 404
+// so clients keep their working (e.g. proxy-provided) base URL.
 func (a *API) WellKnownClient(w http.ResponseWriter, r *http.Request) {
+	if !a.Config.ServeClientWellKnown {
+		httpx.WriteError(w, httpx.ErrNotFound("well-known is not configured"))
+		return
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"m.homeserver": map[string]string{"base_url": a.Config.PublicBaseURL},
 	})

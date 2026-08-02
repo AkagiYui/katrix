@@ -42,6 +42,10 @@ func testAPI(t *testing.T) (*API, *httptest.Server) {
 	cfg := config.Default()
 	cfg.ServerName = "test.katrix"
 	cfg.PublicBaseURL = "https://test.katrix"
+	// The tests assert the well-known is injected into register/login responses;
+	// opt into serving it explicitly (the production default omits it unless
+	// public_base_url is configured through config, see config.Load).
+	cfg.ServeClientWellKnown = true
 	cfg.Registration.Enabled = true
 	cfg.Registration.AllowGuest = true
 

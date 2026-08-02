@@ -18,6 +18,13 @@ type Config struct {
 	ServerName string `yaml:"server_name"`
 	// PublicBaseURL is the externally reachable client base URL.
 	PublicBaseURL string `yaml:"public_base_url"`
+	// ServeClientWellKnown controls whether the m.homeserver well-known block
+	// is served on /.well-known/matrix/client and injected into register/login
+	// responses. Like Synapse, the well-known is only served when public_base_url
+	// has been configured explicitly (the implicit default is not guaranteed to
+	// be reachable — e.g. Complement containers are proxied, and advertising an
+	// internal URL would redirect clients away from their working endpoint).
+	ServeClientWellKnown bool `yaml:"serve_client_wellknown"`
 
 	Listen struct {
 		Client     string `yaml:"client"`     // client + admin API, e.g. ":8008"
@@ -91,11 +98,26 @@ func Default() *Config {
 // Load reads config from path (if non-empty) and applies environment overrides.
 func Load(path string) (*Config, error) {
 	c := Default()
+	// Track whether public_base_url / serve_client_wellknown were configured
+	// explicitly (in YAML). The client well-known is only served when
+	// public_base_url was: the implicit default base URL is not guaranteed
+	// reachable, and advertising it (as Synapse notes) would send clients to a
+	// broken URL.
+	explicitPublicBase := false
+	serveFlagSet := false
 	if path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("config: %w", err)
 		}
+		var raw map[string]any
+		if err := yaml.Unmarshal(data, &raw); err != nil {
+			return nil, fmt.Errorf("config: parse %s: %w", path, err)
+		}
+		if _, ok := raw["public_base_url"]; ok {
+			explicitPublicBase = true
+		}
+		_, serveFlagSet = raw["serve_client_wellknown"]
 		if err := yaml.Unmarshal(data, c); err != nil {
 			return nil, fmt.Errorf("config: parse %s: %w", path, err)
 		}
@@ -103,6 +125,17 @@ func Load(path string) (*Config, error) {
 	applyEnv(c)
 	if c.ServerName == "" {
 		return nil, fmt.Errorf("config: server_name is required")
+	}
+	// An explicit KATRIX_PUBLIC_BASE_URL also counts as an explicit base URL;
+	// an explicit serve flag (YAML or env) always wins.
+	if os.Getenv("KATRIX_PUBLIC_BASE_URL") != "" {
+		explicitPublicBase = true
+	}
+	if envServeFlagSet() {
+		serveFlagSet = true
+	}
+	if explicitPublicBase && !serveFlagSet {
+		c.ServeClientWellKnown = true
 	}
 	return c, nil
 }
@@ -113,6 +146,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("KATRIX_PUBLIC_BASE_URL"); v != "" {
 		c.PublicBaseURL = v
+	}
+	if v := os.Getenv("KATRIX_SERVE_CLIENT_WELLKNOWN"); v != "" {
+		c.ServeClientWellKnown = parseBool(v, c.ServeClientWellKnown)
 	}
 	if v := os.Getenv("KATRIX_DATABASE_DSN"); v != "" {
 		c.Database.DSN = v
@@ -157,4 +193,10 @@ func parseBool(s string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+// envServeFlagSet reports whether KATRIX_SERVE_CLIENT_WELLKNOWN was set in the
+// environment (so an explicit env opt-out wins over the public_base_url default).
+func envServeFlagSet() bool {
+	return os.Getenv("KATRIX_SERVE_CLIENT_WELLKNOWN") != ""
 }
