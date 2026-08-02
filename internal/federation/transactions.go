@@ -179,6 +179,13 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	if err != nil || !exists {
 		return "", false
 	}
+	// Server ACLs (spec "Server Access Control Lists"): an event sent by a
+	// server denied by the room's m.room.server_acl must not be accepted.
+	// The sender's origin is the transaction origin (the server vouching for
+	// the PDU).
+	if acl := a.serverACLForRoom(r.Context(), ev.RoomID); acl != nil && !acl.allows(origin) {
+		return "", false
+	}
 	room, err := a.Store.GetRoom(r.Context(), ev.RoomID)
 	if err != nil {
 		return "", false
@@ -493,6 +500,11 @@ func (a *API) GetEvent(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrNotFound("event not found"))
 		return
 	}
+	// The requested event's room ACL gates the response: a server banned from
+	// the room may not fetch its events (spec server_acl).
+	if a.checkServerACL(w, r, ev.RoomID) {
+		return
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"origin": a.ServerName(),
 		"pdus":   []json.RawMessage{ev.RawJSON},
@@ -502,6 +514,9 @@ func (a *API) GetEvent(w http.ResponseWriter, r *http.Request) {
 // GetState handles GET /_matrix/federation/v1/state/{roomID}.
 func (a *API) GetState(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
+	if a.checkServerACL(w, r, roomID) {
+		return
+	}
 	pdus, _ := a.roomStatePDUs(r, roomID)
 	if pdus == nil {
 		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
@@ -517,6 +532,9 @@ func (a *API) GetState(w http.ResponseWriter, r *http.Request) {
 // GetStateIDs handles GET /_matrix/federation/v1/state_ids/{roomID}.
 func (a *API) GetStateIDs(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
+	if a.checkServerACL(w, r, roomID) {
+		return
+	}
 	stateRows, err := a.Store.GetState(r.Context(), roomID)
 	if err != nil || len(stateRows) == 0 {
 		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
@@ -536,6 +554,9 @@ func (a *API) GetStateIDs(w http.ResponseWriter, r *http.Request) {
 // Backfill handles GET /_matrix/federation/v1/backfill/{roomID}.
 func (a *API) Backfill(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
+	if a.checkServerACL(w, r, roomID) {
+		return
+	}
 	evs, err := a.Store.EventsForRoom(r.Context(), roomID, 0, 0, 50, "b")
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
@@ -564,6 +585,9 @@ func (a *API) Backfill(w http.ResponseWriter, r *http.Request) {
 // plus whether it has members in the room).
 func (a *API) GetMissingEvents(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
+	if a.checkServerACL(w, r, roomID) {
+		return
+	}
 	var req struct {
 		EarliestEvents []string `json:"earliest_events"`
 		LatestEvents   []string `json:"latest_events"`
@@ -690,6 +714,10 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
 		return
 	}
+	// Server ACLs: a banned server may not join (spec server_acl).
+	if a.checkServerACL(w, r, roomID) {
+		return
+	}
 	// Version negotiation (spec: the requesting server may state the room
 	// versions it supports via ?ver=; if none of them match the room's version
 	// the join must be refused with 400 M_INCOMPATIBLE_ROOM_VERSION and the
@@ -790,6 +818,10 @@ func (a *API) MakeKnock(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
 		return
 	}
+	// Server ACLs: a banned server may not knock (spec server_acl).
+	if a.checkServerACL(w, r, roomID) {
+		return
+	}
 	if !requestingServerSupportsVersion(r, room.Version) {
 		httpx.WriteJSON(w, http.StatusBadRequest, map[string]any{
 			"errcode":      "M_INCOMPATIBLE_ROOM_VERSION",
@@ -865,6 +897,9 @@ func (a *API) SendJoin(w http.ResponseWriter, r *http.Request) {
 func (a *API) MakeLeave(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
 	userID := r.PathValue("userID")
+	if a.checkServerACL(w, r, roomID) {
+		return
+	}
 	prev, depth := a.dagTipFor(r.Context(), roomID)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"origin": a.ServerName(),
@@ -931,6 +966,16 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) {
 		OSTS     int64           `json:"origin_server_ts"`
 	}
 	_ = json.Unmarshal(req.Event, &ev)
+
+	// Server ACLs (spec server_acl): refuse an invite when the inviter's server
+	// is banned from the room. The room may not exist yet (the invite creates
+	// the local room view); in that case there is no ACL to consult and the
+	// invite is accepted — the delivered stripped state is the room's truth.
+	if ev.RoomID != "" {
+		if exists, _ := a.Store.RoomExists(r.Context(), ev.RoomID); exists && a.checkServerACL(w, r, ev.RoomID) {
+			return
+		}
+	}
 
 	// The event must be an m.room.member with membership=invite. Unlike
 	// send_join/send_leave, the sender (inviter) and state_key (invitee) differ.
@@ -1149,6 +1194,9 @@ func (a *API) seedRoomStateFromInvite(ctx context.Context, roomID string, rules 
 func (a *API) EventAuth(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
 	eventID := r.PathValue("eventID")
+	if a.checkServerACL(w, r, roomID) {
+		return
+	}
 	if _, err := a.Store.GetEvent(r.Context(), eventID); err != nil {
 		httpx.WriteError(w, httpx.ErrNotFound("event not found"))
 		return
@@ -1261,6 +1309,12 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 		OSTS     int64           `json:"origin_server_ts"`
 	}
 	_ = json.Unmarshal(eventJSON, &ev)
+
+	// Server ACLs (spec server_acl): a server banned from the room may not
+	// join/leave/knock it; refuse before persisting anything.
+	if a.checkServerACL(w, r, ev.RoomID) {
+		return
+	}
 
 	// Resolve room version: prefer the request's room_version, else the stored
 	// room's version, else the default.
