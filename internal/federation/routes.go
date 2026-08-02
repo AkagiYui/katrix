@@ -22,6 +22,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	}
 	mux.HandleFunc("GET /_matrix/federation/v1/version", a.Version)
 	a.registerTransactions(mux)
+	a.registerKeys(mux)
 	a.registerJumpAndHierarchy(mux)
 }
 

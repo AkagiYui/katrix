@@ -108,6 +108,18 @@ type RoomKey struct {
 	KeyData   []byte
 }
 
+// KeyBackupEtag returns the current etag of a user's key backup version.
+func (s *Store) KeyBackupEtag(ctx context.Context, userID string, version int64) (int64, error) {
+	var etag int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(etag,0) FROM key_backup_versions WHERE user_id=$1 AND version=$2 AND NOT deleted`,
+		userID, version).Scan(&etag)
+	if err != nil {
+		return 0, err
+	}
+	return etag, nil
+}
+
 // PutRoomKeys upserts a batch of backed-up room keys, bumping the version etag.
 func (s *Store) PutRoomKeys(ctx context.Context, keys []RoomKey) (int64, error) {
 	if len(keys) == 0 {

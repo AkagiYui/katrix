@@ -119,33 +119,60 @@ func (a *API) PutRoomKeysSession(w http.ResponseWriter, r *http.Request) {
 func (a *API) putRoomKeys(w http.ResponseWriter, r *http.Request, roomID, sessionID string) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	version := parseVersion(r.URL.Query().Get("version"))
-	var req struct {
-		Rooms map[string]struct {
-			Sessions map[string]struct {
-				SessionKey json.RawMessage `json:"session_key"`
-			} `json:"sessions"`
-		} `json:"rooms"`
-	}
 	body, err := readBody(r)
 	if err != nil {
 		httpx.WriteError(w, err)
 		return
 	}
-	if len(body) > 0 {
-		_ = json.Unmarshal(body, &req)
-	}
 	var keys []storage.RoomKey
-	for rid, room := range req.Rooms {
-		if roomID != "" {
-			rid = roomID
-		}
-		for sid, sess := range room.Sessions {
-			if sessionID != "" {
-				sid = sessionID
+	if sessionID != "" && roomID != "" {
+		// Single-session endpoint: the request body IS the backup key object
+		// (first_message_index, forwarded_count, is_verified, session_data), not
+		// the bulk {rooms: {...}} envelope used by PUT /room_keys/keys.
+		keys = append(keys, storage.RoomKey{
+			UserID: auth.UserID, Version: version, RoomID: roomID, SessionID: sessionID, KeyData: body,
+		})
+		// Per the spec, uploading a key for a room/session that already exists
+		// only replaces it when the new key is "better": a verified key beats an
+		// unverified one; ties on is_verified are broken by a lower
+		// first_message_index; further ties by a lower forwarded_count. Otherwise
+		// the existing key is kept.
+		if existing, err := a.Store.GetRoomKeys(r.Context(), auth.UserID, version, roomID, sessionID); err == nil && len(existing) > 0 {
+			if !replacementWins(existing[0].KeyData, body) {
+				// Keep the existing key: no-op, but still return the current etag.
+				if etag, err := a.Store.KeyBackupEtag(r.Context(), auth.UserID, version); err == nil {
+					httpx.WriteJSON(w, http.StatusOK, map[string]any{
+						"version": version,
+						"etag":    strconv.FormatInt(etag, 10),
+						"count":   0,
+					})
+					return
+				}
 			}
-			keys = append(keys, storage.RoomKey{
-				UserID: auth.UserID, Version: version, RoomID: rid, SessionID: sid, KeyData: sess.SessionKey,
-			})
+		}
+	} else {
+		var req struct {
+			Rooms map[string]struct {
+				Sessions map[string]struct {
+					SessionKey json.RawMessage `json:"session_key"`
+				} `json:"sessions"`
+			} `json:"rooms"`
+		}
+		if len(body) > 0 {
+			_ = json.Unmarshal(body, &req)
+		}
+		for rid, room := range req.Rooms {
+			if roomID != "" {
+				rid = roomID
+			}
+			for sid, sess := range room.Sessions {
+				if sessionID != "" {
+					sid = sessionID
+				}
+				keys = append(keys, storage.RoomKey{
+					UserID: auth.UserID, Version: version, RoomID: rid, SessionID: sid, KeyData: sess.SessionKey,
+				})
+			}
 		}
 	}
 	etag, err := a.Store.PutRoomKeys(r.Context(), keys)
@@ -158,6 +185,39 @@ func (a *API) putRoomKeys(w http.ResponseWriter, r *http.Request, roomID, sessio
 		"etag":    strconv.FormatInt(etag, 10),
 		"count":   len(keys),
 	})
+}
+
+// backupKeyFields extracts the replacement-comparison fields from a backup key
+// object. Missing fields default to zero values.
+func backupKeyFields(data []byte) (isVerified bool, firstMessageIndex, forwardedCount int64) {
+	var k struct {
+		IsVerified        bool  `json:"is_verified"`
+		FirstMessageIndex int64 `json:"first_message_index"`
+		ForwardedCount    int64 `json:"forwarded_count"`
+	}
+	_ = json.Unmarshal(data, &k)
+	return k.IsVerified, k.FirstMessageIndex, k.ForwardedCount
+}
+
+// replacementWins reports whether the new backup key should replace the
+// existing one per the spec's replacement rules: a verified key replaces an
+// unverified one; on equal is_verified the key with the lower
+// first_message_index wins; on equal is_verified and first_message_index the
+// key with the lower forwarded_count wins. Identical keys keep the existing
+// entry.
+func replacementWins(existing, incoming []byte) bool {
+	ev, efmi, efc := backupKeyFields(existing)
+	iv, ifmi, ifc := backupKeyFields(incoming)
+	if iv != ev {
+		return iv && !ev
+	}
+	if ifmi != efmi {
+		return ifmi < efmi
+	}
+	if ifc != efc {
+		return ifc < efc
+	}
+	return false
 }
 
 // GetRoomKeys handles GET /_matrix/client/v3/room_keys/keys.
@@ -181,6 +241,22 @@ func (a *API) getRoomKeys(w http.ResponseWriter, r *http.Request, roomID, sessio
 	keys, err := a.Store.GetRoomKeys(r.Context(), auth.UserID, version, roomID, sessionID)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	// Single-session endpoint: the response IS the backup key object (the same
+	// shape the PUT accepted), not the {rooms: {...}} envelope.
+	if roomID != "" && sessionID != "" {
+		if len(keys) == 0 {
+			httpx.WriteError(w, httpx.ErrNotFound("key not found"))
+			return
+		}
+		var obj map[string]any
+		_ = json.Unmarshal(keys[0].KeyData, &obj)
+		if obj == nil {
+			obj = map[string]any{}
+		}
+		obj["session_id"] = sessionID
+		httpx.WriteJSON(w, http.StatusOK, obj)
 		return
 	}
 	// Group into rooms -> sessions -> session_key.

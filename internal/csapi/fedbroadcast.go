@@ -75,6 +75,26 @@ func (a *API) broadcastDeviceListForUser(ctx context.Context, userID string) {
 	}
 }
 
+// broadcastDeviceListDelete queues an m.device_list_update EDU marked deleted
+// (device_lists.left) to every remote server sharing roomID. It is used when a
+// local user leaves/ban/unbans a room: the user's own room list no longer
+// contains the room (the membership row was already updated), so the generic
+// broadcastDeviceListUpdate would miss the room's servers. The room's other
+// members (e.g. on the remote server) still need to learn the user is no
+// longer sharing the room.
+func (a *API) broadcastDeviceListDelete(ctx context.Context, userID, roomID string) {
+	if a.fed == nil {
+		return
+	}
+	content := map[string]any{
+		"user_id":   userID,
+		"device_id": "",
+		"deleted":   true,
+		"stream_id": a.Now(),
+	}
+	a.fed.BroadcastEDUToRooms(ctx, "m.device_list_update", content, []string{roomID})
+}
+
 // broadcastPresence queues an m.presence EDU for userID to every remote server
 // sharing a room with the user.
 func (a *API) broadcastPresence(ctx context.Context, userID string, p *storage.PresenceRow) {

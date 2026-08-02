@@ -715,6 +715,9 @@ func (a *API) ingestRemoteJoin(ctx context.Context, roomID string, version roomv
 		RoomID: roomID, UserID: ev.Sender(), Membership: "join",
 		EventID: ev.EventID(), StreamOrdering: joinRow.StreamOrdering, Depth: ev.Depth(),
 	})
+	// Record a device-list change for the joining user so their own devices
+	// learn of the join (they appear in device_lists.changed in /sync).
+	_, _ = a.Store.RecordDeviceListChange(ctx, ev.Sender(), false)
 	a.notifyRoomMembers(ctx, roomID)
 	return nil
 }

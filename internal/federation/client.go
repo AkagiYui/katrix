@@ -1,6 +1,7 @@
 package federation
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
+	"github.com/AkagiYui/katrix/internal/metrics"
 	"github.com/AkagiYui/katrix/internal/storage"
 )
 
@@ -168,6 +170,90 @@ func (c *Client) QueryProfile(ctx context.Context, serverName, userID string) (*
 		return nil, fmt.Errorf("federation: decode profile for %s: %w", userID, err)
 	}
 	return &p, nil
+}
+
+// RemoteKeys is the response to an outbound /user/keys/query: device keys plus
+// cross-signing keys, per user.
+type RemoteKeys struct {
+	DeviceKeys      map[string]map[string]json.RawMessage `json:"device_keys"`
+	MasterKeys      map[string]json.RawMessage            `json:"master_keys"`
+	SelfSigningKeys map[string]json.RawMessage            `json:"self_signing_keys"`
+}
+
+// QueryRemoteKeys performs POST /_matrix/federation/v1/user/keys/query against
+// serverName for the given users, returning their device keys. Used by the
+// client-server /keys/query handler to resolve remote users' device keys.
+func (c *Client) QueryRemoteKeys(ctx context.Context, serverName string, users map[string][]string) (*RemoteKeys, error) {
+	url := c.serverBaseURL(serverName) + "/_matrix/federation/v1/user/keys/query"
+	body, _ := json.Marshal(map[string]any{"device_keys": users})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = serverName
+	if err := signRequestWith(req, c.originName(), c.key); err != nil {
+		return nil, err
+	}
+	metrics.Counters.FedOutboundRequests.Add(1)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("federation: keys/query %s: %w", serverName, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("federation: keys/query %s: HTTP %d: %s", serverName, resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	var out RemoteKeys
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("federation: decode keys/query from %s: %w", serverName, err)
+	}
+	return &out, nil
+}
+
+// ClaimRemoteKeys performs POST /_matrix/federation/v1/user/keys/claim against
+// serverName for the given one-time key requests (user -> device -> algorithm).
+func (c *Client) ClaimRemoteKeys(ctx context.Context, serverName string, oneTimeKeys map[string]map[string]string) (map[string]map[string]map[string]json.RawMessage, error) {
+	url := c.serverBaseURL(serverName) + "/_matrix/federation/v1/user/keys/claim"
+	body, _ := json.Marshal(map[string]any{"one_time_keys": oneTimeKeys})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = serverName
+	if err := signRequestWith(req, c.originName(), c.key); err != nil {
+		return nil, err
+	}
+	metrics.Counters.FedOutboundRequests.Add(1)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("federation: keys/claim %s: %w", serverName, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("federation: keys/claim %s: HTTP %d: %s", serverName, resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		OneTimeKeys map[string]map[string]map[string]json.RawMessage `json:"one_time_keys"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("federation: decode keys/claim from %s: %w", serverName, err)
+	}
+	if out.OneTimeKeys == nil {
+		out.OneTimeKeys = map[string]map[string]map[string]json.RawMessage{}
+	}
+	return out.OneTimeKeys, nil
 }
 
 // RemoteProfile is a remote user's profile data from /query/profile.

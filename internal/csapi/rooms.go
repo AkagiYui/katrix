@@ -1932,7 +1932,7 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 			if mc.Membership == "join" {
 				a.broadcastDeviceListForUser(r.Context(), target)
 			} else {
-				a.broadcastDeviceListUpdate(r.Context(), target, "", true)
+				a.broadcastDeviceListDelete(r.Context(), target, roomID)
 			}
 		}
 	}

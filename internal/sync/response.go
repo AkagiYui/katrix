@@ -472,11 +472,26 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	// peers (initial sync).
 	e.appendPresence(ctx, resp, opts)
 
-	// Device list changes for the syncing user (their own device list updates
-	// surface on their other devices' /sync).
+	// Device list changes for the syncing user. Per the spec, the server only
+	// reports users whose device lists changed AND who share a room with the
+	// syncing user (plus the user's own device list, which surfaces on their
+	// other devices). The `left` list is the exception: it reports users who
+	// just stopped sharing a room with the syncing user, so it passes through
+	// unfiltered (filtering it by current room membership would drop exactly the
+	// users it exists to report).
 	if changed, left, err := e.store.DeviceListChangesSince(ctx, opts.Since.Stream); err == nil {
 		if len(changed) > 0 || len(left) > 0 {
-			resp.DeviceLists = &DeviceLists{Changed: changed, Left: left}
+			peers := e.roomPeers(ctx, opts)
+			peers[opts.UserID] = true // always see your own device-list changes
+			var ch []string
+			for _, u := range changed {
+				if peers[u] {
+					ch = append(ch, u)
+				}
+			}
+			if len(ch) > 0 || len(left) > 0 {
+				resp.DeviceLists = &DeviceLists{Changed: ch, Left: left}
+			}
 		}
 	}
 

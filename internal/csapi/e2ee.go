@@ -131,10 +131,18 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 	for u := range req.DeviceKeys {
 		users = append(users, u)
 	}
-	devKeys, err := a.Store.DeviceKeysForUsers(r.Context(), users)
-	if err != nil {
-		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
-		return
+	// Split the requested users into local and remote. Local keys come from the
+	// store; remote keys are fetched from each remote user's server over
+	// federation (spec: keys/query may ask about remote users, and the server
+	// resolves them by querying the relevant remote server).
+	var localUsers []string
+	remoteByDomain := map[string][]string{}
+	for _, u := range users {
+		if a.IsLocalUser(u) {
+			localUsers = append(localUsers, u)
+		} else if dom := a.userDomain(u); dom != "" {
+			remoteByDomain[dom] = append(remoteByDomain[dom], u)
+		}
 	}
 	out := map[string]map[string]any{}
 	// Ensure every requested user has an entry (empty dict if no keys).
@@ -143,18 +151,44 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 			out[u] = map[string]any{}
 		}
 	}
-	for _, dk := range devKeys {
-		if out[dk.UserID] == nil {
-			out[dk.UserID] = map[string]any{}
+	if len(localUsers) > 0 {
+		devKeys, err := a.Store.DeviceKeysForUsers(r.Context(), localUsers)
+		if err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
 		}
-		devs := out[dk.UserID]
-		filter := req.DeviceKeys[dk.UserID]
-		if len(filter) > 0 && !contains(filter, dk.DeviceID) {
-			continue
+		for _, dk := range devKeys {
+			devs := out[dk.UserID]
+			filter := req.DeviceKeys[dk.UserID]
+			if len(filter) > 0 && !contains(filter, dk.DeviceID) {
+				continue
+			}
+			var keyObj map[string]any
+			_ = json.Unmarshal(dk.KeyJSON, &keyObj)
+			devs[dk.DeviceID] = keyObj
 		}
-		var keyObj map[string]any
-		_ = json.Unmarshal(dk.KeyJSON, &keyObj)
-		devs[dk.DeviceID] = keyObj
+	}
+	// Remote keys: query each remote user's server once (per domain) and merge
+	// the returned device keys into the response.
+	if a.fed != nil {
+		for dom, domUsers := range remoteByDomain {
+			query := map[string][]string{}
+			for _, u := range domUsers {
+				query[u] = req.DeviceKeys[u]
+			}
+			remote, err := a.fed.Client().QueryRemoteKeys(r.Context(), dom, query)
+			if err != nil {
+				continue
+			}
+			for uid, devs := range remote.DeviceKeys {
+				merged := out[uid]
+				for did, keyJSON := range devs {
+					var keyObj map[string]any
+					_ = json.Unmarshal(keyJSON, &keyObj)
+					merged[did] = keyObj
+				}
+			}
+		}
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"device_keys": out})
 }
@@ -175,7 +209,21 @@ func (a *API) KeysClaim(w http.ResponseWriter, r *http.Request) {
 	// an algorithm name and any available key of that algorithm is claimed.
 	type claimReq struct{ uid, did, algo, keyID string }
 	var reqs []claimReq
+	remoteByDomain := map[string]map[string]map[string]string{}
 	for uid, devs := range raw.OneTimeKeys {
+		if !a.IsLocalUser(uid) {
+			// Remote one-time keys are claimed from the user's server over
+			// federation (spec: keys/claim may ask for remote keys).
+			if dom := a.userDomain(uid); dom != "" {
+				m := remoteByDomain[dom]
+				if m == nil {
+					m = map[string]map[string]string{}
+					remoteByDomain[dom] = m
+				}
+				m[uid] = devs
+			}
+			continue
+		}
 		for did, val := range devs {
 			if strings.Contains(val, ":") {
 				algo, id := splitKeyID(val)
@@ -211,6 +259,28 @@ func (a *API) KeysClaim(w http.ResponseWriter, r *http.Request) {
 		}
 		out[k.UserID][k.DeviceID][k.Algorithm+":"+k.KeyID] = k.KeyJSON
 	}
+	// Remote claims: query each remote user's server once (per domain) and merge.
+	if a.fed != nil {
+		for dom, reqBody := range remoteByDomain {
+			remote, err := a.fed.Client().ClaimRemoteKeys(r.Context(), dom, reqBody)
+			if err != nil {
+				continue
+			}
+			for uid, devs := range remote {
+				if out[uid] == nil {
+					out[uid] = map[string]map[string]json.RawMessage{}
+				}
+				for did, keys := range devs {
+					if out[uid][did] == nil {
+						out[uid][did] = map[string]json.RawMessage{}
+					}
+					for kid, keyJSON := range keys {
+						out[uid][did][kid] = keyJSON
+					}
+				}
+			}
+		}
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"one_time_keys": out})
 }
 
@@ -236,7 +306,8 @@ func (a *API) KeysChanges(w http.ResponseWriter, r *http.Request) {
 // SendToDevice handles POST /_matrix/client/v3/sendToDevice/{eventType}/{txnID}.
 // The server only relays to-device messages; it never decrypts. A target device
 // of "*" means "all of the user's devices" and is expanded server-side (used by
-// m.secret.send to fan out a secret to every session).
+// m.secret.send to fan out a secret to every session). Messages to remote users
+// are forwarded to their server as an m.direct_to_device EDU.
 func (a *API) SendToDevice(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	eventType := r.PathValue("eventType")
@@ -249,20 +320,31 @@ func (a *API) SendToDevice(w http.ResponseWriter, r *http.Request) {
 	}
 	var msgs []storage.ToDeviceMessage
 	now := a.Now()
+	// Messages bound for remote users, grouped by their server: {user: {device: content}}.
+	remote := map[string]map[string]map[string]json.RawMessage{}
 	for targetUser, devs := range req.Messages {
+		if !a.IsLocalUser(targetUser) {
+			if dom := a.userDomain(targetUser); dom != "" {
+				m := remote[dom]
+				if m == nil {
+					m = map[string]map[string]json.RawMessage{}
+					remote[dom] = m
+				}
+				m[targetUser] = devs
+			}
+			continue
+		}
 		for targetDevice, content := range devs {
 			if targetDevice == "*" {
 				// Fan out to every device of the target user.
 				userLocalpart := a.LocalpartOf(targetUser)
-				if a.IsLocalUser(targetUser) {
-					devRows, err := a.Store.ListDevices(r.Context(), userLocalpart)
-					if err == nil {
-						for _, d := range devRows {
-							msgs = append(msgs, storage.ToDeviceMessage{
-								TargetUser: targetUser, TargetDevice: d.DeviceID,
-								Sender: auth.UserID, Type: eventType, Content: content, CreatedTS: now,
-							})
-						}
+				devRows, err := a.Store.ListDevices(r.Context(), userLocalpart)
+				if err == nil {
+					for _, d := range devRows {
+						msgs = append(msgs, storage.ToDeviceMessage{
+							TargetUser: targetUser, TargetDevice: d.DeviceID,
+							Sender: auth.UserID, Type: eventType, Content: content, CreatedTS: now,
+						})
 					}
 				}
 				continue
@@ -273,9 +355,24 @@ func (a *API) SendToDevice(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	if err := a.Store.EnqueueToDevice(r.Context(), msgs); err != nil {
-		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
-		return
+	if len(msgs) > 0 {
+		if err := a.Store.EnqueueToDevice(r.Context(), msgs); err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+	}
+	// Forward remote-bound messages to their servers as m.direct_to_device EDUs
+	// (one EDU per destination server, per the spec's direct-to-device flow).
+	if a.fed != nil && len(remote) > 0 {
+		for dom, byUser := range remote {
+			content := map[string]any{
+				"sender":     auth.UserID,
+				"type":       eventType,
+				"message_id": r.PathValue("txnID"),
+				"messages":   byUser,
+			}
+			a.fed.BroadcastDirectToDeviceToServer(r.Context(), dom, content)
+		}
 	}
 	// Wake each target user's parked /sync long-poll so the to-device messages
 	// are delivered promptly (the enqueue also advances the shared sync stream,
@@ -396,6 +493,15 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// userDomain returns the server part of a Matrix user ID ("" when malformed).
+func (a *API) userDomain(userID string) string {
+	i := strings.IndexByte(userID, ':')
+	if i <= 0 {
+		return ""
+	}
+	return userID[i+1:]
 }
 
 // guard against unused import in error paths.

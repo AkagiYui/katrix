@@ -10,6 +10,7 @@ import (
 
 	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/metrics"
+	"github.com/AkagiYui/katrix/internal/storage"
 )
 
 // ---- outbound EDU delivery (spec "Transaction delivery") ----
@@ -19,6 +20,7 @@ const (
 	eduDeviceListUpdate = "m.device_list_update"
 	eduPresence         = "m.presence"
 	eduTyping           = "m.typing"
+	eduDirectToDevice   = "m.direct_to_device"
 )
 
 // BroadcastEDUToRooms queues an EDU for delivery to every remote server that
@@ -193,6 +195,11 @@ func (a *API) handleEDU(ctx context.Context, origin string, edu json.RawMessage)
 		// (device_lists.changed) for its own users who share a room. The change
 		// advances the sync stream, waking long-polls.
 		_ = a.applyDeviceListEDU(ctx, e.Content)
+	case eduDirectToDevice:
+		// Direct-to-device messages (E2EE payloads) are relayed into the local
+		// to-device queues so the target devices receive them on their next
+		// /sync. The server never decrypts.
+		a.applyDirectToDeviceEDU(ctx, e.Content)
 	}
 }
 
@@ -233,20 +240,107 @@ func (a *API) applyPresenceEDU(ctx context.Context, content json.RawMessage) {
 
 // applyDeviceListEDU applies an inbound m.device_list_update EDU: it records a
 // device-list change for the (remote) user in the shared sync stream so local
-// users in shared rooms get device_lists.changed in their next /sync, and
-// wakes those users' long-polls.
+// users in shared rooms get device_lists.changed (or device_lists.left when the
+// EDU marks the user as deleted) in their next /sync, and wakes those users'
+// long-polls. The EDU's `deleted` flag distinguishes a user leaving all shared
+// rooms (device_lists.left) from a device-list change (device_lists.changed).
 func (a *API) applyDeviceListEDU(ctx context.Context, content json.RawMessage) error {
 	var c struct {
-		UserID string `json:"user_id"`
+		UserID  string `json:"user_id"`
+		Deleted *bool  `json:"deleted"`
 	}
 	if err := json.Unmarshal(content, &c); err != nil || c.UserID == "" {
 		return fmt.Errorf("device_list_update missing user_id")
 	}
-	if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, false); err != nil {
+	if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, c.Deleted != nil && *c.Deleted); err != nil {
 		return err
 	}
 	a.wakeSharedRoomLocals(ctx, c.UserID)
 	return nil
+}
+
+// applyDirectToDeviceEDU applies an inbound m.direct_to_device EDU: it
+// enqueues the message for every matching local device so the target device
+// receives it on its next /sync. Per the spec the content carries:
+//
+//	{ sender, type, message_id, messages: { <user_id>: { <device_id>|"*": <body> } } }
+//
+// A "*" device ID fans out to all of the user's devices. The sender must not
+// be a local user (a local sender would have used the client API already).
+func (a *API) applyDirectToDeviceEDU(ctx context.Context, content json.RawMessage) error {
+	var c struct {
+		Sender    string                                `json:"sender"`
+		Type      string                                `json:"type"`
+		MessageID string                                `json:"message_id"`
+		Messages  map[string]map[string]json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(content, &c); err != nil {
+		return fmt.Errorf("direct_to_device: bad content: %w", err)
+	}
+	if c.Sender == "" || c.Type == "" || len(c.Messages) == 0 {
+		return fmt.Errorf("direct_to_device: missing sender/type/messages")
+	}
+	var msgs []storage.ToDeviceMessage
+	for targetUser, devices := range c.Messages {
+		if !a.IsLocalUser(targetUser) {
+			continue
+		}
+		localpart := a.LocalpartOf(targetUser)
+		for targetDevice, msgContent := range devices {
+			if targetDevice == "*" {
+				devRows, err := a.Store.ListDevices(ctx, localpart)
+				if err != nil {
+					continue
+				}
+				for _, d := range devRows {
+					msgs = append(msgs, storage.ToDeviceMessage{
+						TargetUser: targetUser, TargetDevice: d.DeviceID,
+						Sender: c.Sender, Type: c.Type, Content: msgContent, CreatedTS: a.Now(),
+					})
+				}
+				continue
+			}
+			msgs = append(msgs, storage.ToDeviceMessage{
+				TargetUser: targetUser, TargetDevice: targetDevice,
+				Sender: c.Sender, Type: c.Type, Content: msgContent, CreatedTS: a.Now(),
+			})
+		}
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+	if err := a.Store.EnqueueToDevice(ctx, msgs); err != nil {
+		return err
+	}
+	// Wake each target user's parked /sync long-poll so the messages are
+	// delivered promptly (the enqueue also advances the shared sync stream).
+	seen := map[string]bool{}
+	for _, m := range msgs {
+		if !seen[m.TargetUser] {
+			seen[m.TargetUser] = true
+			a.Notifier.NotifyUser(m.TargetUser)
+		}
+	}
+	return nil
+}
+
+// BroadcastDirectToDeviceToServer delivers an m.direct_to_device EDU to the
+// given server. The content is the full EDU content (sender, type, message_id,
+// messages) per the spec; a missing destination (the local server or an empty
+// name) is a no-op.
+func (a *API) BroadcastDirectToDeviceToServer(ctx context.Context, dest string, content map[string]any) {
+	if a == nil || a.Store == nil || dest == "" || dest == a.ServerName() {
+		return
+	}
+	raw, err := json.Marshal(content)
+	if err != nil {
+		return
+	}
+	_ = a.Store.InsertOutboundEDU(ctx, ids.RandomTxnSuffix(), eduDirectToDevice, raw, []string{dest}, a.Now())
+	select {
+	case a.eduWake <- struct{}{}:
+	default:
+	}
 }
 
 // wakeSharedRoomLocals notifies the local users who share a room with userID,
