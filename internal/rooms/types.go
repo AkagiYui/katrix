@@ -139,6 +139,11 @@ type CreateContent struct {
 	Predecessor json.RawMessage `json:"predecessor,omitempty"`
 	Type        string          `json:"type,omitempty"`
 	MSCFederate *bool           `json:"m.federate"`
+	// AdditionalCreators (MSC4289, room version 12): users granted the same
+	// implicit "infinite" power as the creator. They must not appear in the
+	// m.room.power_levels `users` map and cannot be kicked/baned by finite
+	// power levels.
+	AdditionalCreators []string `json:"additional_creators,omitempty"`
 }
 
 // ParseCreate decodes m.room.create content.
@@ -154,6 +159,24 @@ func ParseCreate(raw json.RawMessage) (*CreateContent, error) {
 		c.RoomVersion = roomver.Default
 	}
 	return &c, nil
+}
+
+// IsPrivileged reports whether userID is the room creator or one of the
+// additional creators (MSC4289). Such users hold effectively infinite power in
+// room version 12.
+func (c *CreateContent) IsPrivileged(userID string) bool {
+	if userID == "" {
+		return false
+	}
+	if userID == c.Creator {
+		return true
+	}
+	for _, ac := range c.AdditionalCreators {
+		if ac == userID {
+			return true
+		}
+	}
+	return false
 }
 
 // MemberContent is the parsed m.room.member event content.

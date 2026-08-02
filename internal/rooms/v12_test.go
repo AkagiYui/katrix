@@ -10,8 +10,8 @@ import (
 
 // TestBuildInitialEventsV12DerivesRoomID verifies that building a v12 room
 // produces a create event that omits room_id and a derived room ID of the form
-// "!<url-safe-base64-hash>:server", and that the room ID equals the create
-// event's id with the sigil changed from $ to !.
+// "!<url-safe-base64-hash>" (no server-name suffix, per MSC4291), and that the
+// room ID equals the create event's id with the sigil changed from $ to !.
 func TestBuildInitialEventsV12DerivesRoomID(t *testing.T) {
 	key, err := crypto.GenerateSigningKey("v1")
 	if err != nil {
@@ -19,15 +19,17 @@ func TestBuildInitialEventsV12DerivesRoomID(t *testing.T) {
 	}
 	res, err := BuildInitialEvents(
 		"!placeholder:ignored", roomver.Version("12"),
-		"@alice:test", PresetPublicChat, nil, nil, false,
+		"@alice:test", PresetPublicChat, nil, nil, false, nil,
 		"test", key, 1000,
 	)
 	if err != nil {
 		t.Fatalf("BuildInitialEvents: %v", err)
 	}
 	roomID := res.RoomID
-	if !strings.HasPrefix(roomID, "!") || !strings.HasSuffix(roomID, ":test") {
-		t.Fatalf("room id %q is not a v12 hash id (!hash:server)", roomID)
+	// MSC4291: the v12 room ID is "!" + the unpadded url-safe base64 hash with
+	// no server-name suffix.
+	if !strings.HasPrefix(roomID, "!") || strings.Contains(roomID, ":") {
+		t.Fatalf("room id %q is not a v12 hash id (!hash, no server suffix)", roomID)
 	}
 	if roomID == "!placeholder:ignored" {
 		t.Fatal("room id was not derived from the create hash")
@@ -44,11 +46,6 @@ func TestBuildInitialEventsV12DerivesRoomID(t *testing.T) {
 		t.Fatalf("create event id %q must start with $", createID)
 	}
 	wantRoomID := "!" + strings.TrimPrefix(createID, "$")
-	if !strings.HasSuffix(wantRoomID, ":test") {
-		// v12 event ids (and thus room ids) have no server suffix; the room id
-		// is "!hash:server" per MSC4291 where the server is the creating server.
-		wantRoomID = "!" + strings.TrimPrefix(createID, "$") + ":test"
-	}
 	if roomID != wantRoomID {
 		t.Fatalf("room id %q != derived %q", roomID, wantRoomID)
 	}
@@ -63,7 +60,7 @@ func TestBuildInitialEventsV11KeepsRoomID(t *testing.T) {
 	}
 	res, err := BuildInitialEvents(
 		"!random:test", roomver.Version("11"),
-		"@alice:test", PresetPublicChat, nil, nil, false,
+		"@alice:test", PresetPublicChat, nil, nil, false, nil,
 		"test", key, 1000,
 	)
 	if err != nil {

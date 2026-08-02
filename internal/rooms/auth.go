@@ -39,8 +39,13 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 	if len(content) == 0 {
 		return fmt.Errorf("rooms: empty event content")
 	}
-	// 1. The m.room.create event authorises its own sender as creator.
+	// 1. The m.room.create event authorises its own sender as creator. A second
+	// create event in an already-created room is rejected (spec: the create
+	// event is the genesis event; a room cannot be created twice).
 	if eventType == "m.room.create" {
+		if len(st.Create) > 0 {
+			return fmt.Errorf("rooms: room already has an m.room.create event")
+		}
 		var c CreateContent
 		if err := json.Unmarshal(content, &c); err != nil {
 			return fmt.Errorf("rooms: bad create content: %w", err)
@@ -78,9 +83,10 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 	}
 
 	// userLevel applies the v12 creator privilege: in room version 12 the
-	// creator is exempt from power-level checks (effectively infinite power).
+	// creator (and any additional creators, MSC4289) is exempt from power-level
+	// checks (effectively infinite power).
 	userLevel := func(userID string) int64 {
-		if rules.CreatorPrivileged && userID == create.Creator {
+		if rules.CreatorPrivileged && create.IsPrivileged(userID) {
 			return 1 << 62
 		}
 		return pl.UserLevel(userID)
@@ -238,7 +244,10 @@ func authorizeMember(rules roomver.Rules, sender, stateKey string, content json.
 		if senderLevel < pl.Kick {
 			return fmt.Errorf("rooms: insufficient power to kick")
 		}
-		targetLevel := pl.UserLevel(stateKey)
+		// The target's level uses the same creator-privilege rule as the sender:
+		// a privileged creator/additional creator outranks any finite power, so
+		// no finite-power user may kick them (MSC4289).
+		targetLevel := userLevel(stateKey)
 		if targetLevel >= senderLevel {
 			return fmt.Errorf("rooms: cannot kick user of equal/higher power")
 		}
@@ -256,7 +265,9 @@ func authorizeMember(rules roomver.Rules, sender, stateKey string, content json.
 		if senderLevel < pl.Ban {
 			return fmt.Errorf("rooms: insufficient power to ban")
 		}
-		targetLevel := pl.UserLevel(stateKey)
+		// A privileged creator/additional creator cannot be banned by any finite
+		// power user (MSC4289).
+		targetLevel := userLevel(stateKey)
 		if targetLevel >= senderLevel {
 			return fmt.Errorf("rooms: cannot ban user of equal/higher power")
 		}

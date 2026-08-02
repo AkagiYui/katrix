@@ -3,6 +3,7 @@ package rooms
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/events"
@@ -49,9 +50,15 @@ func InitialPowerLevels(creator string, preset string, override json.RawMessage,
 			"m.room.canonical_alias":    50,
 			"m.room.avatar":             50,
 			"m.room.topic":              50,
-			"m.room.tombstone":          100,
 			"m.room.encryption":         100,
 		},
+	}
+	// Room version 12 (MSC4289) raises the default m.room.tombstone requirement
+	// to PL150 ("a new PL150 tier for tombstoning the room") so that regular
+	// admins at PL100 cannot upgrade the room out from under the creator.
+	pl.Events["m.room.tombstone"] = 100
+	if privilegedCreator {
+		pl.Events["m.room.tombstone"] = 150
 	}
 	// For rooms with privileged creators (v12+, MSC4239) the creator's power is
 	// implicit and the creator is NOT listed in `users`; the map is emitted as
@@ -159,6 +166,7 @@ func BuildInitialEvents(
 	powerOverride json.RawMessage,
 	creationContent json.RawMessage,
 	isDirect bool,
+	invitees []string,
 	serverName string,
 	key *crypto.SigningKey,
 	now int64,
@@ -206,6 +214,29 @@ func BuildInitialEvents(
 			}
 		}
 	}
+
+	// additional_creators (MSC4289, room version 12): users granted the same
+	// implicit power as the creator. The list must be an array of valid user
+	// IDs; anything else is rejected. For a trusted_private_chat direct room the
+	// invited users are implicitly added as additional creators.
+	if rules.CreatorPrivileged {
+		additional, err := validateAdditionalCreators(createContent["additional_creators"])
+		if err != nil {
+			return nil, err
+		}
+		if preset == PresetTrustedPrivateChat && isDirect {
+			for _, inv := range invitees {
+				if inv != "" && inv != creator && !containsUser(additional, inv) {
+					additional = append(additional, inv)
+				}
+			}
+		}
+		if len(additional) > 0 {
+			createContent["additional_creators"] = additional
+		} else {
+			delete(createContent, "additional_creators")
+		}
+	}
 	createRaw, _ := json.Marshal(createContent)
 
 	// Build create event (depth 0, no prev/auth). For v12 the room_id field is
@@ -230,30 +261,41 @@ func BuildInitialEvents(
 
 	// The auth_events for the non-create initial state events are:
 	// [create, creator's member, power_levels, join_rules] per spec.
-	// For the initial creator-join member event, auth = [create, power_levels].
+	// For room version 12 (MSC4291) the create event is omitted from every
+	// event's auth_events — its presence is implied — so the creator-join
+	// references nothing and the later events reference the prior initial
+	// events only.
 	creatorJoinRaw, _ := json.Marshal(map[string]any{
 		"membership": MembershipJoin,
 	})
+	creatorJoinAuth := []string{createEv.EventID()}
+	if rules.RoomIDIsCreateHash {
+		creatorJoinAuth = nil
+	}
 	creatorJoin, err := buildAndSign(serverName, key, version, "m.room.member", creator, creator, roomID, creatorJoinRaw, now, 1,
-		[]string{createEv.EventID()}, []string{createEv.EventID()})
+		[]string{createEv.EventID()}, creatorJoinAuth)
 	if err != nil {
 		return nil, err
 	}
 
+	plAuth := []string{createEv.EventID(), creatorJoin.EventID()}
+	if rules.RoomIDIsCreateHash {
+		plAuth = []string{creatorJoin.EventID()}
+	}
 	plEv, err := buildAndSign(serverName, key, version, "m.room.power_levels", "", creator, roomID, plRaw, now, 2,
-		[]string{creatorJoin.EventID()}, []string{createEv.EventID(), creatorJoin.EventID()})
+		[]string{creatorJoin.EventID()}, plAuth)
 	if err != nil {
 		return nil, err
 	}
 
 	jrEv, err := buildAndSign(serverName, key, version, "m.room.join_rules", "", creator, roomID, InitialJoinRules(preset), now, 3,
-		[]string{plEv.EventID()}, []string{createEv.EventID(), creatorJoin.EventID(), plEv.EventID()})
+		[]string{plEv.EventID()}, append(plAuth, plEv.EventID()))
 	if err != nil {
 		return nil, err
 	}
 
 	hvEv, err := buildAndSign(serverName, key, version, "m.room.history_visibility", "", creator, roomID, InitialHistoryVisibility(preset), now, 4,
-		[]string{jrEv.EventID()}, []string{createEv.EventID(), creatorJoin.EventID(), plEv.EventID()})
+		[]string{jrEv.EventID()}, append(plAuth, plEv.EventID()))
 	if err != nil {
 		return nil, err
 	}
@@ -265,6 +307,117 @@ func BuildInitialEvents(
 		Version: version,
 		Create:  createEv,
 	}, nil
+}
+
+// validateAdditionalCreators checks that a parsed additional_creators value is
+// an array of valid user ID strings (MSC4289). nil/absent yields nil.
+func validateAdditionalCreators(v any) ([]string, error) {
+	if v == nil {
+		return nil, nil
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return nil, fmt.Errorf("rooms: additional_creators must be an array of user IDs")
+	}
+	out := make([]string, 0, len(arr))
+	for _, e := range arr {
+		s, ok := e.(string)
+		if !ok || !isValidUserID(s) {
+			return nil, fmt.Errorf("rooms: additional_creators must be an array of valid user IDs")
+		}
+		if !containsUser(out, s) {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+// isValidUserID reports whether s looks like a valid Matrix user ID
+// (@localpart:server). The localpart allows the character set of the spec's
+// user ID grammar; the server name allows the hostname grammar (letters, digits,
+// dots and hyphens), so a domain with other punctuation is rejected.
+func isValidUserID(s string) bool {
+	if len(s) < 2 || s[0] != '@' {
+		return false
+	}
+	colon := -1
+	for i := 1; i < len(s); i++ {
+		if s[i] == ':' {
+			colon = i
+			break
+		}
+	}
+	if colon <= 1 || colon == len(s)-1 {
+		return false
+	}
+	localpart := s[1:colon]
+	domain := s[colon+1:]
+	if domain == "" {
+		return false
+	}
+	for _, c := range localpart {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '.', c == '_', c == '=', c == '-', c == '/', c == '+':
+		default:
+			return false
+		}
+	}
+	host := domain
+	// A server name may carry a ":port" suffix (per the spec's server-name
+	// grammar); validate the host and the port separately.
+	if c := strings.LastIndex(host, ":"); c > 0 && c < len(host)-1 {
+		for _, d := range host[c+1:] {
+			if d < '0' || d > '9' {
+				return false
+			}
+		}
+		host = host[:c]
+	}
+	for _, c := range host {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '.', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// containsUser reports whether a user ID is present in a list.
+func containsUser(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidatePrivilegedPowerOverride rejects a power_level_content_override whose
+// `users` map lists the room creator or any additional creator (MSC4289, room
+// version 12): their power is implicit and they must not appear in the users
+// object. Returns nil when the override is absent or lists nobody privileged.
+func ValidatePrivilegedPowerOverride(creator string, additional []string, override json.RawMessage) error {
+	if len(override) == 0 || len(creator) == 0 {
+		return nil
+	}
+	var ov struct {
+		Users map[string]any `json:"users"`
+	}
+	if err := json.Unmarshal(override, &ov); err != nil || len(ov.Users) == 0 {
+		return nil
+	}
+	if _, ok := ov.Users[creator]; ok {
+		return fmt.Errorf("rooms: the room creator may not be listed in power_level_content_override users")
+	}
+	for _, ac := range additional {
+		if _, ok := ov.Users[ac]; ok {
+			return fmt.Errorf("rooms: additional creators may not be listed in power_level_content_override users")
+		}
+	}
+	return nil
 }
 
 // buildAndSign is a thin wrapper over events.Builder for the genesis flow.
@@ -303,8 +456,10 @@ func buildAndSign(serverName string, key *crypto.SigningKey, version roomver.Ver
 }
 
 // BuildV12RoomID computes the v12 room ID as the url-safe base64 sha256 of the
-// redacted create event's reference hash (MSC4291), suffixed with the server
-// name. For non-v12 it returns the supplied roomID unchanged.
+// redacted create event's reference hash (MSC4291). Room version 12 drops the
+// server-name suffix from room IDs entirely: the room ID is the create event's
+// hash with the sigil swapped from $ to ! (e.g. "!<hash>"). For non-v12 it
+// returns the supplied roomID unchanged.
 func BuildV12RoomID(version roomver.Version, createEvent *events.Event, serverName string) string {
 	rules, ok := roomver.Get(version)
 	if !ok || !rules.RoomIDIsCreateHash {
@@ -315,5 +470,5 @@ func BuildV12RoomID(version roomver.Version, createEvent *events.Event, serverNa
 		// Fall back to a random ID; this should not happen for a valid create.
 		return "!" + ids.RandomLocalpart() + ":" + serverName
 	}
-	return "!" + h + ":" + serverName
+	return "!" + h
 }

@@ -38,6 +38,9 @@ func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
 	var req struct {
 		NewVersion string `json:"new_version"`
+		// MSC4289 (room version 12): users granted the same implicit power as
+		// the new room's creator. Only valid when upgrading to v12.
+		AdditionalCreators []string `json:"additional_creators"`
 	}
 	if err := httpx.DecodeJSON(w, r, &req); err != nil {
 		httpx.WriteError(w, err)
@@ -88,7 +91,20 @@ func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
 	var initRes *rooms.InitialEventsResult
 	var newRoomID string
 	var tombstoneEventID string
-	powerOverride := a.upgradePowerLevels(r, auth, roomID, version, rules)
+	// additional_creators (MSC4289): valid only when upgrading to a v12 room.
+	// They are added to the new create event and excluded from the copied PL
+	// users map (their power is implicit).
+	var additional []string
+	if rules.CreatorPrivileged {
+		if len(req.AdditionalCreators) > 0 {
+			additional = req.AdditionalCreators
+			creationContent["additional_creators"] = additional
+		}
+	} else if len(req.AdditionalCreators) > 0 {
+		httpx.WriteError(w, httpx.ErrBadJSON("additional_creators is only valid when upgrading to room version 12"))
+		return
+	}
+	powerOverride := a.upgradePowerLevels(r, auth, roomID, version, rules, additional)
 
 	if rules.RoomIDIsCreateHash {
 		// v12+ (MSC4291): the room ID is derived from the create event's
@@ -97,7 +113,7 @@ func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
 		// the room, then send the tombstone referencing it.
 		creationContent["predecessor"] = map[string]any{"room_id": roomID}
 		ccRaw, _ := json.Marshal(creationContent)
-		initRes, err = rooms.BuildInitialEvents(ids.NewRoomID(a.ServerName()), version, auth.UserID, "", powerOverride, ccRaw, false, a.ServerName(), a.Key, a.Now())
+		initRes, err = rooms.BuildInitialEvents(ids.NewRoomID(a.ServerName()), version, auth.UserID, "", powerOverride, ccRaw, false, nil, a.ServerName(), a.Key, a.Now())
 		if err != nil {
 			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
@@ -127,7 +143,7 @@ func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
 			"event_id": tombstoneEventID,
 		}
 		ccRaw, _ := json.Marshal(creationContent)
-		initRes, err = rooms.BuildInitialEvents(newRoomID, version, auth.UserID, "", powerOverride, ccRaw, false, a.ServerName(), a.Key, a.Now())
+		initRes, err = rooms.BuildInitialEvents(newRoomID, version, auth.UserID, "", powerOverride, ccRaw, false, nil, a.ServerName(), a.Key, a.Now())
 		if err != nil {
 			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
@@ -175,7 +191,10 @@ func (a *API) stateContent(ctx context.Context, roomID, eventType, stateKey stri
 // with the upgrader elevated to the minimum level needed to send the copied
 // state events when their current level is too low, and the creator removed
 // from the users map for v12+ (privileged-creator) rooms.
-func (a *API) upgradePowerLevels(r *http.Request, auth *homeserver.Auth, roomID string, version roomver.Version, rules roomver.Rules) json.RawMessage {
+// upgradePowerLevels builds the power-levels content for the upgraded room from
+// the old room's PL. additional are the v12 additional creators (MSC4289) whose
+// power is implicit and who must not appear in the users map.
+func (a *API) upgradePowerLevels(r *http.Request, auth *homeserver.Auth, roomID string, version roomver.Version, rules roomver.Rules, additional []string) json.RawMessage {
 	oldPL := a.stateContent(r.Context(), roomID, "m.room.power_levels", "")
 	if oldPL == nil {
 		return nil
@@ -213,9 +232,14 @@ func (a *API) upgradePowerLevels(r *http.Request, auth *homeserver.Auth, roomID 
 		}
 		users[auth.UserID] = float64(needed)
 	}
-	// v12+ privileged creators must not be listed in the users map.
+	// v12+ privileged creators and additional creators must not be listed in the
+	// users map (their power is implicit). The upgrading user is the new room's
+	// creator, so they too are removed.
 	if rules.CreatorPrivileged {
 		delete(users, auth.UserID)
+		for _, ac := range additional {
+			delete(users, ac)
+		}
 	}
 	out, err := json.Marshal(pl)
 	if err != nil {
@@ -279,6 +303,18 @@ func (a *API) copyStateToNewRoom(r *http.Request, auth *homeserver.Auth, oldRoom
 		"m.room.join_rules", "m.room.name", "m.room.topic", "m.room.guest_access",
 		"m.room.history_visibility", "m.room.avatar", "m.room.encryption",
 		"m.room.server_acl", "m.room.power_levels",
+	}
+	// For v12 (privileged-creator) upgrades the power levels must NOT be copied
+	// verbatim: the new room's initial PL was already built from
+	// upgradePowerLevels (which strips the new creator and any additional
+	// creators from the users map), and re-sending the old PL would reintroduce
+	// them (and be rejected by the creator-omission rule).
+	if rules, ok := roomver.Get(version); ok && rules.CreatorPrivileged {
+		types = []string{
+			"m.room.join_rules", "m.room.name", "m.room.topic", "m.room.guest_access",
+			"m.room.history_visibility", "m.room.avatar", "m.room.encryption",
+			"m.room.server_acl",
+		}
 	}
 	for _, t := range types {
 		content := a.stateContent(r.Context(), oldRoomID, t, "")

@@ -114,8 +114,22 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	seedRoomID := ids.NewRoomID(a.ServerName())
 	now := a.Now()
 
-	initRes, err := rooms.BuildInitialEvents(seedRoomID, version, auth.UserID, preset, req.PowerLevelOverride, req.CreationContent, isDirect, a.ServerName(), a.Key, now)
+	// v12 (MSC4289): the power_level_content_override must not list the creator
+	// or the additional creators (their power is implicit). Reject with 400.
+	if rules, ok := roomver.Get(version); ok && rules.CreatorPrivileged {
+		if err := rooms.ValidatePrivilegedPowerOverride(auth.UserID, additionalCreatorsOf(req.CreationContent), req.PowerLevelOverride); err != nil {
+			httpx.WriteError(w, httpx.ErrBadJSON(err.Error()))
+			return
+		}
+	}
+
+	initRes, err := rooms.BuildInitialEvents(seedRoomID, version, auth.UserID, preset, req.PowerLevelOverride, req.CreationContent, isDirect, req.Invite, a.ServerName(), a.Key, now)
 	if err != nil {
+		// additional_creators validation failures are client errors (400).
+		if strings.Contains(err.Error(), "additional_creators") {
+			httpx.WriteError(w, httpx.ErrBadJSON(err.Error()))
+			return
+		}
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
@@ -1620,6 +1634,19 @@ func (a *API) checkCanReadRoom(ctx context.Context, roomID, userID string) error
 	}
 }
 
+// additionalCreatorsOf extracts the additional_creators list from raw
+// creation_content (MSC4289). A missing or malformed field yields nil; the
+// authoritative validation happens in rooms.BuildInitialEvents.
+func additionalCreatorsOf(creationContent json.RawMessage) []string {
+	var cc struct {
+		AdditionalCreators []string `json:"additional_creators"`
+	}
+	if err := json.Unmarshal(creationContent, &cc); err != nil {
+		return nil
+	}
+	return cc.AdditionalCreators
+}
+
 // joinRoom performs a join for the authenticated user: a local join (auth
 // rules + persist the m.room.member(join) event) when the room is known
 // locally, or a federated join against a remote server when it is not.
@@ -1911,10 +1938,20 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	// Rooms with privileged creators (v12+, MSC4239) forbid the creator from
 	// appearing in the m.room.power_levels `users` map; the creator's power is
 	// implicit. A PUT that lists them is rejected with 400.
-	if eventType == "m.room.power_levels" && rules.CreatorPrivileged {
-		if err := a.rejectCreatorInPowerLevels(r.Context(), roomID, content); err != nil {
+	if eventType == "m.room.power_levels" {
+		if rules.CreatorPrivileged {
+			if err := a.rejectCreatorInPowerLevels(r.Context(), roomID, content); err != nil {
+				return nil, err
+			}
+		}
+		if err := validatePowerLevelIntegers(rules, content); err != nil {
 			return nil, err
 		}
+	}
+	// A room cannot be created twice: the m.room.create event is the genesis
+	// event, and a second create in an existing room is rejected (spec auth).
+	if eventType == "m.room.create" {
+		return nil, newRoomError(http.StatusBadRequest, "M_FORBIDDEN", "a room can only be created once")
 	}
 	if err := rooms.Authorize(rules, eventType, stateKey, auth.UserID, content, st); err != nil {
 		return nil, newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
@@ -1947,13 +1984,88 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	return ev, nil
 }
 
+// validatePowerLevelIntegers validates an m.room.power_levels content object:
+// every power-level value (users, events, notifications, and the scalar fields)
+// must be an integer between 0 and the largest integer representable in
+// canonical JSON (2^53-1). Room versions 10+ (MSC3667) additionally reject
+// strings that merely parse as integers. A violation yields M_BAD_JSON (400).
+func validatePowerLevelIntegers(rules roomver.Rules, content json.RawMessage) error {
+	// The largest integer canonical JSON can represent (2^53-1).
+	const maxCanonicalJSONInt = float64(1<<53) - 1
+
+	var obj struct {
+		Users         map[string]json.RawMessage `json:"users"`
+		Events        map[string]json.RawMessage `json:"events"`
+		Notifications map[string]json.RawMessage `json:"notifications"`
+		UsersDefault  json.RawMessage            `json:"users_default"`
+		EventsDefault json.RawMessage            `json:"events_default"`
+		StateDefault  json.RawMessage            `json:"state_default"`
+		Ban           json.RawMessage            `json:"ban"`
+		Kick          json.RawMessage            `json:"kick"`
+		Redact        json.RawMessage            `json:"redact"`
+		Invite        json.RawMessage            `json:"invite"`
+	}
+	if err := json.Unmarshal(content, &obj); err != nil {
+		return nil
+	}
+	check := func(raw json.RawMessage) error {
+		if len(raw) == 0 {
+			return nil
+		}
+		var n json.Number
+		if err := json.Unmarshal(raw, &n); err != nil {
+			return nil // non-numeric; the content parser will handle it
+		}
+		f, err := n.Float64()
+		if err != nil {
+			return newRoomError(http.StatusBadRequest, "M_BAD_JSON", "power level is not a valid number")
+		}
+		// Reject values outside the canonical-JSON integer range.
+		if f < 0 || f > maxCanonicalJSONInt {
+			return newRoomError(http.StatusBadRequest, "M_BAD_JSON", "power level exceeds the maximum representable in canonical JSON")
+		}
+		// Strict power levels (room version 10+): values must be integers, not
+		// strings that happen to parse as integers.
+		if rules.StrictPowerLevels {
+			var s string
+			if json.Unmarshal(raw, &s) == nil {
+				return newRoomError(http.StatusBadRequest, "M_BAD_JSON", "power levels must be integers, not strings")
+			}
+		}
+		return nil
+	}
+	checks := make([]json.RawMessage, 0, len(obj.Users)+len(obj.Events)+len(obj.Notifications)+9)
+	for _, v := range obj.Users {
+		checks = append(checks, v)
+	}
+	for _, v := range obj.Events {
+		checks = append(checks, v)
+	}
+	for _, v := range obj.Notifications {
+		checks = append(checks, v)
+	}
+	for _, v := range []json.RawMessage{obj.UsersDefault, obj.EventsDefault, obj.StateDefault, obj.Ban, obj.Kick, obj.Redact, obj.Invite} {
+		checks = append(checks, v)
+	}
+	for _, v := range checks {
+		if err := check(v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // rejectCreatorInPowerLevels enforces the v12+ (privileged-creator) rule that
-// the room creator must not appear in an m.room.power_levels `users` object:
-// their power is implicit. A PUT that lists the creator is rejected with 400
-// (spec: "the room creator must not be listed in the users object").
+// the room creator and any additional creators must not appear in an
+// m.room.power_levels `users` object: their power is implicit. A PUT that lists
+// them is rejected with 400 (spec: "the room creator must not be listed in the
+// users object"). It also rejects power-level values that exceed the largest
+// integer representable in canonical JSON (2^53-1): implementations may treat
+// the creator's implicit power as "infinite" (above that value), so listing
+// another user at such a value would be ambiguous.
 func (a *API) rejectCreatorInPowerLevels(ctx context.Context, roomID string, content json.RawMessage) error {
 	var pl struct {
-		Users map[string]any `json:"users"`
+		Users map[string]json.RawMessage `json:"users"`
 	}
 	if err := json.Unmarshal(content, &pl); err != nil || len(pl.Users) == 0 {
 		return nil
@@ -1962,8 +2074,29 @@ func (a *API) rejectCreatorInPowerLevels(ctx context.Context, roomID string, con
 	if err != nil || room == nil || room.Creator == "" {
 		return nil
 	}
-	if _, ok := pl.Users[room.Creator]; ok {
-		return newRoomError(http.StatusBadRequest, "M_INVALID_PARAM", "the room creator may not be listed in m.room.power_levels users")
+	privileged := map[string]bool{room.Creator: true}
+	// additional_creators (from the create event content) are privileged too.
+	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.create", ""); err == nil {
+		if createEv, err := a.Store.GetEvent(ctx, id); err == nil {
+			if cc, err := rooms.ParseCreate(createEv.Content); err == nil {
+				for _, ac := range cc.AdditionalCreators {
+					privileged[ac] = true
+				}
+			}
+		}
+	}
+	// The largest integer canonical JSON can represent (2^53-1).
+	const maxCanonicalJSONInt = float64(1<<53) - 1
+	for userID, raw := range pl.Users {
+		if privileged[userID] {
+			return newRoomError(http.StatusBadRequest, "M_INVALID_PARAM", "privileged room creators may not be listed in m.room.power_levels users")
+		}
+		var n json.Number
+		if err := json.Unmarshal(raw, &n); err == nil {
+			if f, err := n.Float64(); err == nil && f > maxCanonicalJSONInt {
+				return newRoomError(http.StatusBadRequest, "M_INVALID_PARAM", "power level exceeds the maximum representable in canonical JSON")
+			}
+		}
 	}
 	return nil
 }
@@ -2053,10 +2186,22 @@ func (a *API) buildEvent(r *http.Request, auth *homeserver.Auth, roomID string, 
 // events for the sender and for the state_key. The target's member event is
 // what lets a receiving server recognise an invite rescission (the leave
 // references the invite it revokes).
+//
+// Room version 12 (MSC4291) omits the create event from every event's
+// auth_events — the create is implied by the room itself.
 func (a *API) authEventIDs(ctx context.Context, roomID, sender, stateKey string) []string {
 	var out []string
-	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.create", ""); err == nil {
-		out = append(out, id)
+	// v12 (MSC4291): the create event is not referenced in auth_events.
+	omitCreate := false
+	if room, err := a.Store.GetRoom(ctx, roomID); err == nil {
+		if rules, ok := roomver.Get(roomver.Version(room.Version)); ok && rules.RoomIDIsCreateHash {
+			omitCreate = true
+		}
+	}
+	if !omitCreate {
+		if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.create", ""); err == nil {
+			out = append(out, id)
+		}
 	}
 	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.member", sender); err == nil {
 		out = append(out, id)
