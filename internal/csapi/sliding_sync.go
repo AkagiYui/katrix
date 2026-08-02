@@ -791,11 +791,31 @@ func ssClientEvent(row *storage.EventRow) json.RawMessage {
 		"origin_server_ts": row.OriginServerTS,
 		"event_id":         row.EventID,
 	}
-	if row.StateKey != "" {
+	// A state event always carries its state_key — even when empty (e.g.
+	// m.room.encryption, m.room.name). The ruma deserializer only recognises
+	// an event as state when the state_key field is present; omitting it (as an
+	// empty string would be if skipped) drops the event entirely, which is how
+	// the rust SDK ends up reporting an encrypted room as unencrypted.
+	if row.StateKey != "" || isStateEventType(row.Type) {
 		m["state_key"] = row.StateKey
 	}
 	b, _ := json.Marshal(m)
 	return b
+}
+
+// isStateEventType reports whether the event type is a known state event type.
+// State events carry a state_key field in the client-visible format even when
+// the key is the empty string.
+func isStateEventType(eventType string) bool {
+	switch eventType {
+	case "m.room.create", "m.room.power_levels", "m.room.join_rules",
+		"m.room.history_visibility", "m.room.name", "m.room.topic",
+		"m.room.member", "m.room.third_party_invite", "m.room.canonical_alias",
+		"m.room.aliases", "m.room.encryption", "m.room.tombstone",
+		"m.room.server_acl", "m.room.pinned_events", "m.room.avatar":
+		return true
+	}
+	return false
 }
 
 // ssToDeviceEvent renders a to-device message in the extension's event shape.
