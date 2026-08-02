@@ -87,6 +87,10 @@ func (a *API) registerTransactions(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/federation/v1/make_join/{roomID}/{userID}", a.MakeJoin)
 	mux.HandleFunc("GET /_matrix/federation/v1/make_leave/{roomID}/{userID}", a.MakeLeave)
 	mux.HandleFunc("GET /_matrix/federation/v1/event_auth/{roomID}/{eventID}", a.EventAuth)
+	// The room alias is a query parameter (room_alias), not a path segment;
+	// the legacy {roomAlias} route is kept so old clients using the path form
+	// still resolve (QueryDirectory reads the query first, then the path).
+	mux.HandleFunc("GET /_matrix/federation/v1/query/directory", a.QueryDirectory)
 	mux.HandleFunc("GET /_matrix/federation/v1/query/directory/{roomAlias}", a.QueryDirectory)
 	mux.HandleFunc("GET /_matrix/federation/v1/query/profile", a.QueryProfile)
 }
@@ -1227,10 +1231,16 @@ func (a *API) EventAuth(w http.ResponseWriter, r *http.Request) {
 	_ = roomID
 }
 
-// QueryDirectory handles GET /_matrix/federation/v1/query/directory/{roomAlias},
-// resolving a local room alias for a remote server.
+// QueryDirectory handles GET /_matrix/federation/v1/query/directory, resolving a
+// local room alias for a remote server. The alias is carried in the room_alias
+// query parameter per the spec (GET /query/directory?room_alias={alias}); the
+// legacy path-segment form /query/directory/{alias} is also accepted for
+// compatibility with older clients.
 func (a *API) QueryDirectory(w http.ResponseWriter, r *http.Request) {
-	alias := r.PathValue("roomAlias")
+	alias := r.URL.Query().Get("room_alias")
+	if alias == "" {
+		alias = r.PathValue("roomAlias")
+	}
 	roomID, err := a.Store.LookupAlias(r.Context(), alias)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrNotFound("room alias not found"))

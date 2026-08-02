@@ -132,11 +132,7 @@ func (c *Client) VerifyKeyFor(ctx context.Context, serverName, keyID string) ([]
 // server name directly as host:port (or :8448 default) over HTTPS. Full
 // .well-known + SRV discovery is out of scope for the minimal P5 surface.
 func (c *Client) serverBaseURL(serverName string) string {
-	host := serverName
-	if !strings.Contains(host, ":") {
-		host = host + ":8448"
-	}
-	return "https://" + host
+	return "https://" + fedHostPort(serverName)
 }
 
 // QueryProfile fetches a remote user's profile over federation

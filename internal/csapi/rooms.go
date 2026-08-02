@@ -266,13 +266,19 @@ func (a *API) JoinRoom(w http.ResponseWriter, r *http.Request) {
 	roomID := a.resolveRoomIDOrAlias(r.Context(), roomIDOrAlias)
 	if roomID == "" && strings.HasPrefix(roomIDOrAlias, "#") {
 		// Remote alias: resolve it over federation on the alias's own domain
-		// server, then join the resolved room via that server.
+		// server, then join the resolved room via that server. The directory
+		// response's servers are the suggested join candidates (the alias's own
+		// domain first); fall back to the alias domain when the list is empty.
 		if a.fed != nil {
-			if id, err := a.fed.ResolveRemoteAlias(r.Context(), roomIDOrAlias); err == nil && id != "" {
-				roomID = id
-				if dom := ids.DomainOf(roomIDOrAlias); dom != "" && (len(via) == 0 || via[0] == "") {
-					via = append([]string{dom}, via...)
+			if dir, err := a.fed.ResolveRemoteAliasFull(r.Context(), roomIDOrAlias); err == nil && dir != nil && dir.RoomID != "" {
+				roomID = dir.RoomID
+				candidates := dir.Servers
+				if len(candidates) == 0 {
+					if dom := ids.DomainOf(roomIDOrAlias); dom != "" {
+						candidates = []string{dom}
+					}
 				}
+				via = append(candidates, via...)
 			}
 		}
 	}
@@ -302,13 +308,19 @@ func (a *API) KnockRoom(w http.ResponseWriter, r *http.Request) {
 	roomID := a.resolveRoomIDOrAlias(r.Context(), roomIDOrAlias)
 	if roomID == "" && strings.HasPrefix(roomIDOrAlias, "#") {
 		// Remote alias: resolve it over federation on the alias's own domain
-		// server, then knock the resolved room via that server.
+		// server, then knock the resolved room via that server. Use the
+		// directory response's suggested servers as the knock candidates,
+		// falling back to the alias domain when none are given.
 		if a.fed != nil {
-			if id, err := a.fed.ResolveRemoteAlias(r.Context(), roomIDOrAlias); err == nil && id != "" {
-				roomID = id
-				if dom := ids.DomainOf(roomIDOrAlias); dom != "" && (len(via) == 0 || via[0] == "") {
-					via = append([]string{dom}, via...)
+			if dir, err := a.fed.ResolveRemoteAliasFull(r.Context(), roomIDOrAlias); err == nil && dir != nil && dir.RoomID != "" {
+				roomID = dir.RoomID
+				candidates := dir.Servers
+				if len(candidates) == 0 {
+					if dom := ids.DomainOf(roomIDOrAlias); dom != "" {
+						candidates = []string{dom}
+					}
 				}
+				via = append(candidates, via...)
 			}
 		}
 	}

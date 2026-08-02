@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
@@ -137,12 +138,32 @@ func (a *API) joinRemoteRoomFrom(ctx context.Context, userID, roomID, dest strin
 	return false, nil
 }
 
+// remoteDirectory is the response to GET /_matrix/federation/v1/query/directory:
+// the room ID the alias maps to, plus the servers the directory server suggests
+// as join candidates (the alias's own domain first). Per the spec, the joining
+// server may need to try multiple servers before finding one it can join from.
+type remoteDirectory struct {
+	RoomID  string   `json:"room_id"`
+	Servers []string `json:"servers"`
+}
+
 // ResolveRemoteAlias resolves a remote room alias (#alias:domain) to a room ID
 // by querying the alias's own domain server over federation.
 func (a *API) ResolveRemoteAlias(ctx context.Context, alias string) (string, error) {
+	dir, err := a.ResolveRemoteAliasFull(ctx, alias)
+	if err != nil {
+		return "", err
+	}
+	return dir.RoomID, nil
+}
+
+// ResolveRemoteAliasFull resolves a remote room alias (#alias:domain) against
+// the alias's own domain server, returning both the room ID and the directory
+// server's suggested join candidates so callers can pick a viable via server.
+func (a *API) ResolveRemoteAliasFull(ctx context.Context, alias string) (*remoteDirectory, error) {
 	dom := ids.DomainOf(alias)
 	if dom == "" {
-		return "", fmt.Errorf("federation: alias %s has no domain", alias)
+		return nil, fmt.Errorf("federation: alias %s has no domain", alias)
 	}
 	return a.client.queryRemoteDirectory(ctx, dom, alias)
 }
@@ -646,42 +667,56 @@ func (c *Client) sendKnock(ctx context.Context, dest, roomID, userID string, ev 
 }
 
 // queryRemoteDirectory resolves a room alias on a remote server via GET
-// /_matrix/federation/v1/query/directory/{alias}.
-func (c *Client) queryRemoteDirectory(ctx context.Context, dest, alias string) (string, error) {
-	// The '#' sigil must be escaped: url.Parse would otherwise treat it as the
-	// fragment separator.
-	url := c.serverBaseURL(dest) + "/_matrix/federation/v1/query/directory/" + urlPathEscape(alias)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// /_matrix/federation/v1/query/directory?room_alias={alias}. The alias is a
+// query parameter (not a path segment): the spec defines the endpoint as
+// /query/directory with the alias in the room_alias query parameter, matching
+// gomatrixserverlib's LookupRoomAlias and every known implementation.
+func (c *Client) queryRemoteDirectory(ctx context.Context, dest, alias string) (*remoteDirectory, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cdirectoryURL(dest, alias), nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Host = dest
 	if err := signRequestWith(req, c.originName(), c.key); err != nil {
-		return "", err
+		return nil, err
 	}
 	metrics.Counters.FedOutboundRequests.Add(1)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("federation: query directory %s: %w", dest, err)
+		return nil, fmt.Errorf("federation: query directory %s: %w", dest, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("federation: query directory %s: HTTP %d", dest, resp.StatusCode)
+		return nil, fmt.Errorf("federation: query directory %s: HTTP %d", dest, resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	var out struct {
-		RoomID string `json:"room_id"`
-	}
+	var out remoteDirectory
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("federation: decode query directory from %s: %w", dest, err)
+		return nil, fmt.Errorf("federation: decode query directory from %s: %w", dest, err)
 	}
 	if out.RoomID == "" {
-		return "", fmt.Errorf("federation: query directory %s returned no room", dest)
+		return nil, fmt.Errorf("federation: query directory %s returned no room", dest)
 	}
-	return out.RoomID, nil
+	return &out, nil
+}
+
+// cdirectoryURL builds the federation directory lookup URL for an alias on a
+// remote server. The alias is carried in the room_alias query parameter, per
+// the spec (GET /_matrix/federation/v1/query/directory?room_alias=...).
+func cdirectoryURL(dest, alias string) string {
+	return "https://" + fedHostPort(dest) + "/_matrix/federation/v1/query/directory?room_alias=" + url.QueryEscape(alias)
+}
+
+// fedHostPort normalises a server name for URL use: names without an explicit
+// port get the federation default :8448.
+func fedHostPort(serverName string) string {
+	if strings.Contains(serverName, ":") {
+		return serverName
+	}
+	return serverName + ":8448"
 }
 
 // urlPathEscape escapes a single path segment for use inside a URL. '#' is the

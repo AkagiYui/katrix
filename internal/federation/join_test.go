@@ -77,3 +77,15 @@ func TestURLPathEscape(t *testing.T) {
 		t.Fatalf("escape = %q", got)
 	}
 }
+
+func TestQueryRemoteDirectoryURL(t *testing.T) {
+	// The spec defines the directory lookup as
+	// GET /_matrix/federation/v1/query/directory?room_alias={alias}: the alias
+	// is a query parameter, not a path segment. The '#' sigil must be escaped
+	// (url.QueryEscape turns it into %23) so it is not treated as a fragment.
+	u := cdirectoryURL("hs2.example", "#flibble:hs2.example")
+	const want = "https://hs2.example:8448/_matrix/federation/v1/query/directory?room_alias=%23flibble%3Ahs2.example"
+	if u != want {
+		t.Fatalf("directory URL = %q, want %q", u, want)
+	}
+}
