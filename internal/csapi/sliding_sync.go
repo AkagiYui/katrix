@@ -100,7 +100,10 @@ type slidingSyncRoomResp struct {
 	Avatar        *string           `json:"avatar,omitempty"`
 	Initial       bool              `json:"initial,omitempty"`
 	RequiredState []json.RawMessage `json:"required_state,omitempty"`
-	Timeline      []json.RawMessage `json:"timeline,omitempty"`
+	// Timeline is always emitted, even when empty: clients (and test
+	// harnesses) rely on the field being present to locate a room's event
+	// list in the response.
+	Timeline      []json.RawMessage `json:"timeline"`
 	PrevBatch     string            `json:"prev_batch,omitempty"`
 	Limited       bool              `json:"limited,omitempty"`
 	NumLive       *int64            `json:"num_live,omitempty"`
@@ -475,7 +478,7 @@ func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID str
 	if timelineLimit != nil && *timelineLimit >= 0 {
 		limit = *timelineLimit
 	}
-	rr := &slidingSyncRoomResp{Membership: entry.membership}
+	rr := &slidingSyncRoomResp{Membership: entry.membership, Timeline: []json.RawMessage{}}
 
 	// initial: the first time the client sees the room (initial sync, or the
 	// membership relationship is new), or the server is re-delivering it with a
