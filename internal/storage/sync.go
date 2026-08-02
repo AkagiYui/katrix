@@ -266,6 +266,28 @@ type PresenceRow struct {
 // SetPresence upserts a user's presence state and records a presence change in
 // the shared sync stream so other users' /sync deltas pick it up.
 func (s *Store) SetPresence(ctx context.Context, userID, presence, statusMsg string, ts int64) error {
+	// A presence update is only a *change* when the stored presence/status
+	// actually differs. Clients commonly send set_presence=online on every
+	// /sync; writing a presence_changes row each time would advance the sync
+	// stream on every poll, so a long-polling client would perpetually see new
+	// data and never park — the classic /sync busy loop. When nothing changed,
+	// only touch last_active_ts (no stream advance).
+	var cur struct {
+		Presence  string
+		StatusMsg *string
+	}
+	row := s.pool.QueryRow(ctx, `SELECT presence, status_msg FROM presence WHERE user_id=$1`, userID)
+	if err := row.Scan(&cur.Presence, &cur.StatusMsg); err == nil {
+		statusSame := (statusMsg == "" && cur.StatusMsg == nil) || (cur.StatusMsg != nil && *cur.StatusMsg == statusMsg)
+		if cur.Presence == presence && statusSame {
+			_, _ = s.pool.Exec(ctx,
+				`INSERT INTO presence(user_id, presence, status_msg, last_active_ts)
+				 VALUES ($1,$2,$3,$4)
+				 ON CONFLICT (user_id) DO UPDATE SET last_active_ts=EXCLUDED.last_active_ts`,
+				userID, presence, statusMsg, ts)
+			return nil
+		}
+	}
 	streamID, err := s.NextSyncStream(ctx)
 	if err != nil {
 		return err
