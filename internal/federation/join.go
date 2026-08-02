@@ -42,23 +42,23 @@ type sendJoinResponse struct {
 	ServersInRoom  []string          `json:"servers_in_room,omitempty"`
 }
 
-// fedHTTPError is a federation request failure carrying the remote server's
+// FedHTTPError is a federation request failure carrying the remote server's
 // HTTP status, so callers can distinguish a rejection (403) from a not-found
 // (404). A remote server refusing a join/membership transition (e.g. a room
 // with join_rule knock) should surface to the client as the same 403.
-type fedHTTPError struct {
+type FedHTTPError struct {
 	code int
 	msg  string
 }
 
-func (e *fedHTTPError) Error() string { return e.msg }
+func (e *FedHTTPError) Error() string { return e.msg }
 
 // HTTPCode returns the remote server's HTTP status code.
-func (e *fedHTTPError) HTTPCode() int { return e.code }
+func (e *FedHTTPError) HTTPCode() int { return e.code }
 
-// newFedHTTPError builds a fedHTTPError for a non-2xx federation response.
+// newFedHTTPError builds a FedHTTPError for a non-2xx federation response.
 func newFedHTTPError(code int, msg string) error {
-	return &fedHTTPError{code: code, msg: msg}
+	return &FedHTTPError{code: code, msg: msg}
 }
 
 // JoinRemoteRoom joins userID to roomID by federating with the server(s) in
@@ -613,7 +613,8 @@ func (c *Client) makeKnock(ctx context.Context, dest, roomID, userID string) (*m
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("federation: make_knock %s: HTTP %d", dest, resp.StatusCode)
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: make_knock %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))))
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
@@ -651,7 +652,7 @@ func (c *Client) sendKnock(ctx context.Context, dest, roomID, userID string, ev 
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("federation: send_knock %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg)))
+		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: send_knock %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))))
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {

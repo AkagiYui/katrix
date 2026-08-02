@@ -16,6 +16,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/canonicaljson"
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/eventstate"
+	"github.com/AkagiYui/katrix/internal/federation"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/identity"
@@ -367,10 +368,23 @@ func (a *API) knockRoom(r *http.Request, auth *homeserver.Auth, roomID string, v
 		return err
 	}
 	// Not a local room: federated knock (make_knock/send_knock against a remote
-	// server, then persist the delivered room view as a knock).
+	// server, then persist the delivered room view as a knock). The remote
+	// server's HTTP status is propagated to the client: knocking a room whose
+	// join_rule is not knock (or otherwise refusing the knock) surfaces as the
+	// same 403/404 the remote returned, per the spec (a knock on a non-knock
+	// room is rejected with 403 M_FORBIDDEN).
 	if a.fed != nil {
 		if err := a.fed.KnockRemoteRoom(r.Context(), auth.UserID, roomID, via, body.Reason); err != nil {
-			return newRoomError(http.StatusNotFound, "M_NOT_FOUND", err.Error())
+			status := http.StatusNotFound
+			code := "M_NOT_FOUND"
+			var fe *federation.FedHTTPError
+			if errors.As(err, &fe) {
+				status = fe.HTTPCode()
+				if status == http.StatusForbidden {
+					code = "M_FORBIDDEN"
+				}
+			}
+			return newRoomError(status, code, err.Error())
 		}
 		return nil
 	}
