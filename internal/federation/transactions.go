@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
@@ -663,6 +664,18 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
 		return
 	}
+	// Version negotiation (spec: the requesting server may state the room
+	// versions it supports via ?ver=; if none of them match the room's version
+	// the join must be refused with 400 M_INCOMPATIBLE_ROOM_VERSION and the
+	// room's version in the response body).
+	if !requestingServerSupportsVersion(r, room.Version) {
+		httpx.WriteJSON(w, http.StatusBadRequest, map[string]any{
+			"errcode":      "M_INCOMPATIBLE_ROOM_VERSION",
+			"error":        "room version " + room.Version + " is not supported by the requesting server",
+			"room_version": room.Version,
+		})
+		return
+	}
 	latest, _ := a.Store.LatestEvent(r.Context(), roomID)
 	var prev []string
 	depth := int64(1)
@@ -690,6 +703,39 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// requestingServerSupportsVersion reports whether a make_join/make_knock
+// request's ?ver= query parameters include the room's version. Per the spec a
+// requesting server states the room versions it supports via ver; when the
+// room's version is not among them (including when ver is entirely absent —
+// the requesting server has declared no supported versions) the join is
+// refused with 400 M_INCOMPATIBLE_ROOM_VERSION.
+func requestingServerSupportsVersion(r *http.Request, roomVersion string) bool {
+	versions := r.URL.Query()["ver"]
+	if len(versions) == 0 {
+		return false
+	}
+	for _, v := range versions {
+		for _, part := range strings.Split(v, ",") {
+			if strings.TrimSpace(part) == roomVersion {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// supportedVersionsQuery builds the ?ver= query string advertising the room
+// versions this server supports (sent on outbound make_join/make_knock so the
+// remote server can perform its version negotiation).
+func supportedVersionsQuery() string {
+	supported := roomver.Supported()
+	parts := make([]string, 0, len(supported))
+	for _, v := range supported {
+		parts = append(parts, string(v))
+	}
+	return "?ver=" + url.QueryEscape(strings.Join(parts, ","))
+}
+
 // SendJoinV1 handles PUT /_matrix/federation/v1/send_join/{roomID}/{eventID}
 // (legacy endpoint). Same handling as v2 but the response is the v1
 // [200, body] array form.
@@ -714,13 +760,22 @@ func (a *API) SendKnock(w http.ResponseWriter, r *http.Request) {
 // MakeKnock handles GET /_matrix/federation/v1/make_knock/{roomID}/{userID}
 // (MSC2409). It returns an unsigned m.room.member(knock) template event (with
 // prev_events/auth_events/depth anchored at the room's current DAG tip) that
-// the knocking server signs and submits via send_knock.
+// the knocking server signs and submits via send_knock. The ?ver= version
+// negotiation matches make_join.
 func (a *API) MakeKnock(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
 	userID := r.PathValue("userID")
 	room, err := a.Store.GetRoom(r.Context(), roomID)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
+		return
+	}
+	if !requestingServerSupportsVersion(r, room.Version) {
+		httpx.WriteJSON(w, http.StatusBadRequest, map[string]any{
+			"errcode":      "M_INCOMPATIBLE_ROOM_VERSION",
+			"error":        "room version " + room.Version + " is not supported by the requesting server",
+			"room_version": room.Version,
+		})
 		return
 	}
 	latest, _ := a.Store.LatestEvent(r.Context(), roomID)

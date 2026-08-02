@@ -496,7 +496,7 @@ func tplEventTS(raw json.RawMessage, now int64) int64 {
 // make_join step is always a GET on the v1 make_join path; the v2 send_join
 // path is PUT-only (it submits the signed join and returns room state).
 func (c *Client) makeJoin(ctx context.Context, dest, roomID, userID string) (*makeJoinResponse, error) {
-	url := c.serverBaseURL(dest) + "/_matrix/federation/v1/make_join/" + roomID + "/" + userID
+	url := c.serverBaseURL(dest) + "/_matrix/federation/v1/make_join/" + roomID + "/" + userID + supportedVersionsQuery()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -576,7 +576,7 @@ func (c *Client) sendJoin(ctx context.Context, dest, roomID, userID string, ev *
 // against dest, returning the unsigned knock template event + room version
 // (MSC2409). Same response shape as make_join.
 func (c *Client) makeKnock(ctx context.Context, dest, roomID, userID string) (*makeJoinResponse, error) {
-	url := c.serverBaseURL(dest) + "/_matrix/federation/v1/make_knock/" + roomID + "/" + userID
+	url := c.serverBaseURL(dest) + "/_matrix/federation/v1/make_knock/" + roomID + "/" + userID + supportedVersionsQuery()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
