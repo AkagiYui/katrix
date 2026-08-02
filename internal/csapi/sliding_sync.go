@@ -127,8 +127,8 @@ type slidingSyncToDeviceResp struct {
 
 type slidingSyncE2EEResp struct {
 	DeviceLists                  slidingSyncDeviceLists `json:"device_lists,omitempty"`
-	DeviceOneTimeKeysCount       map[string]int `json:"device_one_time_keys_count,omitempty"`
-	DeviceUnusedFallbackKeyTypes *[]string      `json:"device_unused_fallback_key_types,omitempty"`
+	DeviceOneTimeKeysCount       map[string]int         `json:"device_one_time_keys_count,omitempty"`
+	DeviceUnusedFallbackKeyTypes *[]string              `json:"device_unused_fallback_key_types,omitempty"`
 }
 
 type slidingSyncDeviceLists struct {
