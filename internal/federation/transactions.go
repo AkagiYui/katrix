@@ -19,6 +19,28 @@ import (
 	"github.com/AkagiYui/katrix/internal/storage"
 )
 
+// dagTipFor returns the prev_events + depth for a new event in roomID, derived
+// from the room's forward extremities (the true DAG tip) rather than the max
+// stream_ordering. The two diverge in rooms seeded from a remote snapshot (an
+// invite-created room inserts the invite first and the stripped-state events
+// after it; a partial-state join does the same with its critical state), where
+// LatestEvent returns a state snapshot instead of the tip. Building a template
+// against the wrong prev both forks the room and (for a join) silently fails
+// the membership monotonicity guard. A room with no extremities yields depth 0.
+func (a *API) dagTipFor(ctx context.Context, roomID string) (prev []string, depth int64) {
+	exts, err := a.Store.ForwardExtremities(ctx, roomID)
+	if err != nil {
+		return nil, 0
+	}
+	for _, ex := range exts {
+		prev = append(prev, ex.EventID)
+		if ex.Depth+1 > depth {
+			depth = ex.Depth + 1
+		}
+	}
+	return prev, depth
+}
+
 // notifyRoomMembers wakes up all joined users' /sync requests for a room. This
 // is the federation-side mirror of csapi.notifyRoomMembers, used when an
 // inbound transaction changes a room's state. Peeking devices (MSC2753) are
@@ -316,13 +338,7 @@ func (a *API) kickLocalGuest(ctx context.Context, roomID, userID string) {
 		return
 	}
 	version := roomver.Version(room.Version)
-	latest, _ := a.Store.LatestEvent(ctx, roomID)
-	var prev []string
-	depth := int64(1)
-	if latest != nil {
-		prev = []string{latest.EventID}
-		depth = latest.Depth + 1
-	}
+	prev, depth := a.dagTipFor(ctx, roomID)
 	content, _ := json.Marshal(map[string]any{"membership": "leave", "reason": "guest access revoked"})
 	b := events.Builder{
 		Type:           "m.room.member",
@@ -676,13 +692,7 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	latest, _ := a.Store.LatestEvent(r.Context(), roomID)
-	var prev []string
-	depth := int64(1)
-	if latest != nil {
-		prev = []string{latest.EventID}
-		depth = latest.Depth + 1
-	}
+	prev, depth := a.dagTipFor(r.Context(), roomID)
 	authIDs := a.memberAuthIDs(r, roomID, userID)
 	template := map[string]any{
 		"type":             "m.room.member",
@@ -778,13 +788,7 @@ func (a *API) MakeKnock(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	latest, _ := a.Store.LatestEvent(r.Context(), roomID)
-	var prev []string
-	depth := int64(1)
-	if latest != nil {
-		prev = []string{latest.EventID}
-		depth = latest.Depth + 1
-	}
+	prev, depth := a.dagTipFor(r.Context(), roomID)
 	authIDs := a.memberAuthIDs(r, roomID, userID)
 	template := map[string]any{
 		"type":             "m.room.member",
@@ -851,13 +855,7 @@ func (a *API) SendJoin(w http.ResponseWriter, r *http.Request) {
 func (a *API) MakeLeave(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
 	userID := r.PathValue("userID")
-	latest, _ := a.Store.LatestEvent(r.Context(), roomID)
-	var prev []string
-	depth := int64(1)
-	if latest != nil {
-		prev = []string{latest.EventID}
-		depth = latest.Depth + 1
-	}
+	prev, depth := a.dagTipFor(r.Context(), roomID)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"origin": a.ServerName(),
 		"event": map[string]any{

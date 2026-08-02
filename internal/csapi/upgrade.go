@@ -364,13 +364,7 @@ func (a *API) copyMembersToNewRoom(r *http.Request, auth *homeserver.Auth, oldRo
 // buildAndPersistMemberJoin builds, persists and broadcasts an m.room.member
 // join event for a local user in a room (used by the upgrade auto-join path).
 func (a *API) buildAndPersistMemberJoin(ctx context.Context, roomID string, version roomver.Version, userID string) error {
-	latest, _ := a.Store.LatestEvent(ctx, roomID)
-	var prev []string
-	depth := int64(1)
-	if latest != nil {
-		prev = []string{latest.EventID}
-		depth = latest.Depth + 1
-	}
+	prev, depth := a.dagTipFor(ctx, roomID)
 	b := events.Builder{
 		Type:           "m.room.member",
 		Sender:         userID,

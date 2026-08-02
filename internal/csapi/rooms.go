@@ -2434,13 +2434,7 @@ func validateAliasForRoom(ctx context.Context, store *storage.Store, alias, room
 // (state_key may be "") from a message event (no state_key).
 func (a *API) buildEvent(r *http.Request, auth *homeserver.Auth, roomID string, version roomver.Version, eventType, stateKey, txnID string, isState bool, content json.RawMessage) (*events.Event, error) {
 	now := a.Now()
-	latest, _ := a.Store.LatestEvent(r.Context(), roomID)
-	var prev []string
-	depth := int64(0)
-	if latest != nil {
-		prev = []string{latest.EventID}
-		depth = latest.Depth + 1
-	}
+	prev, depth := a.dagTipFor(r.Context(), roomID)
 	// auth_events = [create, sender_member, power_levels, join_rules, target_member] per spec.
 	authIDs := a.authEventIDs(r.Context(), roomID, auth.UserID, stateKey)
 	b := events.Builder{
@@ -2458,6 +2452,32 @@ func (a *API) buildEvent(r *http.Request, auth *homeserver.Auth, roomID string, 
 		b.StateKey = &sk
 	}
 	return b.BuildForVersion(a.ServerName(), a.Key, version)
+}
+
+// dagTipFor returns the prev_events + depth for a new event in roomID, derived
+// from the room's forward extremities (the true DAG tip) rather than the max
+// stream_ordering. The two diverge exactly when a room is seeded from a remote
+// snapshot: an invite-created room inserts the invite event first (depth = the
+// origin's tip) and the delivered stripped-state events after it (their own,
+// lower depths), and a partial-state join does the same with its critical
+// state. LatestEvent then returns a state snapshot rather than the tip, so a
+// locally-built event references the wrong prev and gets a bogus low depth —
+// for a join that silently fails the membership monotonicity guard (the join's
+// depth must exceed the invite's, or the upsert keeps the older "invite" row
+// and the room never appears under rooms.join). A room with no extremities
+// yields depth 0 (the create-event case).
+func (a *API) dagTipFor(ctx context.Context, roomID string) (prev []string, depth int64) {
+	exts, err := a.Store.ForwardExtremities(ctx, roomID)
+	if err != nil {
+		return nil, 0
+	}
+	for _, ex := range exts {
+		prev = append(prev, ex.EventID)
+		if ex.Depth+1 > depth {
+			depth = ex.Depth + 1
+		}
+	}
+	return prev, depth
 }
 
 // authEventIDs returns the create + sender's m.room.member + power_levels +

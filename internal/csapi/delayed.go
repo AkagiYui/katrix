@@ -167,13 +167,7 @@ func (a *API) buildAndPersistMessageCtx(ctx context.Context, auth *homeserver.Au
 	version := roomver.Version(room.Version)
 	// Build with the same prev/depth/auth wiring as the HTTP send path so the
 	// event forms a normal forward chain (see buildAndPersistStateCtx).
-	latest, _ := a.Store.LatestEvent(ctx, roomID)
-	var prev []string
-	depth := int64(0)
-	if latest != nil {
-		prev = []string{latest.EventID}
-		depth = latest.Depth + 1
-	}
+	prev, depth := a.dagTipFor(ctx, roomID)
 	authIDs := a.authEventIDs(ctx, roomID, auth.UserID, "")
 	b := events.Builder{
 		Type:           eventType,
@@ -218,13 +212,7 @@ func (a *API) buildAndPersistStateCtx(ctx context.Context, auth *homeserver.Auth
 	// Build the event with the same prev/depth/auth wiring as the HTTP path
 	// (buildEvent): a state event without prev_events makes SnapshotForEvent
 	// start from an empty base and the state resolution drops the tuple.
-	latest, _ := a.Store.LatestEvent(ctx, roomID)
-	var prev []string
-	depth := int64(0)
-	if latest != nil {
-		prev = []string{latest.EventID}
-		depth = latest.Depth + 1
-	}
+	prev, depth := a.dagTipFor(ctx, roomID)
 	authIDs := a.authEventIDs(ctx, roomID, auth.UserID, "")
 	b := events.Builder{
 		Type:           eventType,
