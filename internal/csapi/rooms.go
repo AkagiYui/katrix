@@ -2207,14 +2207,14 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	if err != nil {
 		return nil, err
 	}
-		if _, err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
-			return nil, err
-		}
-		// room_state is maintained by persistEvent (snapshot + recompute).
-		a.notifyRoomMembers(r.Context(), roomID)
-		a.broadcastPDU(r.Context(), roomID, ev)
-		return ev, nil
+	if _, err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
+		return nil, err
 	}
+	// room_state is maintained by persistEvent (snapshot + recompute).
+	a.notifyRoomMembers(r.Context(), roomID)
+	a.broadcastPDU(r.Context(), roomID, ev)
+	return ev, nil
+}
 
 // guestAccessAllowsJoin reports whether an m.room.guest_access content value
 // permits guests to join ("can_join").
