@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/eventstate"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/identity"
 	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/rooms"
 	"github.com/AkagiYui/katrix/internal/roomver"
@@ -73,9 +75,19 @@ type createRoomRequest struct {
 	RoomAliasName      string              `json:"room_alias_name,omitempty"`
 	Visibility         string              `json:"visibility,omitempty"`
 	Invite             []string            `json:"invite,omitempty"`
+	Invite3PID         []invite3PIDEntry   `json:"invite_3pid,omitempty"`
 	IsDirect           *bool               `json:"is_direct,omitempty"`
 	PowerLevelOverride json.RawMessage     `json:"power_level_content_override,omitempty"`
 	InitialState       []initialStateEvent `json:"initial_state,omitempty"`
+}
+
+// invite3PIDEntry is one entry of the createRoom invite_3pid array: a
+// third-party address to invite, resolved to a Matrix user via the identity
+// server at creation time.
+type invite3PIDEntry struct {
+	IDServer string `json:"id_server"`
+	Medium   string `json:"medium"`
+	Address  string `json:"address"`
 }
 
 // initialStateEvent is one entry of the createRoom initial_state array.
@@ -209,6 +221,22 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 			content["is_direct"] = true
 		}
 		_, _ = a.sendMemberEventWithContent(r, auth, roomID, invitee, content)
+	}
+	// 3PID invites: resolve each address via the identity server and invite the
+	// bound user (the "existing 3pid" flow). An unresolvable address is
+	// best-effort (createRoom still succeeds) — the invitee can complete a
+	// third-party invite later.
+	for _, entry := range req.Invite3PID {
+		if entry.IDServer == "" || entry.Medium == "" || entry.Address == "" {
+			continue
+		}
+		if bound, err := a.lookup3PID(r.Context(), entry.IDServer, entry.Medium, entry.Address); err == nil && bound != "" {
+			content := map[string]any{"membership": rooms.MembershipInvite}
+			if isDirect {
+				content["is_direct"] = true
+			}
+			_, _ = a.sendMemberEventWithContent(r, auth, roomID, bound, content)
+		}
 	}
 
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"room_id": roomID})
@@ -352,6 +380,14 @@ func (a *API) RoomLeave(w http.ResponseWriter, r *http.Request) {
 type inviteRequest struct {
 	UserID string `json:"user_id"`
 	Reason string `json:"reason"`
+
+	// 3PID invite (spec: an invite may name a third-party address instead of a
+	// Matrix user ID). The homeserver resolves the address via the identity
+	// server and invites the bound user.
+	IDServer      string `json:"id_server"`
+	IDAccessToken string `json:"id_access_token"`
+	Medium        string `json:"medium"`
+	Address       string `json:"address"`
 }
 
 // RoomInvite handles POST /_matrix/client/v3/rooms/{roomID}/invite.
@@ -363,11 +399,51 @@ func (a *API) RoomInvite(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	if err := a.sendMemberEvent(r, auth, roomID, "", req.UserID, rooms.MembershipInvite, req.Reason); err != nil {
+	if req.UserID != "" && req.Address != "" {
+		httpx.WriteError(w, httpx.ErrBadJSON("invite must name either a user_id or a 3PID address, not both"))
+		return
+	}
+	target := req.UserID
+	if target == "" && req.Address != "" {
+		// 3PID invite: resolve the address to a Matrix user ID via the identity
+		// server. A bound 3PID invites that user (the "existing 3pid" flow); an
+		// unbound one uses the store-invite + third-party invite flow (deferred:
+		// requires the invitee to complete the signed third-party membership).
+		bound, err := a.lookup3PID(r.Context(), req.IDServer, req.Medium, req.Address)
+		if err != nil || bound == "" {
+			// The sytest identity server stores invites for unbound 3PIDs; we
+			// cannot complete the third-party invite flow without signing-key
+			// verification of the returned public key, so reject with 403 to
+			// avoid silently "succeeding" without creating an invite. A lookup
+			// failure (unreachable identity server) is also a 403 per the spec's
+			// "the identity server must be reachable" requirement.
+			httpx.WriteError(w, httpx.ErrForbidden("cannot resolve 3PID address"))
+			return
+		}
+		target = bound
+	}
+	if target == "" {
+		httpx.WriteError(w, httpx.ErrBadJSON("invite requires user_id or a 3PID address"))
+		return
+	}
+	if err := a.sendMemberEvent(r, auth, roomID, "", target, rooms.MembershipInvite, req.Reason); err != nil {
 		writeRoomErr(w, err)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// lookup3PID resolves a (medium, address) 3PID to a Matrix user ID using the
+// named identity server. An empty identity server name or an unreachable/lookup
+// failure yields an error.
+func (a *API) lookup3PID(ctx context.Context, idServer, medium, address string) (string, error) {
+	if idServer == "" {
+		return "", fmt.Errorf("3pid invite requires id_server")
+	}
+	if medium == "" || address == "" {
+		return "", fmt.Errorf("3pid invite requires medium and address")
+	}
+	return identity.New(idServer, a.Config.IdentityServerInsecure).Lookup(ctx, medium, address)
 }
 
 type kickRequest struct {

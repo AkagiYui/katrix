@@ -124,6 +124,11 @@ sub _get_config
 
       federation_enabled => $JSON::true,
 
+      # The sytest mock identity server presents a self-signed certificate
+      # (keys/tls-selfsigned.crt), so skip TLS verification for identity-server
+      # requests (3PID invites).
+      identity_server_insecure => $JSON::true,
+
       federation_tls => {
          cert_path => $self->{paths}{tls_cert},
          key_path  => $self->{paths}{tls_key},

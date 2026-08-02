@@ -59,6 +59,12 @@ type Config struct {
 	Metrics struct {
 		Enabled bool `yaml:"enabled"`
 	} `yaml:"metrics"`
+
+	// IdentityServerInsecure skips TLS certificate verification for outbound
+	// identity-server requests. The sytest suite's mock identity server presents
+	// a self-signed certificate (keys/tls-selfsigned.crt), so this must be
+	// enabled there; production deployments should leave it off.
+	IdentityServerInsecure bool `yaml:"identity_server_insecure"`
 }
 
 // Default returns a config populated with development defaults.
