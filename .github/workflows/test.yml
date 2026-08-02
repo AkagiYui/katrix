@@ -52,7 +52,14 @@ jobs:
           COMPLEMENT_SHARE_ENV_PREFIX: PASS_
         run: |
           cd complement
-          go test -json -tags="katrix_blacklist msc2836 msc2946 msc3030 msc3874 msc3890 msisns" ./tests/... 2>&1 \
+          # Only the katrix_blacklist tag matters here: it lets
+          # runtime.SkipIf() identify katrix as the HS under test (see
+          # .complement-runtime/hs_katrix.go). The mscXXXX / msisns tags are
+          # dead weight — no complement build constraint ever referenced them,
+          # and the msc2946/msc3030 suites have since been deleted upstream.
+          # ./tests/... runs every package regardless, so all current MSC
+          # suites (msc2836 ... msc4306) are exercised automatically.
+          go test -json -tags="katrix_blacklist" ./tests/... 2>&1 \
             | tee /tmp/complement.log || true
       - name: summary
         if: always()
