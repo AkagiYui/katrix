@@ -541,6 +541,13 @@ func (a *API) RoomStatePut(w http.ResponseWriter, r *http.Request) {
 		writeRoomErr(w, err)
 		return
 	}
+	// A client-sent m.room.tombstone marks a manual room upgrade: copy the local
+	// users' per-room push rules from the old room to the replacement room (the
+	// spec's server-behaviour note, also exercised by Complement's manual-upgrade
+	// push-rule test).
+	if eventType == "m.room.tombstone" && stateKey == "" {
+		a.copyPushRulesOnTombstone(r.Context(), roomID, content)
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": ev.EventID()})
 }
 

@@ -12,6 +12,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/eventstate"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/metrics"
+	"github.com/AkagiYui/katrix/internal/pushrules"
 	"github.com/AkagiYui/katrix/internal/rooms"
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
@@ -265,7 +266,37 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 			a.applyRemoteMembershipNotify(r.Context(), ev.RoomID, *ev.StateKey, mc.Membership)
 		}
 	}
+	// An inbound m.room.tombstone means the room was upgraded (locally or on a
+	// remote server). Per the spec's server-behaviour notes, the local users'
+	// per-room push rules must be copied to the replacement room so their
+	// notification settings follow them (Complement's remote-upgrade push-rule
+	// test relies on this).
+	if ev.Type == "m.room.tombstone" && ev.StateKey != nil && *ev.StateKey == "" {
+		a.copyPushRulesOnRemoteTombstone(r.Context(), ev.RoomID, ev.Content)
+	}
 	return evID, true
+}
+
+// copyPushRulesOnRemoteTombstone copies the local joined users' per-room push
+// rules to the replacement room named in an inbound tombstone.
+func (a *API) copyPushRulesOnRemoteTombstone(ctx context.Context, oldRoomID string, content json.RawMessage) {
+	var tc struct {
+		ReplacementRoom string `json:"replacement_room"`
+	}
+	if err := json.Unmarshal(content, &tc); err != nil || tc.ReplacementRoom == "" {
+		return
+	}
+	members, err := a.Store.Members(ctx, oldRoomID, "join")
+	if err != nil {
+		return
+	}
+	var localparts []string
+	for _, m := range members {
+		if a.IsLocalUser(m.UserID) {
+			localparts = append(localparts, a.LocalpartOf(m.UserID))
+		}
+	}
+	pushrules.CopyRulesForRoom(ctx, a.Store, localparts, oldRoomID, tc.ReplacementRoom)
 }
 
 // membershipRowFromContent builds the denormalised membership row for a member

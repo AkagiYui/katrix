@@ -377,11 +377,15 @@ func (s *Store) EventByTimestamp(ctx context.Context, roomID string, ts int64, d
 	              COALESCE(redacts,''), redacted, outlier
 	       FROM events WHERE room_id=$1`
 	args := []any{roomID}
+	// MSC3030: when multiple events share the same timestamp the "next event"
+	// is resolved topologically (by DAG depth), not by insertion order: a
+	// backward search finds the topologically-last event at that timestamp, a
+	// forward search the topologically-first.
 	switch dir {
 	case "b":
-		q += ` AND origin_server_ts<=$2 ORDER BY origin_server_ts DESC, stream_ordering DESC LIMIT 1`
+		q += ` AND origin_server_ts<=$2 ORDER BY origin_server_ts DESC, depth DESC, stream_ordering DESC LIMIT 1`
 	case "f":
-		q += ` AND origin_server_ts>=$2 ORDER BY origin_server_ts ASC, stream_ordering ASC LIMIT 1`
+		q += ` AND origin_server_ts>=$2 ORDER BY origin_server_ts ASC, depth ASC, stream_ordering ASC LIMIT 1`
 	default:
 		return nil, errors.New("storage: invalid dir")
 	}

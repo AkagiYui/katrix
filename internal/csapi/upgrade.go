@@ -9,6 +9,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/ids"
+	"github.com/AkagiYui/katrix/internal/pushrules"
 	"github.com/AkagiYui/katrix/internal/rooms"
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
@@ -463,38 +464,34 @@ func (a *API) copyPushRulesForAllLocalUsers(ctx context.Context, oldRoomID, newR
 	if err != nil {
 		return
 	}
+	var localparts []string
 	for _, m := range members {
-		if !a.IsLocalUser(m.UserID) {
-			continue
+		if a.IsLocalUser(m.UserID) {
+			localparts = append(localparts, a.LocalpartOf(m.UserID))
 		}
-		a.copyPushRulesForRoom(a.LocalpartOf(m.UserID), oldRoomID, newRoomID)
 	}
+	pushrules.CopyRulesForRoom(ctx, a.Store, localparts, oldRoomID, newRoomID)
+}
+
+// copyPushRulesOnTombstone copies the local users' per-room push rules to the
+// replacement room when an m.room.tombstone is observed (a manual upgrade or a
+// remote upgrade whose tombstone arrives over federation). The replacement room
+// is named in the tombstone content's replacement_room field.
+func (a *API) copyPushRulesOnTombstone(ctx context.Context, oldRoomID string, content json.RawMessage) {
+	var tc struct {
+		ReplacementRoom string `json:"replacement_room"`
+	}
+	if err := json.Unmarshal(content, &tc); err != nil || tc.ReplacementRoom == "" {
+		return
+	}
+	a.copyPushRulesForAllLocalUsers(ctx, oldRoomID, tc.ReplacementRoom)
 }
 
 // copyPushRulesForRoom clones a user's room-specific push rules from oldRoomID
 // to newRoomID (used by room upgrade so local users keep their per-room
 // notification settings in the replacement room).
 func (a *API) copyPushRulesForRoom(localpart, oldRoomID, newRoomID string) {
-	rules := a.loadRules(localpart)
-	global, _ := rules["global"].(map[string]any)
-	list, _ := global["room"].([]any)
-	for _, e := range list {
-		em, ok := e.(map[string]any)
-		if !ok {
-			continue
-		}
-		if em["rule_id"] != oldRoomID {
-			continue
-		}
-		clone := map[string]any{}
-		for k, v := range em {
-			clone[k] = v
-		}
-		clone["rule_id"] = newRoomID
-		global["room"] = append(list, clone)
-	}
-	rules["global"] = global
-	_ = a.savePushRules(localpart, rules)
+	pushrules.CopyRulesForRoom(context.Background(), a.Store, []string{localpart}, oldRoomID, newRoomID)
 }
 
 // updateDirectRoom replaces the old room ID with the new one in the user's
