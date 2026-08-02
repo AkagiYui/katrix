@@ -15,6 +15,10 @@ type StateSnapshot struct {
 	Create     json.RawMessage // m.room.create content (state_key "")
 	JoinRules  json.RawMessage // m.room.join_rules content (state_key "")
 	PowerLevel json.RawMessage // m.room.power_levels content (state_key "")
+	// GuestAccess carries the m.room.guest_access content (state_key ""); a
+	// guest may join a room whose guest_access is "can_join" even when the
+	// join_rule is invite (spec guest_access semantics).
+	GuestAccess json.RawMessage
 	// Member of the event sender ("" if absent).
 	SenderMember json.RawMessage
 	// Member of the target (state_key) for m.room.member events ("" if absent).
@@ -22,6 +26,9 @@ type StateSnapshot struct {
 	// ThirdPartyInvite content for a matching third_party_invite token, if the
 	// member event references one.
 	ThirdPartyInvite json.RawMessage
+	// SenderIsGuest marks the sender as a guest account, which the join rules
+	// use to permit joining guest_access "can_join" rooms (spec guest_access).
+	SenderIsGuest bool
 	// RestrictedAuthorised records that the user named in the join event's
 	// join_authorised_via_users_server is a joined member of this room and of
 	// one of the rooms in the join_rules allow list (MSC3083). It is computed
@@ -138,6 +145,22 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 	}
 }
 
+// guestAccessCanJoin reports whether an m.room.guest_access content value
+// permits guests to join ("can_join"). An absent event (empty content) or any
+// other value ("forbidden") denies.
+func guestAccessCanJoin(content json.RawMessage) bool {
+	if len(content) == 0 {
+		return false
+	}
+	var ga struct {
+		GuestAccess string `json:"guest_access"`
+	}
+	if err := json.Unmarshal(content, &ga); err != nil {
+		return false
+	}
+	return ga.GuestAccess == "can_join"
+}
+
 // authorizeMember applies the m.room.member authorization rules (the
 // membership state machine). userLevel is the closure that already applies
 // creator-privilege (v12) so member rules use it consistently. stateKey is the
@@ -202,7 +225,14 @@ func authorizeMember(rules roomver.Rules, sender, stateKey string, content json.
 					return fmt.Errorf("rooms: join not authorised via an allowed room")
 				}
 			default:
-				return fmt.Errorf("rooms: room is not publicly joinable")
+				// A guest may join an invite-only room when the room's
+				// m.room.guest_access is "can_join" (spec guest_access: the
+				// guest_access state event determines whether guests may join).
+				if st.SenderIsGuest && guestAccessCanJoin(st.GuestAccess) {
+					// guests may join
+				} else {
+					return fmt.Errorf("rooms: room is not publicly joinable")
+				}
 			}
 		case MembershipBan:
 			// A banned user cannot join without being unbanned first.

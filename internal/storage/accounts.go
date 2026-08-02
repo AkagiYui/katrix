@@ -6,6 +6,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // ErrNotFound is returned when a lookup finds no row.
@@ -291,6 +292,54 @@ func (s *Store) LookupAccessToken(ctx context.Context, token string) (*AccessTok
 func (s *Store) DeleteAccessToken(ctx context.Context, token string) error {
 	_, err := s.pool.Exec(ctx, `DELETE FROM access_tokens WHERE token=$1`, token)
 	return err
+}
+
+// GuestAccessTokenValid reports whether token is an active access token of the
+// guest account with the given localpart (the guest-upgrade flow's proof of
+// ownership: only the guest themself may upgrade their session).
+func (s *Store) GuestAccessTokenValid(ctx context.Context, localpart, token string) error {
+	var guest bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT u.is_guest FROM users u
+		 JOIN access_tokens t ON t.user_localpart=u.localpart
+		 WHERE u.localpart=$1 AND t.token=$2`,
+		localpart, token,
+	).Scan(&guest)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if !guest {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpgradeGuest converts a guest account into a full account: the is_guest flag
+// is cleared and (when a password is supplied) the password hash is set. All
+// of the guest's existing sessions keep working (they now belong to a full
+// user).
+func (s *Store) UpgradeGuest(ctx context.Context, localpart, password string) error {
+	hash := ""
+	if password != "" {
+		h, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+		if err != nil {
+			return err
+		}
+		hash = string(h)
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE users SET is_guest=FALSE, password_hash=$2 WHERE localpart=$1 AND is_guest=TRUE`,
+		localpart, hash)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // DeleteAllAccessTokens removes all of a user's tokens (logout all).

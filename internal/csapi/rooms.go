@@ -2147,7 +2147,49 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	// room_state is maintained by persistEvent (snapshot + recompute).
 	a.notifyRoomMembers(r.Context(), roomID)
 	a.broadcastPDU(r.Context(), roomID, ev)
+	// Revoking guest_access ("forbidden") kicks the room's joined guest users:
+	// per the spec's guest_access semantics, guests may only be in the room
+	// while guest_access permits it. The kick is a leave sent by the room's
+	// members.
+	if eventType == "m.room.guest_access" && stateKey == "" && !guestAccessAllowsJoin(content) {
+		a.kickJoinedGuests(r, auth, roomID)
+	}
 	return ev, nil
+}
+
+// guestAccessAllowsJoin reports whether an m.room.guest_access content value
+// permits guests to join ("can_join").
+func guestAccessAllowsJoin(content json.RawMessage) bool {
+	var ga struct {
+		GuestAccess string `json:"guest_access"`
+	}
+	if err := json.Unmarshal(content, &ga); err != nil {
+		return false
+	}
+	return ga.GuestAccess == "can_join"
+}
+
+// kickJoinedGuests sends a leave for every joined guest member of the room (the
+// guest_access revocation behaviour). Remote guests are left to their own
+// server; local guests are kicked with a leave from a room member.
+func (a *API) kickJoinedGuests(r *http.Request, auth *homeserver.Auth, roomID string) {
+	members, err := a.Store.Members(r.Context(), roomID, "join")
+	if err != nil {
+		return
+	}
+	for _, m := range members {
+		if !a.IsLocalUser(m.UserID) {
+			continue
+		}
+		u, err := a.Store.GetUser(r.Context(), a.LocalpartOf(m.UserID))
+		if err != nil || !u.IsGuest {
+			continue
+		}
+		if m.UserID == auth.UserID {
+			continue
+		}
+		_ = a.sendMemberEvent(r, auth, roomID, "", m.UserID, rooms.MembershipLeave, "guest access revoked")
+	}
 }
 
 // validatePowerLevelIntegers validates an m.room.power_levels content object:
@@ -2403,6 +2445,16 @@ func (a *API) buildStateSnapshot(ctx context.Context, roomID, target, sender str
 		if ev, err := a.Store.GetEvent(ctx, id); err == nil {
 			st.PowerLevel = ev.Content
 		}
+	}
+	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.guest_access", ""); err == nil {
+		if ev, err := a.Store.GetEvent(ctx, id); err == nil {
+			st.GuestAccess = ev.Content
+		}
+	}
+	// A guest sender may join a guest_access "can_join" room even when the
+	// join_rule is invite (spec guest_access semantics).
+	if m, err := a.Store.GetUser(ctx, a.LocalpartOf(sender)); err == nil && m.IsGuest {
+		st.SenderIsGuest = true
 	}
 	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.member", sender); err == nil {
 		if ev, err := a.Store.GetEvent(ctx, id); err == nil {

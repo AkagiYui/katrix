@@ -38,6 +38,7 @@ type registerRequest struct {
 	InitialDeviceDisplayName string          `json:"initial_device_display_name"`
 	InhibitLogin             bool            `json:"inhibit_login"`
 	RefreshToken             bool            `json:"refresh_token"`
+	GuestAccessToken         string          `json:"guest_access_token"`
 	Auth                     json.RawMessage `json:"auth"`
 }
 
@@ -88,6 +89,15 @@ func (a *API) RegisterAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Guest upgrade (spec: registering with a guest_access_token converts the
+	// guest session to a full account). The username must name an existing guest
+	// whose access token matches; after UIA the guest's is_guest flag is cleared
+	// and the password is set.
+	if req.GuestAccessToken != "" {
+		a.upgradeGuestAccount(w, r, body, req)
+		return
+	}
+
 	// Validate username up front so we can 400 before starting UIA where useful.
 	localpart := strings.ToLower(req.Username)
 	if localpart != "" {
@@ -119,6 +129,54 @@ func (a *API) RegisterAccount(w http.ResponseWriter, r *http.Request) {
 		localpart = strings.ToLower(ids.RandomDeviceID())
 	}
 	a.completeRegistration(w, r, localpart, req)
+}
+
+// upgradeGuestAccount converts an existing guest session into a full account
+// (spec: POST /register with a guest_access_token). The guest's username must
+// be given, the guest_access_token must match the guest's session, and the
+// upgrade goes through UIA (the sytest suite uses m.login.dummy). On success
+// the guest flag is cleared, the password is stored, and a fresh session is
+// issued.
+func (a *API) upgradeGuestAccount(w http.ResponseWriter, r *http.Request, body []byte, req registerRequest) {
+	localpart := strings.ToLower(req.Username)
+	if localpart == "" || !ids.ValidLocalpart(localpart) {
+		httpx.WriteError(w, httpx.ErrInvalidUsername("invalid username"))
+		return
+	}
+	// The guest_access_token must belong to the guest being upgraded.
+	if err := a.Store.GuestAccessTokenValid(r.Context(), localpart, req.GuestAccessToken); err != nil {
+		httpx.WriteError(w, httpx.ErrForbidden("guest_access_token does not match the given user"))
+		return
+	}
+	ok, err := a.checkUIA(w, r, body, false)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	if !ok {
+		return // UIA challenge written; the client completes with auth
+	}
+	// Upgrade: clear the guest flag, set the password, keep the same localpart.
+	if err := a.Store.UpgradeGuest(r.Context(), localpart, req.Password); err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	deviceID := req.DeviceID
+	if deviceID == "" {
+		deviceID = ids.RandomDeviceID()
+	}
+	login, err := a.issueLogin(r, localpart, deviceID, req.InitialDeviceDisplayName, req.RefreshToken)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"user_id":      a.UserID(localpart),
+		"home_server":  a.ServerName(),
+		"well_known":   a.wellKnown(),
+		"device_id":    deviceID,
+		"access_token": login.AccessToken,
+	})
 }
 
 func (a *API) completeRegistration(w http.ResponseWriter, r *http.Request, localpart string, req registerRequest) {

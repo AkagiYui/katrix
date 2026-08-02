@@ -14,9 +14,12 @@ import (
 func (a *API) registerProfile(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/profile/{userId}", a.GetProfile)
 	mux.HandleFunc("GET /_matrix/client/v3/profile/{userId}/displayname", a.GetDisplayName)
-	mux.HandleFunc("PUT /_matrix/client/v3/profile/{userId}/displayname", a.RequireUserAuth(a.SetDisplayName))
+	// Profile edits use RequireAuth (not RequireUserAuth): per the spec a guest
+	// may set their own display name and avatar (the guest_access sytest suite
+	// exercises exactly this).
+	mux.HandleFunc("PUT /_matrix/client/v3/profile/{userId}/displayname", a.RequireAuth(a.SetDisplayName))
 	mux.HandleFunc("GET /_matrix/client/v3/profile/{userId}/avatar_url", a.GetAvatarURL)
-	mux.HandleFunc("PUT /_matrix/client/v3/profile/{userId}/avatar_url", a.RequireUserAuth(a.SetAvatarURL))
+	mux.HandleFunc("PUT /_matrix/client/v3/profile/{userId}/avatar_url", a.RequireAuth(a.SetAvatarURL))
 }
 
 // GetProfile handles GET /_matrix/client/v3/profile/{userId}.

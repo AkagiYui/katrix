@@ -274,7 +274,109 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	if ev.Type == "m.room.tombstone" && ev.StateKey != nil && *ev.StateKey == "" {
 		a.copyPushRulesOnRemoteTombstone(r.Context(), ev.RoomID, ev.Content)
 	}
+	// Revoking guest_access kicks the room's local joined guests (spec
+	// guest_access semantics).
+	if ev.Type == "m.room.guest_access" && ev.StateKey != nil && *ev.StateKey == "" {
+		a.kickJoinedGuestsOnRemote(r.Context(), ev.RoomID, ev.Content)
+	}
 	return evID, true
+}
+
+// kickJoinedGuestsOnRemote sends a leave for each local joined guest of the
+// room after an inbound m.room.guest_access event revoked access.
+func (a *API) kickJoinedGuestsOnRemote(ctx context.Context, roomID string, content json.RawMessage) {
+	var ga struct {
+		GuestAccess string `json:"guest_access"`
+	}
+	if err := json.Unmarshal(content, &ga); err != nil || ga.GuestAccess == "can_join" {
+		return
+	}
+	members, err := a.Store.Members(ctx, roomID, "join")
+	if err != nil {
+		return
+	}
+	for _, m := range members {
+		if !a.IsLocalUser(m.UserID) {
+			continue
+		}
+		u, err := a.Store.GetUser(ctx, a.LocalpartOf(m.UserID))
+		if err != nil || !u.IsGuest {
+			continue
+		}
+		a.kickLocalGuest(ctx, roomID, m.UserID)
+	}
+}
+
+// kickLocalGuest builds, persists and broadcasts a leave event for a local
+// guest whose room access was revoked.
+func (a *API) kickLocalGuest(ctx context.Context, roomID, userID string) {
+	room, err := a.Store.GetRoom(ctx, roomID)
+	if err != nil {
+		return
+	}
+	version := roomver.Version(room.Version)
+	latest, _ := a.Store.LatestEvent(ctx, roomID)
+	var prev []string
+	depth := int64(1)
+	if latest != nil {
+		prev = []string{latest.EventID}
+		depth = latest.Depth + 1
+	}
+	content, _ := json.Marshal(map[string]any{"membership": "leave", "reason": "guest access revoked"})
+	b := events.Builder{
+		Type:           "m.room.member",
+		Sender:         userID,
+		RoomID:         roomID,
+		Content:        content,
+		Depth:          depth,
+		OriginServerTS: a.Now(),
+		PrevEvents:     prev,
+		AuthEvents:     a.memberAuthIDsFromStore(ctx, roomID, userID),
+	}
+	sk := userID
+	b.StateKey = &sk
+	ev, err := b.BuildForVersion(a.ServerName(), a.Key, version)
+	if err != nil {
+		return
+	}
+	stream, err := a.Store.InsertEvent(ctx, &storage.EventRow{
+		EventID: ev.EventID(), RoomID: roomID, Type: ev.Type(), StateKey: userID,
+		Sender: ev.Sender(), Depth: ev.Depth(), OriginServerTS: ev.OriginServerTS(),
+		Content: ev.Content(), RawJSON: ev.Raw(), AuthEvents: ev.AuthEvents(), PrevEvents: ev.PrevEvents(),
+	})
+	if err != nil {
+		return
+	}
+	if rules, ok := roomver.Get(version); ok {
+		_ = eventstate.Maintain(ctx, a.Store, &storage.EventRow{
+			EventID: ev.EventID(), RoomID: roomID, Type: ev.Type(), StateKey: userID,
+			Sender: ev.Sender(), Depth: ev.Depth(), OriginServerTS: ev.OriginServerTS(),
+			Content: ev.Content(), RawJSON: ev.Raw(), AuthEvents: ev.AuthEvents(), PrevEvents: ev.PrevEvents(),
+		}, rules)
+	}
+	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
+		RoomID: roomID, UserID: userID, Membership: "leave",
+		EventID: ev.EventID(), StreamOrdering: stream, Depth: ev.Depth(),
+	})
+	a.notifyRoomMembers(ctx, roomID)
+	a.BroadcastPDUToRoom(ctx, roomID, ev)
+}
+
+// memberAuthIDsFromStore returns the auth_events for a member event using the
+// same rule as the make_join handler (create, power_levels, the target's
+// member event).
+func (a *API) memberAuthIDsFromStore(ctx context.Context, roomID, userID string) []string {
+	var ids []string
+	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.create", ""); err == nil {
+		ids = append(ids, id)
+	}
+	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.power_levels", ""); err == nil {
+		ids = append(ids, id)
+	}
+	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.member", userID); err == nil {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // copyPushRulesOnRemoteTombstone copies the local joined users' per-room push
@@ -1257,6 +1359,7 @@ func (a *API) memberStateSnapshot(r *http.Request, roomID, sender, target string
 		{"m.room.create", "", &st.Create},
 		{"m.room.join_rules", "", &st.JoinRules},
 		{"m.room.power_levels", "", &st.PowerLevel},
+		{"m.room.guest_access", "", &st.GuestAccess},
 		{"m.room.member", sender, &st.SenderMember},
 	} {
 		if id, err := a.Store.GetStateEvent(r.Context(), roomID, tc.typ, tc.sk); err == nil {
