@@ -601,7 +601,7 @@ func (e *Engine) appendPresence(ctx context.Context, resp *Response, opts SyncOp
 			changed = nil
 		}
 		roomIDs, _ := e.store.RoomsForUser(ctx, opts.UserID)
-		newPeers, err := e.store.NewRoomPeersSince(ctx, roomIDs, opts.Since.Stream)
+		newPeers, err := e.store.NewRoomPeersSince(ctx, roomIDs, opts.Since.Stream, opts.UserID)
 		if err != nil {
 			newPeers = nil
 		}

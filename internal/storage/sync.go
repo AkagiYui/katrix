@@ -419,14 +419,27 @@ func (s *Store) PresenceChangesSince(ctx context.Context, since int64) ([]string
 // presence must be delivered even when their presence row predates the sync
 // token, because the shared-room relationship (and thus visibility) is new
 // (spec: presence is delivered to the users who share a room).
-func (s *Store) NewRoomPeersSince(ctx context.Context, roomIDs []string, since int64) ([]string, error) {
+func (s *Store) NewRoomPeersSince(ctx context.Context, roomIDs []string, since int64, syncerUserID string) ([]string, error) {
 	if len(roomIDs) == 0 {
 		return nil, nil
 	}
+	// A peer is "newly visible" to the syncer when the sharing relationship is
+	// new on either side: the peer joined one of the syncer's rooms after the
+	// token (peer-side), OR the syncer themselves joined a room after the token
+	// — every joined member of that room becomes newly visible at once (their
+	// presence must be emitted even though their own membership predates the
+	// token, e.g. Alice created the room before Bob's sync token and Bob then
+	// joined it; Bob's incremental sync must still report Alice's presence).
 	rows, err := s.pool.Query(ctx,
-		`SELECT DISTINCT user_id FROM room_memberships
-		 WHERE room_id = ANY($1) AND membership='join' AND stream_ordering > $2`,
-		roomIDs, since)
+		`SELECT DISTINCT rm.user_id FROM room_memberships rm
+		 WHERE rm.room_id = ANY($1) AND rm.membership='join' AND (
+		       rm.stream_ordering > $2
+		       OR rm.room_id IN (
+		           SELECT room_id FROM room_memberships
+		           WHERE user_id=$3 AND membership='join' AND stream_ordering > $2
+		       )
+		 )`,
+		roomIDs, since, syncerUserID)
 	if err != nil {
 		return nil, err
 	}
