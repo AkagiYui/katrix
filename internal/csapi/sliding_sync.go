@@ -108,7 +108,7 @@ type slidingSyncRoomResp struct {
 	JoinedCount   *int              `json:"joined_count,omitempty"`
 	InvitedCount  *int              `json:"invited_count,omitempty"`
 	Membership    string            `json:"membership,omitempty"`
-	StrippedState []json.RawMessage `json:"stripped_state,omitempty"`
+	StrippedState []json.RawMessage `json:"invite_state,omitempty"`
 }
 
 type slidingSyncExtResp struct {
