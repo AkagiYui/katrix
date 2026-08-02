@@ -50,7 +50,9 @@ jobs:
       - name: run complement
         env:
           COMPLEMENT_SHARE_ENV_PREFIX: PASS_
+        shell: bash
         run: |
+          set -o pipefail
           cd complement
           # Only the katrix_blacklist tag matters here: it lets
           # runtime.SkipIf() identify katrix as the HS under test (see
@@ -60,7 +62,7 @@ jobs:
           # ./tests/... runs every package regardless, so all current MSC
           # suites (msc2836 ... msc4306) are exercised automatically.
           go test -json -tags="katrix_blacklist" ./tests/... 2>&1 \
-            | tee /tmp/complement.log || true
+            | tee /tmp/complement.log
       - name: summary
         if: always()
         # testreport renders the per-test breakdown (expected vs actual) from
@@ -104,7 +106,9 @@ jobs:
       - name: build sytest-katrix image
         run: docker build -f Containerfile.sytest -t sytest-katrix .
       - name: run sytest
+        shell: bash
         run: |
+          set -o pipefail
           mkdir -p sytest-logs
           docker run --rm \
             -v "$PWD/sytest-src:/sytest" \
@@ -112,7 +116,7 @@ jobs:
             -v "$PWD/sytest-logs:/logs" \
             -e POSTGRES=1 \
             -e SYTEST_DEFAULT_BRANCH=develop \
-            sytest-katrix 2>&1 | tee /tmp/sytest.log || true
+            sytest-katrix 2>&1 | tee /tmp/sytest.log
       - name: summary
         if: always()
         run: |
@@ -242,7 +246,7 @@ jobs:
           cd complement-crypto
           set -o pipefail
           go test -p 3 -v -json -tags='jssdk,rust' -count=1 -timeout 15m \
-            ./tests ./tests/js ./tests/rust 2>&1 | tee /tmp/crypto.log || true
+            ./tests ./tests/js ./tests/rust 2>&1 | tee /tmp/crypto.log
       - name: summary
         if: always()
         run: |
