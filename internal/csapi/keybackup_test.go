@@ -27,13 +27,20 @@ func TestKeyBackupCRUD(t *testing.T) {
 		t.Fatalf("get backup: code=%d body=%v", code, body)
 	}
 
-	// Put room keys.
+	// Put room keys. Per the spec the session value IS the backup key object
+	// (first_message_index, forwarded_count, is_verified, session_data) — no
+	// `session_key` wrapper.
 	code, body = doJSON(t, srv, http.MethodPut, "/_matrix/client/v3/room_keys/keys?version="+itoa(version), tok,
 		map[string]any{
 			"rooms": map[string]any{
 				"!room:test.katrix": map[string]any{
 					"sessions": map[string]any{
-						"sess1": map[string]any{"session_key": "KEYDATA"},
+						"sess1": map[string]any{
+							"first_message_index": 0,
+							"forwarded_count":     0,
+							"is_verified":         false,
+							"session_data":        map[string]any{"ciphertext": "C"},
+						},
 					},
 				},
 			},

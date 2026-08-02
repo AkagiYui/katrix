@@ -63,13 +63,7 @@ func (a *API) LatestKeyBackup(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrNotFound("no key backup"))
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"version":   v.Version,
-		"algorithm": v.Algorithm,
-		"auth_data": json.RawMessage(v.AuthData),
-		"etag":      strconv.FormatInt(v.Etag, 10),
-		"count":     0,
-	})
+	writeKeyBackupInfo(w, v)
 }
 
 // GetKeyBackup handles GET /_matrix/client/v3/room_keys/version/{version}.
@@ -81,8 +75,15 @@ func (a *API) GetKeyBackup(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrNotFound("key backup not found"))
 		return
 	}
+	writeKeyBackupInfo(w, v)
+}
+
+// writeKeyBackupInfo renders a key-backup version object. Per the spec the
+// version and etag are opaque strings (not JSON numbers); the ruma deserializer
+// rejects a numeric version.
+func writeKeyBackupInfo(w http.ResponseWriter, v *storage.KeyBackupVersion) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"version":   v.Version,
+		"version":   strconv.FormatInt(v.Version, 10),
 		"algorithm": v.Algorithm,
 		"auth_data": json.RawMessage(v.AuthData),
 		"etag":      strconv.FormatInt(v.Etag, 10),
@@ -151,11 +152,14 @@ func (a *API) putRoomKeys(w http.ResponseWriter, r *http.Request, roomID, sessio
 			}
 		}
 	} else {
+		// Bulk endpoint (PUT /room_keys/keys and PUT /room_keys/keys/{roomID}):
+		// the body is {rooms: {roomID: {sessions: {sessionID: KeyBackupData}}}}.
+		// Per the spec (and Synapse), each session value IS the backup key object
+		// (first_message_index, forwarded_count, is_verified, session_data) —
+		// there is no extra `session_key` wrapper.
 		var req struct {
 			Rooms map[string]struct {
-				Sessions map[string]struct {
-					SessionKey json.RawMessage `json:"session_key"`
-				} `json:"sessions"`
+				Sessions map[string]json.RawMessage `json:"sessions"`
 			} `json:"rooms"`
 		}
 		if len(body) > 0 {
@@ -165,12 +169,12 @@ func (a *API) putRoomKeys(w http.ResponseWriter, r *http.Request, roomID, sessio
 			if roomID != "" {
 				rid = roomID
 			}
-			for sid, sess := range room.Sessions {
+			for sid, keyData := range room.Sessions {
 				if sessionID != "" {
 					sid = sessionID
 				}
 				keys = append(keys, storage.RoomKey{
-					UserID: auth.UserID, Version: version, RoomID: rid, SessionID: sid, KeyData: sess.SessionKey,
+					UserID: auth.UserID, Version: version, RoomID: rid, SessionID: sid, KeyData: keyData,
 				})
 			}
 		}
@@ -259,7 +263,9 @@ func (a *API) getRoomKeys(w http.ResponseWriter, r *http.Request, roomID, sessio
 		httpx.WriteJSON(w, http.StatusOK, obj)
 		return
 	}
-	// Group into rooms -> sessions -> session_key.
+	// Group into rooms -> sessions -> key data. Per the spec the session value
+	// IS the backup key object (first_message_index, forwarded_count,
+	// is_verified, session_data), matching the PUT request format.
 	out := map[string]any{"rooms": map[string]any{}}
 	rooms := out["rooms"].(map[string]any)
 	for _, k := range keys {
@@ -267,9 +273,12 @@ func (a *API) getRoomKeys(w http.ResponseWriter, r *http.Request, roomID, sessio
 			rooms[k.RoomID] = map[string]any{"sessions": map[string]any{}}
 		}
 		sessions := rooms[k.RoomID].(map[string]any)["sessions"].(map[string]any)
-		sessions[k.SessionID] = map[string]any{
-			"session_key": json.RawMessage(k.KeyData),
+		var obj map[string]any
+		_ = json.Unmarshal(k.KeyData, &obj)
+		if obj == nil {
+			obj = map[string]any{}
 		}
+		sessions[k.SessionID] = obj
 	}
 	httpx.WriteJSON(w, http.StatusOK, out)
 }

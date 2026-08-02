@@ -190,7 +190,36 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"device_keys": out})
+	// Cross-signing keys (per spec, keys/query also returns each user's
+	// master/self_signing/user_signing keys). Clients use the master key to
+	// verify key backups and cross-signing signatures; without it the SDK
+	// refuses to import a recovery key ("public key of the imported private key
+	// doesn't match").
+	masterKeys := map[string]json.RawMessage{}
+	selfSigningKeys := map[string]json.RawMessage{}
+	userSigningKeys := map[string]json.RawMessage{}
+	for _, u := range localUsers {
+		cks, err := a.Store.CrossSigningKeys(r.Context(), u)
+		if err != nil {
+			continue
+		}
+		for _, k := range cks {
+			switch k.KeyType {
+			case "master":
+				masterKeys[u] = k.KeyJSON
+			case "self_signing":
+				selfSigningKeys[u] = k.KeyJSON
+			case "user_signing":
+				userSigningKeys[u] = k.KeyJSON
+			}
+		}
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"device_keys":       out,
+		"master_keys":       masterKeys,
+		"self_signing_keys": selfSigningKeys,
+		"user_signing_keys": userSigningKeys,
+	})
 }
 
 // KeysClaim handles POST /_matrix/client/v3/keys/claim.
