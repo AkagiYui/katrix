@@ -214,6 +214,24 @@ func (a *API) SlidingSync(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, resp)
 }
 
+// sameRequiredState reports whether two required_state lists are equal (same
+// (type, state_key) pairs, order-insensitive).
+func sameRequiredState(a, b [][2]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := map[[2]string]bool{}
+	for _, p := range a {
+		seen[p] = true
+	}
+	for _, p := range b {
+		if !seen[p] {
+			return false
+		}
+	}
+	return true
+}
+
 // parsePos decodes a sliding-sync position into a stream value (0 when absent
 // or malformed). The position is the shared sync stream's "s<N>" form.
 func parsePos(pos string) int64 {
@@ -266,14 +284,38 @@ func (a *API) buildSlidingSync(ctx context.Context, auth *homeserver.Auth, since
 	// ---- Room subscriptions ----
 	// Processed first: a subscription's config (timeline_limit, required_state)
 	// always wins over the coarser list config for the same room, because the
-	// client subscribes to follow a specific room closely.
+	// client subscribes to follow a specific room closely. A room that was
+	// already delivered on this connection (through a list) but is now
+	// subscribed with a different (typically higher) config must be re-delivered
+	// with initial=true and the subscription's timeline, so the client replaces
+	// its local copy instead of merging incrementally.
+	connID := req.ConnID
 	for roomID, sub := range req.RoomSubscriptions {
 		entry := a.slidingRoomEntryFor(ctx, roomID, auth.UserID)
 		if entry == nil {
 			continue
 		}
-		if rr := a.slidingRoomResult(ctx, *entry, auth.UserID, since, maxStream, sub.TimelineLimit, sub.RequiredState); rr != nil {
+		forceInitial := false
+		if cfg, ok := a.ssConns.wasDelivered(auth.UserID, connID, roomID); ok {
+			// Re-deliver when the subscription asks for a different config than
+			// the room was last delivered with.
+			subLimit := 1
+			if sub.TimelineLimit != nil {
+				subLimit = *sub.TimelineLimit
+			}
+			if subLimit > cfg.timelineLimit || !sameRequiredState(sub.RequiredState, cfg.requiredState) {
+				forceInitial = true
+			}
+		}
+		a.ssConns.setSubscribed(auth.UserID, connID, roomID, true)
+		if rr := a.slidingRoomResult(ctx, *entry, auth.UserID, since, maxStream, sub.TimelineLimit, sub.RequiredState, forceInitial); rr != nil {
 			resp.Rooms[roomID] = *rr
+			cfg := ssDeliveredConfig{timelineLimit: 1}
+			if sub.TimelineLimit != nil {
+				cfg.timelineLimit = *sub.TimelineLimit
+			}
+			cfg.requiredState = sub.RequiredState
+			a.ssConns.markDelivered(auth.UserID, connID, roomID, cfg)
 		}
 	}
 
@@ -285,6 +327,8 @@ func (a *API) buildSlidingSync(ctx context.Context, auth *homeserver.Auth, since
 		// then invited) shared by all lists. Each list applies its own filters
 		// and ranges.
 		entries := a.slidingRoomEntries(ctx, auth.UserID)
+		prevWindow := a.ssConns.listWindow(auth.UserID, connID)
+		window := make(map[string]bool, len(entries))
 		for name, list := range req.Lists {
 			filtered := filterRoomEntries(entries, list.Filters)
 			// The total number of rooms matching the list, ignoring the range.
@@ -302,15 +346,44 @@ func (a *API) buildSlidingSync(ctx context.Context, auth *homeserver.Auth, since
 				}
 				for i := start; i <= end; i++ {
 					entry := filtered[i]
+					window[entry.roomID] = true
 					if _, ok := resp.Rooms[entry.roomID]; ok {
 						continue
 					}
-					if rr := a.slidingRoomResult(ctx, entry, auth.UserID, since, maxStream, list.TimelineLimit, list.RequiredState); rr != nil {
+					// A room entering the list window on an incremental sync
+					// (first appearance, or re-entry after having scrolled out of
+					// range) is new to the client and must be delivered as
+					// initial=true with a timeline anchored at its latest event,
+					// per MSC4186. The membership-stream ordering alone cannot
+					// detect this: a room that entered just before `since` (e.g.
+					// the syncing user's own join) would otherwise yield an empty
+					// incremental window.
+					forceInitial := since > 0 && !prevWindow[entry.roomID]
+					if cfg, ok := a.ssConns.wasDelivered(auth.UserID, connID, entry.roomID); ok {
+						// Re-deliver when the list's config asks for more than the
+						// room was last delivered with (e.g. a higher timeline
+						// limit), mirroring the subscription path.
+						listLimit := 1
+						if list.TimelineLimit != nil {
+							listLimit = *list.TimelineLimit
+						}
+						if listLimit > cfg.timelineLimit || !sameRequiredState(list.RequiredState, cfg.requiredState) {
+							forceInitial = true
+						}
+					}
+					if rr := a.slidingRoomResult(ctx, entry, auth.UserID, since, maxStream, list.TimelineLimit, list.RequiredState, forceInitial); rr != nil {
 						resp.Rooms[entry.roomID] = *rr
+						cfg := ssDeliveredConfig{timelineLimit: 1}
+						if list.TimelineLimit != nil {
+							cfg.timelineLimit = *list.TimelineLimit
+						}
+						cfg.requiredState = list.RequiredState
+						a.ssConns.markDelivered(auth.UserID, connID, entry.roomID, cfg)
 					}
 				}
 			}
 		}
+		a.ssConns.setListWindow(auth.UserID, connID, window)
 	}
 
 	// ---- Extensions ----
@@ -392,8 +465,11 @@ func filterRoomEntries(entries []roomEntry, f *slidingSyncFilters) []roomEntry {
 	return out
 }
 
-// slidingRoomResult builds a room's result section.
-func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID string, since, maxStream int64, timelineLimit *int, requiredState [][2]string) *slidingSyncRoomResp {
+// slidingRoomResult builds a room's result section. forceInitial forces the
+// room to be treated as newly-returned (initial=true with a timeline anchored
+// at the room's latest event) even on an incremental sync — used when a room
+// subscription overrides the config a room was previously delivered with.
+func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID string, since, maxStream int64, timelineLimit *int, requiredState [][2]string, forceInitial bool) *slidingSyncRoomResp {
 	roomID := entry.roomID
 	limit := 1
 	if timelineLimit != nil && *timelineLimit >= 0 {
@@ -402,8 +478,9 @@ func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID str
 	rr := &slidingSyncRoomResp{Membership: entry.membership}
 
 	// initial: the first time the client sees the room (initial sync, or the
-	// membership relationship is new).
-	initial := since == 0 || entry.stream > since
+	// membership relationship is new), or the server is re-delivering it with a
+	// different config.
+	initial := since == 0 || entry.stream > since || forceInitial
 	rr.Initial = initial
 
 	// bump_stamp: latest event stream ordering (recency).
@@ -428,14 +505,17 @@ func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID str
 		rr.JoinedCount = &joined
 		rr.InvitedCount = &invited
 
-		// Timeline: on initial sync the most recent `limit` events; on
-		// incremental sync the events after `since`. The initial-sync window is
-		// anchored at the room's own latest event (not the global max stream:
-		// unrelated activity elsewhere can leave the room far behind it, and a
-		// small timeline_limit would then yield an empty window). Fetch one
-		// extra event to detect a truncated window (limited=true) precisely.
+		// Timeline: on initial sync (or a room newly appearing in the sliding
+		// window) return the most recent `limit` events; on a plain incremental
+		// sync the events after `since`. The window is anchored at the room's own
+		// latest event for new rooms — the shared sync stream advances globally
+		// (key uploads, other rooms' events), so a `since` based on it can already
+		// be past this room's newest events and would otherwise yield an empty
+		// window. Fetch one extra event to detect a truncated window
+		// (limited=true) precisely.
+		newRoom := since == 0 || entry.stream > since || forceInitial
 		var evs []storage.EventRow
-		if since == 0 {
+		if newRoom {
 			roomMax := maxStream
 			if ev, err := a.Store.LatestEvent(ctx, roomID); err == nil {
 				roomMax = ev.StreamOrdering
@@ -461,7 +541,7 @@ func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID str
 			senders[evs[i].Sender] = true
 		}
 		if len(evs) > 0 {
-			if since == 0 {
+			if newRoom {
 				// The oldest visible event's position; back-pagination goes
 				// before it.
 				rr.PrevBatch = "s" + strconv.FormatInt(evs[0].StreamOrdering-1, 10)
@@ -469,10 +549,10 @@ func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID str
 				rr.PrevBatch = "s" + strconv.FormatInt(since, 10)
 			}
 		}
-		// num_live: events that "just occurred" since the previous sync. On an
-		// incremental sync every returned event is live; an initial sync is all
-		// historical.
-		if since > 0 {
+		// num_live: events that "just occurred" since the previous sync. Only
+		// events returned on a plain incremental sync (the room was already in
+		// the window) are live; a new room's timeline is historical.
+		if !newRoom && since > 0 {
 			numLive := int64(len(evs))
 			rr.NumLive = &numLive
 		}
