@@ -4,8 +4,10 @@ name: test
 # parallel jobs + alls-green gate" layout. All three jobs are informational
 # baselines (continue-on-error) while katrix is still early — they establish a
 # progress baseline rather than blocking PRs. The integration-done gate is
-# therefore effectively a no-op today; flip a job's continue-on-error off (and
-# drop the `|| true` on its run step) once its pass rate is high enough to gate.
+# therefore effectively a no-op today. Run steps surface failures honestly
+# (set -o pipefail, no `|| true` swallowing), so a failing suite shows a red
+# step with the real exit code; to turn a job into a hard gate, drop its
+# `continue-on-error: true` once its pass rate is high enough.
 #
 # Each job's summary step renders a per-test report (PASS/FAIL/SKIP per suite,
 # plus expected-vs-actual for every failing test) via cmd/testreport, fed by
@@ -143,6 +145,12 @@ jobs:
           if awk '/^Are We Synapse Yet\?/{p=1} p && /^[A-Za-z -]+ APIs:/' /tmp/sytest.log | grep -q .; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "### Are We Synapse Yet? (feature areas)" >> "$GITHUB_STEP_SUMMARY"
+            # The area→pass-rate table comes from are-we-synapse-yet.list, a
+            # static snapshot vendored from dendrite (last updated upstream
+            # 2023-09); it groups sytest names into feature areas. The
+            # "Unknown API" row under Non-Spec APIs is the drift indicator:
+            # new sytest cases not in the list land there, so watch that row
+            # grow rather than chasing the table for freshness.
             echo "| area | pass rate |" >> "$GITHUB_STEP_SUMMARY"
             echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
             awk '/^Are We Synapse Yet\?/{p=1} p && /^[A-Za-z -]+ APIs:/{
