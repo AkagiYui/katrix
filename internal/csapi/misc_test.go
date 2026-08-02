@@ -12,7 +12,7 @@ import (
 func TestPushRulesDefaultAndGet(t *testing.T) {
 	_, srv := testAPI(t)
 	tok := registerUser(t, srv, "alice", "pw")
-	code, body := getJSON(t, srv, "/_matrix/client/v3/pushrules", tok)
+	code, body := getJSON(t, srv, "/_matrix/client/v3/pushrules/", tok)
 	if code != 200 {
 		t.Fatalf("pushrules: code=%d body=%v", code, body)
 	}
@@ -38,7 +38,7 @@ func TestPushRuleAddDelete(t *testing.T) {
 		t.Fatalf("put rule: code=%d", code)
 	}
 	// Verify it's present.
-	code, body := getJSON(t, srv, "/_matrix/client/v3/pushrules", tok)
+	code, body := getJSON(t, srv, "/_matrix/client/v3/pushrules/", tok)
 	override, _ := body["global"].(map[string]any)["override"].([]any)
 	found := false
 	for _, e := range override {
@@ -55,7 +55,7 @@ func TestPushRuleAddDelete(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("delete rule: code=%d", code)
 	}
-	code, body = getJSON(t, srv, "/_matrix/client/v3/pushrules", tok)
+	code, body = getJSON(t, srv, "/_matrix/client/v3/pushrules/", tok)
 	override, _ = body["global"].(map[string]any)["override"].([]any)
 	for _, e := range override {
 		if em, ok := e.(map[string]any); ok && em["rule_id"] == "my.custom.rule" {

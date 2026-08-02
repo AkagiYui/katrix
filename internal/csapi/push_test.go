@@ -14,7 +14,7 @@ func TestPushRulesEndpoints(t *testing.T) {
 	tok := registerUser(t, srv, "push-alice", "pw")
 
 	// Default ruleset is served and contains the MSC3930 poll rules.
-	code, body := getJSON(t, srv, "/_matrix/client/v3/pushrules", tok)
+	code, body := getJSON(t, srv, "/_matrix/client/v3/pushrules/", tok)
 	if code != 200 {
 		t.Fatalf("get pushrules: %d", code)
 	}

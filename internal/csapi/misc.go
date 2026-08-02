@@ -23,20 +23,31 @@ func (a *API) registerMisc(mux *http.ServeMux) {
 	mux.HandleFunc("POST /_matrix/client/v3/user/{userID}/filter", a.RequireAuth(a.PostFilter))
 	mux.HandleFunc("GET /_matrix/client/v3/user/{userID}/filter/{filterID}", a.RequireAuth(a.GetFilter))
 	// Push rules (global ruleset + scoped actions on override/underride).
-	mux.HandleFunc("GET /_matrix/client/v3/pushrules", a.RequireAuth(a.GetPushRules))
-	// Trailing-slash variant: the spec requires GET /pushrules/ (with the slash)
-	// to return the full ruleset (matrix-spec#457); the {scope} routes below are
-	// more specific and still win for /pushrules/global.
+	// Per the spec (matrix-spec#457) GET /pushrules/ (with the slash) returns
+	// the full ruleset; the no-slash GET /pushrules is a 404. Scope/kind/ruleID
+	// sub-resources are only valid with their trailing slash (the {scope} and
+	// {scope}/{kind} patterns below 400 without it), and unknown scopes,
+	// templates and attributes are 400 per the sytest torture suite.
 	mux.HandleFunc("GET /_matrix/client/v3/pushrules/", a.RequireAuth(a.GetPushRules))
-	mux.HandleFunc("GET /_matrix/client/v3/pushrules/{scope}", a.RequireAuth(a.GetPushRules))
-	mux.HandleFunc("PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}", a.RequireAuth(a.PutPushRule))
+	mux.HandleFunc("GET /_matrix/client/v3/pushrules", a.RequireAuth(a.GetPushRulesNoSlash))
+	mux.HandleFunc("GET /_matrix/client/v3/pushrules/{scope}", a.RequireAuth(a.GetPushRuleScope))
+	mux.HandleFunc("GET /_matrix/client/v3/pushrules/{scope}/", a.RequireAuth(a.GetPushRuleScopeSlash))
+	mux.HandleFunc("GET /_matrix/client/v3/pushrules/{scope}/{kind}", a.RequireAuth(a.GetPushRuleKind))
+	mux.HandleFunc("GET /_matrix/client/v3/pushrules/{scope}/{kind}/", a.RequireAuth(a.GetPushRuleKindSlash))
 	mux.HandleFunc("GET /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}", a.RequireAuth(a.GetPushRule))
-	mux.HandleFunc("DELETE /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}", a.RequireAuth(a.DeletePushRule))
+	mux.HandleFunc("GET /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}/{attr}", a.RequireAuth(a.GetPushRuleAttr))
+	mux.HandleFunc("PUT /_matrix/client/v3/pushrules/", a.RequireAuth(a.PushRuleMalformed))
+	mux.HandleFunc("PUT /_matrix/client/v3/pushrules/{scope}", a.RequireAuth(a.PushRuleMalformed))
+	mux.HandleFunc("PUT /_matrix/client/v3/pushrules/{scope}/{kind}", a.RequireAuth(a.PushRuleMalformed))
+	mux.HandleFunc("PUT /_matrix/client/v3/pushrules/{scope}/{kind}/", a.RequireAuth(a.PushRuleMalformed))
+	mux.HandleFunc("PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}", a.RequireAuth(a.PutPushRule))
+	mux.HandleFunc("PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}/{attr}", a.RequireAuth(a.PushRuleMalformed))
 	// Push rule sub-resources: /enabled and /actions.
 	mux.HandleFunc("PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}/enabled", a.RequireAuth(a.PutPushRuleEnabled))
 	mux.HandleFunc("GET /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}/enabled", a.RequireAuth(a.GetPushRuleEnabled))
 	mux.HandleFunc("PUT /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}/actions", a.RequireAuth(a.PutPushRuleActions))
 	mux.HandleFunc("GET /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}/actions", a.RequireAuth(a.GetPushRuleActions))
+	mux.HandleFunc("DELETE /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}", a.RequireAuth(a.DeletePushRule))
 	// Pushers (POST /pushers/set registers or removes an HTTP pusher).
 	mux.HandleFunc("POST /_matrix/client/v3/pushers/set", a.RequireAuth(a.PushSet))
 	mux.HandleFunc("GET /_matrix/client/v3/pushers", a.RequireAuth(a.PushGet))
@@ -55,12 +66,11 @@ func (a *API) registerMisc(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/admin/statistics", a.RequireAuth(a.AdminStatistics))
 }
 
-// GetPushRules handles GET /_matrix/client/v3/pushrules[/{scope}]. The ruleset
-// is stored (and delivered in /sync) as the m.push_rules account data event,
-// so both views share one source of truth.
+// GetPushRules handles GET /_matrix/client/v3/pushrules/ (the trailing-slash
+// form). The ruleset is stored (and delivered in /sync) as the m.push_rules
+// account data event, so both views share one source of truth.
 func (a *API) GetPushRules(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
-	scope := r.PathValue("scope")
 	raw, err := a.Store.GetPushRules(r.Context(), auth.Localpart)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
@@ -69,44 +79,114 @@ func (a *API) GetPushRules(w http.ResponseWriter, r *http.Request) {
 	if len(raw) == 0 {
 		raw = pushrules.MarshalDefault()
 	}
-	if scope == "" {
-		httpx.WriteJSON(w, http.StatusOK, json.RawMessage(raw))
-		return
-	}
+	httpx.WriteJSON(w, http.StatusOK, json.RawMessage(raw))
+}
+
+// GetPushRulesNoSlash handles GET /_matrix/client/v3/pushrules (no trailing
+// slash). The spec only defines the trailing-slash form for retrieving all
+// rules; without it the path is not a valid push-rules resource, so 404.
+func (a *API) GetPushRulesNoSlash(w http.ResponseWriter, r *http.Request) {
+	httpx.WriteError(w, httpx.ErrNotFound("unknown endpoint"))
+}
+
+// GetPushRuleScope handles GET /pushrules/{scope} (no trailing slash). The
+// scope sub-resource requires its trailing slash; without it the path is
+// malformed, so 400.
+func (a *API) GetPushRuleScope(w http.ResponseWriter, r *http.Request) {
+	httpx.WriteError(w, httpx.ErrInvalidParam("push rule scope requires a trailing slash"))
+}
+
+// GetPushRuleScopeSlash handles GET /pushrules/{scope}/. Returns the scope's
+// ruleset (the kind -> rule-list map) for the "global" scope; unknown scopes
+// are 400.
+func (a *API) GetPushRuleScopeSlash(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	scope := r.PathValue("scope")
 	if scope != "global" {
-		httpx.WriteError(w, httpx.ErrNotFound("unknown scope"))
+		httpx.WriteError(w, httpx.ErrInvalidParam("unknown push rule scope"))
 		return
 	}
-	var rules map[string]any
-	_ = json.Unmarshal(raw, &rules)
+	global := a.globalRuleset(auth.Localpart)
+	httpx.WriteJSON(w, http.StatusOK, global)
+}
+
+// GetPushRuleKind handles GET /pushrules/{scope}/{kind} (no trailing slash).
+// Like the scope resource, the kind list requires its trailing slash; without
+// it the path is malformed, so 400.
+func (a *API) GetPushRuleKind(w http.ResponseWriter, r *http.Request) {
+	httpx.WriteError(w, httpx.ErrInvalidParam("push rule kind requires a trailing slash"))
+}
+
+// GetPushRuleKindSlash handles GET /pushrules/{scope}/{kind}/. Returns the
+// rule list for the kind; unknown scopes and unknown kinds are 400.
+func (a *API) GetPushRuleKindSlash(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	scope := r.PathValue("scope")
+	kind := r.PathValue("kind")
+	if scope != "global" {
+		httpx.WriteError(w, httpx.ErrInvalidParam("unknown push rule scope"))
+		return
+	}
+	if !contains(pushrules.Kinds, kind) {
+		httpx.WriteError(w, httpx.ErrInvalidParam("unknown push rule kind"))
+		return
+	}
+	global := a.globalRuleset(auth.Localpart)
+	list, _ := global[kind].([]any)
+	if list == nil {
+		list = []any{}
+	}
+	httpx.WriteJSON(w, http.StatusOK, list)
+}
+
+// GetPushRuleAttr handles GET /pushrules/{scope}/{kind}/{ruleID}/{attr}. Only
+// the "enabled" and "actions" attributes exist (handled by their dedicated
+// routes); any other attribute is 400.
+func (a *API) GetPushRuleAttr(w http.ResponseWriter, r *http.Request) {
+	httpx.WriteError(w, httpx.ErrInvalidParam("unknown push rule attribute"))
+}
+
+// PushRuleMalformed handles PUT requests to malformed push-rule paths (no
+// scope, no kind, empty rule ID, or an unknown attribute): all are 400.
+func (a *API) PushRuleMalformed(w http.ResponseWriter, r *http.Request) {
+	httpx.WriteError(w, httpx.ErrInvalidParam("malformed push rule path"))
+}
+
+// globalRuleset returns the user's global ruleset map (defaulting when unset).
+func (a *API) globalRuleset(localpart string) map[string]any {
+	rules := a.loadRules(localpart)
 	global, _ := rules["global"].(map[string]any)
 	if global == nil {
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{})
-		return
+		global = map[string]any{}
 	}
-	httpx.WriteJSON(w, http.StatusOK, global)
+	return global
 }
 
 // GetPushRule handles GET /_matrix/client/v3/pushrules/{scope}/{kind}/{ruleID}.
 func (a *API) GetPushRule(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
+	scope := r.PathValue("scope")
 	kind := r.PathValue("kind")
 	ruleID := r.PathValue("ruleID")
-	rules := a.loadRules(auth.Localpart)
-	global := rules["global"].(map[string]any)
-	list, _ := global[kind].([]any)
-	for _, e := range list {
-		if em, ok := e.(map[string]any); ok && em["rule_id"] == ruleID {
-			httpx.WriteJSON(w, http.StatusOK, em)
-			return
-		}
+	if !a.validPushRulePath(scope, kind, ruleID) {
+		httpx.WriteError(w, httpx.ErrInvalidParam("malformed push rule path"))
+		return
 	}
-	httpx.WriteError(w, httpx.ErrNotFound("push rule not found"))
+	rule := a.findRule(auth.Localpart, kind, ruleID)
+	if rule == nil {
+		httpx.WriteError(w, httpx.ErrNotFound("push rule not found"))
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, rule)
 }
 
 // GetPushRuleEnabled handles GET /pushrules/{scope}/{kind}/{ruleID}/enabled.
 func (a *API) GetPushRuleEnabled(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
+	if !a.validPushRulePath(r.PathValue("scope"), r.PathValue("kind"), r.PathValue("ruleID")) {
+		httpx.WriteError(w, httpx.ErrInvalidParam("malformed push rule path"))
+		return
+	}
 	rule := a.findRule(auth.Localpart, r.PathValue("kind"), r.PathValue("ruleID"))
 	if rule == nil {
 		httpx.WriteError(w, httpx.ErrNotFound("push rule not found"))
@@ -119,6 +199,10 @@ func (a *API) GetPushRuleEnabled(w http.ResponseWriter, r *http.Request) {
 // PutPushRuleEnabled handles PUT /pushrules/{scope}/{kind}/{ruleID}/enabled.
 func (a *API) PutPushRuleEnabled(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
+	if !a.validPushRulePath(r.PathValue("scope"), r.PathValue("kind"), r.PathValue("ruleID")) {
+		httpx.WriteError(w, httpx.ErrInvalidParam("malformed push rule path"))
+		return
+	}
 	var req struct {
 		Enabled bool `json:"enabled"`
 	}
@@ -137,6 +221,10 @@ func (a *API) PutPushRuleEnabled(w http.ResponseWriter, r *http.Request) {
 // GetPushRuleActions handles GET /pushrules/{scope}/{kind}/{ruleID}/actions.
 func (a *API) GetPushRuleActions(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
+	if !a.validPushRulePath(r.PathValue("scope"), r.PathValue("kind"), r.PathValue("ruleID")) {
+		httpx.WriteError(w, httpx.ErrInvalidParam("malformed push rule path"))
+		return
+	}
 	rule := a.findRule(auth.Localpart, r.PathValue("kind"), r.PathValue("ruleID"))
 	if rule == nil {
 		httpx.WriteError(w, httpx.ErrNotFound("push rule not found"))
@@ -149,6 +237,10 @@ func (a *API) GetPushRuleActions(w http.ResponseWriter, r *http.Request) {
 // PutPushRuleActions handles PUT /pushrules/{scope}/{kind}/{ruleID}/actions.
 func (a *API) PutPushRuleActions(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
+	if !a.validPushRulePath(r.PathValue("scope"), r.PathValue("kind"), r.PathValue("ruleID")) {
+		httpx.WriteError(w, httpx.ErrInvalidParam("malformed push rule path"))
+		return
+	}
 	var req struct {
 		Actions []json.RawMessage `json:"actions"`
 	}
@@ -165,13 +257,16 @@ func (a *API) PutPushRuleActions(w http.ResponseWriter, r *http.Request) {
 }
 
 // PutPushRule handles PUT a single rule. The optional before/after query
-// parameters reorder the rule within its kind list (spec ordering semantics).
+// parameters reorder the rule within its kind list (spec ordering semantics);
+// without them a new rule is inserted at the top of its kind (new rules take
+// precedence over older ones). The rule body is validated per the spec.
 func (a *API) PutPushRule(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
+	scope := r.PathValue("scope")
 	kind := r.PathValue("kind")
 	ruleID := r.PathValue("ruleID")
-	if !contains(pushrules.Kinds, kind) {
-		httpx.WriteError(w, httpx.ErrInvalidParam("unknown rule kind"))
+	if !a.validPushRulePath(scope, kind, ruleID) {
+		httpx.WriteError(w, httpx.ErrInvalidParam("malformed push rule path"))
 		return
 	}
 	body, err := readBody(r)
@@ -182,9 +277,15 @@ func (a *API) PutPushRule(w http.ResponseWriter, r *http.Request) {
 	var newRule map[string]any
 	_ = json.Unmarshal(body, &newRule)
 	newRule["rule_id"] = ruleID
-	// A newly created rule is enabled by default when the body omits it.
+	// A newly created rule is enabled by default when the body omits it, and is
+	// not a server default rule (default: false per the spec).
 	if _, ok := newRule["enabled"]; !ok {
 		newRule["enabled"] = true
+	}
+	newRule["default"] = false
+	if err := validatePushRuleBody(kind, newRule); err != nil {
+		httpx.WriteError(w, httpx.ErrInvalidParam(err.Error()))
+		return
 	}
 	rules := a.loadRules(auth.Localpart)
 	global := rules["global"].(map[string]any)
@@ -208,7 +309,8 @@ func (a *API) PutPushRule(w http.ResponseWriter, r *http.Request) {
 	case pos >= 0 && pos < len(list):
 		list = append(list[:pos], append([]any{newRule}, list[pos:]...)...)
 	default:
-		list = append(list, newRule)
+		// New rules take precedence over existing ones: prepend.
+		list = append([]any{newRule}, list...)
 	}
 	global[kind] = list
 	rules["global"] = global
@@ -223,8 +325,13 @@ func (a *API) PutPushRule(w http.ResponseWriter, r *http.Request) {
 // DeletePushRule handles DELETE a single rule.
 func (a *API) DeletePushRule(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
+	scope := r.PathValue("scope")
 	kind := r.PathValue("kind")
 	ruleID := r.PathValue("ruleID")
+	if !a.validPushRulePath(scope, kind, ruleID) {
+		httpx.WriteError(w, httpx.ErrInvalidParam("malformed push rule path"))
+		return
+	}
 	rules := a.loadRules(auth.Localpart)
 	global := rules["global"].(map[string]any)
 	list, _ := global[kind].([]any)
@@ -243,6 +350,62 @@ func (a *API) DeletePushRule(w http.ResponseWriter, r *http.Request) {
 	}
 	a.Notifier.NotifyUser(auth.UserID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// validPushRulePath validates a push-rule resource path: the scope must be
+// "global", the kind one of the five rule kinds, and the rule_id non-empty and
+// free of path-escaping characters (the spec forbids '/' and '\' in rule IDs).
+func (a *API) validPushRulePath(scope, kind, ruleID string) bool {
+	if scope != "global" || !contains(pushrules.Kinds, kind) {
+		return false
+	}
+	if ruleID == "" || strings.ContainsAny(ruleID, "/\\") {
+		return false
+	}
+	return true
+}
+
+// validatePushRuleBody validates a push rule body per the spec: override and
+// underride rules require conditions (each with a kind), content rules require
+// a pattern, and every rule requires a non-empty list of valid actions.
+func validatePushRuleBody(kind string, rule map[string]any) error {
+	switch kind {
+	case "override", "underride":
+		conds, ok := rule["conditions"].([]any)
+		if !ok || len(conds) == 0 {
+			return fmt.Errorf("%s rules require a non-empty conditions list", kind)
+		}
+		for _, c := range conds {
+			cm, ok := c.(map[string]any)
+			if !ok || cm["kind"] == nil {
+				return fmt.Errorf("%s rule conditions require a kind", kind)
+			}
+		}
+	case "content":
+		pattern, _ := rule["pattern"].(string)
+		if pattern == "" {
+			return fmt.Errorf("content rules require a pattern")
+		}
+	}
+	actions, ok := rule["actions"].([]any)
+	if !ok || len(actions) == 0 {
+		return fmt.Errorf("push rules require a non-empty actions list")
+	}
+	for _, act := range actions {
+		switch a := act.(type) {
+		case string:
+			if a != "notify" && a != "dont_notify" {
+				return fmt.Errorf("unknown action %q", a)
+			}
+		case map[string]any:
+			if _, ok := a["set_tweak"]; !ok {
+				return fmt.Errorf("action object must contain set_tweak")
+			}
+		default:
+			return fmt.Errorf("invalid action")
+		}
+	}
+	return nil
 }
 
 // ---- Pushers ----
