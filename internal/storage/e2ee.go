@@ -97,10 +97,15 @@ func (s *Store) ClaimOneTimeKeyByAlgo(ctx context.Context, userID, deviceID, alg
 	}}, nil
 }
 
-// ClaimFallbackKey claims the unused fallback key for a device, if any. Per
+// ClaimFallbackKey claims the current fallback key for a device, if any. Per
 // the spec, when a server has run out of one-time keys for a device it may
 // hand out the fallback key in response to /keys/claim so clients can keep
 // establishing sessions (the fallback key is then re-uploaded by the device).
+//
+// A fallback key may be handed out to many different sessions: it is only
+// superseded when the device uploads a replacement. Claiming marks the key
+// used (which removes its algorithm from device_unused_fallback_key_types, so
+// the device knows to rotate), but the key remains claimable until then.
 //
 // Fallback keys live in their own table (fallback_keys): vodozemac numbers the
 // fallback key and the one-time keys from the same counter, so the first
@@ -113,8 +118,8 @@ func (s *Store) ClaimFallbackKey(ctx context.Context, userID, deviceID, algorith
 		`UPDATE fallback_keys SET used=TRUE
 		 WHERE ctid IN (
 		   SELECT ctid FROM fallback_keys
-		   WHERE user_id=$1 AND device_id=$2 AND algorithm=$3 AND used=FALSE
-		   ORDER BY ctid ASC
+		   WHERE user_id=$1 AND device_id=$2 AND algorithm=$3
+		   ORDER BY ctid DESC
 		   LIMIT 1 FOR UPDATE SKIP LOCKED
 		 )
 		 RETURNING key_id, key_json`,
