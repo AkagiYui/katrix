@@ -17,6 +17,7 @@ func (a *API) Register(mux *http.ServeMux) {
 
 	a.registerAccounts(mux)
 	a.registerRooms(mux)
+	a.registerRoomV1(mux)
 	a.registerSync(mux)
 	a.registerE2EE(mux)
 	a.registerQRAuth(mux)

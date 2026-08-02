@@ -166,6 +166,7 @@ type eventRelationshipsRequest struct {
 	MaxDepth           int    `json:"max_depth"`
 	TerminatingEventID string `json:"terminating_event_id"`
 }
+
 // EventRelationships handles POST /_matrix/client/unstable/event_relationships
 // (MSC2836). It walks the aggregation tree from event_id — following
 // m.reference links either up (the event's own parent) or down (its children)

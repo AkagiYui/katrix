@@ -229,7 +229,7 @@ type execer interface {
 // but with a lower local stream on this server) cannot overwrite the leave.
 // Equal depths fall back to stream_ordering as a tiebreak.
 func upsertMembershipTx(ctx context.Context, ex execer, m *MembershipRow) error {
-_, err := ex.Exec(ctx,
+	_, err := ex.Exec(ctx,
 		`INSERT INTO room_memberships(room_id, user_id, membership, event_id,
 		                              display_name, avatar_url, forgotten, stream_ordering, depth)
 		 VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$8)
@@ -362,6 +362,38 @@ func (s *Store) EventsForRoom(ctx context.Context, roomID string, from, to int64
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// EventByTimestamp returns the event closest to the given origin_server_ts in a
+// room (MSC3030 / GET /timestamp_to_event). dir "f" (forwards) returns the
+// earliest event with origin_server_ts >= ts; dir "b" (backwards) returns the
+// latest event with origin_server_ts <= ts. The "closest" search is therefore a
+// boundary search on origin_server_ts, not an absolute distance. Returns
+// ErrNotFound when no such event exists (e.g. a backwards search before the
+// room's first event, or a forwards search after its last).
+func (s *Store) EventByTimestamp(ctx context.Context, roomID string, ts int64, dir string) (*EventRow, error) {
+	q := `SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
+	              origin_server_ts, stream_ordering, content, json,
+	              COALESCE(redacts,''), redacted, outlier
+	       FROM events WHERE room_id=$1`
+	args := []any{roomID}
+	switch dir {
+	case "b":
+		q += ` AND origin_server_ts<=$2 ORDER BY origin_server_ts DESC, stream_ordering DESC LIMIT 1`
+	case "f":
+		q += ` AND origin_server_ts>=$2 ORDER BY origin_server_ts ASC, stream_ordering ASC LIMIT 1`
+	default:
+		return nil, errors.New("storage: invalid dir")
+	}
+	args = append(args, ts)
+	ev, err := scanEvent(s.pool.QueryRow(ctx, q, args...))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return ev, nil
 }
 
 // LatestEvent returns the event with the highest stream_ordering in a room

@@ -2194,7 +2194,9 @@ func indexEventRelation(ctx context.Context, store *storage.Store, row *storage.
 	})
 }
 
-// notifyRoomMembers wakes up all joined users' /sync requests for a room.
+// notifyRoomMembers wakes up all joined users' /sync requests for a room, plus
+// any devices peeking into it (MSC2753 peekers are not members, so they would
+// never be woken otherwise).
 func (a *API) notifyRoomMembers(ctx context.Context, roomID string) {
 	userIDs, err := a.Store.JoinedUserIDs(ctx, roomID)
 	if err != nil {
@@ -2203,6 +2205,9 @@ func (a *API) notifyRoomMembers(ctx context.Context, roomID string) {
 	users := make([]string, 0, len(userIDs))
 	for _, u := range userIDs {
 		users = append(users, u)
+	}
+	if peekers, err := a.Store.PeekingUsers(ctx, roomID); err == nil {
+		users = append(users, peekers...)
 	}
 	a.Notifier.NotifyUsers(users...)
 }

@@ -33,6 +33,10 @@ type RoomsResp struct {
 	Join   map[string]JoinedRoom  `json:"join,omitempty"`
 	Invite map[string]InvitedRoom `json:"invite,omitempty"`
 	Leave  map[string]LeftRoom    `json:"leave,omitempty"`
+	// Peek (MSC2753): rooms the calling device has peeks into without joining
+	// (world_readable only). Peeked rooms appear only in the sync of the device
+	// that peeked them, never in other devices' or users' syncs.
+	Peek map[string]JoinedRoom `json:"peek,omitempty"`
 }
 
 // JoinedRoom is a room the user has joined.
@@ -255,7 +259,12 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	// For initial sync we want the full state of each joined room + a recent
 	// timeline window ending at maxStream.
 	resp := &Response{}
-	rooms := RoomsResp{Join: map[string]JoinedRoom{}, Invite: map[string]InvitedRoom{}, Leave: map[string]LeftRoom{}}
+	rooms := RoomsResp{
+		Join:   map[string]JoinedRoom{},
+		Invite: map[string]InvitedRoom{},
+		Leave:  map[string]LeftRoom{},
+		Peek:   map[string]JoinedRoom{},
+	}
 
 	// Rooms the user has joined.
 	joinedRoomIDs, err := e.store.RoomsForUser(ctx, opts.UserID)
@@ -321,6 +330,22 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 			}
 			rooms.Leave[roomID] = lr
 		}
+	}
+
+	// Peeked rooms (MSC2753): world_readable rooms this device peeks into
+	// without joining. They are scoped to the device, so each device's /sync
+	// carries only its own peeks. A peeked room the user has since joined is
+	// delivered via the join section instead (the peek is subsumed).
+	peeked, _ := e.store.PeekedRooms(ctx, opts.UserID, opts.DeviceID)
+	for _, roomID := range peeked {
+		if _, joined := rooms.Join[roomID]; joined {
+			continue
+		}
+		pr, err := e.buildPeekedRoom(ctx, roomID, opts, maxStream)
+		if err != nil || pr == nil {
+			continue
+		}
+		rooms.Peek[roomID] = *pr
 	}
 
 	resp.Rooms = rooms
@@ -680,6 +705,41 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// m.invited_member_count) plus up to five hero user IDs.
 	jr.Summary = e.roomSummary(ctx, roomID, opts.UserID)
 	return jr, nil
+}
+
+// buildPeekedRoom constructs the peek section entry (MSC2753) for a device that
+// peeks into a world_readable room without joining. The timeline starts at the
+// room's beginning (a peek is a history watch, so the first sync carries the
+// room's creation onward) and advances incrementally. On an incremental sync
+// with no new events the room is omitted entirely (nil), matching the spec's
+// "unchanged rooms aren't re-sent" behaviour.
+func (e *Engine) buildPeekedRoom(ctx context.Context, roomID string, opts SyncOptions, maxStream int64) (*JoinedRoom, error) {
+	from := opts.Since.Stream
+	limit := 50
+	evs, err := e.store.EventsForRoom(ctx, roomID, from, maxStream, limit, "f")
+	if err != nil {
+		return nil, err
+	}
+	// Incremental sync with nothing new: the peeked room disappears from the
+	// response (the client already has the timeline up to its token).
+	if from > 0 && len(evs) == 0 {
+		return nil, nil
+	}
+	pr := &JoinedRoom{}
+	timeline := Timeline{Events: make([]json.RawMessage, 0, len(evs))}
+	for _, ev := range evs {
+		timeline.Events = append(timeline.Events, clientEvent(&ev))
+	}
+	if len(evs) >= limit {
+		timeline.Limited = true
+	}
+	// prev_batch is always present: it points at the sync point (or the oldest
+	// visible event for a truncated window), so clients can back-paginate.
+	timeline.PrevBatch = Token{Stream: maxStream}.Encode()
+	pr.Timeline = timeline
+	// The state section, when present, must hold no events for a peeked room.
+	pr.State.Events = []json.RawMessage{}
+	return pr, nil
 }
 
 // lazyLoadMemberEvent reports whether a state event should be included under a

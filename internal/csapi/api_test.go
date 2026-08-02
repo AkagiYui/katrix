@@ -13,6 +13,7 @@ import (
 
 	"github.com/AkagiYui/katrix/internal/config"
 	"github.com/AkagiYui/katrix/internal/crypto"
+	"github.com/AkagiYui/katrix/internal/federation"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/media"
 	"github.com/AkagiYui/katrix/internal/storage"
@@ -52,6 +53,10 @@ func testAPI(t *testing.T) (*API, *httptest.Server) {
 	// Media backend needs a writable store path; use a per-test temp dir.
 	cfg.Media.StorePath = t.TempDir()
 	api := New(hs)
+	// The federation API is part of the full server surface; wire it so
+	// room hierarchy / summary / timestamp-to-event handlers work (they
+	// consult the outbound federation client for remote fallback).
+	api.SetFederation(federation.New(hs))
 	mux := http.NewServeMux()
 	api.Register(mux)
 	// The media API is part of the full server surface; register it so

@@ -19,7 +19,8 @@ import (
 
 // notifyRoomMembers wakes up all joined users' /sync requests for a room. This
 // is the federation-side mirror of csapi.notifyRoomMembers, used when an
-// inbound transaction changes a room's state.
+// inbound transaction changes a room's state. Peeking devices (MSC2753) are
+// woken too: they are not members, but their /sync carries the room's timeline.
 func (a *API) notifyRoomMembers(ctx context.Context, roomID string) {
 	userIDs, err := a.Store.JoinedUserIDs(ctx, roomID)
 	if err != nil {
@@ -28,6 +29,9 @@ func (a *API) notifyRoomMembers(ctx context.Context, roomID string) {
 	users := make([]string, 0, len(userIDs))
 	for _, u := range userIDs {
 		users = append(users, u)
+	}
+	if peekers, err := a.Store.PeekingUsers(ctx, roomID); err == nil {
+		users = append(users, peekers...)
 	}
 	a.Notifier.NotifyUsers(users...)
 }
@@ -148,7 +152,7 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	}
 	exists, err := a.Store.RoomExists(r.Context(), ev.RoomID)
 	if err != nil || !exists {
-			return "", false
+		return "", false
 	}
 	room, err := a.Store.GetRoom(r.Context(), ev.RoomID)
 	if err != nil {
