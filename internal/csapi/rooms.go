@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/AkagiYui/katrix/internal/canonicaljson"
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/eventstate"
@@ -136,24 +138,35 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	initRes, err := rooms.BuildInitialEvents(seedRoomID, version, auth.UserID, preset, req.PowerLevelOverride, req.CreationContent, isDirect, req.Invite, a.ServerName(), a.Key, now)
-	if err != nil {
-		// additional_creators validation failures are client errors (400).
-		if strings.Contains(err.Error(), "additional_creators") {
-			httpx.WriteError(w, httpx.ErrBadJSON(err.Error()))
+	// For v12 (MSC4291) the room ID is the create event's reference hash, so
+	// two rooms created in the same millisecond with identical creation content
+	// collide (the same room ID). Retry with an incremented timestamp (which
+	// changes the create event's origin_server_ts and thus its hash) until the
+	// room ID is unique. Pre-v12 room IDs are random and never collide.
+	var roomID string
+	for attempt := 0; ; attempt++ {
+		initRes, err := rooms.BuildInitialEvents(seedRoomID, version, auth.UserID, preset, req.PowerLevelOverride, req.CreationContent, isDirect, req.Invite, a.ServerName(), a.Key, now)
+		if err != nil {
+			// additional_creators validation failures are client errors (400).
+			if strings.Contains(err.Error(), "additional_creators") {
+				httpx.WriteError(w, httpx.ErrBadJSON(err.Error()))
+				return
+			}
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
 		}
-		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
-		return
-	}
-	roomID := initRes.RoomID
+		roomID = initRes.RoomID
 
-	// Persist the room + initial state events.
-	{
+		// Persist the room + initial state events.
 		isPublic := req.Visibility == "public"
-		if err := a.Store.CreateRoom(r.Context(), storage.Room{
+		err = a.Store.CreateRoom(r.Context(), storage.Room{
 			RoomID: roomID, Version: string(version), Creator: auth.UserID, IsPublic: isPublic, CreatedTS: now,
-		}); err != nil {
+		})
+		if err != nil {
+			if v12, _ := roomver.Get(version); v12.RoomIDIsCreateHash && isUniqueViolationErr(err) && attempt < 5 {
+				now++
+				continue // v12 room ID collision; rebuild with a new timestamp
+			}
 			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
 		}
@@ -185,6 +198,7 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		break
 	}
 
 	// Apply initial_state events (before name/topic so those override).
@@ -640,6 +654,15 @@ func (a *API) RoomStatePut(w http.ResponseWriter, r *http.Request) {
 	// push-rule test).
 	if eventType == "m.room.tombstone" && stateKey == "" {
 		a.copyPushRulesOnTombstone(r.Context(), roomID, content)
+	}
+	// Revoking guest_access ("forbidden") kicks the room's joined guest users
+	// (spec guest_access semantics: guests may only be in the room while
+	// guest_access permits it). This runs after buildAndPersistState, whose
+	// stateMu write lock has been released — kickJoinedGuests sends leave
+	// events that themselves take stateMu, so calling it here (rather than
+	// inside buildAndPersistState) avoids a non-reentrant-mutex deadlock.
+	if eventType == "m.room.guest_access" && stateKey == "" && !guestAccessAllowsJoin(content) {
+		a.kickJoinedGuests(r, auth, roomID)
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": ev.EventID()})
 }
@@ -1864,6 +1887,16 @@ func fedHTTPStatusCode(err error) int {
 	return 0
 }
 
+// isUniqueViolationErr reports whether err is a Postgres unique_violation
+// (SQLSTATE 23505), used to detect v12 room-ID collisions on createRoom.
+func isUniqueViolationErr(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505"
+	}
+	return false
+}
+
 // joinCustomContent extracts arbitrary fields from a join request body,
 // excluding the reserved `membership` and `reason` keys (which the server
 // sets). An empty body yields no extra content.
@@ -2174,21 +2207,14 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	if err != nil {
 		return nil, err
 	}
-	if _, err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
-		return nil, err
+		if _, err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
+			return nil, err
+		}
+		// room_state is maintained by persistEvent (snapshot + recompute).
+		a.notifyRoomMembers(r.Context(), roomID)
+		a.broadcastPDU(r.Context(), roomID, ev)
+		return ev, nil
 	}
-	// room_state is maintained by persistEvent (snapshot + recompute).
-	a.notifyRoomMembers(r.Context(), roomID)
-	a.broadcastPDU(r.Context(), roomID, ev)
-	// Revoking guest_access ("forbidden") kicks the room's joined guest users:
-	// per the spec's guest_access semantics, guests may only be in the room
-	// while guest_access permits it. The kick is a leave sent by the room's
-	// members.
-	if eventType == "m.room.guest_access" && stateKey == "" && !guestAccessAllowsJoin(content) {
-		a.kickJoinedGuests(r, auth, roomID)
-	}
-	return ev, nil
-}
 
 // guestAccessAllowsJoin reports whether an m.room.guest_access content value
 // permits guests to join ("can_join").
