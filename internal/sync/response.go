@@ -720,23 +720,19 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 			earliest = ev.StreamOrdering
 		}
 	}
-	// prev_batch is the token a client passes to paginate further back: the
-	// oldest event's position in the window. It is set even when the timeline
-	// is not limited (so clients that page backwards from a full window get an
-	// empty page rather than a missing token), and doubles as the `at` anchor
-	// for /members?at= and /messages back-pagination.
-	// prev_batch is the token a client passes to paginate further back. For an
-	// unlimited timeline it is the sync point itself (maxStream): paginating
-	// with from=prev_batch yields the events before the window, and
-	// /members?at=prev_batch returns the members as of that sync (all of whom
-	// were already members). For a limited timeline it is the oldest visible
-	// event's position so back-pagination resumes where the window ended.
+	// prev_batch is the token a client passes to paginate further back: one
+	// position before the oldest visible event (spec/Synapse: backward /messages
+	// `from` is inclusive of the token, so prev_batch must point *before* the
+	// window's oldest event or the oldest event would be re-delivered). It is
+	// set even when the timeline is not limited (so clients that page backwards
+	// from a full window get an empty page rather than a missing token), and
+	// doubles as the `at` anchor for /members?at= and /messages back-pagination.
 	if len(evs) > 0 {
 		if len(evs) >= limit {
 			timeline.Limited = true
-			timeline.PrevBatch = Token{Stream: earliest}.Encode()
+			timeline.PrevBatch = Token{Stream: earliest - 1}.Encode()
 		} else {
-			timeline.PrevBatch = Token{Stream: maxStream}.Encode()
+			timeline.PrevBatch = Token{Stream: maxStream - 1}.Encode()
 		}
 	}
 	jr.Timeline = timeline

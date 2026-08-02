@@ -1155,6 +1155,7 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 		dir = "b"
 	}
 	var from, to int64
+	hasFrom := q.Get("from") != ""
 	if v := q.Get("from"); v != "" {
 		from, _ = parseIntToken(v)
 	}
@@ -1183,12 +1184,22 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	// EventsForRoom treats `from` as an exclusive lower bound and `to` as an
 	// inclusive upper bound. For backward pagination the client's `from` token
-	// is the oldest event it has already seen, so the next page must be events
-	// strictly OLDER than it: swap the bounds (from -> exclusive upper). Forward
-	// pagination keeps `from` as the exclusive lower bound.
-	if dir == "b" && from > 0 {
-		to = from - 1
-		from = 0
+	// marks the newest position it has already seen (e.g. /sync's next_batch or
+	// a previous page's `end`) and is INCLUSIVE of that position (spec/Synapse:
+	// "when paginating backwards we include any rows matching the from token"):
+	// the next page is the events at or before it. The `end` token of the
+	// previous page is the oldest returned event's position minus one, so
+	// passing it back as `from` yields no overlap. A `from` of s0 (the earliest
+	// position) means there is nothing older to page into: return an empty page
+	// without an `end` so the client stops (an empty `end` would loop forever).
+	if dir == "b" && hasFrom {
+		if from > 0 {
+			to = from
+			from = 0
+		} else {
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"chunk": []json.RawMessage{}})
+			return
+		}
 	}
 	evs, err := a.Store.EventsForRoom(r.Context(), roomID, from, to, limit, dir)
 	if err != nil {
@@ -1213,8 +1224,11 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Per spec, for a backward page `end` is the token of the oldest event in
-	// the chunk (pass it as `from` to paginate further back) and `start` is the
-	// newest; for a forward page the roles are reversed. Emitting them the
+	// the chunk minus one (so passing it back as `from` is inclusive of that
+	// position and yields the strictly-older page without overlap; Synapse's
+	// generate_next_token does the same subtract) and `start` is the newest; for
+	// a forward page the roles are reversed and `end` is the newest event's own
+	// position (forward `from` is exclusive, so no overlap). Emitting them the
 	// wrong way round makes clients loop or skip events. When no events are
 	// returned (start of timeline / no permission), `end` is OMITTED so clients
 	// know to stop paginating — an empty chunk with an `end` token loops forever.
@@ -1222,7 +1236,7 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	if len(chunk) > 0 {
 		var startTok, endTok int64
 		if dir == "b" {
-			startTok, endTok = maxTok, minTok
+			startTok, endTok = maxTok, minTok-1
 		} else {
 			startTok, endTok = minTok, maxTok
 		}
