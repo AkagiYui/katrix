@@ -14,12 +14,14 @@ import (
 
 // Response is the /sync response body.
 type Response struct {
-	NextBatch   string         `json:"next_batch"`
-	Rooms       RoomsResp      `json:"rooms"`
-	Presence    *PresenceResp  `json:"presence,omitempty"`
-	AccountData *EventsSection `json:"account_data,omitempty"`
-	ToDevice    *EventsSection `json:"to_device,omitempty"`
-	DeviceLists *DeviceLists   `json:"device_lists,omitempty"`
+	NextBatch                    string         `json:"next_batch"`
+	Rooms                        RoomsResp      `json:"rooms"`
+	Presence                     *PresenceResp  `json:"presence,omitempty"`
+	AccountData                  *EventsSection `json:"account_data,omitempty"`
+	ToDevice                     *EventsSection `json:"to_device,omitempty"`
+	DeviceLists                  *DeviceLists   `json:"device_lists,omitempty"`
+	DeviceOneTimeKeysCount       map[string]int `json:"device_one_time_keys_count,omitempty"`
+	DeviceUnusedFallbackKeyTypes *[]string      `json:"device_unused_fallback_key_types,omitempty"`
 }
 
 // hasDeltas reports whether an incremental response carries any content beyond
@@ -553,6 +555,28 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 
 	// Next batch token is the current max stream.
 	resp.NextBatch = Token{Stream: maxStream}.Encode()
+
+	// Per-device E2EE key counts: how many unused one-time keys (and which
+	// fallback key algorithms) the requesting device holds. Clients use the
+	// one-time-key count to decide when to upload more keys, and the unused
+	// fallback algorithms to decide when to (re)upload a fallback key.
+	//
+	// device_unused_fallback_key_types is emitted even when empty: its presence
+	// advertises that the server supports fallback keys, which tells clients to
+	// generate and upload one (spec: "If the list is empty, the client should
+	// upload a fallback key").
+	if opts.DeviceID != "" {
+		if counts, err := e.store.OneTimeKeyCounts(ctx, opts.UserID, opts.DeviceID); err == nil && len(counts) > 0 {
+			resp.DeviceOneTimeKeysCount = counts
+		}
+		algos, err := e.store.UnusedFallbackKeyAlgorithms(ctx, opts.UserID, opts.DeviceID)
+		if err == nil {
+			if len(algos) == 0 {
+				algos = []string{}
+			}
+			resp.DeviceUnusedFallbackKeyTypes = &algos
+		}
+	}
 
 	// To-device messages: deliver any queued for this device. DequeueToDevice
 	// deletes on delivery, so each message is received exactly once; pass

@@ -127,8 +127,8 @@ type slidingSyncToDeviceResp struct {
 
 type slidingSyncE2EEResp struct {
 	DeviceLists                  slidingSyncDeviceLists `json:"device_lists,omitempty"`
-	DeviceOneTimeKeysCount       map[string]int         `json:"device_one_time_keys_count,omitempty"`
-	DeviceUnusedFallbackKeyTypes []string               `json:"device_unused_fallback_key_types,omitempty"`
+	DeviceOneTimeKeysCount       map[string]int `json:"device_one_time_keys_count,omitempty"`
+	DeviceUnusedFallbackKeyTypes *[]string      `json:"device_unused_fallback_key_types,omitempty"`
 }
 
 type slidingSyncDeviceLists struct {
@@ -712,9 +712,12 @@ func (a *API) slidingExtensions(ctx context.Context, auth *homeserver.Auth, sinc
 			e.DeviceOneTimeKeysCount = counts
 		}
 		// Unused fallback key algorithms (the SDK uploads a fallback key when
-		// this is empty/absent).
-		if algos, err := a.Store.UnusedFallbackKeyAlgorithms(ctx, auth.UserID, auth.DeviceID); err == nil && len(algos) > 0 {
-			e.DeviceUnusedFallbackKeyTypes = algos
+		// this is empty; its presence advertises fallback-key support).
+		if algos, err := a.Store.UnusedFallbackKeyAlgorithms(ctx, auth.UserID, auth.DeviceID); err == nil {
+			if len(algos) == 0 {
+				algos = []string{}
+			}
+			e.DeviceUnusedFallbackKeyTypes = &algos
 		}
 		// Device-list changes for room peers (same semantics as /v3/sync).
 		if changed, left, err := a.Store.DeviceListChangesSince(ctx, since); err == nil && (len(changed) > 0 || len(left) > 0) {

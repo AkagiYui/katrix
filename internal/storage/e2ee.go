@@ -101,14 +101,19 @@ func (s *Store) ClaimOneTimeKeyByAlgo(ctx context.Context, userID, deviceID, alg
 // the spec, when a server has run out of one-time keys for a device it may
 // hand out the fallback key in response to /keys/claim so clients can keep
 // establishing sessions (the fallback key is then re-uploaded by the device).
+//
+// Fallback keys live in their own table (fallback_keys): vodozemac numbers the
+// fallback key and the one-time keys from the same counter, so the first
+// one-time key and the fallback key share a key id; keeping them separate
+// avoids corrupting either row.
 func (s *Store) ClaimFallbackKey(ctx context.Context, userID, deviceID, algorithm string) ([]OneTimeKey, error) {
 	var keyID string
 	var keyJSON json.RawMessage
 	err := s.pool.QueryRow(ctx,
-		`UPDATE one_time_keys SET used=TRUE
+		`UPDATE fallback_keys SET used=TRUE
 		 WHERE ctid IN (
-		   SELECT ctid FROM one_time_keys
-		   WHERE user_id=$1 AND device_id=$2 AND algorithm=$3 AND used=FALSE AND is_fallback=TRUE
+		   SELECT ctid FROM fallback_keys
+		   WHERE user_id=$1 AND device_id=$2 AND algorithm=$3 AND used=FALSE
 		   ORDER BY ctid ASC
 		   LIMIT 1 FOR UPDATE SKIP LOCKED
 		 )
@@ -149,14 +154,27 @@ func (s *Store) ClaimOneTimeKeys(ctx context.Context, requests []OneTimeKey) ([]
 	return out, nil
 }
 
-// UpsertOneTimeKeys stores a batch of one-time keys for a device.
+// UpsertOneTimeKeys stores a batch of one-time keys for a device. Fallback
+// keys (IsFallback=true) are stored in the separate fallback_keys table so
+// they never collide with a one-time key of the same id.
 func (s *Store) UpsertOneTimeKeys(ctx context.Context, keys []OneTimeKey) error {
 	for _, k := range keys {
+		if k.IsFallback {
+			if _, err := s.pool.Exec(ctx,
+				`INSERT INTO fallback_keys(user_id, device_id, algorithm, key_id, key_json)
+				 VALUES ($1,$2,$3,$4,$5)
+				 ON CONFLICT (user_id, device_id, algorithm, key_id) DO UPDATE SET key_json=EXCLUDED.key_json, used=FALSE`,
+				k.UserID, k.DeviceID, k.Algorithm, k.KeyID, k.KeyJSON,
+			); err != nil {
+				return err
+			}
+			continue
+		}
 		if _, err := s.pool.Exec(ctx,
-			`INSERT INTO one_time_keys(user_id, device_id, algorithm, key_id, key_json, is_fallback)
-			 VALUES ($1,$2,$3,$4,$5,$6)
+			`INSERT INTO one_time_keys(user_id, device_id, algorithm, key_id, key_json)
+			 VALUES ($1,$2,$3,$4,$5)
 			 ON CONFLICT (user_id, device_id, algorithm, key_id) DO UPDATE SET key_json=EXCLUDED.key_json, used=FALSE`,
-			k.UserID, k.DeviceID, k.Algorithm, k.KeyID, k.KeyJSON, k.IsFallback,
+			k.UserID, k.DeviceID, k.Algorithm, k.KeyID, k.KeyJSON,
 		); err != nil {
 			return err
 		}
@@ -169,7 +187,7 @@ func (s *Store) UpsertOneTimeKeys(ctx context.Context, keys []OneTimeKey) error 
 func (s *Store) OneTimeKeyCounts(ctx context.Context, userID, deviceID string) (map[string]int, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT algorithm, COUNT(*) FROM one_time_keys
-		 WHERE user_id=$1 AND device_id=$2 AND used=FALSE AND is_fallback=FALSE
+		 WHERE user_id=$1 AND device_id=$2 AND used=FALSE
 		 GROUP BY algorithm`, userID, deviceID)
 	if err != nil {
 		return nil, err
@@ -322,8 +340,8 @@ func (s *Store) DequeueToDeviceSince(ctx context.Context, userID, deviceID strin
 // these so clients know they don't need to upload a fresh fallback key.
 func (s *Store) UnusedFallbackKeyAlgorithms(ctx context.Context, userID, deviceID string) ([]string, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT DISTINCT algorithm FROM one_time_keys
-		 WHERE user_id=$1 AND device_id=$2 AND used=FALSE AND is_fallback=TRUE`,
+		`SELECT DISTINCT algorithm FROM fallback_keys
+		 WHERE user_id=$1 AND device_id=$2 AND used=FALSE`,
 		userID, deviceID)
 	if err != nil {
 		return nil, err
