@@ -413,6 +413,12 @@ func reportGoSuite(title string, data []byte, mode string) {
 	}
 	fmt.Printf("## %s results\n", title)
 	fmt.Println()
+	// The aggregate counts tally test cases (every subtest individually),
+	// while the failure table collapses each top-level test into one row.
+	// Label this up front so the PASS/FAIL vs rows discrepancy reads as
+	// intended rather than as a bug.
+	fmt.Println("_PASS/FAIL/SKIP count test cases (each subtest individually); the failure table below collapses to top-level tests._")
+	fmt.Println()
 	if mode == "crypto" {
 		fmt.Println("Note: baseline run, crypto implementation is incomplete; failures expected.")
 		fmt.Println()
@@ -497,7 +503,10 @@ func topLevel(name string) string {
 func printFailTable(summary string, rows []detailsRow) {
 	total := len(rows)
 	shown := total
-	const maxRows = 150
+	// High enough that even the full SyTest failure list (a few hundred rows)
+	// fits in the summary; the "… and N more" hint still covers the extreme
+	// cases that would otherwise blow past the step-summary size limit.
+	const maxRows = 500
 	if shown > maxRows {
 		shown = maxRows
 	}
