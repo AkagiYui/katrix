@@ -179,3 +179,41 @@ func TestParseCreateDefaultsVersion(t *testing.T) {
 		t.Fatalf("default version = %s, want %s", c.RoomVersion, roomver.Default)
 	}
 }
+
+func TestAuthorizeOwnedState(t *testing.T) {
+	creator := "@alice:test"
+	other := "@bob:test"
+	rules, _ := roomver.Get("11")
+	create := mustJSON(t, map[string]string{"creator": creator, "room_version": "11"})
+	// events map grants bob power to set the custom event type.
+	pl := mustJSON(t, map[string]any{
+		"users":         map[string]int{creator: 100, other: 50},
+		"events":        map[string]int{"com.example.test": 0},
+		"users_default": 0,
+	})
+	joined := mustJSON(t, map[string]string{"membership": MembershipJoin})
+	st := StateSnapshot{Create: create, PowerLevel: pl, SenderMember: joined}
+	content := mustJSON(t, map[string]any{"foo": "bar"})
+
+	// Bob may set state with his own user ID as state_key.
+	if err := Authorize(rules, "com.example.test", other, other, content, st); err != nil {
+		t.Fatalf("self state_key should be allowed: %v", err)
+	}
+	// Bob may set state with a non-user state_key (e.g. room-wide config).
+	if err := Authorize(rules, "com.example.test", "config", other, content, st); err != nil {
+		t.Fatalf("non-user state_key should be allowed: %v", err)
+	}
+	// Bob may NOT set state with another user's ID as state_key (owned state).
+	if err := Authorize(rules, "com.example.test", other+"suffix", other, content, st); err == nil {
+		t.Fatal("suffixed own user ID as state_key must be rejected")
+	}
+	if err := Authorize(rules, "com.example.test", creator, other, content, st); err == nil {
+		t.Fatal("another user's ID as state_key must be rejected")
+	}
+	if err := Authorize(rules, "com.example.test", "@notinroom:remote", other, content, st); err == nil {
+		t.Fatal("non-member user ID as state_key must be rejected")
+	}
+	if err := Authorize(rules, "com.example.test", "@oops", other, content, st); err == nil {
+		t.Fatal("malformed user ID as state_key must be rejected")
+	}
+}

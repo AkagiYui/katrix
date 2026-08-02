@@ -3,6 +3,7 @@ package rooms
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/AkagiYui/katrix/internal/roomver"
 )
@@ -124,6 +125,9 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 		"m.room.avatar", "m.room.canonical_alias", "m.room.aliases", "m.room.encryption",
 		"m.room.tombstone", "m.room.server_acl", "m.room.guest_access":
 		// Generic state event: sender must be joined and meet the event level.
+		if err := checkOwnedState(rules, stateKey, sender); err != nil {
+			return err
+		}
 		if senderMembership != MembershipJoin {
 			return fmt.Errorf("rooms: %s sender not joined", eventType)
 		}
@@ -134,6 +138,11 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 	default:
 		// State event (has state_key) vs message.
 		isState := stateKey != ""
+		if isState {
+			if err := checkOwnedState(rules, stateKey, sender); err != nil {
+				return err
+			}
+		}
 		if senderMembership != MembershipJoin {
 			return fmt.Errorf("rooms: sender not joined")
 		}
@@ -143,6 +152,22 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 		}
 		return nil
 	}
+}
+
+// checkOwnedState enforces the spec's "owned state" auth rule (room versions
+// 10+, MSC3757): "If the event has a state_key that starts with an @ and does
+// not match the sender, reject." A state event whose key names another user
+// (or a malformed/foreign user ID) must be rejected regardless of power level,
+// so no user can set state on another user's behalf. m.room.member is exempt —
+// its state_key is the membership target, governed by the membership rules.
+func checkOwnedState(rules roomver.Rules, stateKey, sender string) error {
+	if !strings.HasPrefix(stateKey, "@") {
+		return nil
+	}
+	if stateKey != sender {
+		return fmt.Errorf("rooms: state_key %q does not match sender %q", stateKey, sender)
+	}
+	return nil
 }
 
 // guestAccessCanJoin reports whether an m.room.guest_access content value
