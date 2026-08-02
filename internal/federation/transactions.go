@@ -272,6 +272,11 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	if _, err := a.Store.InsertEventWithMembership(r.Context(), row, membershipRow); err != nil {
 		return evID, false
 	}
+	// Index the event's relates_to relation so /relations, /threads and the
+	// MSC2836 /event_relationships walk can answer for events ingested over
+	// federation (the CS path indexes via persistEventInRoom; the federated
+	// path must do the same or related events never appear in the index).
+	a.Store.IndexRelationFromRow(r.Context(), row)
 	metrics.Counters.FedInboundPDUs.Add(1)
 	// Maintain the per-event state snapshot and recompute room_state from the
 	// forward extremities (handles single-extremity fast path and multi-
@@ -1058,6 +1063,7 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown("persist invite event"))
 		return
 	}
+	a.Store.IndexRelationFromRow(r.Context(), row)
 	metrics.Counters.FedInboundPDUs.Add(1)
 
 	// Persist the delivered invite_room_state (stripped state) so the invitee's
@@ -1141,6 +1147,7 @@ func (a *API) persistStrippedState(ctx context.Context, roomID string, version r
 	if _, err := a.Store.InsertEvent(ctx, srow); err != nil {
 		return storage.StateRow{}, false
 	}
+	a.Store.IndexRelationFromRow(ctx, srow)
 	// Member events in the stripped state belong in the denormalised membership
 	// table too, so /sync and serversForRooms (outbound PDU broadcast) see the
 	// room's remote members. Without this, an invited server never learns which
@@ -1379,6 +1386,7 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 	if vres.Valid || vres.Signed {
 		if evID != "" {
 			if _, err := a.Store.InsertEvent(r.Context(), row); err == nil {
+				a.Store.IndexRelationFromRow(r.Context(), row)
 				// Maintain the per-event state snapshot and recompute room_state
 				// from the forward extremities (handles fork resolution).
 				if rules, ok := roomver.Get(version); ok {

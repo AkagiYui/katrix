@@ -839,6 +839,7 @@ func (a *API) persistRemotePDUs(ctx context.Context, roomID string, rules roomve
 		if _, err := a.Store.InsertEvent(ctx, row); err != nil {
 			continue
 		}
+		a.Store.IndexRelationFromRow(ctx, row)
 		metrics.Counters.FedInboundPDUs.Add(1)
 		// Update the denormalised membership table for remote member state
 		// events so /joined_members, /members and lazy-loading syncs see them

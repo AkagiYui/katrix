@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/jackc/pgx/v5"
@@ -29,6 +30,42 @@ func (s *Store) InsertRelation(ctx context.Context, r RelationRow) error {
 		 ON CONFLICT (event_id) DO NOTHING`,
 		r.EventID, r.RoomID, r.ParentEventID, r.RelType, r.EventType, r.Sender, r.StreamOrdering)
 	return err
+}
+
+// IndexRelationFromRow extracts an event's m.relates_to / m.relationship
+// reference from a stored row and records it in the event_relations index. A
+// missing or malformed reference is ignored. Both the stabilised m.relates_to
+// key and MSC2836's m.relationship key are recognised.
+func (s *Store) IndexRelationFromRow(ctx context.Context, row *EventRow) {
+	var content struct {
+		RelatesTo struct {
+			EventID string `json:"event_id"`
+			RelType string `json:"rel_type"`
+		} `json:"m.relates_to"`
+		Relationship struct {
+			EventID string `json:"event_id"`
+			RelType string `json:"rel_type"`
+		} `json:"m.relationship"`
+	}
+	if err := json.Unmarshal(row.Content, &content); err != nil {
+		return
+	}
+	parentID, relType := content.RelatesTo.EventID, content.RelatesTo.RelType
+	if parentID == "" || relType == "" {
+		parentID, relType = content.Relationship.EventID, content.Relationship.RelType
+	}
+	if parentID == "" || relType == "" {
+		return
+	}
+	_ = s.InsertRelation(ctx, RelationRow{
+		EventID:        row.EventID,
+		RoomID:         row.RoomID,
+		ParentEventID:  parentID,
+		RelType:        relType,
+		EventType:      row.Type,
+		Sender:         row.Sender,
+		StreamOrdering: row.StreamOrdering,
+	})
 }
 
 // RelationsSince returns the events relating to parentEventID, filtered by

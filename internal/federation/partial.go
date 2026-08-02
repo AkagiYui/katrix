@@ -310,6 +310,7 @@ func (a *API) persistVerifiedPDUWithRow(ctx context.Context, roomID string, vers
 	if _, err := a.Store.InsertEvent(ctx, row); err != nil {
 		return storage.StateRow{}, false
 	}
+	a.Store.IndexRelationFromRow(ctx, row)
 	if ev.StateKey != nil {
 		// Update the denormalised membership table for remote member state
 		// events so /joined_members, /members and lazy-loading syncs see them.

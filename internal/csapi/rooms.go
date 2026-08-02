@@ -2675,7 +2675,7 @@ func persistEventInRoom(ctx context.Context, store *storage.Store, ev *events.Ev
 	// Index the event's relates_to relation (if any) so /relations and
 	// /threads can answer from the index. Best-effort: a malformed relates_to
 	// must not roll back the event insert.
-	indexEventRelation(ctx, store, row)
+	store.IndexRelationFromRow(ctx, row)
 	// Maintain the per-event state snapshot and recompute room_state from the
 	// forward extremities. For an unsupported room version we skip this (the
 	// event is still persisted; room_state is left as-is).
@@ -2685,42 +2685,6 @@ func persistEventInRoom(ctx context.Context, store *storage.Store, ev *events.Ev
 		}
 	}
 	return stream, nil
-}
-
-// indexEventRelation extracts an event's m.relates_to reference and records it
-// in the event_relations index. A missing or malformed relates_to is ignored.
-// Both the stabilised m.relates_to key and MSC2836's m.relationship key are
-// recognised.
-func indexEventRelation(ctx context.Context, store *storage.Store, row *storage.EventRow) {
-	var content struct {
-		RelatesTo struct {
-			EventID string `json:"event_id"`
-			RelType string `json:"rel_type"`
-		} `json:"m.relates_to"`
-		Relationship struct {
-			EventID string `json:"event_id"`
-			RelType string `json:"rel_type"`
-		} `json:"m.relationship"`
-	}
-	if err := json.Unmarshal(row.Content, &content); err != nil {
-		return
-	}
-	parentID, relType := content.RelatesTo.EventID, content.RelatesTo.RelType
-	if parentID == "" || relType == "" {
-		parentID, relType = content.Relationship.EventID, content.Relationship.RelType
-	}
-	if parentID == "" || relType == "" {
-		return
-	}
-	_ = store.InsertRelation(ctx, storage.RelationRow{
-		EventID:        row.EventID,
-		RoomID:         row.RoomID,
-		ParentEventID:  parentID,
-		RelType:        relType,
-		EventType:      row.Type,
-		Sender:         row.Sender,
-		StreamOrdering: row.StreamOrdering,
-	})
 }
 
 // notifyRoomMembers wakes up all joined users' /sync requests for a room, plus

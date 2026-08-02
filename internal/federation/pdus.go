@@ -279,6 +279,7 @@ func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roo
 	if _, err := a.Store.InsertEvent(ctx, row); err != nil {
 		return err
 	}
+	a.Store.IndexRelationFromRow(ctx, row)
 	if err := eventstate.Maintain(ctx, a.Store, row, rules); err != nil {
 		_ = err
 	}
