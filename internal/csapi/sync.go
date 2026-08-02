@@ -94,8 +94,17 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 		Filter:        filter,
 	}
 	// set_presence lets a client declare its presence as part of /sync (spec
-	// "Presence can be set from sync").
-	if sp := q.Get("set_presence"); sp != "" {
+	// "Presence can be set from sync"). When the parameter is omitted the client
+	// is automatically marked online ("If this parameter is omitted then the
+	// client is automatically marked as online when it uses this API"); only
+	// set_presence=offline leaves it unmarked. Without the default, a user who
+	// never explicitly PUT /presence has no presence row, so peers sharing a
+	// room never see their presence in /sync.
+	sp := q.Get("set_presence")
+	if sp == "" {
+		sp = "online"
+	}
+	if sp != "offline" {
 		_ = a.Store.SetPresence(r.Context(), auth.UserID, sp, "", a.Now())
 	}
 
