@@ -22,6 +22,63 @@ type Response struct {
 	DeviceLists *DeviceLists   `json:"device_lists,omitempty"`
 }
 
+// hasDeltas reports whether an incremental response carries any content beyond
+// the empty baseline: room timeline/state/leave/invite changes, account data,
+// presence (of peers — the user's own presence is always echoed), to-device
+// messages or device-list updates. The long-poll loop uses this to decide
+// whether to park: a response whose NextBatch token has not moved may still
+// carry real data (notably to-device messages, which are not tied to the
+// shared event stream), and such a response must be delivered immediately
+// rather than held for the next notify.
+//
+// A joined room is always present in rooms.join even with nothing new (its
+// timeline and state are empty arrays), and state_after is always populated
+// for use_state_after clients, so only rooms with non-empty timeline, state,
+// account_data or ephemeral content count as a delta.
+func (r *Response) HasDeltas(userID string) bool {
+	if len(r.Rooms.Invite) > 0 || len(r.Rooms.Leave) > 0 || len(r.Rooms.Peek) > 0 {
+		return true
+	}
+	for _, jr := range r.Rooms.Join {
+		if len(jr.Timeline.Events) > 0 {
+			return true
+		}
+		if len(jr.State.Events) > 0 {
+			return true
+		}
+		if jr.Ephemeral != nil && len(jr.Ephemeral.Events) > 0 {
+			return true
+		}
+		if len(jr.AccountData.Events) > 0 {
+			return true
+		}
+	}
+	if r.Presence != nil {
+		for _, ev := range r.Presence.Events {
+			var obj map[string]json.RawMessage
+			if json.Unmarshal(ev, &obj) != nil {
+				continue
+			}
+			var sender string
+			_ = json.Unmarshal(obj["sender"], &sender)
+			// The user's own presence is always echoed and is not a delta.
+			if sender != userID {
+				return true
+			}
+		}
+	}
+	if r.AccountData != nil && len(r.AccountData.Events) > 0 {
+		return true
+	}
+	if r.ToDevice != nil && len(r.ToDevice.Events) > 0 {
+		return true
+	}
+	if r.DeviceLists != nil && (len(r.DeviceLists.Changed) > 0 || len(r.DeviceLists.Left) > 0) {
+		return true
+	}
+	return false
+}
+
 // DeviceLists carries device-list changes for the syncing user.
 type DeviceLists struct {
 	Changed []string `json:"changed,omitempty"`
@@ -301,15 +358,14 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	}
 
 	// Rooms the user is invited to (membership=invite).
-	inviteRows, _ := e.store.Members(ctx, "", "")
-	_ = inviteRows // filtered below per-room via a dedicated query path
 	ignored := e.ignoredUsers(ctx, opts.Localpart)
 	invited, err := e.store.InvitedRooms(ctx, opts.UserID)
 	if err == nil {
 		for _, roomID := range invited {
-			if ignored != nil && e.inviteIsFromIgnored(ctx, roomID, opts.UserID, ignored) {
-				// Spec: "Servers must not send room invites from ignored users
-				// to clients." Drop the invite from the sync response.
+			// MSC4155 + m.ignored_user_list: an invite whose sender (or sender's
+			// server) the user has configured as ignored is accepted by the
+			// server but must not be delivered in /sync.
+			if e.inviteIsHidden(ctx, roomID, opts.UserID, opts.Localpart, ignored) {
 				continue
 			}
 			rooms.Invite[roomID] = e.buildInvitedRoom(ctx, roomID)
@@ -1092,17 +1148,38 @@ func (e *Engine) ignoredUsers(ctx context.Context, localpart string) map[string]
 	return out
 }
 
-// inviteIsFromIgnored reports whether the invite for roomID targeting userID
-// was sent by a user in the ignored set. The inviter is the sender of the
-// room's m.room.member(invite) event for the target user.
-func (e *Engine) inviteIsFromIgnored(ctx context.Context, roomID, userID string, ignored map[string]bool) bool {
-	id, err := e.store.GetStateEvent(ctx, roomID, "m.room.member", userID)
+// inviteIsHidden reports whether the invite for roomID must be hidden from the
+// invitee's /sync: the sender is in their m.ignored_user_list, or the sender /
+// sender's server is ignored under the MSC4155 invite-permission config.
+func (e *Engine) inviteIsHidden(ctx context.Context, roomID, inviteeUserID, inviteeLocalpart string, ignored map[string]bool) bool {
+	// The inviter is the sender of the room's m.room.member(invite) event for
+	// the invitee.
+	id, err := e.store.GetStateEvent(ctx, roomID, "m.room.member", inviteeUserID)
 	if err != nil {
 		return false
 	}
 	ev, err := e.store.GetEvent(ctx, id)
+	if err != nil || ev == nil {
+		return false
+	}
+	// m.ignored_user_list: the inviter is directly ignored.
+	if ignored != nil && ignored[ev.Sender] {
+		return true
+	}
+	// MSC4155: ignored_users / ignored_servers.
+	hidden, err := e.store.InviteIsHiddenFromSync(ctx, inviteeLocalpart, ev.Sender, serverOfUser(ev.Sender))
 	if err != nil {
 		return false
 	}
-	return ignored[ev.Sender]
+	return hidden
+}
+
+// serverOfUser extracts the server name from a Matrix user ID.
+func serverOfUser(userID string) string {
+	for i := len(userID) - 1; i >= 0; i-- {
+		if userID[i] == ':' {
+			return userID[i+1:]
+		}
+	}
+	return ""
 }

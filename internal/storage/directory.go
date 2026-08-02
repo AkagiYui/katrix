@@ -62,6 +62,10 @@ func (s *Store) SearchUserDirectory(ctx context.Context, serverName, term, searc
 	out := make([]UserDirectoryEntry, 0, len(candidates))
 	for _, c := range candidates {
 		userID := "@" + c.Localpart + ":" + serverName
+		// The searching user never appears in their own directory results.
+		if userID == searcherUserID {
+			continue
+		}
 		if s.userVisibleToSearcher(ctx, userID, searcherUserID) {
 			out = append(out, c)
 			if len(out) >= 50 {
@@ -82,9 +86,7 @@ func (s *Store) userVisibleToSearcher(ctx context.Context, userID, searcherUserI
 		return false
 	}
 	defer rows.Close()
-	found := false
 	for rows.Next() {
-		found = true
 		var roomID string
 		if err := rows.Scan(&roomID); err != nil {
 			return false
@@ -105,14 +107,22 @@ func (s *Store) userVisibleToSearcher(ctx context.Context, userID, searcherUserI
 			}
 		}
 	}
-	// A user with no joined rooms (or only rooms that fail the checks) is not
-	// visible.
-	return found && rows.Err() == nil
+	// A user is visible only when at least one joined room passed the public or
+	// shared checks above; having joined rooms alone is not enough.
+	return false
 }
 
 // roomIsPubliclyVisible reports whether a room is "public" for user-directory
-// purposes: join_rule == public or history_visibility == world_readable.
+// purposes: it is directory-published (is_public), its join_rule is public, or
+// its history_visibility is world_readable. The directory-published case covers
+// rooms created with visibility=public (which keep an invite join rule but are
+// still "public" per the directory semantics); the join_rule/world_readable
+// cases cover sytest's "Users appear/disappear from directory when join_rules
+// are changed" behaviour.
 func (s *Store) roomIsPubliclyVisible(ctx context.Context, roomID string) bool {
+	if r, err := s.GetRoom(ctx, roomID); err == nil && r.IsPublic {
+		return true
+	}
 	if id, err := s.GetStateEvent(ctx, roomID, "m.room.join_rules", ""); err == nil {
 		if ev, err := s.GetEvent(ctx, id); err == nil {
 			var c struct {

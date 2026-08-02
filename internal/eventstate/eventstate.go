@@ -95,6 +95,18 @@ func senderPowerLevel(ctx context.Context, store *storage.Store, meta *stateres.
 		}
 	}
 
+	// Room version 12 (MSC4291) omits the create event from auth_events (it is
+	// implied by the room itself), so the create content must be resolved from
+	// the room's current state instead. The creator/additional-creator power
+	// check depends on it.
+	if createContent == "" && rules.CreatorPrivileged && ev.RoomID() != "" {
+		if id, err := store.GetStateEvent(ctx, ev.RoomID(), "m.room.create", ""); err == nil {
+			if createEv, err := store.GetEvent(ctx, id); err == nil {
+				createContent = string(createEv.Content)
+			}
+		}
+	}
+
 	// v12 (MSC4289): creator and additional creators have effectively infinite
 	// power, outranking any finite power level (including PL at the canonical
 	// JSON max).

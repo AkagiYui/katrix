@@ -1789,6 +1789,16 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	}
 	version := roomver.Version(room.Version)
 	contentRaw, _ := json.Marshal(content)
+	// MSC4155 invite filtering: a local invite to a user whose permission config
+	// blocks the sender (or the sender's server) is rejected with
+	// M_INVITE_BLOCKED (403) — the same rule the federation invite endpoint
+	// enforces. The check applies to client invites, membership-state invites
+	// and createRoom invite lists alike (spec: "Blocking rejects the invite").
+	if mc, _ := rooms.ParseMember(contentRaw); mc != nil && mc.Membership == rooms.MembershipInvite && a.IsLocalUser(target) {
+		if verdict, verr := a.Store.EvaluateInviteFilter(r.Context(), a.LocalpartOf(target), auth.UserID, a.ServerName()); verr == nil && verdict == storage.InviteFilterBlock {
+			return "", newRoomError(http.StatusForbidden, "M_INVITE_BLOCKED", "the invite was blocked by the invitee's permission settings")
+		}
+	}
 	st, err := a.buildStateSnapshot(r.Context(), roomID, target, auth.UserID)
 	if err != nil {
 		return "", err
@@ -1870,14 +1880,25 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	// via PUT /_matrix/federation/v2/invite/{roomID}/{eventID} (spec "inviting
 	// a user to a room"). Generic PDU broadcast cannot reach the invitee's
 	// server before it knows the room exists — the invite endpoint creates the
-	// room view there. Best-effort: a delivery failure (server unreachable,
-	// invite rejected) does not fail the client's invite call.
+	// room view there. A rejection by the invitee's server (MSC4155 blocked
+	// invite, or an auth failure) is propagated to the caller so the client's
+	// invite request fails with the remote server's status (e.g. 403
+	// M_INVITE_BLOCKED); a transport error (server unreachable) is best-effort.
 	if mc != nil && mc.Membership == "invite" && a.fed != nil && !a.IsLocalUser(target) {
 		if err := a.fed.SendRemoteInvite(r.Context(), roomID, target, ev, version); err != nil {
+			if isBlockedInviteError(err) {
+				return "", newRoomError(http.StatusForbidden, "M_INVITE_BLOCKED", "the invite was blocked by the invitee's permission settings")
+			}
 			_ = err
 		}
 	}
 	return ev.EventID(), nil
+}
+
+// isBlockedInviteError reports whether a SendRemoteInvite error came from the
+// invitee's server rejecting the invite with M_INVITE_BLOCKED.
+func isBlockedInviteError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "M_INVITE_BLOCKED")
 }
 
 // sendStateEvent is a helper used by createRoom for name/topic events.

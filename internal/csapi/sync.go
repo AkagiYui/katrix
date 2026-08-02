@@ -106,8 +106,11 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 	}
 	// If the client gave a since and we have no new data beyond it, wait. The
 	// response already reflects the fresh state (including ephemeral/presence/
-	// device-list deltas), so only park when the token genuinely hasn't moved.
-	if since.Stream > 0 && resp.NextBatch == since.Encode() && timeout > 0 {
+	// device-list deltas), so only park when the token genuinely hasn't moved
+	// AND the response carries no deltas. The hasDeltas check is what delivers
+	// non-stream content (notably to-device messages, which are not tied to the
+	// shared event stream) immediately even though NextBatch is unchanged.
+	if since.Stream > 0 && !resp.HasDeltas(auth.UserID) && timeout > 0 {
 		wait, cancel := a.Notifier.Wait(auth.UserID)
 		defer cancel()
 		// Re-check after registering the waiter: a notify that fired between
@@ -120,7 +123,7 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
 		}
-		if resp.NextBatch != since.Encode() {
+		if resp.NextBatch != since.Encode() || resp.HasDeltas(auth.UserID) {
 			httpx.WriteJSON(w, http.StatusOK, resp)
 			return
 		}

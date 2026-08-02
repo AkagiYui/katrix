@@ -746,6 +746,15 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// MSC4155 invite filtering: consult the invitee's permission config. A
+	// blocked invite is rejected with M_INVITE_BLOCKED (403) before anything is
+	// persisted; an ignored invite is accepted (the inviter gets no feedback)
+	// but hidden from the invitee's /sync.
+	if verdict, ferr := a.Store.EvaluateInviteFilter(r.Context(), a.LocalpartOf(*ev.StateKey), ev.Sender, userDomain(ev.Sender)); ferr == nil && verdict == storage.InviteFilterBlock {
+		httpx.WriteError(w, httpx.NewError(http.StatusForbidden, "M_INVITE_BLOCKED", "the invite was blocked by the invitee's permission settings"))
+		return
+	}
+
 	// A server first learns a room exists via an invite: create the room view
 	// when it is unknown, seeded from the delivered invite_room_state.
 	exists, _ := a.Store.RoomExists(r.Context(), ev.RoomID)
