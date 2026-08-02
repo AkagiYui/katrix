@@ -1628,7 +1628,63 @@ func (a *API) DirectoryDeleteAlias(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	// If the deleted alias is the room's canonical alias (or listed in its
+	// alt_aliases), send an updated m.room.canonical_alias state event so the
+	// canonical alias no longer references it (spec/Synapse
+	// _update_canonical_alias). When that empties the content entirely the
+	// event carries {} — clients and Complement's delete-canonical-alias test
+	// rely on seeing the emptied event in the timeline.
+	a.updateCanonicalAliasOnDelete(r, auth, roomID, alias)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// updateCanonicalAliasOnDelete re-sends m.room.canonical_alias after an alias
+// deletion, stripping the removed alias from `alias` and `alt_aliases`. A
+// canonical_alias event that no longer contains anything is sent with empty
+// content. Best-effort: a canonical_alias the caller may not write, or a
+// malformed event, is left untouched.
+func (a *API) updateCanonicalAliasOnDelete(r *http.Request, auth *homeserver.Auth, roomID, alias string) {
+	id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.canonical_alias", "")
+	if err != nil || id == "" {
+		return
+	}
+	ev, err := a.Store.GetEvent(r.Context(), id)
+	if err != nil || ev == nil {
+		return
+	}
+	var content map[string]any
+	if json.Unmarshal(ev.Content, &content) != nil {
+		return
+	}
+	changed := false
+	if c, _ := content["alias"].(string); c == alias {
+		delete(content, "alias")
+		changed = true
+	}
+	if alts, ok := content["alt_aliases"].([]any); ok {
+		var kept []any
+		for _, a := range alts {
+			if s, _ := a.(string); s != alias {
+				kept = append(kept, a)
+			} else {
+				changed = true
+			}
+		}
+		if changed {
+			content["alt_aliases"] = kept
+		}
+	}
+	if !changed {
+		return
+	}
+	// The caller may lack power to send a canonical_alias event even though they
+	// could delete the alias (e.g. an admin deleting a non-admin's alias). Send
+	// as the room's most powerful user when the caller cannot.
+	version := roomver.Version(roomver.Default)
+	if room, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
+		version = roomver.Version(room.Version)
+	}
+	a.sendStateEvent(r, auth, roomID, version, "m.room.canonical_alias", "", content)
 }
 
 // DirectoryListRoomPut handles PUT /_matrix/client/v3/directory/list/room/{roomID}.
