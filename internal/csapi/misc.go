@@ -168,8 +168,15 @@ func (a *API) GetPushRule(w http.ResponseWriter, r *http.Request) {
 	scope := r.PathValue("scope")
 	kind := r.PathValue("kind")
 	ruleID := r.PathValue("ruleID")
-	if !a.validPushRulePath(scope, kind, ruleID) {
+	if scope != "global" || ruleID == "" || strings.ContainsAny(ruleID, "/\\") {
 		httpx.WriteError(w, httpx.ErrInvalidParam("malformed push rule path"))
+		return
+	}
+	// An unknown kind (e.g. the MSC4306 postcontent namespace) holds no rules;
+	// report that as a 404 like any missing rule, so clients that probe for a
+	// rule's existence can distinguish "not implemented" from "bad request".
+	if !contains(pushrules.Kinds, kind) {
+		httpx.WriteError(w, httpx.ErrNotFound("push rule not found"))
 		return
 	}
 	rule := a.findRule(auth.Localpart, kind, ruleID)
