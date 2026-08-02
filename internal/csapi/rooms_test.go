@@ -204,6 +204,64 @@ func TestRoomMessagesPagination(t *testing.T) {
 	if len(chunk) < 3 {
 		t.Fatalf("expected >=3 messages, got %d", len(chunk))
 	}
+	// The first (newest) chunk entry must be the last message sent.
+	if first, _ := chunk[0].(map[string]any); first["content"] == nil {
+		t.Fatalf("expected an event in chunk[0], got %v", chunk[0])
+	} else if c, _ := first["content"].(map[string]any); c["body"] != "msg" {
+		t.Fatalf("chunk[0] body = %v, want the newest message", c["body"])
+	}
+}
+
+// TestRoomMessagesNextBatchBackwardPagination reproduces the SyTest scenario
+// (guest_access message delivery) where a room's newest event is a message sent
+// right after another member joined. /messages pagination starts from the
+// /sync next_batch token, which is the position *after* the newest event; a
+// backward page from it must include that newest event (spec: backward `from`
+// is inclusive of the token). An off-by-one that excludes the token event
+// returns the previous join event instead of the message.
+func TestRoomMessagesNextBatchBackwardPagination(t *testing.T) {
+	_, srv := testAPI(t)
+	aliceTok := registerUser(t, srv, "alice_pg", "pw")
+	roomID := createRoom(t, srv, aliceTok, map[string]any{"preset": "public_chat"})
+	bobTok := registerUser(t, srv, "bob_pg", "pw")
+	// Bob joins (a member state event lands in the room's timeline).
+	code, _ := doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/join/"+roomID, bobTok, struct{}{})
+	if code != 200 {
+		t.Fatalf("bob join: code=%d", code)
+	}
+	// Bob sends a message; it becomes the room's newest event.
+	code, body := doJSON(t, srv, http.MethodPut,
+		"/_matrix/client/v3/rooms/"+roomID+"/send/m.room.message/m1", bobTok,
+		map[string]any{"body": "sup", "msgtype": "m.text"})
+	if code != 200 {
+		t.Fatalf("send: code=%d body=%v", code, body)
+	}
+	msgID, _ := body["event_id"].(string)
+	if msgID == "" {
+		t.Fatal("no event_id returned")
+	}
+	// Alice syncs to obtain next_batch, then pages back one event from it.
+	code, syncBody := getJSON(t, srv, "/_matrix/client/v3/sync", aliceTok)
+	if code != 200 {
+		t.Fatalf("sync: code=%d", code)
+	}
+	nextBatch, _ := syncBody["next_batch"].(string)
+	if nextBatch == "" {
+		t.Fatal("no next_batch in sync")
+	}
+	code, body = getJSON(t, srv,
+		"/_matrix/client/v3/rooms/"+roomID+"/messages?dir=b&limit=1&from="+url.QueryEscape(nextBatch), aliceTok)
+	if code != 200 {
+		t.Fatalf("messages: code=%d body=%v", code, body)
+	}
+	chunk, _ := body["chunk"].([]any)
+	if len(chunk) != 1 {
+		t.Fatalf("expected exactly 1 event, got %d: %v", len(chunk), body)
+	}
+	first, _ := chunk[0].(map[string]any)
+	if first["event_id"] != msgID {
+		t.Fatalf("chunk[0] event_id = %v, want the newest message %s (got a stale earlier event)", first["event_id"], msgID)
+	}
 }
 
 func TestRoomMessagesLazyLoadMembers(t *testing.T) {
