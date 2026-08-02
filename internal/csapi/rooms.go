@@ -2121,6 +2121,16 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 			return ev.EventID, nil
 		}
 	}
+	// A knock when already knocking is a no-op: the user is already awaiting a
+	// decision, and re-knocking (possibly with a different reason) must not
+	// overwrite the pending knock's content — the room's members see the
+	// original request (spec knocks are a single pending request; Complement's
+	// knocking tests verify the original reason survives a second knock).
+	if mc, _ := rooms.ParseMember(contentRaw); mc != nil && mc.Membership == rooms.MembershipKnock {
+		if m, err := a.Store.GetMembership(r.Context(), roomID, target); err == nil && m.Membership == rooms.MembershipKnock {
+			return m.EventID, nil
+		}
+	}
 	ev, err := a.buildEvent(r, auth, roomID, version, "m.room.member", target, ids.RandomTxnSuffix(), true, contentRaw)
 	if err != nil {
 		return "", err
