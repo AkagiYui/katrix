@@ -287,6 +287,16 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 			}
 			_ = json.Unmarshal(ev.Content, &mc)
 			a.applyRemoteMembershipNotify(r.Context(), ev.RoomID, *ev.StateKey, mc.Membership)
+			// A remote user's join/leave changes their device-list visibility to
+			// the room's local members: record it in the shared device-list stream
+			// so the local members' /sync reports the user in
+			// device_lists.changed (join) or device_lists.left (leave/ban). The
+			// send_join path records the joiner already; the ordinary PDU path
+			// (a remote leave, or a join propagated after a send_join) needs it
+			// too, and dedup in DeviceListChangesSince makes repeats harmless.
+			if mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban" {
+				_, _ = a.Store.RecordDeviceListChange(r.Context(), *ev.StateKey, mc.Membership != "join")
+			}
 		}
 	}
 	// An inbound m.room.tombstone means the room was upgraded (locally or on a

@@ -2092,6 +2092,23 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 		// sharing a room with a local user, including on join).
 		if mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban" {
 			_, _ = a.Store.RecordDeviceListChange(r.Context(), target, mc.Membership != "join")
+			// The reverse direction is spec-mandated too. Joining a room makes
+			// the room's existing members newly-visible to the joiner, so the
+			// joiner's /sync must receive their device lists in
+			// device_lists.changed; leaving/being banned makes them
+			// no-longer-visible, so device_lists.left must name them. Without
+			// this, a user who joins a room whose members uploaded their keys
+			// beforehand never learns their devices (the upload predates the
+			// joiner's sync token and its changed record was filtered out by the
+			// sharing-a-room check — Complement's DeviceListUpdates test).
+			if members, err := a.Store.Members(r.Context(), roomID, "join"); err == nil {
+				for _, m := range members {
+					if m.UserID == target {
+						continue
+					}
+					_, _ = a.Store.RecordDeviceListChange(r.Context(), m.UserID, mc.Membership != "join")
+				}
+			}
 			if mc.Membership == "join" {
 				a.broadcastDeviceListForUser(r.Context(), target)
 			} else {
