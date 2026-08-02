@@ -535,8 +535,9 @@ func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID str
 			evs = evs[len(evs)-limit:]
 		}
 		senders := map[string]bool{}
+		render := a.ssPrevContentRenderer(ctx, roomID, maxStream)
 		for i := range evs {
-			ev := ssClientEvent(&evs[i])
+			ev := render(&evs[i])
 			rr.Timeline = append(rr.Timeline, ev)
 			senders[evs[i].Sender] = true
 		}
@@ -558,7 +559,7 @@ func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID str
 		}
 
 		// Required state (expand $ME/$LAZY).
-		rr.RequiredState = a.slidingRequiredState(ctx, roomID, userID, senders, requiredState)
+		rr.RequiredState = a.slidingRequiredState(ctx, roomID, userID, senders, requiredState, maxStream)
 
 		// Room name/avatar from state.
 		if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.name", ""); err == nil {
@@ -585,7 +586,7 @@ func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID str
 	case "invite":
 		// Invited rooms carry the stripped invite state; the client has no
 		// timeline access yet.
-		rr.StrippedState = a.slidingInviteState(ctx, roomID)
+		rr.StrippedState = a.slidingInviteState(ctx, roomID, maxStream)
 	case "leave", "ban":
 		// A leave just needs to be surfaced so clients drop the room.
 		rr.Initial = true
@@ -598,7 +599,7 @@ func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID str
 // current state events. $ME and $LAZY are expanded per MSC4186: $ME is the
 // syncing user's own membership, $LAZY the memberships of timeline senders.
 // "*" state keys match every state event of that type.
-func (a *API) slidingRequiredState(ctx context.Context, roomID, userID string, timelineSenders map[string]bool, req [][2]string) []json.RawMessage {
+func (a *API) slidingRequiredState(ctx context.Context, roomID, userID string, timelineSenders map[string]bool, req [][2]string, maxStream int64) []json.RawMessage {
 	if len(req) == 0 {
 		return nil
 	}
@@ -621,6 +622,7 @@ func (a *API) slidingRequiredState(ctx context.Context, roomID, userID string, t
 		}
 		byKey[key] = ev
 	}
+	render := a.ssPrevContentRenderer(ctx, roomID, maxStream)
 	seen := map[string]bool{}
 	var out []json.RawMessage
 	add := func(ev *storage.EventRow) {
@@ -628,7 +630,7 @@ func (a *API) slidingRequiredState(ctx context.Context, roomID, userID string, t
 			return
 		}
 		seen[ev.EventID] = true
-		out = append(out, ssClientEvent(ev))
+		out = append(out, render(ev))
 	}
 	for _, rs := range req {
 		typ, stateKey := rs[0], rs[1]
@@ -658,7 +660,7 @@ func (a *API) slidingRequiredState(ctx context.Context, roomID, userID string, t
 
 // slidingInviteState builds the stripped state for an invited room (the same
 // events /v3/sync delivers under rooms.invite.<room>.invite_state).
-func (a *API) slidingInviteState(ctx context.Context, roomID string) []json.RawMessage {
+func (a *API) slidingInviteState(ctx context.Context, roomID string, maxStream int64) []json.RawMessage {
 	stateRows, err := a.Store.GetState(ctx, roomID)
 	if err != nil {
 		return nil
@@ -668,9 +670,10 @@ func (a *API) slidingInviteState(ctx context.Context, roomID string) []json.RawM
 		ids = append(ids, s.EventID)
 	}
 	evs, _ := a.Store.EventsByIDs(ctx, ids)
+	render := a.ssPrevContentRenderer(ctx, roomID, maxStream)
 	out := make([]json.RawMessage, 0, len(evs))
 	for i := range evs {
-		out = append(out, ssClientEvent(&evs[i]))
+		out = append(out, render(&evs[i]))
 	}
 	return out
 }
@@ -881,6 +884,62 @@ func ssClientEvent(row *storage.EventRow) json.RawMessage {
 	}
 	b, _ := json.Marshal(m)
 	return b
+}
+
+// ssPrevContentRenderer returns a function that renders an event row the same
+// way ssClientEvent does, additionally attaching unsigned.prev_content and
+// unsigned.prev_sender to m.room.member events: the content (and sender) of the
+// previous member event for the same state_key. Per the spec, "Previous
+// membership can be retrieved from the prev_content object on an event"; it
+// lets clients render transitions (invite -> join, join -> leave). The /v3/sync
+// engine does the same for its timeline/state events.
+func (a *API) ssPrevContentRenderer(ctx context.Context, roomID string, upto int64) func(*storage.EventRow) json.RawMessage {
+	history, err := a.Store.MemberEvents(ctx, roomID, upto)
+	if err != nil {
+		return ssClientEvent
+	}
+	return func(row *storage.EventRow) json.RawMessage {
+		ev := ssClientEvent(row)
+		if row == nil || row.Type != "m.room.member" {
+			return ev
+		}
+		// Find the most recent earlier member event for the same user.
+		var prev *storage.MemberEventRow
+		for i := range history {
+			h := &history[i]
+			if h.UserID == row.StateKey && h.StreamOrdering < row.StreamOrdering {
+				if prev == nil || h.StreamOrdering > prev.StreamOrdering {
+					prev = h
+				}
+			}
+		}
+		if prev == nil {
+			return ev
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(ev, &obj); err != nil {
+			return ev
+		}
+		unsigned := map[string]any{}
+		if existing, ok := obj["unsigned"]; ok {
+			var m map[string]json.RawMessage
+			if err := json.Unmarshal(existing, &m); err == nil {
+				for k, v := range m {
+					unsigned[k] = v
+				}
+			}
+		}
+		var prevContent map[string]any
+		if err := json.Unmarshal(prev.Content, &prevContent); err != nil {
+			return ev
+		}
+		unsigned["prev_content"] = prevContent
+		unsigned["prev_sender"] = prev.Sender
+		unsignedJSON, _ := json.Marshal(unsigned)
+		obj["unsigned"] = unsignedJSON
+		b, _ := json.Marshal(obj)
+		return b
+	}
 }
 
 // isStateEventType reports whether the event type is a known state event type.
