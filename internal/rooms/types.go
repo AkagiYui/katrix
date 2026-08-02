@@ -58,10 +58,20 @@ func (p *PowerLevels) EventLevel(eventType string, isState bool) int64 {
 	return p.EventsDefault
 }
 
-// ParsePowerLevels decodes raw m.room.power_levels content, defaulting the
-// whole struct to zero values when raw is empty/invalid.
+// ParsePowerLevels decodes raw m.room.power_levels content, applying the spec's
+// field defaults: ban, kick, redact and state_default default to 50; invite,
+// events_default and users_default default to 0. When the event is absent
+// (empty raw) the caller's StateSnapshot must still apply the "no
+// m.room.power_levels event" defaults — the creator has power 100, everyone
+// else 0 — which the create event's privileged-creator rule covers for v12+;
+// for pre-v12 rooms the caller seeds the creator's power explicitly.
 func ParsePowerLevels(raw json.RawMessage) (*PowerLevels, error) {
-	pl := &PowerLevels{}
+	pl := &PowerLevels{
+		StateDefault: 50,
+		Ban:          50,
+		Kick:         50,
+		Redact:       50,
+	}
 	if len(raw) == 0 {
 		return pl, nil
 	}
