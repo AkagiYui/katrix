@@ -127,8 +127,9 @@ func TestThreadSubscriptionsSlidingSync(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("subscribe: %d", code)
 	}
-	code, body = doJSON(t, srv, http.MethodPost, "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync", tok,
-		map[string]any{"pos": pos, "extensions": map[string]any{"io.element.msc4308.thread_subscriptions": map[string]any{"enabled": true}}})
+	code, body = doJSON(t, srv, http.MethodPost,
+		"/_matrix/client/unstable/org.matrix.simplified_msc3575/sync?pos="+pos, tok,
+		map[string]any{"extensions": map[string]any{"io.element.msc4308.thread_subscriptions": map[string]any{"enabled": true}}})
 	if code != 200 {
 		t.Fatalf("incremental sliding sync: %d %v", code, body)
 	}

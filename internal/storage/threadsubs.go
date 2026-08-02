@@ -28,13 +28,15 @@ type ThreadSubscription struct {
 
 // UpsertThreadSubscription activates a subscription (manual or automatic). The
 // created_stream is only assigned on first insert so incremental sliding sync
-// does not re-deliver an existing subscription.
+// does not re-deliver an existing subscription. It draws from the shared sync
+// stream (migration 0020) so the MSC4308 extension's positions are comparable
+// with the sliding-sync pos.
 func (s *Store) UpsertThreadSubscription(ctx context.Context, sub ThreadSubscription) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO thread_subscriptions
 		   (user_localpart, room_id, thread_root_id, automatic, automatic_event_id,
-		    bump_stamp, consumed_upto, unsubscribed, created_stream)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE,nextval('thread_subscription_stream_seq'))
+		    bump_stamp, consumed_upto, unsubscribed)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE)
 		 ON CONFLICT (user_localpart, room_id, thread_root_id) DO UPDATE SET
 		   automatic=EXCLUDED.automatic,
 		   automatic_event_id=EXCLUDED.automatic_event_id,
@@ -53,8 +55,8 @@ func (s *Store) UnsubscribeThreadSubscription(ctx context.Context, localpart, ro
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO thread_subscriptions
 		   (user_localpart, room_id, thread_root_id, automatic, automatic_event_id,
-		    bump_stamp, consumed_upto, unsubscribed, created_stream)
-		 VALUES ($1,$2,$3,FALSE,'',0,$4,TRUE,nextval('thread_subscription_stream_seq'))
+		    bump_stamp, consumed_upto, unsubscribed)
+		 VALUES ($1,$2,$3,FALSE,'',0,$4,TRUE)
 		 ON CONFLICT (user_localpart, room_id, thread_root_id) DO UPDATE SET
 		   consumed_upto=GREATEST(thread_subscriptions.consumed_upto, EXCLUDED.consumed_upto),
 		   unsubscribed=TRUE`,

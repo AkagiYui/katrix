@@ -26,4 +26,5 @@ func (a *API) Register(mux *http.ServeMux) {
 	a.registerDirectory(mux)
 	a.registerDelayedEvents(mux)
 	a.registerThreadSubscriptions(mux)
+	a.registerSlidingSync(mux)
 }

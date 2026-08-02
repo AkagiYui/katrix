@@ -3,8 +3,6 @@ package csapi
 import (
 	"context"
 	"net/http"
-	"strconv"
-	"strings"
 
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
@@ -17,14 +15,14 @@ const (
 	msc4306ErrConflictingUnsub = "IO.ELEMENT.MSC4306.M_CONFLICTING_UNSUBSCRIPTION"
 )
 
-// registerThreadSubscriptions wires the MSC4306 thread-subscription endpoints
-// and the minimal sliding-sync surface that carries the MSC4308
-// thread-subscriptions extension.
+// registerThreadSubscriptions wires the MSC4306 thread-subscription endpoints.
+// The MSC4308 thread-subscriptions sliding-sync extension is served by the
+// full MSC4186 sliding-sync endpoint (see sliding_sync.go), which also carries
+// the room lists.
 func (a *API) registerThreadSubscriptions(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /_matrix/client/unstable/io.element.msc4306/rooms/{roomID}/thread/{threadRootID}/subscription", a.RequireAuth(a.ThreadSubscriptionPut))
 	mux.HandleFunc("GET /_matrix/client/unstable/io.element.msc4306/rooms/{roomID}/thread/{threadRootID}/subscription", a.RequireAuth(a.ThreadSubscriptionGet))
 	mux.HandleFunc("DELETE /_matrix/client/unstable/io.element.msc4306/rooms/{roomID}/thread/{threadRootID}/subscription", a.RequireAuth(a.ThreadSubscriptionDelete))
-	mux.HandleFunc("POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync", a.RequireAuth(a.SlidingSyncThreadSubscriptions))
 }
 
 // ThreadSubscriptionPut handles PUT .../thread/{threadRootID}/subscription. A
@@ -161,71 +159,3 @@ func (a *API) threadReplyStream(ctx context.Context, roomID, threadRootID, event
 type errNotFound struct{}
 
 func (errNotFound) Error() string { return "not found" }
-
-// slidingSyncSubsRequest is the subset of the sliding-sync request that the
-// MSC4308 thread-subscriptions extension needs.
-type slidingSyncSubsRequest struct {
-	Pos        string `json:"pos"`
-	Extensions struct {
-		ThreadSubs *struct {
-			Enabled bool `json:"enabled"`
-			Limit   int  `json:"limit"`
-		} `json:"io.element.msc4308.thread_subscriptions"`
-	} `json:"extensions"`
-}
-
-// SlidingSyncThreadSubscriptions implements the thread-subscriptions extension
-// (MSC4308) over a minimal sliding-sync endpoint. It returns the user's new
-// active thread subscriptions since the supplied pos, grouped by room.
-func (a *API) SlidingSyncThreadSubscriptions(w http.ResponseWriter, r *http.Request) {
-	auth, _ := homeserver.AuthFrom(r.Context())
-	var req slidingSyncSubsRequest
-	if err := httpx.DecodeJSON(w, r, &req); err != nil {
-		httpx.WriteError(w, err)
-		return
-	}
-	since := parsePos(req.Pos)
-	subs, err := a.Store.ThreadSubscriptionsSince(r.Context(), auth.Localpart, since)
-	if err != nil {
-		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
-		return
-	}
-	subscribed := map[string]map[string]any{}
-	newPos := since
-	for _, sub := range subs {
-		room := subscribed[sub.RoomID]
-		if room == nil {
-			room = map[string]any{}
-			subscribed[sub.RoomID] = room
-		}
-		room[sub.ThreadRootID] = map[string]any{
-			"bump_stamp": sub.BumpStamp,
-			"automatic":  sub.Automatic,
-		}
-		if sub.CreatedStream > newPos {
-			newPos = sub.CreatedStream
-		}
-	}
-	ext := map[string]any{}
-	if len(subscribed) > 0 {
-		ext["subscribed"] = subscribed
-	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"pos":        strconv.FormatInt(newPos, 10),
-		"extensions": map[string]any{"io.element.msc4308.thread_subscriptions": ext},
-	})
-}
-
-// parsePos decodes a sliding-sync position into a stream value (0 when absent
-// or malformed).
-func parsePos(pos string) int64 {
-	pos = strings.TrimPrefix(strings.TrimSpace(pos), "s")
-	if pos == "" {
-		return 0
-	}
-	n, err := strconv.ParseInt(pos, 10, 64)
-	if err != nil || n < 0 {
-		return 0
-	}
-	return n
-}

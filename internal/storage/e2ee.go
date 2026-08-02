@@ -269,3 +269,44 @@ func (s *Store) DequeueToDevice(ctx context.Context, userID, deviceID string, si
 	}
 	return out, nil
 }
+
+// DequeueToDeviceSince is the MSC4186 to-device extension variant: it
+// delivers messages with id > since and returns the new cursor (the max
+// delivered id, or since when nothing was delivered). The cursor is opaque to
+// clients and is echoed back as the extension's since on the next request.
+func (s *Store) DequeueToDeviceSince(ctx context.Context, userID, deviceID string, since int64) ([]ToDeviceMessage, int64, error) {
+	msgs, err := s.DequeueToDevice(ctx, userID, deviceID, since)
+	if err != nil {
+		return nil, since, err
+	}
+	next := since
+	for _, m := range msgs {
+		if m.ID > next {
+			next = m.ID
+		}
+	}
+	return msgs, next, nil
+}
+
+// UnusedFallbackKeyAlgorithms returns the distinct algorithms for which the
+// device has an unused fallback key. The sliding-sync e2ee extension reports
+// these so clients know they don't need to upload a fresh fallback key.
+func (s *Store) UnusedFallbackKeyAlgorithms(ctx context.Context, userID, deviceID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT algorithm FROM one_time_keys
+		 WHERE user_id=$1 AND device_id=$2 AND used=FALSE AND is_fallback=TRUE`,
+		userID, deviceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var algo string
+		if err := rows.Scan(&algo); err != nil {
+			return nil, err
+		}
+		out = append(out, algo)
+	}
+	return out, rows.Err()
+}
