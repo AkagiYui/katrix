@@ -81,9 +81,16 @@ func (a *API) JoinRemoteRoom(ctx context.Context, userID, roomID string, via []s
 	if dest == "" {
 		return false, fmt.Errorf("federation: cannot determine a server to join %s from", roomID)
 	}
-	candidates := append([]string{}, via...)
-	if !containsStr(candidates, dest) {
-		candidates = append(candidates, dest)
+	// The candidates are exactly the servers the client supplied (tried in
+	// order); the room ID's domain is only a fallback when none were given.
+	// Appending the room-ID domain after a failed via server would silently
+	// bypass the client's choice — a restricted-room join the client expects
+	// to fail via server A must not succeed via the room's origin domain
+	// (Synapse dropped this fallback for MSC4291: "we used to add the domain
+	// of the room ID to remote_room_hosts. This is not safe in MSC4291 rooms").
+	candidates := via
+	if len(candidates) == 0 {
+		candidates = []string{dest}
 	}
 	var lastErr error
 	for _, cand := range candidates {
@@ -180,9 +187,11 @@ func (a *API) KnockRemoteRoom(ctx context.Context, userID, roomID string, via []
 	if dest == "" {
 		return fmt.Errorf("federation: cannot determine a server to knock %s from", roomID)
 	}
-	candidates := append([]string{}, via...)
-	if !containsStr(candidates, dest) {
-		candidates = append(candidates, dest)
+	// Same candidate rule as JoinRemoteRoom: the supplied servers are tried in
+	// order; the room ID's domain is only a fallback when none were given.
+	candidates := via
+	if len(candidates) == 0 {
+		candidates = []string{dest}
 	}
 	var lastErr error
 	for _, cand := range candidates {

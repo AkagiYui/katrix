@@ -1868,17 +1868,30 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 		// must be delegated to a remote server that can (Synapse's
 		// _should_perform_remote_join): when the joining user is not already
 		// joined/invited and no local joined member has invite power, the join
-		// event cannot pass auth locally. The candidates are the servers of the
-		// room's joined members with invite power, falling back to the room
-		// ID's domain and the request's via list.
+		// event cannot pass auth locally.
 		if !a.canLocalJoin(r.Context(), roomID, auth.UserID) && a.fed != nil {
-			candidates := a.remoteJoinCandidates(r.Context(), roomID)
-			if len(candidates) == 0 {
-				if dom := ids.DomainOf(roomID); dom != "" {
-					candidates = append(candidates, dom)
+			// The candidate list depends on whether the local server is still
+			// participating in the room, mirroring Synapse's
+			// _should_perform_remote_join:
+			//   * host not in the room → the client's via list is used as-is,
+			//     tried in order. The joining server must not add servers of its
+			//     own choosing — a restricted-room join the client expects to
+			//     fail via server A must not silently succeed via a server the
+			//     room state happens to name.
+			//   * host in the room but nobody local can invite → the servers of
+			//     the room's joined members who can (Synapse returns
+			//     servers_that_can_issue_invite here, not the client's via).
+			var candidates []string
+			if a.Store.ServerHasJoinedMember(r.Context(), roomID, a.ServerName()) {
+				candidates = a.remoteJoinCandidates(r.Context(), roomID)
+				if len(candidates) == 0 {
+					if dom := ids.DomainOf(roomID); dom != "" {
+						candidates = append(candidates, dom)
+					}
 				}
+			} else {
+				candidates = via
 			}
-			candidates = append(candidates, via...)
 			if partial, err := a.fed.JoinRemoteRoom(r.Context(), auth.UserID, roomID, candidates); err == nil {
 				if !partial {
 					a.broadcastDeviceListForUser(r.Context(), auth.UserID)

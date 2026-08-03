@@ -815,9 +815,20 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 			prevMembership = m.Membership
 		}
 		if prevMembership != rooms.MembershipJoin && prevMembership != rooms.MembershipInvite {
-			if authoriser := a.Store.RestrictedJoinAuthoriser(r.Context(), roomID, a.ServerName()); authoriser != "" {
-				content["join_authorised_via_users_server"] = authoriser
+			authoriser := a.Store.RestrictedJoinAuthoriser(r.Context(), roomID, a.ServerName())
+			if authoriser == "" {
+				// No local joined member can issue invites, so this server
+				// cannot generate a correctly-signed join event. Per MSC3083
+				// respond 400 M_UNABLE_TO_GRANT_JOIN so the joining server
+				// fails over to another resident (mirror of Synapse's
+				// get_user_which_could_invite, which raises the same code).
+				httpx.WriteJSON(w, http.StatusBadRequest, map[string]any{
+					"errcode": "M_UNABLE_TO_GRANT_JOIN",
+					"error":   "Unable to find a user which could issue an invite",
+				})
+				return
 			}
+			content["join_authorised_via_users_server"] = authoriser
 		}
 	}
 	template := map[string]any{

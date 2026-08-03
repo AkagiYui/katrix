@@ -68,7 +68,7 @@ func (s *Store) RestrictedJoinAuthorised(ctx context.Context, roomID, joiningUse
 	inAllowed := false
 	participatesInAll := true
 	for _, allowedRoom := range allowedRooms {
-		if !s.serverHasJoinedMember(ctx, allowedRoom, serverName) {
+		if !s.ServerHasJoinedMember(ctx, allowedRoom, serverName) {
 			participatesInAll = false
 			continue
 		}
@@ -97,11 +97,11 @@ func (s *Store) RestrictedJoinAuthorised(ctx context.Context, roomID, joiningUse
 	return RestrictedJoinAuthorised
 }
 
-// serverHasJoinedMember reports whether serverName has at least one joined
+// ServerHasJoinedMember reports whether serverName has at least one joined
 // member in roomID (i.e. whether the server is still participating in the
 // room). A server with no joined members has left the room and cannot vouch
-// for its state.
-func (s *Store) serverHasJoinedMember(ctx context.Context, roomID, serverName string) bool {
+// for its state. Mirror of Synapse's is_host_joined.
+func (s *Store) ServerHasJoinedMember(ctx context.Context, roomID, serverName string) bool {
 	users, err := s.JoinedUserIDs(ctx, roomID)
 	if err != nil {
 		return false
