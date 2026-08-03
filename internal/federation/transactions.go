@@ -223,7 +223,9 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// get_missing_events so the room's timeline stays contiguous). The fetched
 	// events must be persisted before this one so stream ordering (and thus the
 	// /sync timeline) reflects the true DAG order. Best-effort: a failure here
-	// must not reject the already-verified event.
+	// must not reject the already-verified event. The unknown-prevs condition
+	// is re-checked after the fetch (below) so an event whose gap the fetch
+	// closed does not record a false timeline gap.
 	if origin != "" && a.hasUnknownPrevEvents(r.Context(), raw) {
 		a.fetchMissingEventsFor(r.Context(), ev.RoomID, evID, origin)
 	}
@@ -288,6 +290,14 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	}
 	if _, err := a.Store.InsertEventWithMembership(r.Context(), row, membershipRow); err != nil {
 		return evID, false
+	}
+	// An event persisted while its prev_events are still missing locally leaves
+	// the room's DAG discontinuous at this stream position: /sync must mark the
+	// timeline limited and deliver only events after the gap (spec "limited"
+	// semantics). The gap row is keyed by this event's real stream position so
+	// an incremental sync window covering it reports the gap.
+	if origin != "" && a.hasUnknownPrevEvents(r.Context(), raw) {
+		a.Store.RecordTimelineGap(r.Context(), ev.RoomID, row.StreamOrdering)
 	}
 	// Index the event's relates_to relation so /relations, /threads and the
 	// MSC2836 /event_relationships walk can answer for events ingested over

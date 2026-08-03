@@ -383,6 +383,12 @@ func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roo
 	if _, err := a.Store.InsertEvent(ctx, row); err != nil {
 		return err
 	}
+	// A fetched missing event may itself sit on top of history we still do not
+	// hold (a partial gap fill): record the DAG discontinuity so /sync marks
+	// the timeline limited at this position.
+	if a.hasUnknownPrevEvents(ctx, raw) {
+		a.Store.RecordTimelineGap(ctx, roomID, row.StreamOrdering)
+	}
 	a.Store.IndexRelationFromRow(ctx, row)
 	if err := eventstate.Maintain(ctx, a.Store, row, rules); err != nil {
 		_ = err

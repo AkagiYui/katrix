@@ -474,6 +474,23 @@ func (s *Store) LatestEvent(ctx context.Context, roomID string) (*EventRow, erro
 		 ORDER BY stream_ordering DESC LIMIT 1`, roomID))
 }
 
+// HasEventsBefore reports whether the room holds any events with
+// stream_ordering < stream. Used by /sync to decide whether an initial-sync
+// timeline window (which is capped at the newest `limit` events) was
+// truncated by the count limit rather than by the room's history.
+func (s *Store) HasEventsBefore(ctx context.Context, roomID string, stream int64) (bool, error) {
+	var one int
+	err := s.pool.QueryRow(ctx,
+		`SELECT 1 FROM events WHERE room_id=$1 AND stream_ordering < $2 LIMIT 1`, roomID, stream).Scan(&one)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // MaxDepth returns the maximum event depth in a room, or 0 if none.
 func (s *Store) MaxDepth(ctx context.Context, roomID string) (int64, error) {
 	var d *int64

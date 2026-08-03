@@ -557,6 +557,22 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 		rooms.Join[roomID] = jr
 	}
 
+	// Incremental sync omits rooms that have not changed since the token: a
+	// joined room with an empty timeline, no state, no account-data deltas and
+	// no ephemeral content is not re-sent (spec: "rooms.join is a map of rooms
+	// where the user is joined to, *and has been modified since the previous
+	// sync*"). A full_state sync always re-sends the room's state, so it is
+	// never dropped here (its state events count as a delta).
+	if opts.Since.Stream > 0 && !opts.FullState {
+		for roomID, jr := range rooms.Join {
+			if len(jr.Timeline.Events) == 0 && len(jr.State.Events) == 0 &&
+				(jr.Ephemeral == nil || len(jr.Ephemeral.Events) == 0) &&
+				len(jr.AccountData.Events) == 0 {
+				delete(rooms.Join, roomID)
+			}
+		}
+	}
+
 	// Next batch token is the current max stream.
 	resp.NextBatch = Token{Stream: maxStream}.Encode()
 
@@ -710,21 +726,84 @@ func (e *Engine) roomPeers(ctx context.Context, opts SyncOptions) map[string]boo
 func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOptions, maxStream int64) (JoinedRoom, error) {
 	jr := JoinedRoom{}
 	filter := opts.Filter
-	// Timeline: events with stream_ordering > since, limited to 50 for initial.
-	from := opts.Since.Stream
+	// Timeline limit: the filter's per-room timeline limit, else 50 (the spec
+	// default /current window). The window is the room's recent history — the
+	// *last* `limit` events — not the first `limit` events after the token
+	// (mirror of Synapse's _load_filtered_recents, which paginates backwards
+	// from the newest event).
 	limit := 50
 	if filter != nil && filter.TimelineLimit > 0 {
 		limit = filter.TimelineLimit
 	}
-	if from == 0 {
-		from = maxStream - int64(limit)
+
+	// A room the user joined after the sync token is a "newly joined" room: its
+	// timeline is the room's recent history (not just the events since the
+	// token) and is always marked limited, forcing the client to back-paginate
+	// the pre-join history (spec + Synapse).
+	newlyJoined := false
+	if opts.Since.Stream > 0 {
+		if m, err := e.store.LatestMembershipEvent(ctx, roomID, opts.UserID); err == nil && m.StreamOrdering > opts.Since.Stream {
+			newlyJoined = true
+		}
+	}
+
+	// The upper bound of the window is the room's own latest event (its tail is
+	// unaffected by other rooms advancing the shared stream), falling back to
+	// the global max.
+	to := maxStream
+	if latest, err := e.store.LatestEvent(ctx, roomID); err == nil && latest != nil {
+		to = latest.StreamOrdering
+	}
+
+	from := opts.Since.Stream
+	if opts.Since.Stream == 0 || newlyJoined {
+		// Full-room window: the last `limit` events.
+		from = to - int64(limit)
 		if from < 0 {
 			from = 0
 		}
 	}
-	evs, err := e.store.EventsForRoom(ctx, roomID, from, maxStream, limit, "f")
+	// A DAG gap inside the window (an event was persisted while its
+	// prev_events were still missing locally) marks the timeline limited and
+	// drops everything before the gap: the client must back-paginate to fill
+	// the hole (mirror of Synapse's get_timeline_gaps). The gap's own event is
+	// included — the gap sits *before* it.
+	gapLimited := false
+	if gap, ok := e.store.TimelineGapSince(ctx, roomID, opts.Since.Stream); ok && gap > from && gap <= to {
+		gapLimited = true
+		from = gap - 1
+	}
+
+	// Incremental windows are fetched newest-first (DESC LIMIT limit+1) so the
+	// `limit` most recent events are returned; the extra row reveals whether
+	// the window was truncated by the count limit. An initial sync (or a
+	// gap-free room) fetches the (already capped) window forward with the same
+	// +1 probe.
+	var evs []storage.EventRow
+	var err error
+	if opts.Since.Stream == 0 && !gapLimited {
+		evs, err = e.store.EventsForRoom(ctx, roomID, from, to, limit+1, "f")
+	} else {
+		evs, err = e.store.EventsForRoom(ctx, roomID, from, to, limit+1, "b")
+		for i, j := 0, len(evs)-1; i < j; i, j = i+1, j-1 {
+			evs[i], evs[j] = evs[j], evs[i]
+		}
+	}
 	if err != nil {
 		return jr, err
+	}
+	// Count truncation: more than `limit` events in the window -> limited, keep
+	// the newest `limit`. An initial sync's window starts at to-limit, so a
+	// truncated tail is detected by checking whether older events exist below
+	// the window.
+	countLimited := false
+	if opts.Since.Stream == 0 && !gapLimited {
+		if trunc, terr := e.store.HasEventsBefore(ctx, roomID, from); terr == nil && trunc {
+			countLimited = true
+		}
+	} else if len(evs) > limit {
+		countLimited = true
+		evs = evs[len(evs)-limit:]
 	}
 
 	// Track senders for lazy-load members.
@@ -756,11 +835,12 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// from a full window get an empty page rather than a missing token), and
 	// doubles as the `at` anchor for /members?at= and /messages back-pagination.
 	if len(evs) > 0 {
-		if len(evs) >= limit {
-			timeline.Limited = true
+		limited := newlyJoined || gapLimited || countLimited
+		timeline.Limited = limited
+		if limited {
 			timeline.PrevBatch = Token{Stream: earliest - 1}.Encode()
 		} else {
-			timeline.PrevBatch = Token{Stream: maxStream - 1}.Encode()
+			timeline.PrevBatch = Token{Stream: to - 1}.Encode()
 		}
 	}
 	jr.Timeline = timeline
