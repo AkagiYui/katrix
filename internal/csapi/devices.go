@@ -74,6 +74,13 @@ func (a *API) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	// A device display-name change alters the user's device list as seen by
+	// other servers: broadcast an m.device_list_update EDU and record a local
+	// device-list change so /sync delivers device_lists.changed (spec: servers
+	// must send device-list updates whenever a device's metadata changes).
+	_, _ = a.Store.RecordDeviceListChange(r.Context(), auth.UserID, false)
+	a.broadcastDeviceListUpdate(r.Context(), auth.UserID, deviceID, false)
+	a.notifyDeviceListPeers(r.Context(), auth.UserID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 

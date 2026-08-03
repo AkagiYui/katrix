@@ -347,15 +347,20 @@ func (s *Store) GetPresence(ctx context.Context, userID string) (*PresenceRow, e
 // ---- Device list changes (device_lists.changed / .left in /sync) ----
 
 // RecordDeviceListChange records a device-list change for a user in the shared
-// sync stream. Called on key upload and on device deletion (isDelete=true for
-// the latter, which feeds device_lists.left).
+// sync stream. Called on key upload, device rename/delete, and on join/leave
+// (the latter feeds device_lists.left via isDelete=true). The table holds one
+// row per user (spec semantics: a server reports a user's device-list change
+// at most once per sync window, keyed by the change's single monotonic token),
+// so repeats from redundant sources (an EDU hint plus the join PDU it
+// duplicates) collapse instead of surfacing the user in consecutive windows.
 func (s *Store) RecordDeviceListChange(ctx context.Context, userID string, isDelete bool) (int64, error) {
 	streamID, err := s.NextSyncStream(ctx)
 	if err != nil {
 		return 0, err
 	}
 	_, err = s.pool.Exec(ctx,
-		`INSERT INTO device_list_updates(user_id, stream_id, is_delete) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+		`INSERT INTO device_list_updates(user_id, stream_id, is_delete) VALUES ($1,$2,$3)
+		 ON CONFLICT (user_id) DO UPDATE SET stream_id=EXCLUDED.stream_id, is_delete=EXCLUDED.is_delete`,
 		userID, streamID, isDelete)
 	return streamID, err
 }
@@ -369,8 +374,6 @@ func (s *Store) DeviceListChangesSince(ctx context.Context, since int64) (change
 		return nil, nil, err
 	}
 	defer rows.Close()
-	seenChanged := map[string]bool{}
-	seenLeft := map[string]bool{}
 	for rows.Next() {
 		var userID string
 		var isDelete bool
@@ -378,16 +381,41 @@ func (s *Store) DeviceListChangesSince(ctx context.Context, since int64) (change
 			return nil, nil, err
 		}
 		if isDelete {
-			if !seenLeft[userID] {
-				seenLeft[userID] = true
-				left = append(left, userID)
-			}
-		} else if !seenChanged[userID] {
-			seenChanged[userID] = true
+			left = append(left, userID)
+		} else {
 			changed = append(changed, userID)
 		}
 	}
 	return changed, left, rows.Err()
+}
+
+// RecordDeviceListEDUSeen records that an m.device_list_update EDU from origin
+// with the sender's per-user stream_id was processed. It returns true when the
+// EDU is new (the caller should apply it) and false when a stale re-delivery
+// (stream_id not newer than what was already seen) should be ignored.
+func (s *Store) RecordDeviceListEDUSeen(ctx context.Context, origin, userID string, streamID int64) (bool, error) {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO device_list_edu_seen(origin, user_id, stream_id) VALUES ($1,$2,$3)
+		 ON CONFLICT (origin, user_id) DO UPDATE SET stream_id=EXCLUDED.stream_id
+		 WHERE device_list_edu_seen.stream_id < EXCLUDED.stream_id`,
+		origin, userID, streamID)
+	if err != nil {
+		return false, err
+	}
+	// The UPDATE only applies when the incoming stream_id is strictly newer; a
+	// stale re-delivery leaves the row untouched. Report whether this delivery
+	// was new by re-reading the stored value.
+	var stored int64
+	err = s.pool.QueryRow(ctx,
+		`SELECT stream_id FROM device_list_edu_seen WHERE origin=$1 AND user_id=$2`,
+		origin, userID).Scan(&stored)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return true, nil
+		}
+		return false, err
+	}
+	return stored == streamID, nil
 }
 
 // PresenceChangesSince returns the user IDs whose presence changed after the

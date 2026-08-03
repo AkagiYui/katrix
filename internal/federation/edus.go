@@ -203,7 +203,7 @@ func (a *API) handleEDU(ctx context.Context, origin string, edu json.RawMessage)
 		// server needs no action other than reflecting the change in /sync
 		// (device_lists.changed) for its own users who share a room. The change
 		// advances the sync stream, waking long-polls.
-		_ = a.applyDeviceListEDU(ctx, e.Content)
+		_ = a.applyDeviceListEDU(ctx, origin, e.Content)
 	case eduDirectToDevice:
 		// Direct-to-device messages (E2EE payloads) are relayed into the local
 		// to-device queues so the target devices receive them on their next
@@ -293,13 +293,26 @@ func (a *API) applyPresenceEDU(ctx context.Context, content json.RawMessage) {
 // EDU marks the user as deleted) in their next /sync, and wakes those users'
 // long-polls. The EDU's `deleted` flag distinguishes a user leaving all shared
 // rooms (device_lists.left) from a device-list change (device_lists.changed).
-func (a *API) applyDeviceListEDU(ctx context.Context, content json.RawMessage) error {
+func (a *API) applyDeviceListEDU(ctx context.Context, origin string, content json.RawMessage) error {
 	var c struct {
-		UserID  string `json:"user_id"`
-		Deleted *bool  `json:"deleted"`
+		UserID   string `json:"user_id"`
+		Deleted  *bool  `json:"deleted"`
+		StreamID int64  `json:"stream_id"`
 	}
 	if err := json.Unmarshal(content, &c); err != nil || c.UserID == "" {
 		return fmt.Errorf("device_list_update missing user_id")
+	}
+	// An EDU is a hint to re-query /keys/query; the stream_id is the sender's
+	// monotonic per-user counter. A stale re-delivery (an outbound-queue retry
+	// after a restart re-sends an already-acknowledged transaction) must not
+	// re-record the user in the local device-list stream — that would surface
+	// them in a /sync window they were already reported in. Remember the last
+	// seen stream_id per origin+user and ignore older EDUs (mirror of Synapse's
+	// device_list_edus_seen table).
+	if c.StreamID > 0 {
+		if fresh, err := a.Store.RecordDeviceListEDUSeen(ctx, origin, c.UserID, c.StreamID); err == nil && !fresh {
+			return nil
+		}
 	}
 	if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, c.Deleted != nil && *c.Deleted); err != nil {
 		return err

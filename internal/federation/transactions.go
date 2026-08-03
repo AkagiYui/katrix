@@ -277,6 +277,13 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 			membershipRow = mr
 		}
 	}
+	// A re-delivered PDU (a server restarting re-sends already-acknowledged
+	// transactions) must not re-trigger side effects. Capture whether the event
+	// was already known before the insert below.
+	wasKnown := false
+	if _, err := a.Store.GetEvent(r.Context(), evID); err == nil {
+		wasKnown = true
+	}
 	if _, err := a.Store.InsertEventWithMembership(r.Context(), row, membershipRow); err != nil {
 		return evID, false
 	}
@@ -311,10 +318,13 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 			// the room's local members: record it in the shared device-list stream
 			// so the local members' /sync reports the user in
 			// device_lists.changed (join) or device_lists.left (leave/ban). The
-			// send_join path records the joiner already; the ordinary PDU path
-			// (a remote leave, or a join propagated after a send_join) needs it
-			// too, and dedup in DeviceListChangesSince makes repeats harmless.
-			if mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban" {
+			// join PDU is the deterministic signal (the send_join handshake may
+			// already have recorded it via the m.device_list_update EDU; the
+			// per-user UPSERT collapses repeats). Only the first delivery
+			// records: a re-delivered PDU (a restarting server re-sends an
+			// already-acknowledged transaction) must not re-surface the user in
+			// a /sync window they were already reported in.
+			if !wasKnown && (mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban") {
 				_, _ = a.Store.RecordDeviceListChange(r.Context(), *ev.StateKey, mc.Membership != "join")
 			}
 		}
