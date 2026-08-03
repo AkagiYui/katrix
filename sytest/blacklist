@@ -144,7 +144,6 @@ Guest users are kicked from guest_access rooms on revocation of guest_access ove
 Guest users can accept invites to private rooms over federation
 Guest users can sync from invited guest_access rooms if joined
 Guest users can sync from joined guest_access rooms if joined
-Guest users denied access over federation if guest access prohibited
 HS can provide query metadata on a single protocol
 HS provides query metadata
 If a device list update goes missing, the server resyncs on the next one

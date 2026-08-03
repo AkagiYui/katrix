@@ -2184,24 +2184,35 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	if err := rooms.Authorize(rules, "m.room.member", target, auth.UserID, contentRaw, st); err != nil {
 		return "", newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
 	}
-	// Repeated non-join membership writes (an invite whose content is unchanged,
-	// a state PUT carrying identical content) are idempotent: return the existing
-	// event instead of forking the room with a duplicate. The comparison is
-	// against the latest member event in the event stream (the authoritative
-	// source): the denormalised membership table / room_state can lag behind a
-	// concurrent remote membership PDU, which would wrongly make a re-invite
-	// (after the target left) look idempotent.
-	//
-	// A self re-join (membership=join when already joined) is deliberately NOT
-	// idempotent: the spec's join auth rules permit the transition and Synapse
-	// persists a fresh join event on every POST /join. Clients and tests
-	// (join_room_synced) wait for the join to appear in incremental /sync — a
-	// no-op re-join would advance nothing and the room would never surface.
-	if mc, _ := rooms.ParseMember(contentRaw); mc != nil && mc.Membership != rooms.MembershipJoin {
-		if ev, err := a.Store.LatestMembershipEvent(r.Context(), roomID, target); err == nil && ev != nil {
-			if canonicaljson.Equal(contentRaw, json.RawMessage(ev.Content)) {
-				return ev.EventID, nil
+	// Guests may join only a room whose m.room.guest_access is "can_join"
+	// (mirror of Synapse's handler-level _can_guest_join). The auth rules alone
+	// do not capture this: they evaluate the join_rule first, and a public
+	// room's default branch accepts anyone — a guest would be able to join a
+	// plain public room even though guest access is a room-wide opt-in. The
+	// guest gate runs on every join (before the repeat-join idempotency below)
+	// and requires the room's *current* guest_access state to permit guests; an
+	// absent event or any value other than "can_join" ("forbidden"/unset)
+	// denies, per the spec's guest_access semantics.
+	if mc, _ := rooms.ParseMember(contentRaw); mc != nil && mc.Membership == rooms.MembershipJoin {
+		if u, err := a.Store.GetUser(r.Context(), a.LocalpartOf(auth.UserID)); err == nil && u.IsGuest {
+			if !guestAccessAllowsJoin(st.GuestAccess) {
+				return "", newRoomError(http.StatusForbidden, "M_FORBIDDEN", "guests may not join this room (guest_access is not 'can_join')")
 			}
+		}
+	}
+	// Joining (or re-joining) with identical member content is idempotent: if
+	// the current member state already carries exactly this content, return the
+	// existing event instead of forking the room with a duplicate join (mirror
+	// of Synapse's update_membership_locked, which treats a repeat join whose
+	// sender, membership and content all match the current state as a duplicate
+	// and returns the existing event). The comparison is against the latest
+	// member event in the event stream (the authoritative source): the
+	// denormalised membership table / room_state can lag behind a concurrent
+	// remote membership PDU, which would wrongly make a re-invite (after the
+	// target left) look idempotent.
+	if ev, err := a.Store.LatestMembershipEvent(r.Context(), roomID, target); err == nil && ev != nil {
+		if canonicaljson.Equal(contentRaw, json.RawMessage(ev.Content)) {
+			return ev.EventID, nil
 		}
 	}
 	// A knock when already knocking is a no-op: the user is already awaiting a
