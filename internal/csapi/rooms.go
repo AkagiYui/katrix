@@ -2591,6 +2591,15 @@ func validateAliasForRoom(ctx context.Context, store *storage.Store, alias, room
 // (state_key may be "") from a message event (no state_key).
 func (a *API) buildEvent(r *http.Request, auth *homeserver.Auth, roomID string, version roomver.Version, eventType, stateKey, txnID string, isState bool, content json.RawMessage) (*events.Event, error) {
 	now := a.Now()
+	// MSC3030 / MSC2176: an application-service bridge user may set an event's
+	// origin_server_ts via the ?ts= query parameter (used to import historical
+	// messages). Only honoured for appservice-sender requests; a regular user's
+	// ts is ignored (the server always sets the real timestamp).
+	if v := r.URL.Query().Get("ts"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			now = n
+		}
+	}
 	prev, depth := a.dagTipFor(r.Context(), roomID)
 	// auth_events = [create, sender_member, power_levels, join_rules, target_member] per spec.
 	authIDs := a.authEventIDs(r.Context(), roomID, auth.UserID, stateKey)

@@ -63,6 +63,9 @@ export KATRIX_LISTEN_CLIENT=":8008"
 export KATRIX_LISTEN_FEDERATION=":8448"
 export KATRIX_FEDERATION_ENABLED="${KATRIX_FEDERATION_ENABLED:-true}"
 export KATRIX_REGISTRATION_ENABLED="${KATRIX_REGISTRATION_ENABLED:-true}"
+# Complement mounts application-service registration files at
+# /complement/appservice/; load them so the bridge users' as_tokens work.
+export KATRIX_APPSERVICE_DIR="${KATRIX_APPSERVICE_DIR:-/complement/appservice}"
 # Complement's URL-preview fixture (web.NewServer) is served at
 # host.docker.internal:PORT, which resolves to a reserved range; let the SSRF
 # guard reach it. Production deployments leave this off.

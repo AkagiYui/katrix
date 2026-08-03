@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/AkagiYui/katrix/internal/appservice"
 	"github.com/AkagiYui/katrix/internal/config"
 	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/homeserver"
@@ -145,6 +146,15 @@ func runServe(args []string) error {
 		return err
 	}
 	defer store.Close()
+
+	// Load application-service registrations (spec "Application services"): the
+	// registered as_tokens become valid access tokens for their sender
+	// localparts, letting bridge users act through the normal client API.
+	if cfg.AppServiceDir != "" {
+		if err := appservice.LoadDir(ctx, store, cfg.AppServiceDir); err != nil {
+			return fmt.Errorf("appservice: %w", err)
+		}
+	}
 
 	hs := homeserver.New(cfg, store, key)
 	handler, err := httpserver.New(hs)
