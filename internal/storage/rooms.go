@@ -797,6 +797,40 @@ func (s *Store) LatestMembershipEvent(ctx context.Context, roomID, userID string
 	return ev, nil
 }
 
+// NewlyJoinedAfter reports whether the user transitioned to membership "join"
+// in roomID after the given stream position: their latest member event after
+// the token is a join AND their membership at the token was not already join.
+// A profile update (an m.room.member with membership=join when the user was
+// already joined, e.g. a displayname change) does NOT count as newly joined —
+// the /sync "newly joined room" treatment (full recent-history timeline +
+// limited) must only apply to a real join transition.
+func (s *Store) NewlyJoinedAfter(ctx context.Context, roomID, userID string, since int64) (bool, error) {
+	var latestMembership string
+	err := s.pool.QueryRow(ctx,
+		`SELECT content->>'membership' FROM events
+		 WHERE room_id=$1 AND type='m.room.member' AND state_key=$2 AND stream_ordering>$3
+		 ORDER BY stream_ordering DESC LIMIT 1`, roomID, userID, since).Scan(&latestMembership)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if latestMembership != "join" {
+		return false, nil
+	}
+	// Membership at the token: the latest member event at or before `since`.
+	var priorMembership *string
+	_ = s.pool.QueryRow(ctx,
+		`SELECT content->>'membership' FROM events
+		 WHERE room_id=$1 AND type='m.room.member' AND state_key=$2 AND stream_ordering<=$3
+		 ORDER BY stream_ordering DESC LIMIT 1`, roomID, userID, since).Scan(&priorMembership)
+	if priorMembership != nil && *priorMembership == "join" {
+		return false, nil // profile update; already joined before the token
+	}
+	return true, nil
+}
+
 // Members returns membership rows for a room. membershipFilter ("join","invite",
 // "leave","ban","") filters; "" returns all.
 func (s *Store) Members(ctx context.Context, roomID, membershipFilter string) ([]MembershipRow, error) {

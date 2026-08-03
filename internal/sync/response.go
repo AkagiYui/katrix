@@ -796,14 +796,17 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		limit = filter.TimelineLimit
 	}
 
-	// A room the user joined after the sync token is a "newly joined" room: its
-	// timeline is the room's recent history (not just the events since the
-	// token) and is always marked limited, forcing the client to back-paginate
-	// the pre-join history (spec + Synapse).
+	// A room the user *transitioned into* after the sync token is a "newly
+	// joined" room: its timeline is the room's recent history (not just the
+	// events since the token) and is always marked limited, forcing the client
+	// to back-paginate the pre-join history (spec + Synapse). A profile update
+	// (an m.room.member with membership=join when the user was already joined,
+	// e.g. a displayname change) does NOT trigger this — NewlyJoinedAfter
+	// requires the join to be a real membership transition.
 	newlyJoined := false
 	if opts.Since.Stream > 0 {
-		if m, err := e.store.LatestMembershipEvent(ctx, roomID, opts.UserID); err == nil && m.StreamOrdering > opts.Since.Stream {
-			newlyJoined = true
+		if joined, err := e.store.NewlyJoinedAfter(ctx, roomID, opts.UserID, opts.Since.Stream); err == nil {
+			newlyJoined = joined
 		}
 	}
 
@@ -924,6 +927,51 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	if countLimited && len(rendered) > limit {
 		// Keep the newest `limit` filtered events.
 		rendered = rendered[len(rendered)-limit:]
+	}
+	// A count-limited timeline that contains any state event must also carry
+	// the room's CURRENT state: Synapse's "always include current state in the
+	// timeline" behaviour (filter_and_transform_events_for_client with
+	// always_include_ids=current_state_ids) — when a limited window drops
+	// events, clients still need the current state events to render the room
+	// correctly (e.g. a membership join that is the current state but fell
+	// outside the window). The current-state events not already in the
+	// timeline are appended (they are the newest authoritative values).
+	if countLimited && len(evs) > 0 {
+		hasState := false
+		for _, ev := range evs {
+			if ev.StateKey != "" {
+				hasState = true
+				break
+			}
+		}
+		if hasState {
+			if stateRows, err := e.store.GetState(ctx, roomID); err == nil {
+				ids := make([]string, 0, len(stateRows))
+				for _, s := range stateRows {
+					ids = append(ids, s.EventID)
+				}
+				stateEvs, _ := e.store.EventsByIDs(ctx, ids)
+				inTimeline := map[string]bool{}
+				for _, re := range rendered {
+					var obj map[string]json.RawMessage
+					if json.Unmarshal(re.raw, &obj) == nil {
+						var id string
+						if json.Unmarshal(obj["event_id"], &id) == nil {
+							inTimeline[id] = true
+						}
+					}
+				}
+				for _, se := range stateEvs {
+					if inTimeline[se.EventID] {
+						continue
+					}
+					if !filter.keepTimeline(&se) {
+						continue
+					}
+					rendered = append(rendered, renderedEvent{raw: filter.applyEventFields(prevContent(clientEvent(&se), &se)), send: se.Sender})
+				}
+			}
+		}
 	}
 	timeline := Timeline{Events: make([]json.RawMessage, 0, len(rendered))}
 	senders := map[string]bool{}
