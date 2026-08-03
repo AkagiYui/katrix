@@ -2123,7 +2123,12 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 					contentRaw, _ = json.Marshal(content)
 				}
 			}
-			st.RestrictedAuthorised = a.Store.RestrictedJoinAuthorised(r.Context(), roomID, auth.UserID, authorisingUser, a.ServerName())
+			// A local join a server cannot verify (it has left one of the
+			// allowed rooms) is simply rejected here: for a local request
+			// the server must 403 rather than fail over (Synapse's
+			// check_restricted_join_rules raises M_UNABLE_TO_AUTHORISE_JOIN
+			// only for remote requests; local ones fall through to the 403).
+			st.RestrictedAuthorised = a.Store.RestrictedJoinAuthorised(r.Context(), roomID, auth.UserID, authorisingUser, a.ServerName()) == storage.RestrictedJoinAuthorised
 		}
 	}
 	if err := rooms.Authorize(rules, "m.room.member", target, auth.UserID, contentRaw, st); err != nil {

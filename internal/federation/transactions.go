@@ -1489,7 +1489,21 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 		// join_authorised_via_users_server is rejected by the auth rules below.
 		if st.JoinRules != nil && (rooms.JoinRule(st.JoinRules) == rooms.JoinRuleRestricted || rooms.JoinRule(st.JoinRules) == rooms.JoinRuleKnockRestricted) {
 			if mc, err := rooms.ParseMember(ev.Content); err == nil && mc.Membership == rooms.MembershipJoin {
-				st.RestrictedAuthorised = a.Store.RestrictedJoinAuthorised(r.Context(), ev.RoomID, *ev.StateKey, mc.JoinAuthorisedViaUsersServer, a.ServerName())
+				switch a.Store.RestrictedJoinAuthorised(r.Context(), ev.RoomID, *ev.StateKey, mc.JoinAuthorisedViaUsersServer, a.ServerName()) {
+				case storage.RestrictedJoinAuthorised:
+					st.RestrictedAuthorised = true
+				case storage.RestrictedJoinUnableToAuthorise:
+					// This server does not participate in all the allowed rooms,
+					// so it cannot verify the joining user's membership — the
+					// joining server must fail over to a resident that can
+					// (spec MSC3083; Synapse raises the same code in
+					// check_restricted_join_rules).
+					httpx.WriteJSON(w, http.StatusBadRequest, map[string]any{
+						"errcode": "M_UNABLE_TO_AUTHORISE_JOIN",
+						"error":   "This homeserver is unable to verify if the user is in an allowed room; try another resident server.",
+					})
+					return
+				}
 			}
 		}
 		if err := rooms.Authorize(rules, ev.Type, *ev.StateKey, ev.Sender, ev.Content, st); err != nil {
