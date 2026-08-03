@@ -227,6 +227,20 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	if origin != "" && a.hasUnknownPrevEvents(r.Context(), raw) {
 		a.fetchMissingEventsFor(r.Context(), ev.RoomID, evID, origin)
 	}
+	// If the near chain is still disconnected — the event's own prevs, or the
+	// prevs of those (the gap get_missing_events may only partially have
+	// closed) — reconcile the room's state from the origin (Synapse's state
+	// fetch for a room it cannot link): the frontier event anchors a /state_ids
+	// snapshot whose events are fetched and applied, with a corrupted/withheld
+	// auth chain soft-failing the whole snapshot. A reconcile is only attempted
+	// when the event's own prevs are present (the fetch succeeded but left a
+	// deeper gap): when the direct prev is still unknown the event is simply
+	// rejected below, and reconciling would be wrong (the peer served nothing).
+	if origin != "" && !a.hasUnknownPrevEvents(r.Context(), raw) {
+		if frontier := a.unknownDeepFrontier(r.Context(), raw); frontier != "" {
+			a.reconcileStateFrom(r.Context(), ev.RoomID, origin, frontier)
+		}
+	}
 	// If the prev_events are STILL missing after the fetch (the sending server
 	// did not deliver them, or the delivered events were rejected — bad JSON,
 	// failed verification), the event itself must be rejected rather than
@@ -238,6 +252,72 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// succeed once the missing events arrive (TestUnrejectRejectedEvents).
 	if origin != "" && a.hasUnknownPrevEvents(r.Context(), raw) {
 		return evID, false
+	}
+	// Authorization. An event whose auth_events reference events this server
+	// does not hold is fetched via /event_auth (spec: the receiving server may
+	// ask the sending server for the auth chain of an event it cannot
+	// authorise); events that still fail authorization — insufficient power,
+	// referencing an unknown or rejected auth event — are soft-failed: they are
+	// persisted for DAG continuity but marked rejected and never delivered to
+	// clients or included in room state (mirror of Synapse's soft-fail, and the
+	// regression guard for events smuggling a rejected/outlier event into their
+	// auth_events). Skipped for partial-state rooms, whose state (and therefore
+	// auth_events) is intentionally incomplete until the background resync
+	// finishes.
+	rejected := false
+	if origin != "" && !room.PartialState {
+		if a.hasUnknownAuthEvents(r.Context(), raw) {
+			a.fetchAuthChainFor(r.Context(), ev.RoomID, evID, origin)
+		}
+		if a.hasUnknownAuthEvents(r.Context(), raw) {
+			// The auth chain could not be established (the peer did not serve it,
+			// or served an empty chain): soft-fail the event.
+			rejected = true
+		} else if a.authReferencesRejected(r.Context(), raw) {
+			// An auth_event that was itself rejected (soft-failed) propagates the
+			// rejection: an event cannot be authorised by a rejected precedent.
+			rejected = true
+		} else if rules, ok := roomver.Get(version); ok {
+			stateKey := ""
+			if ev.StateKey != nil {
+				stateKey = *ev.StateKey
+			}
+			st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey)
+			// Restricted-rule room (MSC3083): a join event names its authoriser
+			// via join_authorised_via_users_server. The verdict is computed
+			// against the allow-listed rooms the local server participates in
+			// (mirror of the send_join path in ingestRemoteMember). When this
+			// server cannot authoritatively answer (it does not participate in
+			// all the allowed rooms), the join is accepted unvetted: the event
+			// was already authorised by the server that processed the send_join,
+			// and rejecting the re-broadcast here would desync the room (the
+			// M_UNABLE_TO_AUTHORISE_JOIN fail-over lives on the client join
+			// path, not the transaction path).
+			skipAuth := false
+			if ev.Type == "m.room.member" && stateKey != "" {
+				var mc struct {
+					Membership string `json:"membership"`
+				}
+				_ = json.Unmarshal(ev.Content, &mc)
+				if mc.Membership == rooms.MembershipJoin && a.restrictedRoomJoinRules(r.Context(), ev.RoomID) {
+					var authMember struct {
+						Authoriser string `json:"join_authorised_via_users_server"`
+					}
+					_ = json.Unmarshal(ev.Content, &authMember)
+					switch a.Store.RestrictedJoinAuthorised(r.Context(), ev.RoomID, stateKey, authMember.Authoriser, a.ServerName()) {
+					case storage.RestrictedJoinAuthorised:
+						st.RestrictedAuthorised = true
+					case storage.RestrictedJoinUnableToAuthorise:
+						skipAuth = true
+					}
+				}
+			}
+			if !skipAuth {
+				if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st); err != nil {
+					rejected = true
+				}
+			}
+		}
 	}
 	// Invite rescission (spec / Synapse #18823): a leave event sent by someone
 	// other than the target (a kick) can only revoke an invite when it is sent
@@ -284,9 +364,10 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// row atomically: a concurrent /sync must never observe the shared stream
 	// position advancing (the event insert) without the membership row already
 	// reflecting it. Otherwise a sync could mint a token past a leave without
-	// ever delivering the membership transition.
+	// ever delivering the membership transition. A rejected (soft-failed) member
+	// event never updates membership.
 	var membershipRow *storage.MembershipRow
-	if ev.StateKey != nil && ev.Type == "m.room.member" {
+	if !rejected && ev.StateKey != nil && ev.Type == "m.room.member" {
 		if mr, ok := membershipRowFromContent(ev.RoomID, *ev.StateKey, ev.Content, evID, ev.Depth); ok {
 			membershipRow = mr
 		}
@@ -301,6 +382,12 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	if _, err := a.Store.InsertEventWithMembership(r.Context(), row, membershipRow); err != nil {
 		return evID, false
 	}
+	// A soft-failed event is persisted (so the DAG stays connected) but marked
+	// rejected: it is excluded from client delivery, state snapshots and state
+	// resolution below.
+	if rejected {
+		a.Store.MarkEventRejected(r.Context(), evID)
+	}
 	// Index the event's relates_to relation so /relations, /threads and the
 	// MSC2836 /event_relationships walk can answer for events ingested over
 	// federation (the CS path indexes via persistEventInRoom; the federated
@@ -311,18 +398,22 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// forward extremities (handles single-extremity fast path and multi-
 	// extremity fork resolution). For a non-state event the snapshot is the
 	// prev's snapshot copied; for a state event the event's tuple is applied.
-	if rules, ok := roomver.Get(version); ok {
-		if err := eventstate.Maintain(r.Context(), a.Store, row, rules); err != nil {
-			// Snapshot maintenance is best-effort on the ingest path: the event
-			// is already persisted, so log-and-continue (mirroring the prior
-			// resolveRoomState swallow of errors).
-			_ = err
+	// A rejected event never contributes to state.
+	if !rejected {
+		if rules, ok := roomver.Get(version); ok {
+			if err := eventstate.Maintain(r.Context(), a.Store, row, rules); err != nil {
+				// Snapshot maintenance is best-effort on the ingest path: the event
+				// is already persisted, so log-and-continue (mirroring the prior
+				// resolveRoomState swallow of errors).
+				_ = err
+			}
 		}
 	}
 	if ev.StateKey != nil {
 		// For membership state events, wake syncs for the change (the row was
-		// already written atomically above).
-		if ev.Type == "m.room.member" {
+		// already written atomically above). A rejected member event is not
+		// applied: no wake, no device-list change.
+		if ev.Type == "m.room.member" && !rejected {
 			var mc struct {
 				Membership string `json:"membership"`
 			}

@@ -342,6 +342,255 @@ func (a *API) fetchMissingEventsFor(ctx context.Context, roomID string, eventID 
 	}
 }
 
+// authReferencesRejected reports whether any of the event's auth_events was
+// soft-failed (rejected). An event cannot be authorised by a rejected
+// precedent, so it inherits the rejection (spec / Synapse: an event whose
+// auth_events include a rejected event is itself rejected).
+func (a *API) authReferencesRejected(ctx context.Context, raw json.RawMessage) bool {
+	ids := authEventIDsFromRaw(raw)
+	if len(ids) == 0 {
+		return false
+	}
+	rejected, err := a.Store.RejectedEventIDs(ctx, ids)
+	if err != nil {
+		return false
+	}
+	return len(rejected) > 0
+}
+
+// unknownDeepFrontier returns the first event two prev-hops away from the
+// event (a prev of a direct prev) that is not present locally, or "". A
+// non-empty result means the room's history is disconnected *behind* the
+// event's direct prevs — the chain get_missing_events just filled is
+// contiguous, but its own predecessors are missing — and the returned event is
+// the anchor a /state_ids snapshot should be requested as of. The direct
+// prevs must all be present for this to be meaningful (a missing direct prev
+// is simply rejected, not reconciled). The walk is depth-bounded because a
+// room's full known history must never be traversed per inbound event.
+func (a *API) unknownDeepFrontier(ctx context.Context, raw json.RawMessage) string {
+	var ev struct {
+		PrevEvents []string `json:"prev_events"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return ""
+	}
+	// Depth 2: prevs of the (known) direct prevs.
+	for _, id := range ev.PrevEvents {
+		if id == "" {
+			continue
+		}
+		e, err := a.Store.GetEvent(ctx, id)
+		if err != nil || e == nil {
+			continue
+		}
+		for _, pid := range prevEventIDs(e.RawJSON) {
+			if pid == "" {
+				continue
+			}
+			if _, err := a.Store.GetEvent(ctx, pid); err != nil {
+				return pid
+			}
+		}
+	}
+	return ""
+}
+
+// reconcileStateFrom fetches the room's state as of anchorEventID from server
+// (GET /state_ids, then GET /event for each unknown event), persists the
+// events, and applies the verifiable state to the room. When any event in the
+// snapshot — in particular the auth chain — could not be fetched, the snapshot
+// is untrusted: every fetched event is soft-failed (persisted for DAG
+// continuity but excluded from room state and client delivery), mirroring
+// Synapse's behaviour for a room it cannot fully authorise (a "corrupted" or
+// withheld auth chain must not leak into the room's state). Best-effort: a
+// failure anywhere leaves the caller to reject the triggering event.
+func (a *API) reconcileStateFrom(ctx context.Context, roomID, server, anchorEventID string) {
+	if server == "" || server == a.ServerName() {
+		return
+	}
+	stateIDs, authIDs, err := a.fetchStateIDs(ctx, server, roomID, anchorEventID)
+	if err != nil || len(stateIDs) == 0 {
+		return
+	}
+	room, err := a.Store.GetRoom(ctx, roomID)
+	if err != nil {
+		return
+	}
+	version := roomver.Version(room.Version)
+	rules, ok := roomver.Get(version)
+	if !ok {
+		return
+	}
+	// Fetch every event the snapshot names that we do not hold.
+	raws := map[string]json.RawMessage{}
+	unfetchable := map[string]bool{}
+	all := append(append([]string{}, stateIDs...), authIDs...)
+	for _, id := range all {
+		if _, err := a.Store.GetEvent(ctx, id); err == nil {
+			continue
+		}
+		raw, ferr := a.fetchEvent(ctx, server, id)
+		if ferr != nil {
+			unfetchable[id] = true
+			continue
+		}
+		raws[id] = raw
+	}
+	// Transitive rejection: an event whose auth_events reference an unfetchable
+	// or already-rejected event cannot be authorised and is itself rejected.
+	// Iterate to a fixed point (the rejection propagates up the auth chain).
+	rejected := map[string]bool{}
+	changed := true
+	for changed {
+		changed = false
+		for id, raw := range raws {
+			if rejected[id] {
+				continue
+			}
+			for _, aid := range authEventIDsFromRaw(raw) {
+				if unfetchable[aid] {
+					rejected[id] = true
+					changed = true
+					break
+				}
+				if r, _ := a.Store.IsEventRejected(ctx, aid); r {
+					rejected[id] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+	// A missing auth-chain event makes the whole snapshot untrusted: reject
+	// every fetched event so none of them reaches the room's state (a chain
+	// with a hole cannot vouch for any of its members).
+	chainIncomplete := false
+	for _, id := range authIDs {
+		if unfetchable[id] {
+			chainIncomplete = true
+			break
+		}
+	}
+	if chainIncomplete {
+		for id := range raws {
+			rejected[id] = true
+		}
+	}
+	// Phase 3: persist. Rejected events are stored for DAG continuity but never
+	// applied to state snapshots, membership or client-visible state.
+	for id, raw := range raws {
+		a.persistReconcilePDU(ctx, roomID, version, rules, raw, rejected[id])
+	}
+}
+
+// persistReconcilePDU verifies and persists a PDU fetched during state
+// reconciliation. When rejected is true the event is marked soft-failed and
+// skipped for state/membership application.
+func (a *API) persistReconcilePDU(ctx context.Context, roomID string, version roomver.Version, rules roomver.Rules, raw json.RawMessage, rejected bool) error {
+	var ev struct {
+		EventID  string          `json:"event_id"`
+		RoomID   string          `json:"room_id"`
+		Type     string          `json:"type"`
+		Sender   string          `json:"sender"`
+		Depth    int64           `json:"depth"`
+		OSTS     int64           `json:"origin_server_ts"`
+		Content  json.RawMessage `json:"content"`
+		StateKey *string         `json:"state_key"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return err
+	}
+	if ev.RoomID != "" && ev.RoomID != roomID {
+		return errors.New("wrong room")
+	}
+	vres := a.verifier.Verify(ctx, raw, version)
+	if vres.Err != nil || (vres.Signed && !vres.Valid) {
+		return errors.New("verification failed")
+	}
+	id := ev.EventID
+	if id == "" {
+		id = vres.EventID
+	}
+	if id == "" {
+		return errors.New("no event id")
+	}
+	row := &storage.EventRow{
+		EventID: id, RoomID: roomID, Type: ev.Type, Sender: ev.Sender,
+		Depth: ev.Depth, OriginServerTS: ev.OSTS, Content: ev.Content, RawJSON: raw,
+	}
+	if ev.StateKey != nil {
+		row.StateKey = *ev.StateKey
+	}
+	if _, err := a.Store.InsertEvent(ctx, row); err != nil {
+		return err
+	}
+	if rejected {
+		a.Store.MarkEventRejected(ctx, id)
+	}
+	a.Store.IndexRelationFromRow(ctx, row)
+	if rejected {
+		return nil
+	}
+	if err := eventstate.Maintain(ctx, a.Store, row, rules); err != nil {
+		_ = err
+	}
+	if ev.StateKey != nil && ev.Type == "m.room.member" {
+		a.applyRemoteMembership(ctx, roomID, *ev.StateKey, ev.Content, id, ev.Depth)
+	}
+	return nil
+}
+
+// fetchAuthChainFor asks origin for the auth chain of eventID via
+// GET /_matrix/federation/v1/event_auth/{roomID}/{eventID} and persists the
+// returned events (spec: a server receiving an event it cannot authorise may
+// fetch the event's auth chain from the sending server). Best-effort: a
+// failure leaves the caller to soft-fail the event.
+func (a *API) fetchAuthChainFor(ctx context.Context, roomID, eventID, origin string) {
+	if origin == "" || origin == a.ServerName() {
+		return
+	}
+	url := a.client.serverBaseURL(origin) + "/_matrix/federation/v1/event_auth/" + urlPathEscape(roomID) + "/" + urlPathEscape(eventID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return
+	}
+	req.Host = origin
+	if err := signRequestWith(req, a.client.originName(), a.client.key); err != nil {
+		return
+	}
+	metrics.Counters.FedOutboundRequests.Add(1)
+	resp, err := a.client.http.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return
+	}
+	var out struct {
+		AuthChain []json.RawMessage `json:"auth_chain"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return
+	}
+	room, err := a.Store.GetRoom(ctx, roomID)
+	if err != nil {
+		return
+	}
+	version := roomver.Version(room.Version)
+	rules, ok := roomver.Get(version)
+	if !ok {
+		return
+	}
+	for _, rawEv := range out.AuthChain {
+		_ = a.persistVerifiedPDU(ctx, roomID, version, rules, rawEv)
+	}
+}
+
 // persistVerifiedPDU verifies an inbound PDU's signature and persists it,
 // maintaining state snapshots and membership. Returns an error when the event
 // is unverifiable or the insert fails.
@@ -389,12 +638,23 @@ func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roo
 	if a.hasUnknownPrevEvents(ctx, raw) {
 		a.Store.RecordTimelineGap(ctx, roomID, row.StreamOrdering)
 	}
-	a.Store.IndexRelationFromRow(ctx, row)
-	if err := eventstate.Maintain(ctx, a.Store, row, rules); err != nil {
-		_ = err
+	// Rejection propagates through auth_events: a fetched event whose own
+	// auth_events reference a soft-failed event is itself rejected (an event
+	// cannot be authorised by a rejected precedent). Marked rejected, never
+	// applied to state or membership — mirror of Synapse's transitive
+	// soft-fail for events pulled in via /event_auth or get_missing_events.
+	rejected := a.authReferencesRejected(ctx, raw)
+	if rejected {
+		a.Store.MarkEventRejected(ctx, id)
 	}
-	if ev.StateKey != nil && ev.Type == "m.room.member" {
-		a.applyRemoteMembership(ctx, roomID, *ev.StateKey, ev.Content, id, ev.Depth)
+	a.Store.IndexRelationFromRow(ctx, row)
+	if !rejected {
+		if err := eventstate.Maintain(ctx, a.Store, row, rules); err != nil {
+			_ = err
+		}
+		if ev.StateKey != nil && ev.Type == "m.room.member" {
+			a.applyRemoteMembership(ctx, roomID, *ev.StateKey, ev.Content, id, ev.Depth)
+		}
 	}
 	return nil
 }
@@ -417,4 +677,19 @@ func (a *API) hasUnknownPrevEvents(ctx context.Context, raw json.RawMessage) boo
 		return true
 	}
 	return false
+}
+
+// hasUnknownAuthEvents reports whether any of the event's auth_events are not
+// present locally. An event whose auth_events reference events this server
+// does not hold cannot be authorised and must be rejected.
+func (a *API) hasUnknownAuthEvents(ctx context.Context, raw json.RawMessage) bool {
+	ids := authEventIDsFromRaw(raw)
+	if len(ids) == 0 {
+		return false
+	}
+	known, err := a.Store.EventsByIDs(ctx, ids)
+	if err != nil {
+		return true
+	}
+	return len(known) != len(ids)
 }

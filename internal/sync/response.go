@@ -805,6 +805,24 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		countLimited = true
 		evs = evs[len(evs)-limit:]
 	}
+	// Soft-failed (rejected) events are never delivered to clients: drop them
+	// from the timeline (their IDs remain valid as prev_events so pagination
+	// and the DAG stay intact, mirror of Synapse's soft-fail).
+	if len(evs) > 0 {
+		ids := make([]string, 0, len(evs))
+		for _, ev := range evs {
+			ids = append(ids, ev.EventID)
+		}
+		if rejected, err := e.store.RejectedEventIDs(ctx, ids); err == nil && len(rejected) > 0 {
+			kept := evs[:0]
+			for _, ev := range evs {
+				if !rejected[ev.EventID] {
+					kept = append(kept, ev)
+				}
+			}
+			evs = kept
+		}
+	}
 
 	// Track senders for lazy-load members.
 	senders := map[string]bool{}

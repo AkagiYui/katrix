@@ -823,6 +823,13 @@ func (a *API) RoomGetEvent(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrNotFound("event not found"))
 		return
 	}
+	// A soft-failed (rejected) event is never delivered to clients: fetching it
+	// behaves as if it does not exist (spec: a rejected event must not be
+	// visible to clients).
+	if rejected, _ := a.Store.IsEventRejected(r.Context(), eventID); rejected {
+		httpx.WriteError(w, httpx.ErrNotFound("event not found"))
+		return
+	}
 	vis := a.historyVisibility(r.Context(), roomID)
 	m, err := a.Store.GetMembership(r.Context(), roomID, auth.UserID)
 	if err != nil {
