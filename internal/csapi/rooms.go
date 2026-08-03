@@ -725,6 +725,10 @@ func (a *API) RoomStateGet(w http.ResponseWriter, r *http.Request) {
 			"content":          json.RawMessage(e.Content),
 			"origin_server_ts": e.OriginServerTS,
 			"event_id":         e.EventID,
+			// The v12 (MSC4291) create event does not carry room_id in its
+			// content or PDU; the client-facing format must include the room ID
+			// the event belongs to (the state endpoint is keyed by room).
+			"room_id": roomID,
 		}
 		out = append(out, ev)
 	}

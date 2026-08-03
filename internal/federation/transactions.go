@@ -423,11 +423,20 @@ func (a *API) kickLocalGuest(ctx context.Context, roomID, userID string) {
 
 // memberAuthIDsFromStore returns the auth_events for a member event using the
 // same rule as the make_join handler (create, power_levels, the target's
-// member event).
+// member event). Room version 12 (MSC4291) omits the create event (implied by
+// the room ID).
 func (a *API) memberAuthIDsFromStore(ctx context.Context, roomID, userID string) []string {
 	var ids []string
-	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.create", ""); err == nil {
-		ids = append(ids, id)
+	omitCreate := false
+	if room, err := a.Store.GetRoom(ctx, roomID); err == nil {
+		if rules, ok := roomver.Get(roomver.Version(room.Version)); ok && rules.RoomIDIsCreateHash {
+			omitCreate = true
+		}
+	}
+	if !omitCreate {
+		if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.create", ""); err == nil {
+			ids = append(ids, id)
+		}
 	}
 	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.power_levels", ""); err == nil {
 		ids = append(ids, id)
@@ -1869,8 +1878,18 @@ func (a *API) walkAuthChain(ctx context.Context, seed []string) map[string]bool 
 // memberAuthIDs returns the auth_events for a member event.
 func (a *API) memberAuthIDs(r *http.Request, roomID, userID string) []string {
 	var ids []string
-	if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.create", ""); err == nil {
-		ids = append(ids, id)
+	// Room version 12 (MSC4291): the create event is omitted from auth_events
+	// (the room ID is the create's reference hash, so the create is implied).
+	omitCreate := false
+	if room, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
+		if rules, ok := roomver.Get(roomver.Version(room.Version)); ok && rules.RoomIDIsCreateHash {
+			omitCreate = true
+		}
+	}
+	if !omitCreate {
+		if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.create", ""); err == nil {
+			ids = append(ids, id)
+		}
 	}
 	if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.power_levels", ""); err == nil {
 		ids = append(ids, id)
