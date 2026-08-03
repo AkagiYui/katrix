@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -160,6 +161,66 @@ func (s *Store) InsertEvent(ctx context.Context, e *EventRow) (int64, error) {
 	}
 	return stream, nil
 }
+
+// InsertBackfillEvents persists a batch of backfilled PDUs — history older than
+// everything the local server currently holds (e.g. events predating a remote
+// join, fetched via GET /backfill). The rows are handed in newest-first order
+// and are stored with stream orderings allocated *below* the room's current
+// minimum, so backward pagination (which walks stream orderings) reaches them
+// in the right place. A plain BIGSERIAL insert would append them at the top,
+// making them both unreachable by backward pagination and — worse — visible to
+// forward syncs as brand-new events. The range is allocated under an advisory
+// lock so concurrent backfills cannot collide. Extremity maintenance is skipped
+// (backfilled events are ancestors, not new forward extremities).
+func (s *Store) InsertBackfillEvents(ctx context.Context, rows []*EventRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	// Serialise concurrent backfills so the allocated range cannot overlap.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, backfillLockKey); err != nil {
+		return err
+	}
+	var min *int64
+	if err := tx.QueryRow(ctx, `SELECT MIN(stream_ordering) FROM events`).Scan(&min); err != nil {
+		return err
+	}
+	base := int64(0)
+	if min != nil {
+		base = *min
+	}
+	for i, e := range rows {
+		stream := base - int64(i) - 1
+		var stateKey *string
+		if e.StateKey != "" {
+			sk := e.StateKey
+			stateKey = &sk
+		}
+		var redacts *string
+		if e.Redacts != "" {
+			r := e.Redacts
+			redacts = &r
+		}
+		_, err := tx.Exec(ctx,
+			`INSERT INTO events(event_id, room_id, type, state_key, sender, depth,
+			                    origin_server_ts, stream_ordering, content, json, redacts, redacted, outlier)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			 ON CONFLICT (event_id) DO NOTHING`,
+			e.EventID, e.RoomID, e.Type, stateKey, e.Sender, e.Depth,
+			e.OriginServerTS, stream, e.Content, e.RawJSON, redacts, e.Redacted, e.Outlier)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// backfillLockKey is the advisory-lock key serialising InsertBackfillEvents.
+const backfillLockKey = 0x6B61747269 // "katri"
 
 // InsertEventWithMembership atomically inserts an event and its denormalised
 // membership row (when m is non-nil) in a single transaction. This closes the
@@ -335,10 +396,12 @@ func (s *Store) EventsForRoom(ctx context.Context, roomID string, from, to int64
 	       FROM events
 	       WHERE room_id=$1 AND stream_ordering>$2 AND stream_ordering<=$3`
 	// `from` is exclusive (events at or before the token were already seen);
-	// a zero token means "from the start", so use -1 to keep the first event.
+	// a zero token means "from the start". Backfilled history is stored at
+	// negative stream orderings (below the room's current minimum), so the
+	// start bound must reach below them rather than clamping to -1.
 	exclusiveFrom := from
 	if exclusiveFrom <= 0 {
-		exclusiveFrom = -1
+		exclusiveFrom = -(1 << 62)
 	}
 	args := []any{roomID, exclusiveFrom, to}
 	if dir == "b" {
@@ -422,6 +485,133 @@ func (s *Store) MaxDepth(ctx context.Context, roomID string) (int64, error) {
 		return 0, nil
 	}
 	return *d, nil
+}
+
+// BackfillPoints returns up to limit events in roomID whose prev_events are
+// not all present locally — the room's "backwards extremities", the points a
+// remote server's history must be fetched from (mirror of Synapse's
+// event_backward_extremities / get_backfill_points). The room's most recent
+// events are scanned first (a gap sits at the bottom of what we hold, so the
+// qualifying events nearest the top of the scan are the ones pagination will
+// hit first); the oldest qualifying event IDs are returned. An empty result
+// means the local server holds a complete contiguous history.
+func (s *Store) BackfillPoints(ctx context.Context, roomID string, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT event_id, json FROM events WHERE room_id=$1 ORDER BY stream_ordering DESC LIMIT 500`, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type candidate struct {
+		id    string
+		depth int64
+		prevs []string
+	}
+	var cands []candidate
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			return nil, err
+		}
+		var ev struct {
+			Depth int64 `json:"depth"`
+		}
+		var prevRaw struct {
+			PrevEvents json.RawMessage `json:"prev_events"`
+		}
+		_ = json.Unmarshal(raw, &ev)
+		if json.Unmarshal(raw, &prevRaw) != nil || len(prevRaw.PrevEvents) == 0 {
+			continue
+		}
+		prevs := prevEventIDsRaw(prevRaw.PrevEvents)
+		if len(prevs) == 0 {
+			continue
+		}
+		cands = append(cands, candidate{id: id, depth: ev.Depth, prevs: prevs})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(cands) == 0 {
+		return nil, nil
+	}
+	// All referenced prev_events in one query.
+	all := map[string]bool{}
+	for _, c := range cands {
+		for _, p := range c.prevs {
+			all[p] = true
+		}
+	}
+	ids := make([]string, 0, len(all))
+	for id := range all {
+		ids = append(ids, id)
+	}
+	known := map[string]bool{}
+	if len(ids) > 0 {
+		krows, err := s.pool.Query(ctx,
+			`SELECT event_id FROM events WHERE room_id=$1 AND event_id = ANY($2)`, roomID, ids)
+		if err != nil {
+			return nil, err
+		}
+		for krows.Next() {
+			var id string
+			if err := krows.Scan(&id); err == nil {
+				known[id] = true
+			}
+		}
+		krows.Close()
+	}
+	// The qualifying candidates, oldest (lowest depth) first: those are the
+	// events at the frontier of local knowledge, whose history is missing.
+	var out []candidate
+	for _, c := range cands {
+		missing := false
+		for _, p := range c.prevs {
+			if !known[p] {
+				missing = true
+				break
+			}
+		}
+		if missing {
+			out = append(out, c)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].depth < out[j].depth })
+	result := make([]string, 0, len(out))
+	for _, c := range out {
+		result = append(result, c.id)
+		if len(result) >= limit {
+			break
+		}
+	}
+	return result, nil
+}
+
+// prevEventIDsRaw extracts prev_events IDs from a raw prev_events JSON value,
+// handling both the plain-array (v3+) and [id, hash] pair (v1/v2) forms.
+func prevEventIDsRaw(raw json.RawMessage) []string {
+	var idsArr []string
+	if json.Unmarshal(raw, &idsArr) == nil {
+		return idsArr
+	}
+	var pairs [][]json.RawMessage
+	if err := json.Unmarshal(raw, &pairs); err != nil {
+		return nil
+	}
+	var out []string
+	for _, p := range pairs {
+		if len(p) > 0 {
+			var id string
+			if json.Unmarshal(p[0], &id) == nil && id != "" {
+				out = append(out, id)
+			}
+		}
+	}
+	return out
 }
 
 // EventsByIDs returns events for a set of IDs.

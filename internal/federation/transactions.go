@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
@@ -576,22 +577,75 @@ func (a *API) GetStateIDs(w http.ResponseWriter, r *http.Request) {
 }
 
 // Backfill handles GET /_matrix/federation/v1/backfill/{roomID}.
+// Per the spec (§Backfilling) the requesting server names the events it wants
+// history before (v, its backwards extremities) and we return up to limit
+// events that precede them, walking prev_events backwards breadth-first
+// (mirror of Synapse's get_backfill_events: a depth-ordered BFS from the
+// seeds, seeds included). The response events must be redacted where the
+// requesting server's users are not joined — katrix's minimal surface serves
+// them as stored.
 func (a *API) Backfill(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
 	if a.checkServerACL(w, r, roomID) {
 		return
 	}
-	evs, err := a.Store.EventsForRoom(r.Context(), roomID, 0, 0, 50, "b")
+	seeds := r.URL.Query()["v"]
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 100 {
+			limit = n
+		}
+	}
+	room, err := a.Store.GetRoom(r.Context(), roomID)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
 		return
 	}
-	pdus := make([]json.RawMessage, 0, len(evs))
-	ids := make([]string, 0, len(evs))
-	for _, e := range evs {
-		pdus = append(pdus, e.RawJSON)
-		ids = append(ids, e.EventID)
+	version := roomver.Version(room.Version)
+	rules, ok := roomver.Get(version)
+	if !ok {
+		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
+		return
 	}
+	// Breadth-first walk backwards from the seeds (newest-first by depth, then
+	// stream ordering), collecting each event and queueing its prev_events,
+	// until the limit is reached or the walk is exhausted. Events already known
+	// are skipped (the requesting server listed its own extremities; returning
+	// them is harmless and idempotent to persist).
+	collected := map[string]*storage.EventRow{}
+	var order []string
+	queue := make([]string, 0, len(seeds))
+	queue = append(queue, seeds...)
+	for len(queue) > 0 && len(collected) < limit {
+		id := queue[0]
+		queue = queue[1:]
+		if id == "" {
+			continue
+		}
+		if _, dup := collected[id]; dup {
+			continue
+		}
+		ev, err := a.Store.GetEvent(r.Context(), id)
+		if err != nil || ev == nil || ev.RoomID != roomID {
+			continue
+		}
+		collected[id] = ev
+		order = append(order, id)
+		for _, prev := range prevEventIDs(ev.RawJSON) {
+			if _, dup := collected[prev]; !dup {
+				queue = append(queue, prev)
+			}
+		}
+	}
+	pdus := make([]json.RawMessage, 0, len(order))
+	ids := make([]string, 0, len(order))
+	for _, id := range order {
+		if ev := collected[id]; ev != nil {
+			pdus = append(pdus, ev.RawJSON)
+			ids = append(ids, id)
+		}
+	}
+	_ = rules
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"origin":           a.ServerName(),
 		"origin_server_ts": a.Now(),
@@ -726,12 +780,31 @@ func (a *API) GetMissingEvents(w http.ResponseWriter, r *http.Request) {
 // walk an event's ancestry for get_missing_events).
 func prevEventIDs(raw []byte) []string {
 	var ev struct {
-		PrevEvents []string `json:"prev_events"`
+		PrevEvents json.RawMessage `json:"prev_events"`
 	}
-	if err := json.Unmarshal(raw, &ev); err != nil {
+	if err := json.Unmarshal(raw, &ev); err != nil || len(ev.PrevEvents) == 0 {
 		return nil
 	}
-	return ev.PrevEvents
+	// Plain ID array (v3+).
+	var idsArr []string
+	if json.Unmarshal(ev.PrevEvents, &idsArr) == nil {
+		return idsArr
+	}
+	// Legacy [id, hash] pairs (v1/v2).
+	var pairs [][]json.RawMessage
+	if err := json.Unmarshal(ev.PrevEvents, &pairs); err != nil {
+		return nil
+	}
+	var out []string
+	for _, p := range pairs {
+		if len(p) > 0 {
+			var id string
+			if json.Unmarshal(p[0], &id) == nil && id != "" {
+				out = append(out, id)
+			}
+		}
+	}
+	return out
 }
 
 // historyVisibility returns the room's current m.room.history_visibility value

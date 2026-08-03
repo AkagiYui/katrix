@@ -1218,8 +1218,10 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	// passing it back as `from` yields no overlap. A `from` of s0 (the earliest
 	// position) means there is nothing older to page into: return an empty page
 	// without an `end` so the client stops (an empty `end` would loop forever).
+	// A negative `from` (backfilled history, stored below the room's minimum)
+	// is a valid pagination position too — continue below it.
 	if dir == "b" && hasFrom {
-		if from > 0 {
+		if from != 0 {
 			to = from
 			from = 0
 		} else {
@@ -1231,6 +1233,22 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
+	}
+	// Backward pagination may be paging into history the local server does not
+	// have (e.g. events predating a remote join). Per the spec's pagination +
+	// backfill contract (mirror of Synapse's get_messages), when a backward
+	// page comes back short of the requested limit the server asks the room's
+	// other servers for the missing history and re-reads the page (once, so an
+	// empty remote answer doesn't loop). Backfill is best-effort: an
+	// unreachable peer or a refused request leaves the local view as-is.
+	if dir == "b" && a.fed != nil && len(evs) < limit {
+		if a.fed.MaybeBackfill(r.Context(), roomID, limit) > 0 {
+			evs, err = a.Store.EventsForRoom(r.Context(), roomID, from, to, limit, dir)
+			if err != nil {
+				httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+				return
+			}
+		}
 	}
 	chunk := make([]json.RawMessage, 0, len(evs))
 	var minTok, maxTok int64
@@ -1935,13 +1953,25 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 	return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
 }
 
-// canLocalJoin reports whether a join to a restricted-rule room can be
-// authorised locally (Synapse's _should_perform_remote_join equivalent for the
-// MSC3083 case): the user is already joined/invited (auth rules waive the
-// authoriser), or the room is not restricted, or a local joined member can
-// authorise (has invite power). When false and federation is available, the
-// join must be delegated to a remote server.
+// canLocalJoin reports whether a join can be performed locally rather than
+// delegated to a remote server (Synapse's _should_perform_remote_join): the
+// user is already joined/invited (auth rules allow the transition), the local
+// server is in the room (has a joined member — a local join event would
+// otherwise reference the stale local DAG tip, orphaning any history sent
+// while the server was away: "If the host isn't in the room, pass through the
+// prospective hosts"), and — for restricted-rule rooms — a local joined member
+// can authorise (has invite power). When false and federation is available,
+// the join must be delegated to a remote server.
 func (a *API) canLocalJoin(ctx context.Context, roomID, userID string) bool {
+	// Already joined/invited: the auth rules allow the transition without an
+	// authoriser (accepting an invite, or a re-join by a current member).
+	if m, err := a.Store.GetMembership(ctx, roomID, userID); err == nil && (m.Membership == rooms.MembershipJoin || m.Membership == rooms.MembershipInvite) {
+		return true
+	}
+	// The local server must actually be in the room to author a local join.
+	if !a.Store.ServerHasJoinedMember(ctx, roomID, a.ServerName()) {
+		return false
+	}
 	id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.join_rules", "")
 	if err != nil {
 		return true
@@ -1952,11 +1982,6 @@ func (a *API) canLocalJoin(ctx context.Context, roomID, userID string) bool {
 	}
 	rule := rooms.JoinRule(ev.Content)
 	if rule != rooms.JoinRuleRestricted && rule != rooms.JoinRuleKnockRestricted {
-		return true
-	}
-	// Already joined/invited: the auth rules allow the transition without an
-	// authoriser (a re-join, or accepting an invite).
-	if m, err := a.Store.GetMembership(ctx, roomID, userID); err == nil && (m.Membership == rooms.MembershipJoin || m.Membership == rooms.MembershipInvite) {
 		return true
 	}
 	return a.Store.RestrictedJoinAuthoriser(ctx, roomID, a.ServerName()) != ""
@@ -2754,10 +2779,18 @@ func (a *API) notifyRoomMembers(ctx context.Context, roomID string) {
 }
 
 // parseIntToken parses a pagination token (stream_ordering) from a string.
+// The token may be negative: backfilled events are stored with stream
+// orderings below the room's current minimum, so their pagination tokens are
+// negative ("s-<digits>").
 func parseIntToken(s string) (int64, error) {
 	// Pagination tokens share the opaque sync-token format ("s<digits>").
 	// Accept both the prefixed form and a bare integer for robustness.
 	if len(s) > 0 && s[0] == 's' {
+		s = s[1:]
+	}
+	neg := false
+	if len(s) > 0 && s[0] == '-' {
+		neg = true
 		s = s[1:]
 	}
 	var n int64
@@ -2767,14 +2800,19 @@ func parseIntToken(s string) (int64, error) {
 		}
 		n = n*10 + int64(c-'0')
 	}
+	if neg {
+		n = -n
+	}
 	return n, nil
 }
 
 func formatIntToken(n int64) string {
 	// Match the opaque sync-token format ("s<digits>") so pagination tokens
-	// returned by /messages are interchangeable with /sync tokens.
-	if n == 0 {
-		return "s0"
+	// returned by /messages are interchangeable with /sync tokens. Negative
+	// orderings (backfilled history) render as "s-<digits>".
+	neg := n < 0
+	if neg {
+		n = -n
 	}
 	var buf [20]byte
 	i := len(buf)
@@ -2783,5 +2821,12 @@ func formatIntToken(n int64) string {
 		buf[i] = byte('0' + n%10)
 		n /= 10
 	}
-	return "s" + string(buf[i:])
+	s := string(buf[i:])
+	if s == "" {
+		s = "0"
+	}
+	if neg {
+		return "s-" + s
+	}
+	return "s" + s
 }

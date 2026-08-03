@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -142,6 +143,49 @@ func (c *Client) VerifyKeyFor(ctx context.Context, serverName, keyID string) ([]
 // .well-known + SRV discovery is out of scope for the minimal P5 surface.
 func (c *Client) serverBaseURL(serverName string) string {
 	return "https://" + fedHostPort(serverName)
+}
+
+// Backfill performs GET /_matrix/federation/v1/backfill/{roomID} against dest
+// (spec §Backfilling): the server returns up to limit events that precede the
+// ones named in v (the requesting server's forward extremities of the room).
+// The response PDUs are returned raw for the caller to verify and persist.
+func (c *Client) Backfill(ctx context.Context, dest, roomID string, v []string, limit int) ([]json.RawMessage, error) {
+	if len(v) == 0 {
+		return nil, fmt.Errorf("federation: backfill %s: no extremities given", dest)
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	url := c.serverBaseURL(dest) + "/_matrix/federation/v1/backfill/" + urlPathEscape(roomID) +
+		"?v=" + url.QueryEscape(strings.Join(v, ",")) + "&limit=" + strconv.Itoa(limit)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Host = dest
+	if err := signRequestWith(req, c.originName(), c.key); err != nil {
+		return nil, err
+	}
+	metrics.Counters.FedOutboundRequests.Add(1)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("federation: backfill %s: %w", dest, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("federation: backfill %s: HTTP %d", dest, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Pdus []json.RawMessage `json:"pdus"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("federation: decode backfill from %s: %w", dest, err)
+	}
+	return out.Pdus, nil
 }
 
 // QueryProfile fetches a remote user's profile over federation

@@ -166,6 +166,110 @@ func (a *API) deliverPDU(ctx context.Context, id int64, txnID string, raw json.R
 
 // ---- inbound gap filling (get_missing_events) ----
 
+// MaybeBackfill asks the room's remote servers for history preceding the local
+// backwards extremities (GET /_matrix/federation/v1/backfill, spec §Backfilling)
+// and persists any events returned. It is the outbound side of the pagination
+// contract: when a client pages backwards into events the local server does
+// not have (e.g. history predating a join), the server asks the room's other
+// servers for the missing events. Returns the number of events newly stored.
+func (a *API) MaybeBackfill(ctx context.Context, roomID string, limit int) int {
+	if a == nil || a.client == nil {
+		return 0
+	}
+	v, err := a.Store.BackfillPoints(ctx, roomID, 5)
+	if err != nil || len(v) == 0 {
+		return 0
+	}
+	room, err := a.Store.GetRoom(ctx, roomID)
+	if err != nil {
+		return 0
+	}
+	version := roomver.Version(room.Version)
+	servers := a.roomServers(ctx, roomID)
+	for _, dest := range servers {
+		pdus, berr := a.client.Backfill(ctx, dest, roomID, v, limit)
+		if berr != nil {
+			continue
+		}
+		// Verify each PDU (signature + room match); the valid ones become a
+		// backfill batch inserted at stream orderings below the room's current
+		// minimum, so backward pagination reaches them in place and forward
+		// syncs never see them as new events.
+		var rows []*storage.EventRow
+		for _, raw := range pdus {
+			var ev struct {
+				EventID  string          `json:"event_id"`
+				RoomID   string          `json:"room_id"`
+				Type     string          `json:"type"`
+				Sender   string          `json:"sender"`
+				Depth    int64           `json:"depth"`
+				OSTS     int64           `json:"origin_server_ts"`
+				Content  json.RawMessage `json:"content"`
+				StateKey *string         `json:"state_key"`
+			}
+			if json.Unmarshal(raw, &ev) != nil {
+				continue
+			}
+			if ev.RoomID != "" && ev.RoomID != roomID {
+				continue
+			}
+			vres := a.verifier.Verify(ctx, raw, version)
+			if vres.Err != nil || (vres.Signed && !vres.Valid) {
+				continue
+			}
+			id := ev.EventID
+			if id == "" {
+				id = vres.EventID
+			}
+			if id == "" {
+				continue
+			}
+			row := &storage.EventRow{
+				EventID: id, RoomID: roomID, Type: ev.Type, Sender: ev.Sender,
+				Depth: ev.Depth, OriginServerTS: ev.OSTS, Content: ev.Content, RawJSON: raw,
+				Outlier: true,
+			}
+			if ev.StateKey != nil {
+				row.StateKey = *ev.StateKey
+			}
+			rows = append(rows, row)
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		// The /backfill response is newest-first (BFS from the seeds), which is
+		// exactly the order InsertBackfillEvents expects for the stream range.
+		if err := a.Store.InsertBackfillEvents(ctx, rows); err == nil {
+			return len(rows)
+		}
+	}
+	return 0
+}
+
+// roomServers lists the other servers sharing a room: the joined members'
+// server domains plus any server list carried by a partial-state send_join.
+func (a *API) roomServers(ctx context.Context, roomID string) []string {
+	seen := map[string]bool{}
+	var out []string
+	if room, err := a.Store.GetRoom(ctx, roomID); err == nil {
+		for _, s := range room.ServersInRoom {
+			if s != "" && s != a.ServerName() && !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	if members, err := a.Store.Members(ctx, roomID, "join"); err == nil {
+		for _, m := range members {
+			if dom := userDomain(m.UserID); dom != "" && dom != a.ServerName() && !seen[dom] {
+				seen[dom] = true
+				out = append(out, dom)
+			}
+		}
+	}
+	return out
+}
+
 // fetchMissingEventsFor asks origin for the events between the room's current
 // state and the event that just arrived with unknown prev_events, then ingests
 // them. It mirrors what the sender expects per the spec's get_missing_events
