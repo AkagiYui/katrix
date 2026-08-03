@@ -42,7 +42,7 @@ func InitialPowerLevels(creator string, preset string, override json.RawMessage,
 		Ban:           50,
 		Kick:          50,
 		Redact:        50,
-		Invite:        0,
+		Invite:        50,
 		Events: map[string]int64{
 			"m.room.name":               50,
 			"m.room.power_levels":       100,

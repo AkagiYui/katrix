@@ -745,6 +745,26 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	prev, depth := a.dagTipFor(r.Context(), roomID)
 	authIDs := a.memberAuthIDs(r, roomID, userID)
+	content := map[string]string{"membership": "join"}
+	// Restricted-rule room (MSC3083): when the room's join_rules allow
+	// restricted joins, the make_join template must carry a
+	// join_authorised_via_users_server naming a local joined user who can
+	// issue invites, so the join event the requesting server builds passes the
+	// auth rules at send_join time (spec room v8+; mirror of Synapse's
+	// on_make_join_request). The authoriser is only needed when the joining
+	// user is not already joined/invited — the auth rules waive the requirement
+	// for those (already-covered) transitions.
+	if a.restrictedRoomJoinRules(r.Context(), roomID) {
+		prevMembership := ""
+		if m, err := a.Store.GetMembership(r.Context(), roomID, userID); err == nil {
+			prevMembership = m.Membership
+		}
+		if prevMembership != rooms.MembershipJoin && prevMembership != rooms.MembershipInvite {
+			if authoriser := a.Store.RestrictedJoinAuthoriser(r.Context(), roomID, a.ServerName()); authoriser != "" {
+				content["join_authorised_via_users_server"] = authoriser
+			}
+		}
+	}
 	template := map[string]any{
 		"type":             "m.room.member",
 		"state_key":        userID,
@@ -755,13 +775,30 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 		"depth":            depth,
 		"prev_events":      prev,
 		"auth_events":      authIDs,
-		"content":          map[string]string{"membership": "join"},
+		"content":          content,
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"origin":       a.ServerName(),
 		"room_version": room.Version,
 		"event":        template,
 	})
+}
+
+// restrictedRoomJoinRules reports whether the room's current join_rules are
+// restricted or knock_restricted (the room versions that permit restricted
+// joins per MSC3083). It is used by the make_join path to decide whether to
+// inject a join_authorised_via_users_server into the join template.
+func (a *API) restrictedRoomJoinRules(ctx context.Context, roomID string) bool {
+	id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.join_rules", "")
+	if err != nil {
+		return false
+	}
+	ev, err := a.Store.GetEvent(ctx, id)
+	if err != nil {
+		return false
+	}
+	rule := rooms.JoinRule(ev.Content)
+	return rule == rooms.JoinRuleRestricted || rule == rooms.JoinRuleKnockRestricted
 }
 
 // requestingServerSupportsVersion reports whether a make_join/make_knock
@@ -1390,6 +1427,16 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 	// user's join is rejected). Run before persisting.
 	if rules, ok := roomver.Get(version); ok {
 		st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, *ev.StateKey)
+		// Restricted-rule join (MSC3083): the joining user must be a joined
+		// member of one of the allow-listed rooms, and the join event must name
+		// a joined member of this room as authoriser. Unlike the client path,
+		// the (already signed) event cannot be rewritten, so a join omitting
+		// join_authorised_via_users_server is rejected by the auth rules below.
+		if st.JoinRules != nil && (rooms.JoinRule(st.JoinRules) == rooms.JoinRuleRestricted || rooms.JoinRule(st.JoinRules) == rooms.JoinRuleKnockRestricted) {
+			if mc, err := rooms.ParseMember(ev.Content); err == nil && mc.Membership == rooms.MembershipJoin {
+				st.RestrictedAuthorised = a.Store.RestrictedJoinAuthorised(r.Context(), ev.RoomID, *ev.StateKey, mc.JoinAuthorisedViaUsersServer, a.ServerName())
+			}
+		}
 		if err := rooms.Authorize(rules, ev.Type, *ev.StateKey, ev.Sender, ev.Content, st); err != nil {
 			httpx.WriteError(w, httpx.NewError(http.StatusForbidden, "M_FORBIDDEN", err.Error()))
 			return
