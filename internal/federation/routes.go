@@ -24,6 +24,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	a.registerTransactions(mux)
 	a.registerKeys(mux)
 	a.registerJumpAndHierarchy(mux)
+	a.registerRelationsFed(mux)
 }
 
 // KeyQuery handles POST /_matrix/key/v2/query (spec: query the keys of other

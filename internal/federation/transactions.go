@@ -224,19 +224,23 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// events must be persisted before this one so stream ordering (and thus the
 	// /sync timeline) reflects the true DAG order. Best-effort: a failure here
 	// must not reject the already-verified event.
+	gapFetched := false
 	if origin != "" && a.hasUnknownPrevEvents(r.Context(), raw) {
+		gapFetched = true
 		a.fetchMissingEventsFor(r.Context(), ev.RoomID, evID, origin)
 	}
-	// If the near chain is still disconnected — the event's own prevs, or the
-	// prevs of those (the gap get_missing_events may only partially have
-	// closed) — reconcile the room's state from the origin (Synapse's state
-	// fetch for a room it cannot link): the frontier event anchors a /state_ids
-	// snapshot whose events are fetched and applied, with a corrupted/withheld
-	// auth chain soft-failing the whole snapshot. A reconcile is only attempted
-	// when the event's own prevs are present (the fetch succeeded but left a
-	// deeper gap): when the direct prev is still unknown the event is simply
-	// rejected below, and reconciling would be wrong (the peer served nothing).
-	if origin != "" && !a.hasUnknownPrevEvents(r.Context(), raw) {
+	// If the near chain is still disconnected — the prevs of the events
+	// get_missing_events just filled are themselves unknown — reconcile the
+	// room's state from the origin (Synapse's state fetch for a room it cannot
+	// link): the frontier event anchors a /state_ids snapshot whose events are
+	// fetched and applied, with a corrupted/withheld auth chain soft-failing
+	// the whole snapshot. A reconcile is only attempted when the peer is
+	// actively serving the gap (a get_missing_events round-trip happened) AND
+	// the event's own prevs are present (the fetch succeeded but left a deeper
+	// gap): a gap behind already-present prevs (e.g. an event referencing a
+	// join whose own prev is pre-join history) is ordinary missing history,
+	// filled lazily by backfill, not reconciled.
+	if origin != "" && gapFetched && !a.hasUnknownPrevEvents(r.Context(), raw) {
 		if frontier := a.unknownDeepFrontier(r.Context(), raw); frontier != "" {
 			a.reconcileStateFrom(r.Context(), ev.RoomID, origin, frontier)
 		}
