@@ -481,20 +481,80 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	// just stopped sharing a room with the syncing user, so it passes through
 	// unfiltered (filtering it by current room membership would drop exactly the
 	// users it exists to report).
-	if changed, left, err := e.store.DeviceListChangesSince(ctx, opts.Since.Stream); err == nil {
-		if len(changed) > 0 || len(left) > 0 {
-			peers := e.roomPeers(ctx, opts)
-			peers[opts.UserID] = true // always see your own device-list changes
-			var ch []string
-			for _, u := range changed {
-				if peers[u] {
-					ch = append(ch, u)
+	//
+	// Additionally, users who *newly* share a room with the syncer (either the
+	// syncer joined one of their rooms, or they joined one of the syncer's
+	// rooms, after the token) are reported in `changed` even when their device
+	// list itself did not change: their devices became newly-visible (spec
+	// "users who now share an encrypted room").
+	//
+	// Device-list changes are recorded from the authoritative m.device_list_update
+	// EDUs (which the joining server broadcasts for its users, and the room's
+	// resident servers broadcast for theirs when a new user joins), so a remote
+	// user's join is reported once via their EDU record. A membership-based
+	// "newly shared" fallback is consulted only when the window has no direct
+	// change records (e.g. an EDU lost across a server restart): running both
+	// would surface the peer twice, because the membership row and the EDU
+	// record advance the shared stream at different times.
+	changed, left, _ := e.store.DeviceListChangesSince(ctx, opts.Since.Stream)
+	peers := e.roomPeers(ctx, opts)
+	peers[opts.UserID] = true // always see your own device-list changes
+	seen := map[string]bool{}
+	var ch []string
+	for _, u := range changed {
+		// A user may appear more than once in the change stream (a join
+		// records a change both via the send_join path and via the peer's
+		// m.device_list_update EDU): report each user once.
+		if peers[u] && !seen[u] {
+			seen[u] = true
+			ch = append(ch, u)
+		}
+	}
+	// Newly-shared room members, added to `changed`. The membership-based
+	// "newly shared an encrypted room" fallback fires when either (a) the
+	// syncer themselves newly joined a room after the token — every joined
+	// member of that room, and the syncer's own ID, becomes newly-visible — or
+	// (b) the window had no direct change records at all (an EDU was lost, e.g.
+	// across a server restart) and a peer newly joined. It does NOT fire on
+	// windows that already carry direct changes from an unrelated user: a
+	// peer whose join was already reported via their EDU must not be re-listed
+	// from the membership row (the two advance the shared stream at different
+	// times, so the membership row can still postdate the token).
+	syncerJoined := false
+	var newPeers []string
+	if opts.Since.Stream > 0 {
+		roomIDs, _ := e.store.RoomsForUser(ctx, opts.UserID)
+		if np, err := e.store.NewRoomPeersSince(ctx, roomIDs, opts.Since.Stream, opts.UserID); err == nil {
+			newPeers = np
+			for _, u := range np {
+				if u == opts.UserID {
+					syncerJoined = true
+					break
 				}
 			}
-			if len(ch) > 0 || len(left) > 0 {
-				resp.DeviceLists = &DeviceLists{Changed: ch, Left: left}
+		}
+	}
+	if len(ch) == 0 && len(left) == 0 && len(newPeers) > 0 && !syncerJoined {
+		// (b) no direct changes: a peer joined and no EDU record arrived.
+		for _, u := range newPeers {
+			if peers[u] && !seen[u] {
+				seen[u] = true
+				ch = append(ch, u)
 			}
 		}
+	}
+	if syncerJoined {
+		// (a) the syncer newly joined a room: the room's members and the
+		// syncer's own ID are newly-visible.
+		for _, u := range newPeers {
+			if peers[u] && !seen[u] {
+				seen[u] = true
+				ch = append(ch, u)
+			}
+		}
+	}
+	if len(ch) > 0 || len(left) > 0 {
+		resp.DeviceLists = &DeviceLists{Changed: ch, Left: left}
 	}
 
 	// Ephemeral: typing + receipts. Collected as a section object whose

@@ -423,18 +423,24 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 			}
 			_ = json.Unmarshal(ev.Content, &mc)
 			a.applyRemoteMembershipNotify(r.Context(), ev.RoomID, *ev.StateKey, mc.Membership)
-			// A remote user's join/leave changes their device-list visibility to
-			// the room's local members: record it in the shared device-list stream
-			// so the local members' /sync reports the user in
-			// device_lists.changed (join) or device_lists.left (leave/ban). The
-			// join PDU is the deterministic signal (the send_join handshake may
-			// already have recorded it via the m.device_list_update EDU; the
-			// per-user UPSERT collapses repeats). Only the first delivery
-			// records: a re-delivered PDU (a restarting server re-sends an
-			// already-acknowledged transaction) must not re-surface the user in
-			// a /sync window they were already reported in.
-			if !wasKnown && (mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban") {
-				_, _ = a.Store.RecordDeviceListChange(r.Context(), *ev.StateKey, mc.Membership != "join")
+			// A remote user's join/leave does NOT record a device-list change
+			// here: per the spec, remote users' device lists are learned via
+			// m.device_list_update EDUs (which the joining server sends for its
+			// users) — recording from the join PDU too would re-surface the user
+			// in consecutive sync windows (the EDU and the PDU are two
+			// independent signals with different stream positions). The sync
+			// engine's "newly shared room" computation covers the join case.
+			//
+			// A remote user's join makes the room's local users' device lists
+			// newly-visible to the joining server: send them m.device_list_update
+			// EDUs so the joining server can sync device lists for its users
+			// sharing this room (mirror of the send_join path in
+			// ingestRemoteMember — a join delivered as a PDU, e.g. a local join on
+			// the remote side broadcast to the room, never passes through
+			// ingestRemoteMember). Without this, the joining server's users never
+			// learn the room's existing members' device lists.
+			if !wasKnown && mc.Membership == "join" {
+				a.broadcastLocalDeviceListsToRoom(r.Context(), ev.RoomID)
 			}
 		}
 	}

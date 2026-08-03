@@ -2223,38 +2223,30 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 		}); err != nil {
 			return "", err
 		}
-		// A join/leave changes the user's device-list visibility to the room's
-		// other members: their /sync must learn the user in device_lists.changed
-		// (join) or device_lists.left (leave/ban). The change advances the shared
-		// sync stream; notifyRoomMembers below wakes the room's syncing users.
-		// Federating servers sharing the room also need the device list of a
-		// newly-joined local user (spec: m.device_list_update to every server
-		// sharing a room with a local user, including on join).
-		if mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban" {
-			_, _ = a.Store.RecordDeviceListChange(r.Context(), target, mc.Membership != "join")
-			// The reverse direction is spec-mandated too. Joining a room makes
-			// the room's existing members newly-visible to the joiner, so the
-			// joiner's /sync must receive their device lists in
-			// device_lists.changed; leaving/being banned makes them
-			// no-longer-visible, so device_lists.left must name them. Without
-			// this, a user who joins a room whose members uploaded their keys
-			// beforehand never learns their devices (the upload predates the
-			// joiner's sync token and its changed record was filtered out by the
-			// sharing-a-room check — Complement's DeviceListUpdates test).
-			if members, err := a.Store.Members(r.Context(), roomID, "join"); err == nil {
-				for _, m := range members {
-					if m.UserID == target {
-						continue
-					}
-					_, _ = a.Store.RecordDeviceListChange(r.Context(), m.UserID, mc.Membership != "join")
+			// A join/leave changes the user's device-list visibility to the room's
+			// other members: their /sync must learn the user in device_lists.changed
+			// (join) or device_lists.left (leave/ban). The change advances the shared
+			// sync stream; notifyRoomMembers below wakes the room's syncing users.
+			// Federating servers sharing the room also need the device list of a
+			// newly-joined local user (spec: m.device_list_update to every server
+			// sharing a room with a local user, including on join).
+			//
+			// A user's OWN join/leave records a change for themselves too: on join
+			// their other devices must learn the room's device lists are now
+			// relevant (Complement's DeviceListUpdateOverFederation expects the
+			// joining user's own ID on their own sync), and on leave/ban their
+			// devices must learn the room was left (device_lists.left). The
+			// spurious self-records the old reverse-direction loop produced (the
+			// room's existing members being recorded when a new user joined) are
+			// gone — the sync engine computes "newly shared room" members instead.
+			if mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban" {
+				_, _ = a.Store.RecordDeviceListChange(r.Context(), target, mc.Membership != "join")
+				if mc.Membership == "join" {
+					a.broadcastDeviceListForUser(r.Context(), target)
+				} else {
+					a.broadcastDeviceListDelete(r.Context(), target, roomID)
 				}
 			}
-			if mc.Membership == "join" {
-				a.broadcastDeviceListForUser(r.Context(), target)
-			} else {
-				a.broadcastDeviceListDelete(r.Context(), target, roomID)
-			}
-		}
 	}
 	a.notifyRoomMembers(r.Context(), roomID)
 	a.broadcastPDU(r.Context(), roomID, ev)
