@@ -1,15 +1,22 @@
 # SyTest whitelist: tests expected to PASS. A test listed here that fails is a
-# regression (fails the run). Populated from the 2026-08-01 test run: the 258
-# tests that passed. Regenerate after each run with:
+# regression (fails the run). Populated from the 2026-08-03 test run (workflow 30784695958):
+# regenerate after each run with:
 #   grep -E '^ok ' results.tap | grep -vE '# skip' | sed -E 's/^ok [0-9]+ (\(expected fail\) )?//' | sed -E 's/( \([0-9]+ subtests\))? # TODO passed but expected fail$//' | sort -u
 # One test path per line; lines starting with '#' are ignored.
+/context/ on joined room works
+/context/ on non world readable room does not work
+/context/ with lazy_load_members filter works
 /event/ does not allow access to events before the user joined
 /event/ on joined room works
 /event/ on non world readable room does not work
+/joined_rooms returns only joined rooms
+/upgrade is rejected if the user can't send state events
+/upgrade of a bogus room fails gracefully
 3pid invite join valid signature but revoked keys are rejected
 3pid invite join valid signature but unreachable ID server are rejected
 3pid invite join with wrong but valid signature are rejected
 A change to displayname should appear in incremental /sync
+A prev_batch token from incremental sync can be used in the v1 messages API
 Adding the same push rule twice is idempotent
 After changing password, a different session no longer works by default
 After changing password, can log in with new password
@@ -20,27 +27,42 @@ After deactivating account, can't log in with an email
 After deactivating account, can't log in with password
 Alias creators can delete alias with no ops
 Alias creators can delete canonical alias with no ops
+Archived rooms only contain history from before the user left
 AS cannot create users outside its own namespace
 avatar_url updates affect room member events
 Banned rooms appear in the leave section of sync
 Can /sync newly created room
 Can add account data
 Can add account data to room
+Can add global push rule after an existing rule
+Can add global push rule before an existing rule
+Can add global push rule for content
+Can add global push rule for override
+Can add global push rule for room
+Can add global push rule for sender
+Can add global push rule for underride
+Can backup keys
 Can change the actions of a user specified rule
 Can change the actions of default rules
-Can claim one time key using POST
+Can claim one time key using POST (2 subtests)
 Can create backup version
 Can create filter
 Can create more than 10 backup versions
 Can deactivate account
+Can delete a push rule
 Can delete backup
+Can delete canonical alias
+Can disable a push rule
 Can download filter
 Can enable/disable default rules
 Can fetch a user's pushers
 Can get account data without syncing
 Can get room account data without syncing
 Can get rooms/{roomId}/members for a departed room (SPEC-216)
-Can invite users to invite-only rooms
+Can invite existing 3pid
+Can invite existing 3pid in createRoom
+Can invite existing 3pid with no ops into a private room
+Can invite users to invite-only rooms (2 subtests)
 Can logout all devices
 Can logout current device
 Can query specific device keys using POST
@@ -48,9 +70,10 @@ Can read configuration endpoint
 Can send a message directly to a device using PUT /sendToDevice
 Can sync
 Can update backup version
+Can update keys with better versions
 Can upload device keys
-Canonical alias can be set
-Canonical alias can include alt_aliases
+Canonical alias can be set (3 subtests)
+Canonical alias can include alt_aliases (4 subtests)
 Changes to state are included in an incremental sync
 Check creating invalid filters returns 4xx
 Checking local federation server
@@ -61,9 +84,11 @@ DELETE /device/{deviceId} requires UI auth user to match device owner
 DELETE /device/{deviceId} with no body gives a 401
 Deleted & recreated backups are empty
 Deleting a non-existent alias should return a 404
+Device messages over federation wake up /sync
 Device messages wake up /sync
 displayname updates affect room member events
 Event size limits
+Events come down the correct room
 Existing members see new members' join events
 Existing members see new members' presence
 Federation key API allows unsigned requests for keys
@@ -77,7 +102,9 @@ GET /login yields a set of flows
 GET /presence/:user_id/status fetches initial status
 GET /profile/:user_id/avatar_url publicly accessible
 GET /profile/:user_id/displayname publicly accessible
+GET /publicRooms includes avatar URLs
 GET /publicRooms lists newly-created room
+GET /publicRooms lists rooms
 GET /register yields a set of flows
 GET /rooms/:room_id/aliases lists aliases
 GET /rooms/:room_id/joined_members fetches my membership
@@ -88,11 +115,16 @@ GET /rooms/:room_id/state/m.room.name gets name
 GET /rooms/:room_id/state/m.room.power_levels fetches powerlevels
 GET /rooms/:room_id/state/m.room.topic gets topic
 GET /v3/capabilities is not public
+Get left notifs for other users in sync and /keys/changes when user leaves
+Get left notifs in sync and /keys/changes when other user leaves
 Getting messages going forward is limited for a departed room (SPEC-216)
-Getting push rules doesn't corrupt the cache SYN-390
+Getting push rules doesn't corrupt the cache SYN-390 (3 subtests)
 Guest non-joined users can get individual state for world_readable rooms after leaving
 Guest non-joined users cannot send messages to guest_access rooms if not joined
+Guest user can set display names
+Guest user can upgrade to fully featured user
 Guest user cannot upgrade other users
+Guest users are kicked from guest_access rooms on revocation of guest_access
 Guest users can join guest_access rooms
 Guest users can send messages to guest_access rooms if joined
 Guest users can sync from default guest_access rooms if joined
@@ -100,7 +132,13 @@ Guest users can sync from shared guest_access rooms if joined
 Guest users can sync from world_readable guest_access rooms if joined
 Ignore invite in full sync
 Ignore invite in incremental sync
-Inbound federation can receive redacted events
+Inbound federation accepts attempts to join v2 rooms from servers with support
+Inbound federation can get state for a room
+Inbound federation can get state_ids for a room
+Inbound federation can query profile data
+Inbound federation rejects attempts to join v1 rooms from servers without v1 support
+Inbound federation rejects attempts to join v2 rooms from servers lacking version support
+Inbound federation rejects attempts to join v2 rooms from servers only supporting v1
 Invalid JSON floats
 Invalid JSON integers
 Invalid JSON special values
@@ -113,8 +151,12 @@ Left rooms appear in the leave section of full state sync
 Left rooms appear in the leave section of sync
 Local device key changes appear in /keys/changes
 Local device key changes appear in v2 /sync
+Local new device changes appear in v2 /sync
+Local update device changes appear in v2 /sync
+local user can join room with version 1
 local user can join room with version 10
 local user can join room with version 11
+local user can join room with version 2
 local user can join room with version 3
 local user can join room with version 4
 local user can join room with version 5
@@ -122,24 +164,34 @@ local user can join room with version 6
 local user can join room with version 7
 local user can join room with version 8
 local user can join room with version 9
+Local users can peek by room alias
+Local users can peek into world_readable rooms by room ID
 m.room.history_visibility == "default" allows/forbids appropriately for Guest users
 m.room.history_visibility == "default" allows/forbids appropriately for Real users
 m.room.history_visibility == "shared" allows/forbids appropriately for Guest users
 m.room.history_visibility == "shared" allows/forbids appropriately for Real users
 Message history can be paginated
-Multiple calls to /sync should not cause 500 errors
+Multiple calls to /sync should not cause 500 errors (6 subtests)
 New account data appears in incremental v2 /sync
 New read receipts appear in incremental v2 /sync
 New room members see their own join event
+New rules appear before old rules by default
 New users appear in /keys/changes
 Newly banned rooms appear in the leave section of incremental sync
+Newly joined room is included in an incremental sync after invite
+Newly left rooms appear in the leave section of gapped sync
+Newly left rooms appear in the leave section of incremental sync
 Only room members can list aliases of a room
+Peeked rooms only turn up in the sync for the device who peeked them
+POST /createRoom creates a room with the given version
 POST /createRoom ignores attempts to set the room version via creation_content
 POST /createRoom makes a private room
 POST /createRoom makes a private room with invites
 POST /createRoom makes a public room
 POST /createRoom makes a room with a name
 POST /createRoom makes a room with a topic
+POST /createRoom rejects attempts to create rooms with numeric versions
+POST /createRoom rejects attempts to create rooms with unknown versions
 POST /createRoom with creation content
 POST /join/:room_alias can join a room
 POST /join/:room_alias can join a room with custom content
@@ -184,6 +236,7 @@ POST /rooms/:room_id/receipt can create receipts
 POST /rooms/:room_id/state/m.room.name sets name
 POST /rooms/:room_id/state/m.room.topic sets topic
 POST rejects invalid utf-8 in JSON
+Presence change reports an event to myself
 Previously left rooms don't appear in the leave section of sync
 Pushers created with a different access token are deleted on password change
 Pushers created with a the same access token are not deleted on password change
@@ -195,7 +248,9 @@ PUT /profile/:user_id/avatar_url sets my avatar
 PUT /profile/:user_id/displayname sets my name
 PUT /redact disallows redaction of event in different room
 PUT /rooms/:room_id/redact/:event_id/:txn_id as original message sender redacts message
+PUT /rooms/:room_id/redact/:event_id/:txn_id as power user redacts message
 PUT /rooms/:room_id/redact/:event_id/:txn_id as random user does not redact message
+PUT /rooms/:room_id/redact/:event_id/:txn_id is idempotent
 PUT /rooms/:room_id/send/:event_type/:txn_id deduplicates the same txn id
 PUT /rooms/:room_id/send/:event_type/:txn_id sends a message
 PUT /rooms/:room_id/typing/:user_id sets typing notification
@@ -209,6 +264,7 @@ Real non-joined users cannot send messages to guest_access rooms if not joined
 Real users can sync from default guest_access rooms if joined
 Real users can sync from shared guest_access rooms if joined
 Real users can sync from world_readable guest_access rooms if joined
+Redaction of a redaction redacts the redaction reason
 registration accepts non-ascii passwords
 Regular users can add and delete aliases in the default room configuration
 Regular users can add and delete aliases when m.room.aliases is restricted
@@ -225,24 +281,46 @@ Setting room topic reports m.room.topic to myself
 Setting state twice is idempotent
 Should reject keys claiming to belong to a different user
 Sync can be polled for updates
+Trying to add push rule with condition without kind fails with 400
+Trying to add push rule with content rule without pattern fails with 400
+Trying to add push rule with empty rule_id fails with 400
+Trying to add push rule with invalid action fails with 400
+Trying to add push rule with invalid attr fails with 400
+Trying to add push rule with invalid scope fails with 400
 Trying to add push rule with invalid template fails with 400
 Trying to add push rule with invalid value for enabled fails with 400
+Trying to add push rule with missing rule_id fails with 400
+Trying to add push rule with missing template fails with 400
+Trying to add push rule with no actions fails with 400
+Trying to add push rule with no scope fails with 400
+Trying to add push rule with override rule without conditions fails with 400
+Trying to add push rule with rule_id with slashes fails with 400
+Trying to add push rule with underride rule without conditions fails with 400
+Trying to get push rules with no trailing slash fails with 404
+Trying to get push rules with scope without trailing slash fails with 400
+Trying to get push rules with template without tailing slash fails with 400
+Trying to get push rules with unknown attribute fails with 400
 Trying to get push rules with unknown rule_id fails with 404
+Trying to get push rules with unknown scope fails with 400
+Trying to get push rules with unknown template fails with 400
 Typing events appear in gapped sync
 Typing events appear in incremental sync
 Typing events appear in initial sync
 Uninvited users cannot join the room
-User can create and send/receive messages in a room with version 10
-User can create and send/receive messages in a room with version 11
-User can create and send/receive messages in a room with version 3
-User can create and send/receive messages in a room with version 4
-User can create and send/receive messages in a room with version 5
-User can create and send/receive messages in a room with version 6
-User can create and send/receive messages in a room with version 7
-User can create and send/receive messages in a room with version 8
-User can create and send/receive messages in a room with version 9
+User appears in user directory
+User can create and send/receive messages in a room with version 10 (2 subtests)
+User can create and send/receive messages in a room with version 11 (2 subtests)
+User can create and send/receive messages in a room with version 3 (2 subtests)
+User can create and send/receive messages in a room with version 4 (2 subtests)
+User can create and send/receive messages in a room with version 5 (2 subtests)
+User can create and send/receive messages in a room with version 6 (2 subtests)
+User can create and send/receive messages in a room with version 7 (2 subtests)
+User can create and send/receive messages in a room with version 8 (2 subtests)
+User can create and send/receive messages in a room with version 9 (2 subtests)
+User can invite local user to room with version 1
 User can invite local user to room with version 10
 User can invite local user to room with version 11
+User can invite local user to room with version 2
 User can invite local user to room with version 3
 User can invite local user to room with version 4
 User can invite local user to room with version 5
@@ -252,12 +330,20 @@ User can invite local user to room with version 8
 User can invite local user to room with version 9
 User in shared private room does appear in user directory
 User is offline if they set_presence=offline in their sync
+User sees their own presence in a sync
 Users can't delete other's aliases
 Users cannot invite a user that is already in the room
 Users cannot invite themselves to a room
 Users cannot kick users from a room they are not in
 Users cannot kick users who have already left a room
+Users receive device_list updates for their own devices
 Users with sufficient power-level can delete other's aliases
 Version responds 200 OK with valid structure
+We can't peek into rooms with invited history_visibility
+We can't peek into rooms with joined history_visibility
+We can't peek into rooms with shared history_visibility
 We should see our own leave event when rejecting an invite, even if history_visibility is restricted (riot-web/3462)
+We should see our own leave event, even if history_visibility is restricted (SYN-662)
+Wildcard device messages over federation wake up /sync
 Wildcard device messages wake up /sync
+Will not update keys with worse versions
