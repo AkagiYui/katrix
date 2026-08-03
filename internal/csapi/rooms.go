@@ -1864,6 +1864,28 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 	// request body are copied into the event content", e.g. `foo: bar`).
 	extra := joinCustomContent(r)
 	if _, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
+		// A restricted-rule join (MSC3083) the local server cannot authorise
+		// must be delegated to a remote server that can (Synapse's
+		// _should_perform_remote_join): when the joining user is not already
+		// joined/invited and no local joined member has invite power, the join
+		// event cannot pass auth locally. The candidates are the servers of the
+		// room's joined members with invite power, falling back to the room
+		// ID's domain and the request's via list.
+		if !a.canLocalJoin(r.Context(), roomID, auth.UserID) && a.fed != nil {
+			candidates := a.remoteJoinCandidates(r.Context(), roomID)
+			if len(candidates) == 0 {
+				if dom := ids.DomainOf(roomID); dom != "" {
+					candidates = append(candidates, dom)
+				}
+			}
+			candidates = append(candidates, via...)
+			if partial, err := a.fed.JoinRemoteRoom(r.Context(), auth.UserID, roomID, candidates); err == nil {
+				if !partial {
+					a.broadcastDeviceListForUser(r.Context(), auth.UserID)
+				}
+				return nil, nil
+			}
+		}
 		content := map[string]any{"membership": rooms.MembershipJoin}
 		for k, v := range extra {
 			content[k] = v
@@ -1898,6 +1920,51 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 		return nil, nil
 	}
 	return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
+}
+
+// canLocalJoin reports whether a join to a restricted-rule room can be
+// authorised locally (Synapse's _should_perform_remote_join equivalent for the
+// MSC3083 case): the user is already joined/invited (auth rules waive the
+// authoriser), or the room is not restricted, or a local joined member can
+// authorise (has invite power). When false and federation is available, the
+// join must be delegated to a remote server.
+func (a *API) canLocalJoin(ctx context.Context, roomID, userID string) bool {
+	id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.join_rules", "")
+	if err != nil {
+		return true
+	}
+	ev, err := a.Store.GetEvent(ctx, id)
+	if err != nil {
+		return true
+	}
+	rule := rooms.JoinRule(ev.Content)
+	if rule != rooms.JoinRuleRestricted && rule != rooms.JoinRuleKnockRestricted {
+		return true
+	}
+	// Already joined/invited: the auth rules allow the transition without an
+	// authoriser (a re-join, or accepting an invite).
+	if m, err := a.Store.GetMembership(ctx, roomID, userID); err == nil && (m.Membership == rooms.MembershipJoin || m.Membership == rooms.MembershipInvite) {
+		return true
+	}
+	return a.Store.RestrictedJoinAuthoriser(ctx, roomID, a.ServerName()) != ""
+}
+
+// remoteJoinCandidates lists the servers of the room's joined members (who may
+// be able to authorise a restricted join), so a delegated join can pick one.
+func (a *API) remoteJoinCandidates(ctx context.Context, roomID string) []string {
+	users, err := a.Store.JoinedUserIDs(ctx, roomID)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, u := range users {
+		if dom := ids.DomainOf(u); dom != "" && dom != a.ServerName() && !seen[dom] {
+			seen[dom] = true
+			out = append(out, dom)
+		}
+	}
+	return out
 }
 
 // fedHTTPStatusCode extracts the HTTP status from a federation error, returning

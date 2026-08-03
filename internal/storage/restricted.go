@@ -6,6 +6,7 @@ import (
 
 	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/rooms"
+	"github.com/AkagiYui/katrix/internal/roomver"
 )
 
 // RestrictedJoinAuthorised reports whether a restricted-rule join (MSC3083)
@@ -103,7 +104,9 @@ func (s *Store) roomCreator(ctx context.Context, roomID string) string {
 // authoriserCanInvite reports whether authorisingUser has at least the room's
 // invite power level (the spec requirement for the user named in
 // join_authorised_via_users_server). A room with no m.room.power_levels event
-// defaults invite level to 0, so every member qualifies.
+// defaults invite level to 0, so every member qualifies. A room-version-12+
+// creator holds implicit (infinite) power — the creator is deliberately absent
+// from the power-levels users map (MSC4289) — and always qualifies.
 func (s *Store) authoriserCanInvite(ctx context.Context, roomID, authorisingUser string) bool {
 	id, err := s.GetStateEvent(ctx, roomID, "m.room.power_levels", "")
 	if err != nil {
@@ -118,5 +121,18 @@ func (s *Store) authoriserCanInvite(ctx context.Context, roomID, authorisingUser
 	if err != nil {
 		return false
 	}
-	return pl.UserLevel(authorisingUser) >= pl.Invite
+	if pl.UserLevel(authorisingUser) >= pl.Invite {
+		return true
+	}
+	// v12+ (MSC4289): the creator's power is implicit and the creator is not
+	// listed in `users`, so their effective level reads as users_default. Their
+	// implicit power is unbounded, which always clears the invite threshold.
+	if authorisingUser == s.roomCreator(ctx, roomID) {
+		if room, err := s.GetRoom(ctx, roomID); err == nil {
+			if rules, ok := roomver.Get(roomver.Version(room.Version)); ok && rules.CreatorPrivileged {
+				return true
+			}
+		}
+	}
+	return false
 }
