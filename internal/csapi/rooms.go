@@ -1445,21 +1445,21 @@ func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	// The redacted event must exist and belong to this room; redacting an
-	// event from a different room is rejected with 400.
+	// The redacted event must belong to this room when known; redacting an
+	// event from a different room is rejected with 400. An unknown event is
+	// allowed (spec: a redaction may target an event the sender's server has
+	// not seen yet — the receiving servers validate it), so only a known event
+	// of a different room is an error.
 	target, err := a.Store.GetEvent(r.Context(), eventID)
-	if err != nil {
-		httpx.WriteError(w, httpx.ErrNotFound("event not found"))
-		return
-	}
-	if target.RoomID != roomID {
+	if err == nil && target.RoomID != roomID {
 		httpx.WriteError(w, httpx.ErrInvalidParam("event is not in this room"))
 		return
 	}
 	// Redaction permission: the sender may redact their own events; others
-	// need at least the room's redact power level.
+	// need at least the room's redact power level. An unknown event falls to
+	// the power-level check (the sender is by definition not the target).
 	pl := a.roomPowerLevels(r.Context(), roomID)
-	if target.Sender != auth.UserID {
+	if target == nil || target.Sender != auth.UserID {
 		if pl.UserLevel(auth.UserID) < pl.Redact {
 			httpx.WriteError(w, httpx.ErrForbidden("you do not have permission to redact this event"))
 			return
