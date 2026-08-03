@@ -1245,6 +1245,7 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+
 	// Backward pagination may be paging into history the local server does not
 	// have (e.g. events predating a remote join). Per the spec's pagination +
 	// backfill contract (mirror of Synapse's get_messages), when a backward
