@@ -1490,7 +1490,7 @@ func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 	// the power-level check (the sender is by definition not the target).
 	pl := a.roomPowerLevels(r.Context(), roomID)
 	if target == nil || target.Sender != auth.UserID {
-		if pl.UserLevel(auth.UserID) < pl.Redact {
+		if a.roomUserLevel(r.Context(), roomID, auth.UserID) < pl.Redact {
 			httpx.WriteError(w, httpx.ErrForbidden("you do not have permission to redact this event"))
 			return
 		}
@@ -1538,6 +1538,27 @@ func (a *API) roomPowerLevels(ctx context.Context, roomID string) *rooms.PowerLe
 		}
 	}
 	return &rooms.PowerLevels{}
+}
+
+// roomUserLevel returns a user's effective power level in the room, honouring
+// the room version 12 creator privilege (MSC4239/MSC4289): the creator and any
+// additional creators are exempt from power-level checks even though they are
+// not listed in m.room.power_levels.users (their power is implicit). Handler
+//-level permission checks (redact, alias deletion) must use this instead of
+// PowerLevels.UserLevel directly, or a v12 room creator reads as level 0 (the
+// users_default) and is wrongly denied. Mirrors the userLevel closure in
+// rooms.Authorize.
+func (a *API) roomUserLevel(ctx context.Context, roomID, userID string) int64 {
+	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.create", ""); err == nil {
+		if ev, err := a.Store.GetEvent(ctx, id); err == nil {
+			if c, err := rooms.ParseCreate(ev.Content); err == nil {
+				if rules, ok := roomver.Get(roomver.Version(c.RoomVersion)); ok && rules.CreatorPrivileged && c.IsPrivileged(userID) {
+					return 1 << 62
+				}
+			}
+		}
+	}
+	return a.roomPowerLevels(ctx, roomID).UserLevel(userID)
 }
 
 // RoomTyping handles PUT /_matrix/client/v3/rooms/{roomID}/typing/{userID}.
@@ -1666,14 +1687,8 @@ func (a *API) DirectoryDeleteAlias(w http.ResponseWriter, r *http.Request) {
 	canDelete := creator == auth.UserID
 	if !canDelete {
 		// Check room power levels: if the user has power to set canonical_alias (50+).
-		if id, e := a.Store.GetStateEvent(r.Context(), roomID, "m.room.power_levels", ""); e == nil {
-			if ev, e := a.Store.GetEvent(r.Context(), id); e == nil {
-				if pl, e := rooms.ParsePowerLevels(ev.Content); e == nil {
-					if pl.UserLevel(auth.UserID) >= pl.EventLevel("m.room.canonical_alias", true) {
-						canDelete = true
-					}
-				}
-			}
+		if pl := a.roomPowerLevels(r.Context(), roomID); a.roomUserLevel(r.Context(), roomID, auth.UserID) >= pl.EventLevel("m.room.canonical_alias", true) {
+			canDelete = true
 		}
 	}
 	if !canDelete {
