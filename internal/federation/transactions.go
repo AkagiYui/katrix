@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
@@ -625,8 +626,12 @@ func (a *API) GetMissingEvents(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = 20
 	}
-	// Locate the newest of the earliest_events we have (they anchor the walk);
-	// the response is the events between that anchor and the latest events.
+	// The response is the events strictly between the earliest and latest sets:
+	// the ancestors of latest_events (walked via prev_events) that come after
+	// the newest earliest_event the server holds. A room-wide forward scan would
+	// return events that are neither ancestors of latest nor after earliest
+	// (e.g. a later join the requester already has) — the spec's "events which
+	// connect the latest to the earliest" must be exactly the gap.
 	anchorDepth := int64(0)
 	haveAnchor := false
 	for _, id := range req.EarliestEvents {
@@ -637,13 +642,44 @@ func (a *API) GetMissingEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// Pull the room's recent events in forward (oldest-first) order and filter
-	// down to those strictly after the anchor.
-	evs, err := a.Store.EventsForRoom(r.Context(), roomID, 0, 0, limit, "f")
-	if err != nil {
-		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
-		return
+	// Walk prev_events backwards from each latest event, collecting the events
+	// strictly after the anchor until the walk reaches the earliest set (or the
+	// depth budget / limit is exhausted). The latest events themselves are the
+	// response's target, not part of the gap: the walk starts at their
+	// prev_events.
+	collected := map[string]*storage.EventRow{}
+	queue := []string{}
+	for _, id := range req.LatestEvents {
+		if ev, err := a.Store.GetEvent(r.Context(), id); err == nil && ev != nil {
+			queue = append(queue, prevEventIDs(ev.RawJSON)...)
+		}
 	}
+	// Bounded work: at most limit*4 candidates visited (each may have several
+	// prev_events); the walk stops naturally at the earliest set.
+	visits := 0
+	for len(queue) > 0 && len(collected) < limit*4 && visits < limit*8 {
+		visits++
+		id := queue[0]
+		queue = queue[1:]
+		if id == "" || collected[id] != nil {
+			continue
+		}
+		ev, err := a.Store.GetEvent(r.Context(), id)
+		if err != nil || ev == nil {
+			continue
+		}
+		if ev.Depth <= anchorDepth {
+			continue
+		}
+		collected[id] = ev
+		queue = append(queue, prevEventIDs(ev.RawJSON)...)
+	}
+	// Order the collected events forward (oldest-first) by depth.
+	evs := make([]*storage.EventRow, 0, len(collected))
+	for _, e := range collected {
+		evs = append(evs, e)
+	}
+	sort.Slice(evs, func(i, j int) bool { return evs[i].Depth < evs[j].Depth })
 	// Does the requester have any joined users in this room? (Only then may they
 	// see unredacted events that predate the room's history_visibility.)
 	requester := remoteOriginOf(r)
@@ -668,9 +704,6 @@ func (a *API) GetMissingEvents(w http.ResponseWriter, r *http.Request) {
 	pdus := make([]json.RawMessage, 0, len(evs))
 	redactRules, haveRules := roomver.Get(roomver.Version(a.roomVersionOf(r.Context(), roomID)))
 	for _, e := range evs {
-		if haveAnchor && e.Depth <= anchorDepth {
-			continue
-		}
 		if len(pdus) >= limit {
 			break
 		}
@@ -687,6 +720,18 @@ func (a *API) GetMissingEvents(w http.ResponseWriter, r *http.Request) {
 		pdus = append(pdus, e.RawJSON)
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"origin": a.ServerName(), "events": pdus})
+}
+
+// prevEventIDs extracts the prev_events IDs from a raw event JSON (used to
+// walk an event's ancestry for get_missing_events).
+func prevEventIDs(raw []byte) []string {
+	var ev struct {
+		PrevEvents []string `json:"prev_events"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return nil
+	}
+	return ev.PrevEvents
 }
 
 // historyVisibility returns the room's current m.room.history_visibility value
