@@ -502,7 +502,9 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	// rooms.join.<room_id>.ephemeral.events).
 	for roomID := range rooms.Join {
 		jr := rooms.Join[roomID]
-		var ephEvents []json.RawMessage
+		// Empty (not nil) so the always-present section serialises as "events":
+		// [] rather than "events": null.
+		ephEvents := make([]json.RawMessage, 0)
 		// Typing ephemeral. A stop-typing leaves an empty user_ids list, which
 		// is itself a notification (spec + clients expect the empty EDU).
 		typingUsers := e.typing.TypingUsers(roomID)
@@ -547,9 +549,11 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 				ephEvents = append(ephEvents, eph)
 			}
 		}
-		if len(ephEvents) > 0 {
-			jr.Ephemeral = &EphemeralSection{Events: ephEvents}
-		}
+		// The ephemeral section is always present (possibly an empty events
+		// array): the spec requires rooms.join.<room_id>.ephemeral.events, and
+		// clients/tests rely on it (an omitted key is not the same as an empty
+		// section).
+		jr.Ephemeral = &EphemeralSection{Events: ephEvents}
 		rooms.Join[roomID] = jr
 	}
 

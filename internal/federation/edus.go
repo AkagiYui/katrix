@@ -387,38 +387,36 @@ func (a *API) applyDirectToDeviceEDU(ctx context.Context, content json.RawMessag
 }
 
 // applyReceiptEDU applies an inbound m.receipt EDU (spec receipt federation).
-// The content is the same shape /sync emits per room:
+// The content is keyed by room_id per the spec:
 //
-//	{ <event_id>: { <receipt_type>: { <user_id>: { "ts": <ts> } } } }
+//	{ <room_id>: { <event_id>: { <receipt_type>: { <user_id>: { "ts": <ts> } } } } }
 //
-// Each entry is persisted via SetReceipt so local users in the room see the
-// remote user's receipt in the ephemeral /sync section, and the room's local
-// members are woken.
+// The room is taken from the top-level key (never derived from the receipted
+// event, which the receiving server may not have yet). Each entry is persisted
+// via SetReceipt so local users in the room see the remote user's receipt in
+// the ephemeral /sync section, and the room's local members are woken.
 func (a *API) applyReceiptEDU(ctx context.Context, content json.RawMessage) error {
-	var byEvent map[string]map[string]map[string]struct {
+	var byRoom map[string]map[string]map[string]map[string]struct {
 		TS int64 `json:"ts"`
 	}
-	if err := json.Unmarshal(content, &byEvent); err != nil {
+	if err := json.Unmarshal(content, &byRoom); err != nil {
 		return fmt.Errorf("m.receipt: bad content: %w", err)
 	}
 	now := a.Now()
-	for eventID, byType := range byEvent {
-		for receiptType, byUser := range byType {
-			for userID, rc := range byUser {
-				// The room is not in the EDU envelope; derive it from the event.
-				ev, err := a.Store.GetEvent(ctx, eventID)
-				if err != nil || ev == nil {
-					continue
-				}
-				ts := rc.TS
-				if ts == 0 {
-					ts = now
-				}
-				if _, err := a.Store.SetReceipt(ctx, storage.ReceiptRow{
-					RoomID: ev.RoomID, UserID: userID, ReceiptType: receiptType,
-					EventID: eventID, TS: ts,
-				}); err == nil {
-					a.notifyRoomMembers(ctx, ev.RoomID)
+	for roomID, byEvent := range byRoom {
+		for eventID, byType := range byEvent {
+			for receiptType, byUser := range byType {
+				for userID, rc := range byUser {
+					ts := rc.TS
+					if ts == 0 {
+						ts = now
+					}
+					if _, err := a.Store.SetReceipt(ctx, storage.ReceiptRow{
+						RoomID: roomID, UserID: userID, ReceiptType: receiptType,
+						EventID: eventID, TS: ts,
+					}); err == nil {
+						a.notifyRoomMembers(ctx, roomID)
+					}
 				}
 			}
 		}

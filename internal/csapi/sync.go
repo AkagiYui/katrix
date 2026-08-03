@@ -275,6 +275,11 @@ func (a *API) ReadMarkers(w http.ResponseWriter, r *http.Request) {
 		_, _ = a.Store.SetReceipt(r.Context(), storage.ReceiptRow{
 			RoomID: roomID, UserID: auth.UserID, ReceiptType: "m.read", EventID: *req.ReadReceipt, TS: now,
 		})
+		// The read marker's m.read is a receipt like any other: broadcast it to
+		// the room's remote servers as an m.receipt EDU so their syncing users
+		// see it (spec receipt federation). Without this, read_markers receipts
+		// never federate.
+		a.broadcastReceiptEDU(r.Context(), roomID, auth.UserID, "m.read", *req.ReadReceipt)
 	}
 	// m.fully_read is room account data (spec: "read markers are stored as
 	// room account data"); clients receive it in the room's account_data sync
@@ -315,16 +320,21 @@ func (a *API) Receipt(w http.ResponseWriter, r *http.Request) {
 }
 
 // broadcastReceiptEDU queues an m.receipt EDU for the room's remote servers so
-// their syncing users see the receipt. Best-effort: a missing federation client
-// (monolith without federation) simply skips the broadcast.
+// their syncing users see the receipt. Per the spec the EDU content is keyed
+// by room_id: {<room_id>: {<event_id>: {<receipt_type>: {<user_id>: {ts}}}}},
+// so the receiving server derives the room directly from the content (it must
+// not depend on already knowing the receipted event). Best-effort: a missing
+// federation client (monolith without federation) simply skips the broadcast.
 func (a *API) broadcastReceiptEDU(ctx context.Context, roomID, userID, receiptType, eventID string) {
 	if a.fed == nil {
 		return
 	}
 	content := map[string]any{
-		eventID: map[string]any{
-			receiptType: map[string]any{
-				userID: map[string]any{"ts": a.Now()},
+		roomID: map[string]any{
+			eventID: map[string]any{
+				receiptType: map[string]any{
+					userID: map[string]any{"ts": a.Now()},
+				},
 			},
 		},
 	}
