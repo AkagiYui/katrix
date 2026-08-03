@@ -127,6 +127,7 @@ Guest user cannot upgrade other users
 Guest users are kicked from guest_access rooms on revocation of guest_access
 Guest users can join guest_access rooms
 Guest users can send messages to guest_access rooms if joined
+Guest users denied access over federation if guest access prohibited
 Guest users can sync from default guest_access rooms if joined
 Guest users can sync from shared guest_access rooms if joined
 Guest users can sync from world_readable guest_access rooms if joined
