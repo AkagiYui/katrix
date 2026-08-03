@@ -836,15 +836,24 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 
 	// Incremental windows are fetched newest-first (DESC LIMIT limit+1) so the
 	// `limit` most recent events are returned; the extra row reveals whether
-	// the window was truncated by the count limit. An initial sync (or a
-	// gap-free room) fetches the (already capped) window forward with the same
-	// +1 probe.
+	// the window was truncated by the count limit. Initial/full-room windows
+	// (initial sync, newly-joined rooms) fetch a wider raw set (Synapse's
+	// `load_limit = max(timeline_limit * 2, 10)`) so that pre-existing state
+	// events — create, member, power_levels, ... — do not squeeze the message
+	// window below `limit`: the raw set is filtered *after* fetching, and only
+	// filtered events count toward the limit (a room whose messages alone
+	// exceed the limit is limited, a room whose raw set merely contains many
+	// state events is not).
+	rawLimit := limit + 1
+	if opts.Since.Stream == 0 || newlyJoined {
+		rawLimit = max(limit*2, 10)
+	}
 	var evs []storage.EventRow
 	var err error
 	if opts.Since.Stream == 0 && !gapLimited {
-		evs, err = e.store.EventsForRoom(ctx, roomID, from, to, limit+1, "f")
+		evs, err = e.store.EventsForRoom(ctx, roomID, from, to, rawLimit, "f")
 	} else {
-		evs, err = e.store.EventsForRoom(ctx, roomID, from, to, limit+1, "b")
+		evs, err = e.store.EventsForRoom(ctx, roomID, from, to, rawLimit, "b")
 		for i, j := 0, len(evs)-1; i < j; i, j = i+1, j-1 {
 			evs[i], evs[j] = evs[j], evs[i]
 		}
@@ -852,10 +861,13 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	if err != nil {
 		return jr, err
 	}
-	// Count truncation: more than `limit` events in the window -> limited, keep
-	// the newest `limit`. An initial sync's window starts at to-limit, so a
-	// truncated tail is detected by checking whether older events exist below
-	// the window.
+	// Count truncation is decided AFTER client filtering: fetch the raw set,
+	// drop the filter-excluded events, then truncate to `limit` if more remain.
+	// For initial/full-room windows the raw fetch is wider (above), so a room
+	// whose messages alone exceed the limit is limited while a room whose raw
+	// set merely carries many state events is not. The extra probe row (+1)
+	// for incremental windows reveals truncation directly; an initial window
+	// that started at to-limit checks whether older events exist below it.
 	countLimited := false
 	if opts.Since.Stream == 0 && !gapLimited {
 		if trunc, terr := e.store.HasEventsBefore(ctx, roomID, from); terr == nil && trunc {
@@ -863,7 +875,6 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		}
 	} else if len(evs) > limit {
 		countLimited = true
-		evs = evs[len(evs)-limit:]
 	}
 	// Soft-failed (rejected) events are never delivered to clients: drop them
 	// from the timeline (their IDs remain valid as prev_events so pagination
@@ -884,9 +895,9 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		}
 	}
 
-	// Track senders for lazy-load members.
-	senders := map[string]bool{}
-	timeline := Timeline{Events: make([]json.RawMessage, 0, len(evs))}
+	// Track senders for lazy-load members. Events are rendered in stream order
+	// (newest last); when the filtered count exceeds `limit`, the newest `limit`
+	// are kept (countLimited was set above from the pre-filter count).
 	// MSC4115: annotate each timeline event with the syncing user's membership
 	// at the time of the event (unsigned.membership).
 	membershipAt := e.membershipAnnotator(ctx, roomID, opts.UserID, maxStream)
@@ -894,16 +905,31 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// unsigned.prev_content (and unsigned.prev_sender) so clients can render
 	// transitions (e.g. invite -> join, join -> leave).
 	prevContent := e.prevContentAnnotator(ctx, roomID, maxStream)
+	type renderedEvent struct {
+		raw  json.RawMessage
+		send string
+	}
+	var rendered []renderedEvent
 	earliest := int64(0)
 	for _, ev := range evs {
 		if !filter.keepTimeline(&ev) {
 			continue
 		}
-		timeline.Events = append(timeline.Events, filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(clientEvent(&ev), &ev), &ev), ev.EventID)))
-		senders[ev.Sender] = true
+		raw := filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(clientEvent(&ev), &ev), &ev), ev.EventID))
+		rendered = append(rendered, renderedEvent{raw: raw, send: ev.Sender})
 		if earliest == 0 || ev.StreamOrdering < earliest {
 			earliest = ev.StreamOrdering
 		}
+	}
+	if countLimited && len(rendered) > limit {
+		// Keep the newest `limit` filtered events.
+		rendered = rendered[len(rendered)-limit:]
+	}
+	timeline := Timeline{Events: make([]json.RawMessage, 0, len(rendered))}
+	senders := map[string]bool{}
+	for _, re := range rendered {
+		timeline.Events = append(timeline.Events, re.raw)
+		senders[re.send] = true
 	}
 	// prev_batch is the token a client passes to paginate further back: one
 	// position before the oldest visible event (spec/Synapse: backward /messages

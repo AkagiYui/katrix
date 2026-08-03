@@ -2235,16 +2235,30 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 			// their other devices must learn the room's device lists are now
 			// relevant (Complement's DeviceListUpdateOverFederation expects the
 			// joining user's own ID on their own sync), and on leave/ban their
-			// devices must learn the room was left (device_lists.left). The
-			// spurious self-records the old reverse-direction loop produced (the
-			// room's existing members being recorded when a new user joined) are
-			// gone — the sync engine computes "newly shared room" members instead.
+			// devices must learn the room was left (device_lists.left).
 			if mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban" {
 				_, _ = a.Store.RecordDeviceListChange(r.Context(), target, mc.Membership != "join")
 				if mc.Membership == "join" {
 					a.broadcastDeviceListForUser(r.Context(), target)
 				} else {
 					a.broadcastDeviceListDelete(r.Context(), target, roomID)
+					// The reverse direction: the user leaving/being banned stops
+					// sharing the room with its remaining members, so their /sync
+					// must report those users in device_lists.left (they can no
+					// longer receive the members' device updates). Only the *other*
+					// members are recorded — never on a join (a joining user learns
+					// the existing members via the sync engine's newly-shared
+					// computation / the members' device-list EDUs, and recording
+					// them globally would pollute the existing members' own syncs
+					// with their own IDs).
+					if members, err := a.Store.Members(r.Context(), roomID, "join"); err == nil {
+						for _, m := range members {
+							if m.UserID == target {
+								continue
+							}
+							_, _ = a.Store.RecordDeviceListChange(r.Context(), m.UserID, true)
+						}
+					}
 				}
 			}
 	}
