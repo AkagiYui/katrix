@@ -361,10 +361,10 @@ func pickJoinDestination(roomID string, via []string) string {
 			return v
 		}
 	}
-	if i := strings.LastIndexByte(roomID, ':'); i >= 0 {
-		return roomID[i+1:]
-	}
-	return ""
+	// The room ID's domain is everything after the first ':' — it is a server
+	// name which itself may carry a port (e.g. "!room:localhost:8448"), so a
+	// last-colon split would truncate it to just the port.
+	return ids.DomainOf(roomID)
 }
 
 // buildJoinEvent fills in and signs the make_join template. The remote server
