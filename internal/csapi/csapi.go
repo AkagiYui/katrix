@@ -9,6 +9,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/federation"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/media"
 	"github.com/AkagiYui/katrix/internal/roomver"
 )
 
@@ -18,6 +19,10 @@ type API struct {
 	uia        *uiaStore
 	syncEngine *syncEngine
 	fed        *federation.API
+	// media is the content-repository backend, used by URL preview to store the
+	// og:image blob so the response can carry an mxc:// URL. Set by
+	// SetMediaBackend during HTTP server assembly.
+	media *media.FileBackend
 	// stateMu serialises state-event writes so the idempotency check
 	// (read current state, compare content, write if different) is atomic
 	// under concurrent clients. Without it two identical concurrent PUTs both
@@ -42,6 +47,10 @@ func New(hs *homeserver.HS) *API {
 // joins and remote alias resolution. It is called once during HTTP server
 // assembly (the federation API is constructed after the CS API).
 func (a *API) SetFederation(fed *federation.API) { a.fed = fed }
+
+// SetMediaBackend wires the content-repository backend (used by URL preview to
+// store og:image blobs). Called once during HTTP server assembly.
+func (a *API) SetMediaBackend(m *media.FileBackend) { a.media = m }
 
 // supportedVersions is the list of Client-Server spec versions Katrix
 // self-reports. Per the design doc we only advertise versions whose behaviour

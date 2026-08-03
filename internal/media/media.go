@@ -54,6 +54,10 @@ func New(hs *homeserver.HS, remote RemoteFetcher) *API {
 	return &API{HS: hs, backend: backend, remote: remote}
 }
 
+// Backend exposes the file backend (used by the CS API's URL preview to store
+// og:image blobs under the same content-repository namespace).
+func (a *API) Backend() *FileBackend { return a.backend }
+
 // Register wires the media routes: the client-server content repository plus
 // the server-server (federation) media endpoints (GET /_matrix/federation/v1/
 // media/download|thumbnail/...). The federation endpoints are unauthenticated

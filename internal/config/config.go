@@ -67,6 +67,13 @@ type Config struct {
 		Enabled bool `yaml:"enabled"`
 	} `yaml:"metrics"`
 
+	// SSRFAllowPrivateIPs relaxes the outbound-fetch SSRF guard: URL-preview
+	// (and any other guarded fetch) is allowed to reach private/loopback/
+	// link-local/reserved IP ranges. Test harnesses only — Complement serves
+	// its URL-preview fixture at host.docker.internal (a reserved range);
+	// production deployments must keep it off.
+	SSRFAllowPrivateIPs bool `yaml:"ssrf_allow_private_ips"`
+
 	// IdentityServerInsecure skips TLS certificate verification for outbound
 	// identity-server requests. The sytest suite's mock identity server presents
 	// a self-signed certificate (keys/tls-selfsigned.crt), so this must be
@@ -197,6 +204,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("KATRIX_FEDERATION_INSECURE"); v != "" {
 		c.FederationInsecure = parseBool(v, c.FederationInsecure)
+	}
+	if v := os.Getenv("KATRIX_SSRF_ALLOW_PRIVATE_IPS"); v != "" {
+		c.SSRFAllowPrivateIPs = parseBool(v, c.SSRFAllowPrivateIPs)
 	}
 }
 

@@ -27,6 +27,11 @@ type Limits struct {
 	Timeout time.Duration
 	// MaxRedirects caps redirect hops (0 = no redirects).
 	MaxRedirects int
+	// AllowPrivateIPs relaxes the SSRF block: private/loopback/link-local/
+	// reserved ranges become fetchable. Test harnesses only (e.g. Complement
+	// serves its URL-preview fixture at host.docker.internal, which resolves
+	// to a reserved range); production must leave it off.
+	AllowPrivateIPs bool
 }
 
 // DefaultLimits are the production-safe defaults for URL preview / remote media.
@@ -39,11 +44,31 @@ var DefaultLimits = Limits{
 // IsBlocked reports whether an IP is in a private/loopback/link-local/reserved
 // range that must never be fetched.
 func IsBlocked(ip net.IP) bool {
+	return isBlocked(ip, false)
+}
+
+// isBlocked reports whether an IP is in a range the SSRF guard must reject.
+// allowPrivate relaxes the guard for test harnesses whose fixtures live on
+// private/reserved ranges (Complement's host.docker.internal): the private,
+// this-network (0.0.0.0/8), CGNAT, TEST-NET and reserved ranges become
+// fetchable, while loopback, link-local (which includes the cloud metadata
+// address 169.254.169.254), unspecified and multicast addresses stay blocked.
+func isBlocked(ip net.IP, allowPrivate bool) bool {
 	if ip == nil {
 		return true
 	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+	// Always blocked: loopback, link-local (cloud metadata), unspecified and
+	// multicast are never legitimate fetch targets, test harness included.
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsInterfaceLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	if allowPrivate {
+		// The remaining ranges are the SSRF-sensitive ones; the test harness
+		// explicitly opts into reaching them.
+		return false
+	}
+	if ip.IsPrivate() {
 		return true
 	}
 	// IPv4-mapped IPv6 (::ffff:a.b.c.d) reduces to the v4 check above.
@@ -65,13 +90,17 @@ func IsBlocked(ip net.IP) bool {
 // resolved IP is blocked. Returns an error if resolution fails or any IP is
 // blocked. When all IPs are blocked the URL must not be fetched.
 func CheckHost(ctx context.Context, host string) error {
+	return checkHost(ctx, host, false)
+}
+
+func checkHost(ctx context.Context, host string, allowPrivate bool) error {
 	// Strip a port if present.
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
 	// Literal IP?
 	if ip := net.ParseIP(host); ip != nil {
-		if IsBlocked(ip) {
+		if isBlocked(ip, allowPrivate) {
 			return fmt.Errorf("ssrf: ip %s is blocked", ip)
 		}
 		return nil
@@ -81,7 +110,7 @@ func CheckHost(ctx context.Context, host string) error {
 		return fmt.Errorf("ssrf: resolve %s: %w", host, err)
 	}
 	for _, ip := range ips {
-		if IsBlocked(ip) {
+		if isBlocked(ip, allowPrivate) {
 			return fmt.Errorf("ssrf: host %s resolves to blocked ip %s", host, ip)
 		}
 	}
@@ -90,6 +119,10 @@ func CheckHost(ctx context.Context, host string) error {
 
 // CheckURL parses rawURL and runs CheckHost on its hostname.
 func CheckURL(ctx context.Context, rawURL string) error {
+	return checkURL(ctx, rawURL, false)
+}
+
+func checkURL(ctx context.Context, rawURL string, allowPrivate bool) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("ssrf: parse: %w", err)
@@ -100,13 +133,17 @@ func CheckURL(ctx context.Context, rawURL string) error {
 	if u.Host == "" {
 		return fmt.Errorf("ssrf: empty host")
 	}
-	return CheckHost(ctx, u.Hostname())
+	return checkHost(ctx, u.Hostname(), allowPrivate)
 }
 
 // SafeTransport is an http.Transport whose DialContext checks every dialled IP
 // against IsBlocked. It catches DNS-rebinding because the check runs at connect
 // time on the actual address being dialled.
 func SafeTransport() *http.Transport {
+	return safeTransport(false)
+}
+
+func safeTransport(allowPrivate bool) *http.Transport {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	return &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -116,7 +153,7 @@ func SafeTransport() *http.Transport {
 				return nil, fmt.Errorf("ssrf: resolve %s: %w", host, err)
 			}
 			for _, ip := range ips {
-				if IsBlocked(ip.IP) {
+				if isBlocked(ip.IP, allowPrivate) {
 					return nil, fmt.Errorf("ssrf: dial %s blocked (%s)", host, ip.IP)
 				}
 			}
@@ -135,13 +172,13 @@ func Fetch(ctx context.Context, rawURL string, l Limits) (*http.Response, error)
 		ctx, cancel = context.WithTimeout(ctx, l.Timeout)
 		defer cancel()
 	}
-	if err := CheckURL(ctx, rawURL); err != nil {
+	if err := checkURL(ctx, rawURL, l.AllowPrivateIPs); err != nil {
 		return nil, err
 	}
 	client := &http.Client{
 		Timeout:       l.Timeout,
-		CheckRedirect: redirectGuard(ctx, l.MaxRedirects),
-		Transport:     SafeTransport(),
+		CheckRedirect: redirectGuard(ctx, l.MaxRedirects, l.AllowPrivateIPs),
+		Transport:     safeTransport(l.AllowPrivateIPs),
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -157,12 +194,12 @@ func Fetch(ctx context.Context, rawURL string, l Limits) (*http.Response, error)
 
 // redirectGuard returns a CheckRedirect that re-runs the SSRF check on each
 // redirect target and caps the hop count.
-func redirectGuard(ctx context.Context, max int) func(*http.Request, []*http.Request) error {
+func redirectGuard(ctx context.Context, max int, allowPrivate bool) func(*http.Request, []*http.Request) error {
 	return func(req *http.Request, via []*http.Request) error {
 		if max > 0 && len(via) > max {
 			return fmt.Errorf("ssrf: too many redirects")
 		}
-		return CheckURL(ctx, req.URL.String())
+		return checkURL(ctx, req.URL.String(), allowPrivate)
 	}
 }
 

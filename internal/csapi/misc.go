@@ -1,11 +1,14 @@
 package csapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -766,11 +769,14 @@ func stateStringField(content []byte, key string) string {
 }
 
 // PreviewURL handles GET /_matrix/.../preview_url. Fetches the target URL,
-// parses OpenGraph metadata, and returns it. SSRF protection is enforced at
-// the DNS layer: the host is resolved and every IP is checked against the
-// private/loopback/link-local/reserved ranges before dialling, and again at
-// dial time to defeat DNS rebinding. Redirects, body size and timeout are all
-// capped.
+// parses OpenGraph metadata, and returns it. When the page declares an
+// og:image, the image is fetched through the same SSRF-guarded path and stored
+// in the content repository, and the response carries its mxc:// URI plus the
+// image dimensions and size (spec URL previews; Complement asserts these). The
+// image upload is best-effort: a fetch or decode failure leaves the preview
+// without the image fields rather than failing the whole request. SSRF
+// protection is enforced at the DNS layer (and at dial time, defeating DNS
+// rebinding); redirects, body size and timeout are all capped.
 func (a *API) PreviewURL(w http.ResponseWriter, r *http.Request) {
 	target := r.URL.Query().Get("url")
 	if target == "" {
@@ -781,7 +787,13 @@ func (a *API) PreviewURL(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrInvalidParam("url must be absolute http(s)"))
 		return
 	}
-	resp, err := ssrf.Fetch(r.Context(), target, ssrf.DefaultLimits)
+	limits := ssrf.Limits{
+		MaxBodyBytes:    ssrf.DefaultLimits.MaxBodyBytes,
+		Timeout:         ssrf.DefaultLimits.Timeout,
+		MaxRedirects:    ssrf.DefaultLimits.MaxRedirects,
+		AllowPrivateIPs: a.Config.SSRFAllowPrivateIPs,
+	}
+	resp, err := ssrf.Fetch(r.Context(), target, limits)
 	if err != nil {
 		httpx.WriteError(w, httpx.NewError(http.StatusForbidden, "M_FORBIDDEN", "refused to preview url: "+err.Error()))
 		return
@@ -790,6 +802,38 @@ func (a *API) PreviewURL(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(resp.Body)
 	og := extractOpenGraph(string(body))
 	og["org.matrix.msc4095"] = map[string]any{}
+	// og:image handling: download the declared image, store it in the content
+	// repository, and report its mxc URI, size and dimensions. Relative og:image
+	// URLs resolve against the previewed page's URL (OpenGraph allows relative
+	// URLs). Failures leave the text metadata intact.
+	if img := og["og:image"].(string); img != "" && a.media != nil {
+		if u, err := url.Parse(target); err == nil {
+			if iu, perr := url.Parse(img); perr == nil {
+				if !iu.IsAbs() {
+					iu.Scheme = u.Scheme
+					iu.Host = u.Host
+					img = iu.String()
+				}
+			}
+		}
+		if iresp, ierr := ssrf.Fetch(r.Context(), img, limits); ierr == nil {
+			blob, _ := io.ReadAll(io.LimitReader(iresp.Body, a.Config.Media.MaxUploadBytes))
+			ct := iresp.Header.Get("Content-Type")
+			iresp.Body.Close()
+			if len(blob) > 0 {
+				mediaID, uerr := a.media.Upload(r.Context(), bytes.NewReader(blob), ct, "og-image", "", a.Now())
+				if uerr == nil {
+					mxc := "mxc://" + a.ServerName() + "/" + mediaID
+					og["og:image"] = mxc
+					og["matrix:image:size"] = len(blob)
+					if cfg, _, derr := image.DecodeConfig(bytes.NewReader(blob)); derr == nil {
+						og["og:image:width"] = cfg.Width
+						og["og:image:height"] = cfg.Height
+					}
+				}
+			}
+		}
+	}
 	httpx.WriteJSON(w, http.StatusOK, og)
 }
 
@@ -825,6 +869,15 @@ func extractOpenGraph(html string) map[string]any {
 	}
 	if t := get("og:site_name"); t != "" {
 		out["og:site_name"] = t
+	}
+	// The spec's OpenGraph subset also exposes the page's type and canonical
+	// URL (the og:url meta carries the canonical link, distinct from the
+	// fetched URL).
+	if t := get("og:type"); t != "" {
+		out["og:type"] = t
+	}
+	if u := get("og:url"); u != "" {
+		out["og:url"] = u
 	}
 	return out
 }

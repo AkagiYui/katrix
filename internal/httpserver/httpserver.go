@@ -47,6 +47,8 @@ func New(hs *homeserver.HS) (*Server, error) {
 	fed.Register(mux)
 
 	med := media.New(hs, fed.Client())
+	// URL preview stores og:image blobs through the content repository.
+	cs.SetMediaBackend(med.Backend())
 	med.Register(mux)
 
 	// Metrics endpoint (Prometheus text format).

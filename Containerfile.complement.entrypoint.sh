@@ -63,6 +63,10 @@ export KATRIX_LISTEN_CLIENT=":8008"
 export KATRIX_LISTEN_FEDERATION=":8448"
 export KATRIX_FEDERATION_ENABLED="${KATRIX_FEDERATION_ENABLED:-true}"
 export KATRIX_REGISTRATION_ENABLED="${KATRIX_REGISTRATION_ENABLED:-true}"
+# Complement's URL-preview fixture (web.NewServer) is served at
+# host.docker.internal:PORT, which resolves to a reserved range; let the SSRF
+# guard reach it. Production deployments leave this off.
+export KATRIX_SSRF_ALLOW_PRIVATE_IPS="${KATRIX_SSRF_ALLOW_PRIVATE_IPS:-true}"
 
 # Trust Complement's CA for OUTBOUND federation requests too: SSL_CERT_FILE
 # points at /ca/complement-ca.crt, so when Complement mounts its CA (at
