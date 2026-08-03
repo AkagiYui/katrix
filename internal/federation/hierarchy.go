@@ -39,7 +39,7 @@ func (a *API) RoomSummary(r *http.Request, roomID, userID string) (json.RawMessa
 	if _, err := a.Store.GetRoom(r.Context(), roomID); err != nil {
 		return nil, err
 	}
-	summary, _, _, err := a.hierarchySummary(r, roomID, userID)
+	summary, _, _, err := a.hierarchySummary(r, roomID, userID, false)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +98,7 @@ func (a *API) hierarchySubtreeVia(r *http.Request, roomID, userID string, sugges
 	if !a.hierarchyVisible(r, roomID, userID) {
 		return nil, false
 	}
-	summary, children, isSpace, err := a.hierarchySummary(r, roomID, userID)
+	summary, children, isSpace, err := a.hierarchySummary(r, roomID, userID, suggestedOnly)
 	if err != nil {
 		return nil, false
 	}
@@ -155,8 +155,11 @@ type hierarchyChild struct {
 // current local state. The second return value is the room's m.space.child
 // links (ordered by link-event stream ordering, redacted/empty links omitted);
 // the third reports whether the room is a space (m.space create type), and the
-// last is an error when the room is unknown locally.
-func (a *API) hierarchySummary(r *http.Request, roomID, userID string) (json.RawMessage, []hierarchyChild, bool, error) {
+// last is an error when the room is unknown locally. When suggestedOnly is
+// true, non-suggested child links are omitted from both the returned children
+// and the children_state section (MSC2946: "suggested_only ... the server
+// should only return the children which are suggested").
+func (a *API) hierarchySummary(r *http.Request, roomID, userID string, suggestedOnly bool) (json.RawMessage, []hierarchyChild, bool, error) {
 	room, err := a.Store.GetRoom(r.Context(), roomID)
 	if err != nil {
 		return nil, nil, false, err
@@ -219,6 +222,11 @@ func (a *API) hierarchySummary(r *http.Request, roomID, userID string) (json.Raw
 			Suggested bool     `json:"suggested"`
 		}
 		_ = json.Unmarshal(ev.Content, &c)
+		// MSC2946 suggested_only: drop non-suggested links from both the
+		// traversal and the children_state section.
+		if suggestedOnly && !c.Suggested {
+			continue
+		}
 		children = append(children, hierarchyChild{
 			RoomID: ev.StateKey, Suggested: c.Suggested, StreamOrd: ev.StreamOrdering, ViaServers: c.Via,
 		})
