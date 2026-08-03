@@ -129,6 +129,12 @@ sub _get_config
       # requests (3PID invites).
       identity_server_insecure => $JSON::true,
 
+      # Both katrix's own federation listener and every federation test server
+      # sytest stands up present self-signed certificates, so outbound
+      # federation TLS verification must be skipped or every cross-server call
+      # aborts with a "bad certificate" alert.
+      federation_insecure => $JSON::true,
+
       federation_tls => {
          cert_path => $self->{paths}{tls_cert},
          key_path  => $self->{paths}{tls_key},

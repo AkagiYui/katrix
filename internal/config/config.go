@@ -72,6 +72,16 @@ type Config struct {
 	// a self-signed certificate (keys/tls-selfsigned.crt), so this must be
 	// enabled there; production deployments should leave it off.
 	IdentityServerInsecure bool `yaml:"identity_server_insecure"`
+
+	// FederationInsecure skips TLS certificate verification for outbound
+	// federation requests (fetching remote signing keys, querying profiles,
+	// joining rooms, backfilling, ...). Per the server-server spec, federation
+	// must be authenticated by a certificate chain ending in a trust anchor —
+	// this flag exists solely for test harnesses (SyTest) whose homeservers
+	// present self-signed certificates; production deployments must keep it
+	// off. Mirrors Synapse's federation_verify_certificates and Dendrite's
+	// disable_tls_validation.
+	FederationInsecure bool `yaml:"federation_insecure"`
 }
 
 // Default returns a config populated with development defaults.
@@ -184,6 +194,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("KATRIX_METRICS_ENABLED"); v != "" {
 		c.Metrics.Enabled = parseBool(v, c.Metrics.Enabled)
+	}
+	if v := os.Getenv("KATRIX_FEDERATION_INSECURE"); v != "" {
+		c.FederationInsecure = parseBool(v, c.FederationInsecure)
 	}
 }
 

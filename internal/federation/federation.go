@@ -25,7 +25,7 @@ type API struct {
 // New constructs the federation API surface with an outbound client for key
 // fetching and a per-event PDU signature verifier backed by that client.
 func New(hs *homeserver.HS) *API {
-	client := NewClient(hs.Store, hs.Key, hs.ServerName())
+	client := NewClient(hs.Store, hs.Key, hs.ServerName(), hs.Config.FederationInsecure)
 	return &API{
 		HS:       hs,
 		client:   client,

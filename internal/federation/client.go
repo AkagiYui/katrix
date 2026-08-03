@@ -3,6 +3,7 @@ package federation
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -31,12 +32,20 @@ type Client struct {
 
 // NewClient constructs an outbound federation client backed by store for key
 // caching. The signing key + serverName are used to sign outbound requests.
-func NewClient(store *storage.Store, key *crypto.SigningKey, serverName string) *Client {
+// When insecure is set, TLS certificate verification is skipped for outbound
+// federation requests — a test-harness-only escape hatch (the SyTest suite's
+// homeservers present self-signed certificates); production deployments must
+// leave it off.
+func NewClient(store *storage.Store, key *crypto.SigningKey, serverName string, insecure bool) *Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if insecure {
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- test-only flag
+	}
 	return &Client{
 		store:      store,
 		key:        key,
 		serverName: serverName,
-		http:       &http.Client{Timeout: 30 * time.Second},
+		http:       &http.Client{Timeout: 30 * time.Second, Transport: tr},
 	}
 }
 
