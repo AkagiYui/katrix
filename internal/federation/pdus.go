@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/AkagiYui/katrix/internal/events"
@@ -508,21 +509,44 @@ func (a *API) reconcileStateFrom(ctx context.Context, roomID, server, anchorEven
 	if !ok {
 		return
 	}
-	// Fetch every event the snapshot names that we do not hold.
+	// Fetch every event the snapshot names that we do not hold. The /event
+	// fetches are network round-trips against a remote server; fetch them
+	// concurrently (bounded) so a large auth chain (Complement's MSC4297 v2.1
+	// tests hand over ~240 events) does not take tens of seconds serially and
+	// blow the caller's request deadline under load.
 	raws := map[string]json.RawMessage{}
 	unfetchable := map[string]bool{}
 	all := append(append([]string{}, stateIDs...), authIDs...)
+	var (
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, 8)
+	)
 	for _, id := range all {
 		if _, err := a.Store.GetEvent(ctx, id); err == nil {
 			continue
 		}
-		raw, ferr := a.fetchEvent(ctx, server, id)
-		if ferr != nil {
-			unfetchable[id] = true
-			continue
-		}
-		raws[id] = raw
+		id := id
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+			raw, ferr := a.fetchEvent(ctx, server, id)
+			mu.Lock()
+			defer mu.Unlock()
+			if ferr != nil {
+				unfetchable[id] = true
+				return
+			}
+			raws[id] = raw
+		}()
 	}
+	wg.Wait()
 	// Transitive rejection: an event whose auth_events reference an unfetchable
 	// or already-rejected event cannot be authorised and is itself rejected.
 	// Iterate to a fixed point (the rejection propagates up the auth chain).
