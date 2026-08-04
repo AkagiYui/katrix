@@ -258,6 +258,16 @@ jobs:
       - name: build katrix complement image
         run: docker build -f Containerfile.complement -t homeserver:latest .
 
+      # The complement-crypto checkout below overwrites the vendored
+      # complement-crypto/ directory of this repository, which is where
+      # katrix's patches live. Stash them outside the workspace first so the
+      # apply step below can still find them.
+      - name: stash katrix complement-crypto patches
+        run: |
+          mkdir -p "$RUNNER_TEMP/katrix-patches"
+          cp complement-crypto/patches/*.patch "$RUNNER_TEMP/katrix-patches/"
+          ls "$RUNNER_TEMP/katrix-patches"
+
       - name: checkout complement-crypto
         uses: actions/checkout@v7
         with:
@@ -277,7 +287,7 @@ jobs:
       # unpatched code.
       - name: apply complement-crypto patches
         run: |
-          for p in complement-crypto/patches/*.patch; do
+          for p in "$RUNNER_TEMP"/katrix-patches/*.patch; do
             echo "applying $p"
             patch -p1 -d complement-crypto < "$p"
           done

@@ -88,6 +88,7 @@ Can recv a device message using /sync
 Can register using an email address
 Can reject invites over federation for rooms with version 1
 Can reject invites over federation for rooms with version 2
+Can reject invites over federation for rooms with version 3
 Can remove tag
 Can request federation format via the filter
 Can sync a joined room
@@ -189,6 +190,7 @@ Outbound federation can query v1 /send_join
 Outbound federation can query v2 /send_join
 Outbound federation can request missing events
 Outbound federation can send invites via v1 API
+Outbound federation rejects backfill containing invalid JSON for events in room version 6
 Outbound federation correctly handles unsupported room versions
 Outbound federation passes make_join failures through to the client
 Outbound federation rejects invite response which include invalid JSON for room version 6

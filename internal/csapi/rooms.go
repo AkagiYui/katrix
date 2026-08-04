@@ -2260,6 +2260,17 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	// Update the denormalised membership table.
 	mc, _ := rooms.ParseMember(contentRaw)
 	if mc != nil {
+		// The target's membership BEFORE this event: a member(join) event whose
+		// target was already joined is a profile update (displayname/avatar_url
+		// re-emission), not a join — the device list did not change, so no
+		// device-list change/EDU is recorded (Complement's partial-state suite
+		// fails the run on an unexpected m.device_list_update EDU for a mere
+		// display-name change). Must be read BEFORE UpsertMembership below,
+		// which would otherwise already reflect the new membership.
+		prevMembership := ""
+		if pm, err := a.Store.GetMembership(r.Context(), roomID, target); err == nil {
+			prevMembership = pm.Membership
+		}
 		if err := a.Store.UpsertMembership(r.Context(), storage.MembershipRow{
 			RoomID: roomID, UserID: target, Membership: mc.Membership,
 			EventID: ev.EventID(), StreamOrdering: stream, Depth: ev.Depth(),
@@ -2279,16 +2290,6 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 		// relevant (Complement's DeviceListUpdateOverFederation expects the
 		// joining user's own ID on their own sync), and on leave/ban their
 		// devices must learn the room was left (device_lists.left).
-		//
-		// A member(join) event whose target is already joined is a profile
-		// update (displayname/avatar_url re-emission), not a join: the user's
-		// device list did not change, so no device-list EDU/change is recorded
-		// (Complement's partial-state suite fails the run when an unexpected
-		// m.device_list_update EDU arrives for a mere display-name change).
-		prevMembership := ""
-		if pm, err := a.Store.GetMembership(r.Context(), roomID, target); err == nil {
-			prevMembership = pm.Membership
-		}
 		isProfileUpdate := mc.Membership == "join" && prevMembership == "join"
 		if !isProfileUpdate && (mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban") {
 			_, _ = a.Store.RecordDeviceListChange(r.Context(), target, mc.Membership != "join")
