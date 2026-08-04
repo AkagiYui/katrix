@@ -909,24 +909,35 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// transitions (e.g. invite -> join, join -> leave).
 	prevContent := e.prevContentAnnotator(ctx, roomID, maxStream)
 	type renderedEvent struct {
-		raw  json.RawMessage
-		send string
+		raw    json.RawMessage
+		send   string
+		stream int64
 	}
 	var rendered []renderedEvent
-	earliest := int64(0)
 	for _, ev := range evs {
 		if !filter.keepTimeline(&ev) {
 			continue
 		}
 		raw := filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(clientEvent(&ev), &ev), &ev), ev.EventID))
-		rendered = append(rendered, renderedEvent{raw: raw, send: ev.Sender})
-		if earliest == 0 || ev.StreamOrdering < earliest {
-			earliest = ev.StreamOrdering
-		}
+		rendered = append(rendered, renderedEvent{raw: raw, send: ev.Sender, stream: ev.StreamOrdering})
 	}
 	if countLimited && len(rendered) > limit {
 		// Keep the newest `limit` filtered events.
 		rendered = rendered[len(rendered)-limit:]
+	}
+	// prev_batch anchor: the oldest event the client actually receives in the
+	// stream window. Computed AFTER count truncation: a truncated window's
+	// dropped oldest events must remain reachable, so prev_batch must point
+	// before the oldest *delivered* event — paginating back from a token below
+	// a dropped event skips it, and it was not delivered in the window either
+	// (spec invariant: every event is either in /sync or reachable via
+	// /messages from prev_batch; Synapse derives prev_batch from the final
+	// timeline's recents[0].stream - 1 for the same reason).
+	earliest := int64(0)
+	for _, re := range rendered {
+		if earliest == 0 || re.stream < earliest {
+			earliest = re.stream
+		}
 	}
 	// A count-limited timeline that contains any state event must also carry
 	// the room's CURRENT state: Synapse's "always include current state in the
@@ -968,7 +979,7 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 					if !filter.keepTimeline(&se) {
 						continue
 					}
-					rendered = append(rendered, renderedEvent{raw: filter.applyEventFields(prevContent(clientEvent(&se), &se)), send: se.Sender})
+					rendered = append(rendered, renderedEvent{raw: filter.applyEventFields(prevContent(clientEvent(&se), &se)), send: se.Sender, stream: se.StreamOrdering})
 				}
 			}
 		}
