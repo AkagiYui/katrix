@@ -193,6 +193,7 @@ Outbound federation can send events
 Outbound federation can send invites via v1 API
 Outbound federation correctly handles unsupported room versions
 Outbound federation passes make_join failures through to the client
+Outbound federation rejects backfill containing invalid JSON for events in room version 6
 Outbound federation rejects invite response which include invalid JSON for room version 6
 Outbound federation rejects m.room.create events with an unknown room version
 Outbound federation rejects send_join responses with no m.room.create event
