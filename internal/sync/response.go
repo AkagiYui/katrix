@@ -607,6 +607,13 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 			// Build content: {event_id: {receipt_type: {user_id: {ts, thread_id?}}}}
 			// (spec + MSC3773: a threaded read receipt carries the thread root id
 			// under thread_id; the unthreaded form omits it).
+			//
+			// MSC4102: when a user has both an unthreaded and a threaded receipt
+			// for the same event, the unthreaded receipt must be the one emitted —
+			// it is the stronger signal (it reads every timeline, including the
+			// thread). The receipts arrive stream-ordered (a later unthreaded
+			// receipt supersedes an earlier threaded one), so an existing
+			// unthreaded entry is never overwritten by a threaded one.
 			byRoom := map[string]map[string]map[string]map[string]any{}
 			for _, rc := range receipts {
 				if byRoom[rc.RoomID] == nil {
@@ -617,6 +624,12 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 				}
 				if byRoom[rc.RoomID][rc.EventID][rc.ReceiptType] == nil {
 					byRoom[rc.RoomID][rc.EventID][rc.ReceiptType] = map[string]any{}
+				}
+				existing := byRoom[rc.RoomID][rc.EventID][rc.ReceiptType][rc.UserID]
+				if existing != nil && rc.ThreadID != "" {
+					// An unthreaded receipt already occupies the key; a threaded
+					// receipt for the same event must not displace it (MSC4102).
+					continue
 				}
 				userObj := map[string]any{"ts": rc.TS}
 				if rc.ThreadID != "" {
