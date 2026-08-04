@@ -253,6 +253,7 @@ User can create and send/receive messages in a room with version 1
 User can create and send/receive messages in a room with version 2
 User can invite remote user to room with version 1
 User can invite remote user to room with version 2
+User can invite remote user to room with version 3
 User directory correctly update on display name change
 User in remote room doesn't appear in user directory after server left room
 User joining then leaving public room appears and dissappears from directory
