@@ -1,0 +1,37 @@
+Stop complement-crypto's Rust RPC server from panicking when the
+matrix-rust-sdk returns one of the newer NotificationStatus variants.
+
+matrix-rust-sdk's NotificationStatus enum has grown EventNotFound /
+EventFilteredOut / EventRedacted alongside the original Event variant
+(notification.rs: `Event { item }`, `EventNotFound`, `EventFilteredOut`,
+`EventRedacted`). complement-crypto's GetNotification wrapper only handled
+Event and called log.Panicf for everything else. A panic in the RPC server
+kills the shared RPC process, so every later test in the same `go test`
+process then fails with "connection is shut down" noise, obscuring the
+real failures.
+
+Map the non-Event variants to a plain error (which surfaces the actual
+variant via %T) so the test fails cleanly and the RPC server stays up.
+Note the original panic also printed `%T` of the nil `notifItem` (always
+`*matrix_sdk_ffi.NotificationItem`), hiding the true status type; log the
+status value instead.
+
+--- a/internal/api/rust/rust.go
++++ b/internal/api/rust/rust.go
+@@ -181,9 +181,16 @@ func (c *RustClient) GetNotification(t ct.TestLike, roomID, eventID string) (*ap
+ 	switch notifItemType := notifStatus.(type) {
+ 	case matrix_sdk_ffi.NotificationStatusEvent:
+ 		notifItem = &notifItemType.Item
++	default:
++		// matrix-rust-sdk's NotificationStatus has gained EventNotFound /
++		// EventFilteredOut / EventRedacted variants. The RPC server must not
++		// panic on them: a panic kills the shared RPC process, which cascades
++		// into unrelated tests in the same run ("connection is shut down").
++		// Surface the actual variant (via %T) as a test error instead.
++		return nil, fmt.Errorf("GetNotification: unexpected notification status type %T", notifStatus)
+ 	}
+ 	if notifItem == nil {
+-		log.Panicf("GetNotification: unexpected notification status type %T", notifItem)
++		return nil, fmt.Errorf("GetNotification: unexpected notification status type %T", notifStatus)
+ 	}
+ 	notifEvent := notifItem.Event.(matrix_sdk_ffi.NotificationEventTimeline)

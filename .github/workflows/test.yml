@@ -270,6 +270,17 @@ jobs:
           repository: matrix-org/matrix-rust-sdk
           ref: main
           path: complement-crypto/rust-sdk
+      # complement-crypto tracks matrix-rust-sdk main, which has moved ahead of
+      # complement-crypto's wrapper code. Apply katrix's local patches before
+      # building (see complement-crypto/patches/). A patch that no longer
+      # applies cleanly fails the build loudly rather than silently shipping
+      # unpatched code.
+      - name: apply complement-crypto patches
+        run: |
+          for p in complement-crypto/patches/*.patch; do
+            echo "applying $p"
+            patch -p1 -d complement-crypto < "$p"
+          done
 
       # --- toolchains for the two SDK client axes (jr,rj) ---
       - uses: actions/setup-node@v7
