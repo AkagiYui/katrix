@@ -14,6 +14,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/eventstate"
 	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/metrics"
+	"github.com/AkagiYui/katrix/internal/rooms"
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
 )
@@ -137,16 +138,23 @@ func (a *API) resyncPartialState(ctx context.Context, roomID string, version roo
 			continue
 		}
 		if a.resyncFromServer(ctx, roomID, version, rules, server) {
-			// Success: clear the partial-state flag and wake the room's members
-			// so eager /sync responses (and long-polls) pick up the room.
+			// Re-check the events that were accepted while the room was partial
+			// against the now-complete state: events that fail authorization are
+			// soft-failed (hidden from clients, not applied to membership).
+			// This runs BEFORE the partial flag is cleared so any concurrent
+			// /sync, /members or /state_ids request (which blocks on the flag)
+			// observes the revalidated state, not the pre-revalidation one.
+			a.revalidatePartialWindow(ctx, roomID)
+			// Clear the partial-state flag and wake the room's members so eager
+			// /sync responses (and long-polls) pick up the room.
 			_ = a.Store.SetRoomPartialState(ctx, roomID, false)
 			a.notifyRoomMembers(ctx, roomID)
 			// Servers that joined (or were already in) the room while it was
 			// partial may have missed device-list updates broadcast during the
 			// resync window — the membership was incomplete, so the destination
-			// list was wrong. Now that the full state is known, send every local
-			// user's current device list to every server in the room (MSC3902;
-			// mirror of Synapse's handle_room_un_partial_stated).
+			// list was wrong. Replay the updates that happened during the window
+			// to every server in the room (MSC3902; mirror of Synapse's
+			// handle_room_un_partial_stated).
 			a.broadcastDeviceListStateToRoom(ctx, roomID)
 			return
 		}
@@ -269,29 +277,167 @@ func (a *API) resyncFromServer(ctx context.Context, roomID string, version roomv
 	return true
 }
 
-// broadcastDeviceListStateToRoom sends every local joined user's current device
-// list to every remote server in the room as m.device_list_update EDUs. Called
-// when a partial-state room's resync completes: servers that were in the room
-// (or joined it) while it was partial may have missed earlier device-list
-// updates because the joining server did not know the full membership (MSC3902
-// — the joining server must send device-list updates to every server that was
-// in the room once the state re-sync completes).
+// revalidatePartialWindow re-checks the state events that were accepted while
+// the room was partial (MSC3902): their authorization was necessarily skipped
+// or incomplete because the room's state (and therefore the auth_events they
+// could be checked against) was incomplete. Now that the full state is known,
+// an event that fails authorization is soft-failed (marked rejected): it is
+// hidden from clients and never applied to membership — so an event that was
+// accepted "incorrectly" during the partial window is rejected once the resync
+// completes (Complement's State_accepted_incorrectly), and one that was
+// already rejected stays rejected. Events accepted while partial and still
+// valid remain untouched.
+func (a *API) revalidatePartialWindow(ctx context.Context, roomID string) {
+	room, err := a.Store.GetRoom(ctx, roomID)
+	if err != nil {
+		return
+	}
+	// The events to re-validate are exactly the state events that arrived via
+	// inbound transactions while the room was partial (tracked at ingest): the
+	// send_join's critical state and the resync's fetched events are
+	// authoritative and are never re-checked.
+	a.partialMu.Lock()
+	ids := make([]string, 0, len(a.partialStateEvents[roomID]))
+	for id := range a.partialStateEvents[roomID] {
+		ids = append(ids, id)
+	}
+	delete(a.partialStateEvents, roomID)
+	a.partialMu.Unlock()
+	if len(ids) == 0 {
+		return
+	}
+	rows, err := a.Store.EventsByIDs(ctx, ids)
+	if err != nil || len(rows) == 0 {
+		return
+	}
+	log.Printf("katrix: resync %s: revalidating %d partial-window events", roomID, len(rows))
+	version := roomver.Version(room.Version)
+	rules, ok := roomver.Get(version)
+	if !ok {
+		return
+	}
+	for i := range rows {
+		ev := &rows[i]
+		st := a.memberStateSnapshotFromStore(ctx, roomID, ev.Sender, ev.StateKey)
+		if err := rooms.Authorize(rules, ev.Type, ev.StateKey, ev.Sender, ev.Content, st, true); err != nil {
+			// Rejected against the full state: soft-fail (if not already) and
+			// pull the event's tuple out of the room's state so it is hidden
+			// from clients and never applied to membership.
+			if already, _ := a.Store.IsEventRejected(ctx, ev.EventID); !already {
+				a.Store.MarkEventRejected(ctx, ev.EventID)
+				_ = a.Store.RemoveFromState(ctx, roomID, ev.Type, ev.StateKey, ev.EventID)
+				log.Printf("katrix: resync %s: partial-window event %s rejected on revalidation: %v", roomID, ev.EventID, err)
+				if ev.Type == "m.room.member" && ev.StateKey != "" {
+					// The member event's membership row must revert to the
+					// state's replacement (e.g. a kick that was wrongly applied
+					// — the user is still joined per the full state).
+					a.restoreMembershipFromState(ctx, roomID, ev.StateKey)
+				}
+			}
+		} else {
+			// Now authorized against the full state: the event is valid, so make
+			// sure it is (still) applied. The resync's re-seed replaced the
+			// room's state with the fetched full snapshot, which drops the
+			// partial-window events; a valid one is re-applied (it is newer
+			// than the join-anchored snapshot). If it was soft-failed during the
+			// partial window (only because the state was incomplete), un-soft-fail
+			// it so it becomes visible again.
+			if rejected, _ := a.Store.IsEventRejected(ctx, ev.EventID); rejected {
+				a.Store.UnmarkEventRejected(ctx, ev.EventID)
+				if ev.Type == "m.room.member" && ev.StateKey != "" {
+					a.applyRemoteMembership(ctx, roomID, ev.StateKey, ev.Content, ev.EventID, ev.Depth)
+				}
+			}
+			// Every tracked event is a state event (ingest only tracks events
+			// with a present state_key), so its tuple is re-applied even when
+			// the key is the empty string (m.room.create-style events).
+			_ = a.Store.UpsertState(ctx, roomID, ev.Type, ev.StateKey, ev.EventID)
+		}
+	}
+}
+
+// restoreMembershipFromState re-applies the membership row for userID from the
+// room's current state after a member event was rejected on revalidation.
+func (a *API) restoreMembershipFromState(ctx context.Context, roomID, userID string) {
+	id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.member", userID)
+	if err != nil {
+		return
+	}
+	ev, err := a.Store.GetEvent(ctx, id)
+	if err != nil {
+		return
+	}
+	a.applyRemoteMembership(ctx, roomID, userID, ev.Content, ev.EventID, ev.Depth)
+}
+
+// memberStateSnapshotFromStore builds a rooms.StateSnapshot from the room's
+// current state (no HTTP request needed).
+func (a *API) memberStateSnapshotFromStore(ctx context.Context, roomID, sender, target string) rooms.StateSnapshot {
+	var st rooms.StateSnapshot
+	for _, tc := range []struct {
+		typ, sk string
+		dst     *json.RawMessage
+	}{
+		{"m.room.create", "", &st.Create},
+		{"m.room.join_rules", "", &st.JoinRules},
+		{"m.room.power_levels", "", &st.PowerLevel},
+		{"m.room.guest_access", "", &st.GuestAccess},
+		{"m.room.member", sender, &st.SenderMember},
+	} {
+		if id, err := a.Store.GetStateEvent(ctx, roomID, tc.typ, tc.sk); err == nil {
+			if ev, err := a.Store.GetEvent(ctx, id); err == nil {
+				*tc.dst = ev.Content
+			}
+		}
+	}
+	if target != sender && target != "" {
+		if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.member", target); err == nil {
+			if ev, err := a.Store.GetEvent(ctx, id); err == nil {
+				st.TargetMember = ev.Content
+			}
+		}
+	}
+	return st
+}
+
+// broadcastDeviceListStateToRoom replays the device-list updates that were
+// broadcast while the room was partial but could not reach its (unknown)
+// servers. Only local users whose device list changed during the partial
+// window are sent — mirror of Synapse's handle_room_un_partial_stated, which
+// replays exactly the updates that happened since the partial join started
+// (an unconditional broadcast would spam the room's servers with unchanged
+// device lists).
 func (a *API) broadcastDeviceListStateToRoom(ctx context.Context, roomID string) {
+	// The join event's stream position is the start of the partial window.
+	var since int64
+	if exts, err := a.Store.ForwardExtremities(ctx, roomID); err == nil && len(exts) == 1 {
+		if jr, err := a.Store.GetEvent(ctx, exts[0].EventID); err == nil && jr != nil {
+			since = jr.StreamOrdering
+		}
+	}
+	changed, _, err := a.Store.DeviceListChangesSince(ctx, since)
+	if err != nil {
+		return
+	}
+	inRoom := map[string]bool{}
 	members, err := a.Store.Members(ctx, roomID, "join")
 	if err != nil {
 		return
 	}
 	for _, m := range members {
-		if !a.IsLocalUser(m.UserID) {
+		inRoom[m.UserID] = true
+	}
+	for _, userID := range changed {
+		if !inRoom[userID] || !a.IsLocalUser(userID) {
 			continue
 		}
-		devices, err := a.Store.ListDevices(ctx, a.LocalpartOf(m.UserID))
+		devices, err := a.Store.ListDevices(ctx, a.LocalpartOf(userID))
 		if err != nil {
 			continue
 		}
 		for _, d := range devices {
 			a.BroadcastEDUToRooms(ctx, "m.device_list_update", map[string]any{
-				"user_id":   m.UserID,
+				"user_id":   userID,
 				"device_id": d.DeviceID,
 				"deleted":   false,
 				"stream_id": a.Now(),

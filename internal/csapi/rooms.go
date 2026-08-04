@@ -2225,7 +2225,7 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 			st.RestrictedAuthorised = a.Store.RestrictedJoinAuthorised(r.Context(), roomID, auth.UserID, authorisingUser, a.ServerName()) == storage.RestrictedJoinAuthorised
 		}
 	}
-	if err := rooms.Authorize(rules, "m.room.member", target, auth.UserID, contentRaw, st); err != nil {
+	if err := rooms.Authorize(rules, "m.room.member", target, auth.UserID, contentRaw, st, true); err != nil {
 		return "", newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
 	}
 	// Guests may join only a room whose m.room.guest_access is "can_join"
@@ -2438,7 +2438,7 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	if eventType == "m.room.create" {
 		return nil, newRoomError(http.StatusBadRequest, "M_FORBIDDEN", "a room can only be created once")
 	}
-	if err := rooms.Authorize(rules, eventType, stateKey, auth.UserID, content, st); err != nil {
+	if err := rooms.Authorize(rules, eventType, stateKey, auth.UserID, content, st, true); err != nil {
 		if errors.Is(err, rooms.ErrBadStateKey) {
 			// A malformed user-ID state key is a client error (400 M_BAD_JSON),
 			// not a permission failure (MSC3757).

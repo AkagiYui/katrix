@@ -43,8 +43,11 @@ type StateSnapshot struct {
 // non-nil error describing why it is rejected.
 //
 // The event is described by its type, state_key ("" for non-state), sender,
-// and raw content. roomver.Rules selects version-specific behaviour.
-func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content json.RawMessage, st StateSnapshot) error {
+// and raw content. isState reports whether the event carries a state_key at
+// all (an empty-but-present state_key is still a state event — e.g. a generic
+// m.room.test with state_key "" is governed by state_default, not
+// events_default). roomver.Rules selects version-specific behaviour.
+func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content json.RawMessage, st StateSnapshot, isState bool) error {
 	if len(content) == 0 {
 		return fmt.Errorf("rooms: empty event content")
 	}
@@ -138,7 +141,6 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 		return nil
 	default:
 		// State event (has state_key) vs message.
-		isState := stateKey != ""
 		if senderMembership != MembershipJoin {
 			return fmt.Errorf("rooms: sender not joined")
 		}

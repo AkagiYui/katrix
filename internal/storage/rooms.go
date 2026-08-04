@@ -23,6 +23,11 @@ type Room struct {
 	// ServersInRoom is the server list delivered in a partial-state send_join
 	// response (empty for normal rooms).
 	ServersInRoom []string
+	// UnpartialStateStream is the sync-stream position at which the room was
+	// marked fully-stated (0 for rooms that were never partial). Events
+	// persisted after this position during a partial window are re-validated
+	// once the resync completes.
+	UnpartialStateStream int64
 }
 
 // CreateRoom inserts a room record.
@@ -39,9 +44,10 @@ func (s *Store) GetRoom(ctx context.Context, roomID string) (*Room, error) {
 	var r Room
 	var servers []byte
 	err := s.pool.QueryRow(ctx,
-		`SELECT room_id, version, creator, is_public, created_ts, partial_state, COALESCE(servers_in_room,'[]')
+		`SELECT room_id, version, creator, is_public, created_ts, partial_state, COALESCE(servers_in_room,'[]'),
+		        COALESCE(unpartial_state_stream,0)
 		 FROM rooms WHERE room_id=$1`, roomID,
-	).Scan(&r.RoomID, &r.Version, &r.Creator, &r.IsPublic, &r.CreatedTS, &r.PartialState, &servers)
+	).Scan(&r.RoomID, &r.Version, &r.Creator, &r.IsPublic, &r.CreatedTS, &r.PartialState, &servers, &r.UnpartialStateStream)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -92,7 +98,8 @@ func (s *Store) RoomUnpartialStateStream(ctx context.Context, roomID string) (in
 // resyncs that were interrupted by a restart.
 func (s *Store) PartialRooms(ctx context.Context) ([]Room, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT room_id, version, creator, is_public, created_ts, partial_state, COALESCE(servers_in_room,'[]')
+		`SELECT room_id, version, creator, is_public, created_ts, partial_state, COALESCE(servers_in_room,'[]'),
+		        COALESCE(unpartial_state_stream,0)
 		 FROM rooms WHERE partial_state=TRUE`)
 	if err != nil {
 		return nil, err
@@ -102,7 +109,7 @@ func (s *Store) PartialRooms(ctx context.Context) ([]Room, error) {
 	for rows.Next() {
 		var r Room
 		var servers []byte
-		if err := rows.Scan(&r.RoomID, &r.Version, &r.Creator, &r.IsPublic, &r.CreatedTS, &r.PartialState, &servers); err != nil {
+		if err := rows.Scan(&r.RoomID, &r.Version, &r.Creator, &r.IsPublic, &r.CreatedTS, &r.PartialState, &servers, &r.UnpartialStateStream); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(servers, &r.ServersInRoom)
@@ -739,6 +746,17 @@ func (s *Store) UpsertState(ctx context.Context, roomID, eventType, stateKey, ev
 		`INSERT INTO room_state(room_id, type, state_key, event_id)
 		 VALUES ($1,$2,$3,$4)
 		 ON CONFLICT (room_id, type, state_key) DO UPDATE SET event_id=EXCLUDED.event_id`,
+		roomID, eventType, stateKey, eventID)
+	return err
+}
+
+// RemoveFromState removes the (room, type, state_key) tuple from the room's
+// current state when it still points at the given event. Used when an event
+// accepted during a partial-state window is later rejected on revalidation:
+// its tuple must not linger in the room's state.
+func (s *Store) RemoveFromState(ctx context.Context, roomID, eventType, stateKey, eventID string) error {
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM room_state WHERE room_id=$1 AND type=$2 AND state_key=$3 AND event_id=$4`,
 		roomID, eventType, stateKey, eventID)
 	return err
 }

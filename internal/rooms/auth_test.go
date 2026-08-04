@@ -21,11 +21,11 @@ func TestAuthorizeCreate(t *testing.T) {
 	content := mustJSON(t, map[string]string{"creator": creator, "room_version": "11"})
 	rules, _ := roomver.Get("11")
 	// create with matching sender is authorised.
-	if err := Authorize(rules, "m.room.create", "", creator, content, StateSnapshot{}); err != nil {
+	if err := Authorize(rules, "m.room.create", "", creator, content, StateSnapshot{}, true); err != nil {
 		t.Fatalf("create should pass: %v", err)
 	}
 	// create with mismatched sender is rejected.
-	if err := Authorize(rules, "m.room.create", "", "@eve:test", content, StateSnapshot{}); err == nil {
+	if err := Authorize(rules, "m.room.create", "", "@eve:test", content, StateSnapshot{}, true); err == nil {
 		t.Fatal("mismatched creator should be rejected")
 	}
 }
@@ -45,12 +45,12 @@ func TestAuthorizeMessageRequiresJoin(t *testing.T) {
 
 	// Joined sender can send a message.
 	st := StateSnapshot{Create: create, PowerLevel: pl, SenderMember: senderJoined}
-	if err := Authorize(rules, "m.room.message", "", creator, content, st); err != nil {
+	if err := Authorize(rules, "m.room.message", "", creator, content, st, false); err != nil {
 		t.Fatalf("joined sender msg: %v", err)
 	}
 	// Non-joined sender cannot.
 	st2 := StateSnapshot{Create: create, PowerLevel: pl, SenderMember: senderNotJoined}
-	if err := Authorize(rules, "m.room.message", "", creator, content, st2); err == nil {
+	if err := Authorize(rules, "m.room.message", "", creator, content, st2, false); err == nil {
 		t.Fatal("non-joined sender should be rejected")
 	}
 }
@@ -64,11 +64,11 @@ func TestAuthorizeMemberJoinPublic(t *testing.T) {
 
 	// Self-join to a public room is allowed.
 	st := StateSnapshot{Create: create, JoinRules: jr}
-	if err := Authorize(rules, "m.room.member", "@bob:test", "@bob:test", content, st); err != nil {
+	if err := Authorize(rules, "m.room.member", "@bob:test", "@bob:test", content, st, true); err != nil {
 		t.Fatalf("self join public: %v", err)
 	}
 	// Join on behalf of another is rejected.
-	if err := Authorize(rules, "m.room.member", "@bob:test", "@alice:test", content, st); err == nil {
+	if err := Authorize(rules, "m.room.member", "@bob:test", "@alice:test", content, st, true); err == nil {
 		t.Fatal("join for another should be rejected")
 	}
 }
@@ -82,14 +82,14 @@ func TestAuthorizeMemberJoinInviteOnly(t *testing.T) {
 
 	// Joining invite-only room without invite is rejected.
 	st := StateSnapshot{Create: create, JoinRules: jr}
-	if err := Authorize(rules, "m.room.member", "@bob:test", "@bob:test", content, st); err == nil {
+	if err := Authorize(rules, "m.room.member", "@bob:test", "@bob:test", content, st, true); err == nil {
 		t.Fatal("join invite-only without invite should be rejected")
 	}
 
 	// With an existing invite membership, join is allowed.
 	invite := mustJSON(t, map[string]string{"membership": MembershipInvite})
 	st2 := StateSnapshot{Create: create, JoinRules: jr, TargetMember: invite}
-	if err := Authorize(rules, "m.room.member", "@bob:test", "@bob:test", content, st2); err != nil {
+	if err := Authorize(rules, "m.room.member", "@bob:test", "@bob:test", content, st2, true); err != nil {
 		t.Fatalf("join after invite: %v", err)
 	}
 }
@@ -109,7 +109,7 @@ func TestAuthorizeBanRequiresPower(t *testing.T) {
 
 	// Creator (power 100) can ban bob (power 0).
 	st := StateSnapshot{Create: create, PowerLevel: pl, SenderMember: senderJoined}
-	if err := Authorize(rules, "m.room.member", bob, creator, content, st); err != nil {
+	if err := Authorize(rules, "m.room.member", bob, creator, content, st, true); err != nil {
 		t.Fatalf("creator ban bob: %v", err)
 	}
 
@@ -122,7 +122,7 @@ func TestAuthorizeBanRequiresPower(t *testing.T) {
 	carol := "@carol:test"
 	carolJoined := mustJSON(t, map[string]string{"membership": MembershipJoin})
 	st2 := StateSnapshot{Create: create, PowerLevel: lowPl, SenderMember: carolJoined}
-	if err := Authorize(rules, "m.room.member", bob, carol, content, st2); err == nil {
+	if err := Authorize(rules, "m.room.member", bob, carol, content, st2, true); err == nil {
 		t.Fatal("low-power user should not ban high-power user")
 	}
 }
@@ -196,24 +196,24 @@ func TestAuthorizeOwnedState(t *testing.T) {
 	content := mustJSON(t, map[string]any{"foo": "bar"})
 
 	// Bob may set state with his own user ID as state_key.
-	if err := Authorize(rules, "com.example.test", other, other, content, st); err != nil {
+	if err := Authorize(rules, "com.example.test", other, other, content, st, true); err != nil {
 		t.Fatalf("self state_key should be allowed: %v", err)
 	}
 	// Bob may set state with a non-user state_key (e.g. room-wide config).
-	if err := Authorize(rules, "com.example.test", "config", other, content, st); err != nil {
+	if err := Authorize(rules, "com.example.test", "config", other, content, st, true); err != nil {
 		t.Fatalf("non-user state_key should be allowed: %v", err)
 	}
 	// Bob may NOT set state with another user's ID as state_key (owned state).
-	if err := Authorize(rules, "com.example.test", other+"suffix", other, content, st); err == nil {
+	if err := Authorize(rules, "com.example.test", other+"suffix", other, content, st, true); err == nil {
 		t.Fatal("suffixed own user ID as state_key must be rejected")
 	}
-	if err := Authorize(rules, "com.example.test", creator, other, content, st); err == nil {
+	if err := Authorize(rules, "com.example.test", creator, other, content, st, true); err == nil {
 		t.Fatal("another user's ID as state_key must be rejected")
 	}
-	if err := Authorize(rules, "com.example.test", "@notinroom:remote", other, content, st); err == nil {
+	if err := Authorize(rules, "com.example.test", "@notinroom:remote", other, content, st, true); err == nil {
 		t.Fatal("non-member user ID as state_key must be rejected")
 	}
-	if err := Authorize(rules, "com.example.test", "@oops", other, content, st); err == nil {
+	if err := Authorize(rules, "com.example.test", "@oops", other, content, st, true); err == nil {
 		t.Fatal("malformed user ID as state_key must be rejected")
 	}
 }

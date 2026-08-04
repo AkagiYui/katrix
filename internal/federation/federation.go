@@ -6,6 +6,7 @@ package federation
 import (
 	"encoding/json"
 	"net/http"
+	"sync"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/federation/fedverify"
@@ -20,6 +21,15 @@ type API struct {
 	verifier *fedverify.Verifier
 	// eduWake wakes the outbound EDU delivery worker when a new EDU is queued.
 	eduWake chan struct{}
+
+	// partialMu guards partialStateEvents: the per-room set of state events
+	// ingested via inbound transactions while the room was partial-state
+	// (MSC3902). Their authorization was necessarily incomplete (the room's
+	// state — and therefore auth_events — was incomplete), so they are
+	// re-validated against the full state once the background resync completes.
+	// The set is per-room so a room being resynced does not disturb another's.
+	partialMu          sync.Mutex
+	partialStateEvents map[string]map[string]struct{} // roomID -> set of event IDs
 }
 
 // New constructs the federation API surface with an outbound client for key
@@ -31,6 +41,8 @@ func New(hs *homeserver.HS) *API {
 		client:   client,
 		verifier: fedverify.New(client),
 		eduWake:  make(chan struct{}, 1),
+
+		partialStateEvents: map[string]map[string]struct{}{},
 	}
 }
 

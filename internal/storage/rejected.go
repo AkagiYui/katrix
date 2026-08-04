@@ -15,6 +15,14 @@ func (s *Store) MarkEventRejected(ctx context.Context, eventID string) {
 		`INSERT INTO rejected_events(event_id) VALUES ($1) ON CONFLICT (event_id) DO NOTHING`, eventID)
 }
 
+// UnmarkEventRejected clears an event's soft-fail flag. Used after a
+// partial-state resync revalidates a partial-window event against the full
+// state: an event that was rejected only because the partial state was
+// incomplete becomes visible again.
+func (s *Store) UnmarkEventRejected(ctx context.Context, eventID string) {
+	_, _ = s.pool.Exec(ctx, `DELETE FROM rejected_events WHERE event_id=$1`, eventID)
+}
+
 // IsEventRejected reports whether the event was soft-failed.
 func (s *Store) IsEventRejected(ctx context.Context, eventID string) (bool, error) {
 	var one int

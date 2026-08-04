@@ -206,7 +206,7 @@ func (a *API) buildAndPersistStateCtx(ctx context.Context, auth *homeserver.Auth
 	if !ok {
 		return nil, newRoomError(http.StatusBadRequest, "M_UNSUPPORTED_ROOM_VERSION", "unknown room version")
 	}
-	if err := rooms.Authorize(rules, eventType, stateKey, auth.UserID, json.RawMessage(content), st); err != nil {
+	if err := rooms.Authorize(rules, eventType, stateKey, auth.UserID, json.RawMessage(content), st, true); err != nil {
 		return nil, newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
 	}
 	// Build the event with the same prev/depth/auth wiring as the HTTP path
