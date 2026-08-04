@@ -1,6 +1,6 @@
 # SyTest blacklist: tests expected to FAIL. A test listed here that passes is
 # flagged as "passed but expected fail" (prompts you to move it to the
-# whitelist). Populated from the 2026-08-03 test run (workflow 30847337991):
+# whitelist). Populated from the 2026-08-04 test run (workflow 30891659603):
 # regenerate after each run with:
 #   grep -E '^not ok ' results.tap | sed -E 's/^not ok [0-9]+ (\(expected fail\) )?//' | sed -E 's/( \([0-9]+ subtests\))? # TODO expected fail$//' | sort -u
 # One test path per line; lines starting with '#' are ignored.
@@ -88,7 +88,6 @@ Can recv a device message using /sync
 Can register using an email address
 Can reject invites over federation for rooms with version 1
 Can reject invites over federation for rooms with version 2
-Can reject invites over federation for rooms with version 3
 Can remove tag
 Can request federation format via the filter
 Can sync a joined room
@@ -189,11 +188,9 @@ Outbound federation can backfill events
 Outbound federation can query v1 /send_join
 Outbound federation can query v2 /send_join
 Outbound federation can request missing events
-Outbound federation can send events
 Outbound federation can send invites via v1 API
 Outbound federation correctly handles unsupported room versions
 Outbound federation passes make_join failures through to the client
-Outbound federation rejects backfill containing invalid JSON for events in room version 6
 Outbound federation rejects invite response which include invalid JSON for room version 6
 Outbound federation rejects m.room.create events with an unknown room version
 Outbound federation rejects send_join responses with no m.room.create event

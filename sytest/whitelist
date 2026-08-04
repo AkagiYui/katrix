@@ -1,5 +1,5 @@
 # SyTest whitelist: tests expected to PASS. A test listed here that fails is a
-# regression (fails the run). Populated from the 2026-08-03 test run (workflow 30847337991):
+# regression (fails the run). Populated from the 2026-08-04 test run (workflow 30891659603):
 # regenerate after each run with:
 #   grep -E '^ok ' results.tap | grep -vE '# skip' | sed -E 's/^ok [0-9]+ (\(expected fail\) )?//' | sed -E 's/( \([0-9]+ subtests\))? # TODO passed but expected fail$//' | sort -u
 # One test path per line; lines starting with '#' are ignored.
@@ -20,6 +20,7 @@ A full_state incremental update returns only recent timeline
 A message sent after an initial sync appears in the timeline of an incremental sync.
 A next_batch token can be used in the v1 messages API
 A prev_batch token can be used in the v1 messages API
+A pair of servers can establish a join in a v2 room
 A prev_batch token from incremental sync can be used in the v1 messages API
 AS cannot create users outside its own namespace
 Adding the same push rule twice is idempotent
@@ -80,6 +81,7 @@ Can read configuration endpoint
 Can reject invites over federation for rooms with version 10
 Can reject invites over federation for rooms with version 11
 Can reject invites over federation for rooms with version 12
+Can reject invites over federation for rooms with version 3
 Can reject invites over federation for rooms with version 4
 Can reject invites over federation for rooms with version 5
 Can reject invites over federation for rooms with version 6
@@ -212,7 +214,9 @@ Newly left rooms appear in the leave section of incremental sync
 Only room members can list aliases of a room
 Outbound federation can query profile data
 Outbound federation can query room alias directory
+Outbound federation can send events
 Outbound federation can send invites via v2 API
+Outbound federation rejects backfill containing invalid JSON for events in room version 6
 POST /createRoom creates a room with the given version
 POST /createRoom ignores attempts to set the room version via creation_content
 POST /createRoom makes a private room
