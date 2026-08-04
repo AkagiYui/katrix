@@ -337,11 +337,19 @@ func (a *API) KnockRoom(w http.ResponseWriter, r *http.Request) {
 }
 
 // knockRoom performs a knock for the authenticated user: a local knock (auth
-// rules + persist the m.room.member(knock) event) when the room is known
+// rules + persist the m.room.member(knock) event) when the room is hosted
 // locally, or a federated knock (make_knock/send_knock against a remote server,
 // MSC2409) when it is not. The knock's reason (a defined top-level request
-// field, per the spec) and any other custom content are carried in the member
-// event content.
+// field, unlike a join's, which is arbitrary custom content) is carried into
+// the member content so the room's members see why the user knocked.
+//
+// A room being *known* locally is not enough to knock locally: a server that
+// learned of a room via an earlier federated knock (or an invite) holds a view
+// but is not a resident — the knock must still go through the federation
+// make_knock/send_knock flow so the room's actual servers apply it (mirror of
+// canLocalJoin's resident requirement; a local knock would only be delivered
+// as a broadcast PDU, which reaches no one when the local view tracks no
+// resident servers).
 func (a *API) knockRoom(r *http.Request, auth *homeserver.Auth, roomID string, via []string) error {
 	// The knock reason is a defined request field (unlike a join's, which is
 	// arbitrary custom content): read it before joinCustomContent consumes the
@@ -356,7 +364,7 @@ func (a *API) knockRoom(r *http.Request, auth *homeserver.Auth, roomID string, v
 		}
 	}
 	extra := joinCustomContent(r)
-	if _, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
+	if _, err := a.Store.GetRoom(r.Context(), roomID); err == nil && a.Store.ServerHasJoinedMember(r.Context(), roomID, a.ServerName()) {
 		content := map[string]any{"membership": rooms.MembershipKnock}
 		if body.Reason != "" {
 			content["reason"] = body.Reason

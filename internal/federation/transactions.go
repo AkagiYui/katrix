@@ -1717,6 +1717,21 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 			return
 		}
 	}
+	// A re-knock is a no-op: a knock is a single pending request (MSC2409), so
+	// a second knock — possibly carrying a different reason — must not overwrite
+	// the pending request; the room's members keep seeing the original reason
+	// (mirror of the local sendMemberEventWithContent path, and what Complement's
+	// knocking tests assert). Checked after auth: a re-knock that no longer
+	// passes the room's auth rules (e.g. the join rule changed) still 403s.
+	if wantMembership == "knock" && ev.StateKey != nil {
+		if m, err := a.Store.GetMembership(r.Context(), ev.RoomID, *ev.StateKey); err == nil && m.Membership == "knock" {
+			statePDUs, _ := a.roomStatePDUs(r, ev.RoomID)
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{
+				"knock_room_state": statePDUs,
+			})
+			return
+		}
+	}
 	// Persist even unsigned join/leave events that pass verification; the
 	// signature check above establishes authenticity.
 	if vres.Valid || vres.Signed {
