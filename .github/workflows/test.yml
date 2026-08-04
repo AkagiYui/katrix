@@ -318,16 +318,22 @@ jobs:
           cd complement-crypto
           ./rebuild_js_sdk.sh "matrix-js-sdk@https://github.com/matrix-org/matrix-js-sdk#develop"
 
-      # Build the matrix-sdk-ffi crate and generate the Go bindings
-      # (uniffi-bindgen-go + rebuild_rust_sdk.sh live in the complement-crypto repo).
+      # Build the matrix-sdk-ffi crate and generate the Go bindings. Upstream
+      # moved the one-off shell scripts into a `just` recipe set (justfile), so
+      # invoke those: `just install-uniffi-bindgen` installs uniffi-bindgen-go
+      # (cargo install, pinned UNIFFI_GO_VERSION) and `just rebuild-rust-sdk`
+      # builds the crate and regenerates bindings.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
       - name: install uniffi-bindgen-go
         run: |
           cd complement-crypto
-          ./install_uniffi_bindgen_go.sh
+          just install-uniffi-bindgen
       - name: build Rust FFI bindings
         run: |
           cd complement-crypto
-          ./rebuild_rust_sdk.sh ./rust-sdk
+          just rebuild-rust-sdk ./rust-sdk
           echo "RUST_SDK_LIB=$GITHUB_WORKSPACE/complement-crypto/rust-sdk/target/debug" >> "$GITHUB_ENV"
 
       - name: build RPC client

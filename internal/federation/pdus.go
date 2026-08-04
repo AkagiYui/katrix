@@ -401,9 +401,16 @@ func (a *API) fetchMissingEventsFor(ctx context.Context, roomID string, eventID 
 	// DAG — that is the snapshot the remote server can authoritatively serve
 	// (Complement's TestCorruptedAuthChain asserts exactly this anchor, and the
 	// MSC4297 v2.1 tests depend on the /state_ids round-trip).
+	//
+	// The state fetch runs in the background, mirroring Synapse: it is many
+	// network round-trips against a peer (Complement's MSC4297 v2.1 tests hand
+	// over a ~240-event auth chain), and blocking the ingest on it stalls the
+	// /send response beyond the sender's deadline on slow CI. The triggered
+	// event is accepted immediately; the reconcile completes the room's state
+	// asynchronously.
 	for _, rawEv := range out.Events {
 		if id := a.firstUnknownPrev(ctx, rawEv); id != "" {
-			a.reconcileStateFrom(ctx, roomID, origin, id)
+			go a.reconcileStateFrom(context.WithoutCancel(ctx), roomID, origin, id)
 			break
 		}
 	}
