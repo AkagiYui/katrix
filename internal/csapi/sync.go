@@ -342,24 +342,29 @@ func (a *API) Receipt(w http.ResponseWriter, r *http.Request) {
 }
 
 // broadcastReceiptEDU queues an m.receipt EDU for the room's remote servers so
-// their syncing users see the receipt. Per the spec the EDU content is keyed
-// by room_id: {<room_id>: {<event_id>: {<receipt_type>: {<user_id>: {ts}}}}},
-// so the receiving server derives the room directly from the content (it must
-// not depend on already knowing the receipted event). Best-effort: a missing
-// federation client (monolith without federation) simply skips the broadcast.
+// their syncing users see the receipt. Per the spec's receipt-federation
+// format the EDU content is keyed by room_id, then receipt_type, then user_id,
+// carrying the receipt data under `data` and the receipted event IDs under
+// `event_ids`:
+//
+//	{<room_id>: {<receipt_type>: {<user_id>: {"data": {"ts": <ts>, "thread_id": <thread>}, "event_ids": [<event_id>]}}}}
+//
+// Best-effort: a missing federation client (monolith without federation)
+// simply skips the broadcast.
 func (a *API) broadcastReceiptEDU(ctx context.Context, roomID, userID, receiptType, eventID, threadID string) {
 	if a.fed == nil {
 		return
 	}
-	userObj := map[string]any{"ts": a.Now()}
+	data := map[string]any{"ts": a.Now()}
 	if threadID != "" {
-		userObj["thread_id"] = threadID
+		data["thread_id"] = threadID
 	}
 	content := map[string]any{
 		roomID: map[string]any{
-			eventID: map[string]any{
-				receiptType: map[string]any{
-					userID: userObj,
+			receiptType: map[string]any{
+				userID: map[string]any{
+					"data":      data,
+					"event_ids": []string{eventID},
 				},
 			},
 		},
