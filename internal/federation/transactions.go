@@ -273,71 +273,79 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// persisted for DAG continuity but marked rejected and never delivered to
 	// clients or included in room state (mirror of Synapse's soft-fail, and the
 	// regression guard for events smuggling a rejected/outlier event into their
-	// auth_events).
-	//
-	// Partial-state rooms (MSC3902) skip the full check: their state (and
-	// therefore auth_events) is intentionally incomplete until the background
-	// resync finishes, and membership events (ban/kick/leave/invite) must keep
-	// flowing. But NON-member state events are still checked against the
-	// partial state: an event whose sender is not a known joined member (the
-	// partial state carries only critical state, no memberships) is
-	// soft-failed, exactly as if the sender were not in the room. The resync
-	// re-validates these events against the full state once it completes.
+	// Partial-state rooms (MSC3902) defer the authorization check entirely:
+	// their state (and therefore auth_events) is intentionally incomplete
+	// until the background resync finishes, and membership events
+	// (ban/kick/leave/invite) must keep flowing. The resync re-validates the
+	// events that arrived during the partial window against the full state
+	// once it completes.
 	rejected := false
-	if origin != "" {
+	if origin != "" && !room.PartialState {
 		if a.hasUnknownAuthEvents(r.Context(), raw) {
 			a.fetchAuthChainFor(r.Context(), ev.RoomID, evID, origin)
 		}
-		isPartialStateEvent := room.PartialState && ev.StateKey != nil && ev.Type != "m.room.member"
-		if !room.PartialState || isPartialStateEvent {
-			if a.hasUnknownAuthEvents(r.Context(), raw) {
-				// The auth chain could not be established (the peer did not serve it,
-				// or served an empty chain): soft-fail the event.
+		if a.hasUnknownAuthEvents(r.Context(), raw) {
+			// The auth chain could not be established (the peer did not serve it,
+			// or served an empty chain): soft-fail the event.
+			rejected = true
+		} else if a.authReferencesRejected(r.Context(), raw) {
+			// An auth_event that was itself rejected (soft-failed) propagates the
+			// rejection: an event cannot be authorised by a rejected precedent.
+			rejected = true
+		} else if rules, ok := roomver.Get(version); ok {
+			stateKey := ""
+			if ev.StateKey != nil {
+				stateKey = *ev.StateKey
+			}
+			st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey)
+			// Restricted-rule room (MSC3083): a join event names its authoriser
+			// via join_authorised_via_users_server. The verdict is computed
+			// against the allow-listed rooms the local server participates in
+			// (mirror of the send_join path in ingestRemoteMember). When this
+			// server cannot authoritatively answer (it does not participate in
+			// all the allowed rooms), the join is accepted unvetted: the event
+			// was already authorised by the server that processed the send_join,
+			// and rejecting the re-broadcast here would desync the room (the
+			// M_UNABLE_TO_AUTHORISE_JOIN fail-over lives on the client join
+			// path, not the transaction path).
+			skipAuth := false
+			if ev.Type == "m.room.member" && stateKey != "" {
+				var mc struct {
+					Membership string `json:"membership"`
+				}
+				_ = json.Unmarshal(ev.Content, &mc)
+				if mc.Membership == rooms.MembershipJoin && a.restrictedRoomJoinRules(r.Context(), ev.RoomID) {
+					var authMember struct {
+						Authoriser string `json:"join_authorised_via_users_server"`
+					}
+					_ = json.Unmarshal(ev.Content, &authMember)
+					switch a.Store.RestrictedJoinAuthorised(r.Context(), ev.RoomID, stateKey, authMember.Authoriser, a.ServerName()) {
+					case storage.RestrictedJoinAuthorised:
+						st.RestrictedAuthorised = true
+					case storage.RestrictedJoinUnableToAuthorise:
+						skipAuth = true
+					}
+				}
+			}
+			if !skipAuth {
+				if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, ev.StateKey != nil); err != nil {
+					rejected = true
+				}
+			}
+		}
+	} else if origin != "" && room.PartialState && ev.StateKey != nil && ev.Type != "m.room.member" {
+		// Partial-state room, non-member state event: check against the
+		// partial snapshot. The re-validation after the resync completes
+		// re-checks this event against the full state (an event accepted
+		// only because the state was incomplete is then rejected).
+		if rules, ok := roomver.Get(version); ok {
+			stateKey := ""
+			if ev.StateKey != nil {
+				stateKey = *ev.StateKey
+			}
+			st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey)
+			if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, true); err != nil {
 				rejected = true
-			} else if a.authReferencesRejected(r.Context(), raw) {
-				// An auth_event that was itself rejected (soft-failed) propagates the
-				// rejection: an event cannot be authorised by a rejected precedent.
-				rejected = true
-			} else if rules, ok := roomver.Get(version); ok {
-				stateKey := ""
-				if ev.StateKey != nil {
-					stateKey = *ev.StateKey
-				}
-				st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey)
-				// Restricted-rule room (MSC3083): a join event names its authoriser
-				// via join_authorised_via_users_server. The verdict is computed
-				// against the allow-listed rooms the local server participates in
-				// (mirror of the send_join path in ingestRemoteMember). When this
-				// server cannot authoritatively answer (it does not participate in
-				// all the allowed rooms), the join is accepted unvetted: the event
-				// was already authorised by the server that processed the send_join,
-				// and rejecting the re-broadcast here would desync the room (the
-				// M_UNABLE_TO_AUTHORISE_JOIN fail-over lives on the client join
-				// path, not the transaction path).
-				skipAuth := false
-				if ev.Type == "m.room.member" && stateKey != "" {
-					var mc struct {
-						Membership string `json:"membership"`
-					}
-					_ = json.Unmarshal(ev.Content, &mc)
-					if mc.Membership == rooms.MembershipJoin && a.restrictedRoomJoinRules(r.Context(), ev.RoomID) {
-						var authMember struct {
-							Authoriser string `json:"join_authorised_via_users_server"`
-						}
-						_ = json.Unmarshal(ev.Content, &authMember)
-						switch a.Store.RestrictedJoinAuthorised(r.Context(), ev.RoomID, stateKey, authMember.Authoriser, a.ServerName()) {
-						case storage.RestrictedJoinAuthorised:
-							st.RestrictedAuthorised = true
-						case storage.RestrictedJoinUnableToAuthorise:
-							skipAuth = true
-						}
-					}
-				}
-				if !skipAuth {
-					if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, ev.StateKey != nil); err != nil {
-						rejected = true
-					}
-				}
 			}
 		}
 	}

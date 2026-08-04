@@ -310,7 +310,6 @@ func (a *API) revalidatePartialWindow(ctx context.Context, roomID string) {
 	if err != nil || len(rows) == 0 {
 		return
 	}
-	log.Printf("katrix: resync %s: revalidating %d partial-window events", roomID, len(rows))
 	version := roomver.Version(room.Version)
 	rules, ok := roomver.Get(version)
 	if !ok {
