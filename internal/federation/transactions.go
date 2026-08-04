@@ -254,7 +254,14 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// references (prev_events and auth_events) are known and accepted; Synapse
 	// soft-fails such events. Rejection here is what lets a re-delivery later
 	// succeed once the missing events arrive (TestUnrejectRejectedEvents).
-	if origin != "" && a.hasUnknownPrevEvents(r.Context(), raw) {
+	// Skipped for partial-state rooms (MSC3902), whose local DAG is
+	// intentionally incomplete until the background resync completes: only the
+	// critical state and the join event were seeded, so every remote event
+	// would reference unknown prevs and be dropped — including membership
+	// events (ban/kick/leave/invite) that arrive right after a partial join.
+	// The resync fills the history; dropping such events would silently lose
+	// membership transitions the joining user's /sync depends on.
+	if origin != "" && !room.PartialState && a.hasUnknownPrevEvents(r.Context(), raw) {
 		return evID, false
 	}
 	// Authorization. An event whose auth_events reference events this server
