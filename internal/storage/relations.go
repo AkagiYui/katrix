@@ -186,6 +186,99 @@ func (s *Store) RelationParent(ctx context.Context, eventID string) (parent, rel
 	return parent, relType, nil
 }
 
+// EventStreamOrdering returns the stream_ordering of an event, or 0 when the
+// event is not stored locally.
+func (s *Store) EventStreamOrdering(ctx context.Context, eventID string) (int64, error) {
+	var so int64
+	err := s.pool.QueryRow(ctx, `SELECT stream_ordering FROM events WHERE event_id=$1`, eventID).Scan(&so)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return so, nil
+}
+
+// ThreadRootsInRoom returns the distinct thread root event IDs that have at
+// least one m.thread reply in roomID. Used to compute per-thread unread
+// notification counts.
+func (s *Store) ThreadRootsInRoom(ctx context.Context, roomID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT r.parent_event_id FROM event_relations r
+		 WHERE r.room_id=$1 AND r.rel_type='m.thread'`, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// EventsForNotificationCount returns the m.room.message events in roomID
+// delivered (not soft-failed, not from an erased user) with stream_ordering >
+// since. For a thread (root != ""), only events whose thread root is that
+// event are returned; for the main timeline (root == ""), events that are not
+// part of any thread. Events are returned newest-first, bounded by limit, so
+// callers can stop counting once the read receipt position is passed.
+func (s *Store) EventsForNotificationCount(ctx context.Context, roomID, root string, since int64, limit int) ([]EventRow, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	q := `SELECT e.event_id, e.room_id, e.type, COALESCE(e.state_key,''), e.sender, e.depth,
+	              e.origin_server_ts, e.stream_ordering, e.content, e.json,
+	              COALESCE(e.redacts,''), e.redacted, e.outlier
+	       FROM events e
+	       WHERE e.room_id=$1 AND e.stream_ordering>$2 AND e.type='m.room.message' AND e.outlier=false`
+	args := []any{roomID, since}
+	if root == "" {
+		// Main timeline: events that are not part of any thread (m.thread
+		// children belong to their thread's counts; other relation types —
+		// references, annotations, edits — stay in the main timeline).
+		q += ` AND NOT EXISTS (
+			SELECT 1 FROM event_relations r WHERE r.event_id = e.event_id AND r.rel_type = 'm.thread'
+		)`
+	} else {
+		q += ` AND EXISTS (
+			SELECT 1 FROM event_relations r
+			WHERE r.event_id = e.event_id AND r.rel_type = 'm.thread'
+			AND (r.parent_event_id = $3 OR EXISTS (
+				SELECT 1 FROM event_relations r2 WHERE r2.event_id = r.parent_event_id
+				AND r2.parent_event_id = $3 AND r2.rel_type = 'm.thread'
+			))
+		)`
+		args = append(args, root)
+	}
+	q += ` AND NOT EXISTS (SELECT 1 FROM rejected_events x WHERE x.event_id = e.event_id)`
+	if root == "" {
+		q += ` ORDER BY e.stream_ordering DESC LIMIT $3`
+	} else {
+		q += ` ORDER BY e.stream_ordering DESC LIMIT $4`
+	}
+	args = append(args, limit)
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EventRow
+	for rows.Next() {
+		e, err := scanEventRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

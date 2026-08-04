@@ -171,6 +171,31 @@ func (s *Store) ReceiptsSince(ctx context.Context, userID string, since int64) (
 	return out, rows.Err()
 }
 
+// ReadReceiptsForUserInRoom returns the user's m.read receipts in a room (all
+// thread_ids, "main" plus each thread root), used to compute unread
+// notification counts. stream_id is the shared sync stream position of the
+// receipt, i.e. the highest event position the user has read in that timeline.
+func (s *Store) ReadReceiptsForUserInRoom(ctx context.Context, roomID, userID string) ([]ReceiptRow, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT room_id, user_id, receipt_type, COALESCE(thread_id,''), event_id, ts, COALESCE(stream_id,0)
+		 FROM receipts
+		 WHERE room_id=$1 AND user_id=$2 AND receipt_type='m.read'`,
+		roomID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ReceiptRow
+	for rows.Next() {
+		var r ReceiptRow
+		if err := rows.Scan(&r.RoomID, &r.UserID, &r.ReceiptType, &r.ThreadID, &r.EventID, &r.TS, &r.StreamID); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // MaxStreamOrdering returns the current committed position of the shared sync
 // stream. This is what /sync reports as next_batch; every sync-relevant write
 // (events, account data, receipts, device-list changes, presence changes)

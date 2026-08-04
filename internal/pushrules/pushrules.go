@@ -93,6 +93,11 @@ func DefaultRuleset() map[string]any {
 				{"rule_id": ".m.rule.suppress_notices", "enabled": true, "default": true,
 					"conditions": []map[string]any{{"kind": "event_match", "key": "content.msgtype", "pattern": "m.notice"}},
 					"actions":    []string{"dont_notify"}},
+				// Spec default (and Synapse base rule): reactions (annotations)
+				// never notify, regardless of other rules.
+				{"rule_id": ".m.rule.reaction", "enabled": true, "default": true,
+					"conditions": []map[string]any{{"kind": "event_match", "key": "type", "pattern": "m.reaction"}},
+					"actions":    []string{}},
 				// MSC3930: silence all poll responses.
 				{"rule_id": ".org.matrix.msc3930.rule.poll_response", "enabled": true, "default": true,
 					"conditions": []map[string]any{{"kind": "event_match", "key": "type", "pattern": "org.matrix.msc3381.poll.response"}},

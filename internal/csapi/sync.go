@@ -3,6 +3,7 @@ package csapi
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -279,7 +280,7 @@ func (a *API) ReadMarkers(w http.ResponseWriter, r *http.Request) {
 		// the room's remote servers as an m.receipt EDU so their syncing users
 		// see it (spec receipt federation). Without this, read_markers receipts
 		// never federate.
-		a.broadcastReceiptEDU(r.Context(), roomID, auth.UserID, "m.read", *req.ReadReceipt)
+		a.broadcastReceiptEDU(r.Context(), roomID, auth.UserID, "m.read", *req.ReadReceipt, "")
 	}
 	// m.fully_read is room account data (spec: "read markers are stored as
 	// room account data"); clients receive it in the room's account_data sync
@@ -298,7 +299,13 @@ func (a *API) ReadMarkers(w http.ResponseWriter, r *http.Request) {
 }
 
 // Receipt handles POST /_matrix/client/v3/rooms/{roomID}/receipt/{receiptType}/{eventID}.
-// It records a read receipt for the calling user on the given event.
+// It records a read receipt for the calling user on the given event. The body
+// may carry a `thread_id`: "main" (or absent) marks the main timeline; a
+// thread root event ID marks a threaded read receipt that advances only that
+// thread (MSC3773). Both are stored as-is in the receipts table (thread_id
+// "main" is Synapse's MAIN_TIMELINE sentinel; an absent thread_id is the
+// legacy unthreaded receipt stored as "", which acts as a read-position floor
+// for every timeline).
 func (a *API) Receipt(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	roomID := r.PathValue("roomID")
@@ -308,14 +315,29 @@ func (a *API) Receipt(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrForbidden("not joined to room"))
 		return
 	}
+	threadID := ""
+	var body struct {
+		ThreadID string `json:"thread_id"`
+	}
+	if r.Body != nil {
+		if data, err := io.ReadAll(r.Body); err == nil && len(data) > 0 {
+			_ = json.Unmarshal(data, &body)
+		}
+	}
+	// "main" is the spec's sentinel for the main timeline (MSC3773); a missing
+	// thread_id is the unthreaded receipt, stored as "" (legacy form).
+	if body.ThreadID != "" {
+		threadID = body.ThreadID
+	}
 	_, _ = a.Store.SetReceipt(r.Context(), storage.ReceiptRow{
-		RoomID: roomID, UserID: auth.UserID, ReceiptType: receiptType, EventID: eventID, TS: a.Now(),
+		RoomID: roomID, UserID: auth.UserID, ReceiptType: receiptType,
+		ThreadID: threadID, EventID: eventID, TS: a.Now(),
 	})
 	a.notifyRoomMembers(r.Context(), roomID)
 	// Federation: receipts are delivered to the room's remote servers as an
 	// m.receipt EDU (spec receipt federation). The EDU content is the same shape
 	// /sync emits per room: {event_id: {receipt_type: {user_id: {ts, thread_id?}}}}.
-	a.broadcastReceiptEDU(r.Context(), roomID, auth.UserID, receiptType, eventID)
+	a.broadcastReceiptEDU(r.Context(), roomID, auth.UserID, receiptType, eventID, threadID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
@@ -325,15 +347,19 @@ func (a *API) Receipt(w http.ResponseWriter, r *http.Request) {
 // so the receiving server derives the room directly from the content (it must
 // not depend on already knowing the receipted event). Best-effort: a missing
 // federation client (monolith without federation) simply skips the broadcast.
-func (a *API) broadcastReceiptEDU(ctx context.Context, roomID, userID, receiptType, eventID string) {
+func (a *API) broadcastReceiptEDU(ctx context.Context, roomID, userID, receiptType, eventID, threadID string) {
 	if a.fed == nil {
 		return
+	}
+	userObj := map[string]any{"ts": a.Now()}
+	if threadID != "" {
+		userObj["thread_id"] = threadID
 	}
 	content := map[string]any{
 		roomID: map[string]any{
 			eventID: map[string]any{
 				receiptType: map[string]any{
-					userID: map[string]any{"ts": a.Now()},
+					userID: userObj,
 				},
 			},
 		},

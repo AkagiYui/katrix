@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/AkagiYui/katrix/internal/events"
+	"github.com/AkagiYui/katrix/internal/pushrules"
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
 )
@@ -109,7 +110,16 @@ type JoinedRoom struct {
 	AccountData StateSet          `json:"account_data,omitempty"`
 	Ephemeral   *EphemeralSection `json:"ephemeral,omitempty"`
 	Summary     *RoomSummary      `json:"summary,omitempty"`
-	// UnreadNotifications omitted (P8).
+	// Unread notifications (spec unread_notifications; MSC3774 thread counts).
+	UnreadNotifications *UnreadNotifications           `json:"unread_notifications,omitempty"`
+	UnreadThreads       map[string]UnreadNotifications `json:"unread_thread_notifications,omitempty"`
+}
+
+// UnreadNotifications carries a user's unread notification counts for a room
+// timeline (main timeline, or a single thread under unread_thread_notifications).
+type UnreadNotifications struct {
+	NotificationCount *int `json:"notification_count,omitempty"`
+	HighlightCount    *int `json:"highlight_count,omitempty"`
 }
 
 // EphemeralSection holds the ephemeral events for a joined room. The spec
@@ -196,6 +206,10 @@ type SyncFilter struct {
 	// Lazy-load members: only include membership state events, and only for
 	// senders present in the timeline.
 	LazyLoadMembers bool
+	// UnreadThreadNotifications: when true, per-thread unread notification
+	// counts are returned under unread_thread_notifications and the main
+	// unread_notifications counts exclude thread events (MSC3773/MSC3774).
+	UnreadThreadNotifications bool
 	// IncludeLeave controls whether left rooms appear in the response.
 	IncludeLeave bool
 	// EventFields narrows the per-event fields returned (JSON pointer paths).
@@ -216,6 +230,8 @@ func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
 				Senders    []string `json:"senders"`
 				NotSenders []string `json:"not_senders"`
 				Limit      *int     `json:"limit"`
+				// UnreadThreadNotifications (MSC3773): per-thread unread counts.
+				UnreadThreadNotifications bool `json:"unread_thread_notifications"`
 			} `json:"timeline"`
 			State struct {
 				LazyLoadMembers bool `json:"lazy_load_members"`
@@ -233,6 +249,7 @@ func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
 		TimelineSenders:    obj.Room.Timeline.Senders,
 		TimelineNotSenders: obj.Room.Timeline.NotSenders,
 		LazyLoadMembers:    obj.Room.State.LazyLoadMembers,
+		UnreadThreadNotifications: obj.Room.Timeline.UnreadThreadNotifications,
 		IncludeLeave:       obj.Room.IncludeLeave,
 		EventFields:        obj.EventFields,
 	}
@@ -248,7 +265,7 @@ func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
 }
 
 func (f *SyncFilter) anySet() bool {
-	return f.TimelineLimitSet || f.TimelineLimit > 0 || f.LazyLoadMembers || f.IncludeLeave ||
+	return f.TimelineLimitSet || f.TimelineLimit > 0 || f.LazyLoadMembers || f.UnreadThreadNotifications || f.IncludeLeave ||
 		len(f.TimelineTypes) > 0 || len(f.TimelineNotTypes) > 0 ||
 		len(f.TimelineSenders) > 0 || len(f.TimelineNotSenders) > 0 ||
 		len(f.EventFields) > 0
@@ -587,19 +604,25 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 		// rooms the syncer is joined to.
 		receipts, _ := e.store.ReceiptsSince(ctx, opts.UserID, opts.Since.Stream)
 		if len(receipts) > 0 {
-			// Build content: {event_id: {receipt_type: {user_id: {ts: N}}}}
-			byRoom := map[string]map[string]map[string]map[string]int64{}
+			// Build content: {event_id: {receipt_type: {user_id: {ts, thread_id?}}}}
+			// (spec + MSC3773: a threaded read receipt carries the thread root id
+			// under thread_id; the unthreaded form omits it).
+			byRoom := map[string]map[string]map[string]map[string]any{}
 			for _, rc := range receipts {
 				if byRoom[rc.RoomID] == nil {
-					byRoom[rc.RoomID] = map[string]map[string]map[string]int64{}
+					byRoom[rc.RoomID] = map[string]map[string]map[string]any{}
 				}
 				if byRoom[rc.RoomID][rc.EventID] == nil {
-					byRoom[rc.RoomID][rc.EventID] = map[string]map[string]int64{}
+					byRoom[rc.RoomID][rc.EventID] = map[string]map[string]any{}
 				}
 				if byRoom[rc.RoomID][rc.EventID][rc.ReceiptType] == nil {
-					byRoom[rc.RoomID][rc.EventID][rc.ReceiptType] = map[string]int64{}
+					byRoom[rc.RoomID][rc.EventID][rc.ReceiptType] = map[string]any{}
 				}
-				byRoom[rc.RoomID][rc.EventID][rc.ReceiptType][rc.UserID] = rc.TS
+				userObj := map[string]any{"ts": rc.TS}
+				if rc.ThreadID != "" {
+					userObj["thread_id"] = rc.ThreadID
+				}
+				byRoom[rc.RoomID][rc.EventID][rc.ReceiptType][rc.UserID] = userObj
 			}
 			if evMap, ok := byRoom[roomID]; ok {
 				eph, _ := json.Marshal(map[string]any{
@@ -939,15 +962,18 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 			earliest = re.stream
 		}
 	}
-	// A count-limited timeline that contains any state event must also carry
-	// the room's CURRENT state: Synapse's "always include current state in the
+	// A limited timeline that contains any state event must also carry the
+	// room's CURRENT state: Synapse's "always include current state in the
 	// timeline" behaviour (filter_and_transform_events_for_client with
 	// always_include_ids=current_state_ids) — when a limited window drops
 	// events, clients still need the current state events to render the room
-	// correctly (e.g. a membership join that is the current state but fell
-	// outside the window). The current-state events not already in the
-	// timeline are appended (they are the newest authoritative values).
-	if countLimited && len(evs) > 0 {
+	// correctly. This covers both count-truncated windows and newly-joined /
+	// full-room windows: a room whose join event predates a window that drops
+	// to the newest `limit` events would otherwise never surface the user's own
+	// membership (Complement's syncMembershipIn checks the timeline).
+	// The current-state events not already in the timeline are appended (they
+	// are the newest authoritative values).
+	if (newlyJoined || countLimited) && len(evs) > 0 {
 		hasState := false
 		for _, ev := range evs {
 			if ev.StateKey != "" {
@@ -1061,7 +1087,147 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// Room summary: joined/invited member counts (spec m.joined_member_count /
 	// m.invited_member_count) plus up to five hero user IDs.
 	jr.Summary = e.roomSummary(ctx, roomID, opts.UserID)
+	jr.UnreadNotifications, jr.UnreadThreads = e.unreadCounts(ctx, roomID, opts)
 	return jr, nil
+}
+
+// unreadCounts computes the user's unread notification counts for a joined
+// room (spec unread_notifications; MSC3773/MSC3774 thread counts). The main
+// timeline count covers events since the user's latest unthreaded read receipt
+// (falling back to their join position); each thread's count is scoped by its
+// own threaded read receipt, floored by the unthreaded receipt. With the
+// unread_thread_notifications filter the main count excludes thread events and
+// per-thread counts are returned under unread_thread_notifications; otherwise
+// the thread counts are folded into the main count (mirror of Synapse's
+// _get_unread_counts_by_pos_txn + sync handler combination).
+//
+// An event counts as a notification when the user's push rules evaluate it to
+// notify (never for their own events), and as a highlight when the matched
+// rule sets the highlight tweak.
+func (e *Engine) unreadCounts(ctx context.Context, roomID string, opts SyncOptions) (*UnreadNotifications, map[string]UnreadNotifications) {
+	if opts.UserID == "" {
+		return nil, nil
+	}
+	receipts, err := e.store.ReadReceiptsForUserInRoom(ctx, roomID, opts.UserID)
+	if err != nil {
+		return nil, nil
+	}
+	// Read positions per timeline (Synapse semantics): the unthreaded receipt
+	// (thread_id "") is a floor for every timeline; the main-threaded receipt
+	// (thread_id "main", MSC3773's MAIN_TIMELINE sentinel) advances the main
+	// timeline; a threaded receipt (thread_id = thread root) advances that
+	// thread. A timeline's effective position is the later of its own receipt
+	// and the unthreaded floor.
+	unthreadedPos := int64(0)
+	mainPos := int64(0)
+	threadPos := map[string]int64{}
+	for _, rc := range receipts {
+		pos := rc.StreamID
+		if so, err := e.store.EventStreamOrdering(ctx, rc.EventID); err == nil && so > 0 {
+			pos = so
+		}
+		switch rc.ThreadID {
+		case "":
+			if pos > unthreadedPos {
+				unthreadedPos = pos
+			}
+		case "main":
+			if pos > mainPos {
+				mainPos = pos
+			}
+		default:
+			if pos > threadPos[rc.ThreadID] {
+				threadPos[rc.ThreadID] = pos
+			}
+		}
+	}
+	if unthreadedPos == 0 {
+		// No unthreaded receipt: fall back to the user's join position.
+		if m, err := e.store.GetMembership(ctx, roomID, opts.UserID); err == nil && m.StreamOrdering > 0 {
+			unthreadedPos = m.StreamOrdering
+		}
+	}
+	if unthreadedPos <= 0 {
+		return nil, nil
+	}
+	if mainPos < unthreadedPos {
+		mainPos = unthreadedPos
+	}
+
+	rulesRaw, _ := e.store.GetPushRules(ctx, opts.Localpart)
+	var rules map[string]any
+	_ = json.Unmarshal(rulesRaw, &rules)
+	if rules == nil {
+		return nil, nil
+	}
+
+	joined := int64(0)
+	if users, err := e.store.JoinedUserIDs(ctx, roomID); err == nil {
+		joined = int64(len(users))
+	}
+
+	// Main timeline: events after the main timeline's effective read position.
+	mainCount, mainHighlight := e.countFor(ctx, roomID, "", mainPos, opts, rules, joined)
+	// Threads: events after each thread's own (threaded) read position, which
+	// is floored by the unthreaded position (a new unthreaded receipt reads all
+	// threads up to its position, per Synapse).
+	threadCounts := map[string]UnreadNotifications{}
+	roots, err := e.store.ThreadRootsInRoom(ctx, roomID)
+	if err == nil {
+		for _, root := range roots {
+			pos := threadPos[root]
+			if pos < unthreadedPos {
+				pos = unthreadedPos
+			}
+			n, h := e.countFor(ctx, roomID, root, pos, opts, rules, joined)
+			if n == 0 && h == 0 {
+				continue
+			}
+			threadCounts[root] = UnreadNotifications{NotificationCount: &n, HighlightCount: &h}
+		}
+	}
+
+	if opts.Filter != nil && opts.Filter.UnreadThreadNotifications {
+		main := &UnreadNotifications{NotificationCount: &mainCount, HighlightCount: &mainHighlight}
+		return main, threadCounts
+	}
+	// No thread filter: fold the thread counts into the main count.
+	combinedCount, combinedHighlight := mainCount, mainHighlight
+	for _, tc := range threadCounts {
+		if tc.NotificationCount != nil {
+			combinedCount += *tc.NotificationCount
+		}
+		if tc.HighlightCount != nil {
+			combinedHighlight += *tc.HighlightCount
+		}
+	}
+	return &UnreadNotifications{NotificationCount: &combinedCount, HighlightCount: &combinedHighlight}, nil
+}
+
+// countFor evaluates the unread push actions for one timeline (main or a
+// single thread) and returns the notification and highlight counts.
+func (e *Engine) countFor(ctx context.Context, roomID, root string, since int64, opts SyncOptions, rules map[string]any, joined int64) (int, int) {
+	evs, err := e.store.EventsForNotificationCount(ctx, roomID, root, since, 1000)
+	if err != nil {
+		return 0, 0
+	}
+	var notif, highlight int
+	for _, ev := range evs {
+		res := pushrules.Evaluate(rules, opts.UserID, opts.Localpart, pushrules.EventSnapshot{
+			Type:        ev.Type,
+			Sender:      ev.Sender,
+			RoomID:      roomID,
+			Content:     ev.Content,
+			MemberCount: int(joined),
+		})
+		if res.Notifies {
+			notif++
+		}
+		if res.Highlights {
+			highlight++
+		}
+	}
+	return notif, highlight
 }
 
 // buildPeekedRoom constructs the peek section entry (MSC2753) for a device that
