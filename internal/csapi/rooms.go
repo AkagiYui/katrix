@@ -2279,7 +2279,18 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 		// relevant (Complement's DeviceListUpdateOverFederation expects the
 		// joining user's own ID on their own sync), and on leave/ban their
 		// devices must learn the room was left (device_lists.left).
-		if mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban" {
+		//
+		// A member(join) event whose target is already joined is a profile
+		// update (displayname/avatar_url re-emission), not a join: the user's
+		// device list did not change, so no device-list EDU/change is recorded
+		// (Complement's partial-state suite fails the run when an unexpected
+		// m.device_list_update EDU arrives for a mere display-name change).
+		prevMembership := ""
+		if pm, err := a.Store.GetMembership(r.Context(), roomID, target); err == nil {
+			prevMembership = pm.Membership
+		}
+		isProfileUpdate := mc.Membership == "join" && prevMembership == "join"
+		if !isProfileUpdate && (mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban") {
 			_, _ = a.Store.RecordDeviceListChange(r.Context(), target, mc.Membership != "join")
 			if mc.Membership == "join" {
 				a.broadcastDeviceListForUser(r.Context(), target)

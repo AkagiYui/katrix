@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/events"
@@ -688,6 +689,38 @@ func (a *API) GetStateIDs(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
 	if a.checkServerACL(w, r, roomID) {
 		return
+	}
+	// A partial-state room (MSC3902) does not have its full state yet: the
+	// background resync is still fetching it. Answering /state_ids from the
+	// incomplete snapshot would hand a peer an authoritative-looking state that
+	// is missing members (and possibly auth-critical events), which is worse
+	// than waiting — Complement's partial-state suite asserts exactly this
+	// ("/state_ids request did not block when it should have"). Block until the
+	// resync completes (or the caller goes away); once the room is
+	// fully-resynced the state below is authoritative.
+	room, err := a.Store.GetRoom(r.Context(), roomID)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
+		return
+	}
+	if room.PartialState {
+		deadline := time.Now().Add(60 * time.Second)
+		for room.PartialState {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+			if time.Now().After(deadline) {
+				// The resync is stuck; refuse rather than serve a partial snapshot.
+				httpx.WriteError(w, httpx.ErrUnknown("room state not ready"))
+				return
+			}
+			if room, err = a.Store.GetRoom(r.Context(), roomID); err != nil {
+				httpx.WriteError(w, httpx.ErrNotFound("room not found"))
+				return
+			}
+		}
 	}
 	stateRows, err := a.Store.GetState(r.Context(), roomID)
 	if err != nil || len(stateRows) == 0 {
