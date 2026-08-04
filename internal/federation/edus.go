@@ -216,7 +216,7 @@ func (a *API) handleEDU(ctx context.Context, origin string, edu json.RawMessage)
 		if a.aclDeniesReceiptEDU(ctx, e.Content, origin) {
 			return
 		}
-		a.applyReceiptEDU(ctx, e.Content)
+		a.applyReceiptEDU(ctx, origin, e.Content)
 	}
 }
 
@@ -385,33 +385,46 @@ func (a *API) applyDirectToDeviceEDU(ctx context.Context, content json.RawMessag
 }
 
 // applyReceiptEDU applies an inbound m.receipt EDU (spec receipt federation).
-// The content is keyed by room_id per the spec:
+// The federated content is keyed by room_id, then receipt_type, then user_id
+// (the spec's m.receipt EDU shape):
 //
-//	{ <room_id>: { <event_id>: { <receipt_type>: { <user_id>: { "ts": <ts> } } } } }
+//	{ <room_id>: { <receipt_type>: { <user_id>: { "data": {"ts": <ts>, "thread_id": <thread>}, "event_ids": [...] } } } }
 //
-// The room is taken from the top-level key (never derived from the receipted
-// event, which the receiving server may not have yet). Each entry is persisted
-// via SetReceipt so local users in the room see the remote user's receipt in
+// Each event_id in event_ids gets a receipt row (ts from data.ts, thread from
+// data.thread_id), so local users in the room see the remote user's receipt in
 // the ephemeral /sync section, and the room's local members are woken.
-func (a *API) applyReceiptEDU(ctx context.Context, content json.RawMessage) error {
-	var byRoom map[string]map[string]map[string]map[string]struct {
-		TS int64 `json:"ts"`
+// Mirror of Synapse's _received_remote_receipt: only m.read receipts are
+// federated (m.read.private MUST NOT appear in the EDU), and a server only
+// vouches for receipts of its own users.
+func (a *API) applyReceiptEDU(ctx context.Context, origin string, content json.RawMessage) error {
+	var byRoom map[string]map[string]map[string]struct {
+		Data struct {
+			TS       int64  `json:"ts"`
+			ThreadID string `json:"thread_id"`
+		} `json:"data"`
+		EventIDs []string `json:"event_ids"`
 	}
 	if err := json.Unmarshal(content, &byRoom); err != nil {
 		return fmt.Errorf("m.receipt: bad content: %w", err)
 	}
 	now := a.Now()
-	for roomID, byEvent := range byRoom {
-		for eventID, byType := range byEvent {
-			for receiptType, byUser := range byType {
-				for userID, rc := range byUser {
-					ts := rc.TS
-					if ts == 0 {
-						ts = now
-					}
+	for roomID, byType := range byRoom {
+		for receiptType, byUser := range byType {
+			if receiptType != "m.read" {
+				continue
+			}
+			for userID, rc := range byUser {
+				if ids.DomainOf(userID) != origin {
+					continue
+				}
+				ts := rc.Data.TS
+				if ts == 0 {
+					ts = now
+				}
+				for _, eventID := range rc.EventIDs {
 					if _, err := a.Store.SetReceipt(ctx, storage.ReceiptRow{
 						RoomID: roomID, UserID: userID, ReceiptType: receiptType,
-						EventID: eventID, TS: ts,
+						EventID: eventID, TS: ts, ThreadID: rc.Data.ThreadID,
 					}); err == nil {
 						a.notifyRoomMembers(ctx, roomID)
 					}

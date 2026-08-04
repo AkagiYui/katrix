@@ -1017,6 +1017,15 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
 		return
 	}
+	// MSC3902 partial state: while this server has only partial state for the
+	// room it cannot produce a complete /make_join answer (it does not know
+	// the auth events the join template must reference, and it cannot service
+	// the subsequent /send_join). Refuse with 404 as if the room were unknown
+	// (mirror of Synapse's on_make_join_request).
+	if room.PartialState {
+		httpx.WriteError(w, httpx.ErrNotFound("this server is not fully joined to the room"))
+		return
+	}
 	// Server ACLs: a banned server may not join (spec server_acl).
 	if a.checkServerACL(w, r, roomID) {
 		return
@@ -1167,6 +1176,13 @@ func (a *API) MakeKnock(w http.ResponseWriter, r *http.Request) {
 	room, err := a.Store.GetRoom(r.Context(), roomID)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
+		return
+	}
+	// MSC3902 partial state: a server mid-partial-join cannot give a complete
+	// /make_knock answer; refuse with 404 (mirror of Synapse's
+	// on_make_knock_request).
+	if room.PartialState {
+		httpx.WriteError(w, httpx.ErrNotFound("this server is not fully joined to the room"))
 		return
 	}
 	// Server ACLs: a banned server may not knock (spec server_acl).
@@ -1684,6 +1700,16 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 		} else {
 			version = roomver.Default
 		}
+	}
+
+	// MSC3902 partial state: while this server is only partially joined it
+	// cannot produce the complete /send_join, /send_knock or /send_leave answer
+	// (it lacks the full state and the server list). Refuse with 404 as if the
+	// room were unknown (mirror of Synapse's _on_send_membership_event, which
+	// returns "as we would if we weren't in the room at all").
+	if room, err := a.Store.GetRoom(r.Context(), ev.RoomID); err == nil && room.PartialState {
+		httpx.WriteError(w, httpx.ErrNotFound("this server is not fully joined to the room"))
+		return
 	}
 
 	// The event must be the expected membership transition (send_join -> join,
