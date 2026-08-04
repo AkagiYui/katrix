@@ -163,8 +163,14 @@ func (a *API) resyncFromServer(ctx context.Context, roomID string, version roomv
 	for _, id := range stateIDs {
 		if known[id] {
 			// Already persisted (the critical state from the partial send_join,
-			// or an earlier resync attempt): include its state tuple.
-			if ev, err := a.Store.GetEvent(ctx, id); err == nil && ev != nil && ev.StateKey != "" {
+			// or an earlier resync attempt): include its state tuple. Every ID
+			// from /state_ids is a state event by definition, so it is included
+			// even when its state_key is empty — m.room.create, m.room.tombstone,
+			// m.room.join_rules and m.room.power_levels all carry the empty
+			// state_key, and dropping them from the re-seed would leave the room
+			// without its auth-critical state (every join then fails with
+			// "no m.room.create in state").
+			if ev, err := a.Store.GetEvent(ctx, id); err == nil && ev != nil {
 				rows = append(rows, storage.StateRow{RoomID: roomID, Type: ev.Type, StateKey: ev.StateKey, EventID: ev.EventID})
 			}
 			continue
