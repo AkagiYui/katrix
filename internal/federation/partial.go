@@ -179,7 +179,12 @@ func (a *API) resyncFromServer(ctx context.Context, roomID string, version roomv
 		if err != nil {
 			continue // best-effort: missing events do not abort the resync
 		}
-		row, ok := a.persistVerifiedPDUWithRow(ctx, roomID, version, rules, raw)
+		// Every ID from /state_ids is a state event by definition, so the
+		// persisted row must be included even when the raw event carries no
+		// state_key field — m.room.create (and friends) legitimately omit it
+		// (its state_key is implicitly the empty string), and dropping it here
+		// leaves the re-seeded room without its auth-critical create event.
+		row, ok := a.persistVerifiedPDUWithRow(ctx, roomID, version, rules, raw, true)
 		if ok {
 			rows = append(rows, row)
 		}
@@ -192,7 +197,7 @@ func (a *API) resyncFromServer(ctx context.Context, roomID string, version roomv
 		if err != nil {
 			continue
 		}
-		a.persistVerifiedPDUWithRow(ctx, roomID, version, rules, raw)
+		a.persistVerifiedPDUWithRow(ctx, roomID, version, rules, raw, false)
 	}
 	// Re-seed the join event's state-at-event snapshot from the fetched full
 	// state + the join event itself, making the join event the sole forward
@@ -278,7 +283,13 @@ func (a *API) fetchEvent(ctx context.Context, server, eventID string) (json.RawM
 
 // persistVerifiedPDUWithRow verifies and persists a PDU, returning its state
 // row when it is a state event.
-func (a *API) persistVerifiedPDUWithRow(ctx context.Context, roomID string, version roomver.Version, rules roomver.Rules, raw json.RawMessage) (storage.StateRow, bool) {
+// persistVerifiedPDUWithRow verifies and persists a single PDU fetched during a
+// partial-state resync, returning its state tuple. forceState marks the PDU as
+// a state event even when it carries no state_key field (state IDs served by
+// /state_ids are state events by definition; m.room.create and friends omit
+// the field, whose value is implicitly the empty string). Auth-chain events are
+// fetched with forceState=false: they are not necessarily state events.
+func (a *API) persistVerifiedPDUWithRow(ctx context.Context, roomID string, version roomver.Version, rules roomver.Rules, raw json.RawMessage, forceState bool) (storage.StateRow, bool) {
 	var ev struct {
 		EventID  string          `json:"event_id"`
 		RoomID   string          `json:"room_id"`
@@ -317,16 +328,20 @@ func (a *API) persistVerifiedPDUWithRow(ctx context.Context, roomID string, vers
 		return storage.StateRow{}, false
 	}
 	a.Store.IndexRelationFromRow(ctx, row)
-	if ev.StateKey != nil {
-		// Update the denormalised membership table for remote member state
-		// events so /joined_members, /members and lazy-loading syncs see them.
-		if ev.Type == "m.room.member" {
-			a.applyRemoteMembership(ctx, roomID, *ev.StateKey, ev.Content, id, ev.Depth)
+	// Membership state events update the denormalised membership table so
+	// /joined_members, /members and lazy-loading syncs see them.
+	if ev.StateKey != nil && ev.Type == "m.room.member" {
+		a.applyRemoteMembership(ctx, roomID, *ev.StateKey, ev.Content, id, ev.Depth)
+	}
+	if err := eventstate.Maintain(ctx, a.Store, row, rules); err != nil {
+		_ = err
+	}
+	if ev.StateKey != nil || forceState {
+		sk := ""
+		if ev.StateKey != nil {
+			sk = *ev.StateKey
 		}
-		if err := eventstate.Maintain(ctx, a.Store, row, rules); err != nil {
-			_ = err
-		}
-		return storage.StateRow{RoomID: roomID, Type: ev.Type, StateKey: *ev.StateKey, EventID: id}, true
+		return storage.StateRow{RoomID: roomID, Type: ev.Type, StateKey: sk, EventID: id}, true
 	}
 	return storage.StateRow{}, false
 }
