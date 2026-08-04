@@ -244,14 +244,14 @@ func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
 		return nil
 	}
 	f := &SyncFilter{
-		TimelineTypes:      obj.Room.Timeline.Types,
-		TimelineNotTypes:   obj.Room.Timeline.NotTypes,
-		TimelineSenders:    obj.Room.Timeline.Senders,
-		TimelineNotSenders: obj.Room.Timeline.NotSenders,
-		LazyLoadMembers:    obj.Room.State.LazyLoadMembers,
+		TimelineTypes:             obj.Room.Timeline.Types,
+		TimelineNotTypes:          obj.Room.Timeline.NotTypes,
+		TimelineSenders:           obj.Room.Timeline.Senders,
+		TimelineNotSenders:        obj.Room.Timeline.NotSenders,
+		LazyLoadMembers:           obj.Room.State.LazyLoadMembers,
 		UnreadThreadNotifications: obj.Room.Timeline.UnreadThreadNotifications,
-		IncludeLeave:       obj.Room.IncludeLeave,
-		EventFields:        obj.EventFields,
+		IncludeLeave:              obj.Room.IncludeLeave,
+		EventFields:               obj.EventFields,
 	}
 	if obj.Room.Timeline.Limit != nil {
 		f.TimelineLimit = *obj.Room.Timeline.Limit

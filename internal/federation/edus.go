@@ -301,7 +301,7 @@ func (a *API) applyDeviceListEDU(ctx context.Context, origin string, content jso
 	}
 	if err := json.Unmarshal(content, &c); err != nil || c.UserID == "" {
 		return fmt.Errorf("device_list_update missing user_id")
-	}	// monotonic per-user counter. A stale re-delivery (an outbound-queue retry
+	} // monotonic per-user counter. A stale re-delivery (an outbound-queue retry
 	// after a restart re-sends an already-acknowledged transaction) must not
 	// re-record the user in the local device-list stream — that would surface
 	// them in a /sync window they were already reported in. Remember the last

@@ -1552,7 +1552,7 @@ func (a *API) roomPowerLevels(ctx context.Context, roomID string) *rooms.PowerLe
 // the room version 12 creator privilege (MSC4239/MSC4289): the creator and any
 // additional creators are exempt from power-level checks even though they are
 // not listed in m.room.power_levels.users (their power is implicit). Handler
-//-level permission checks (redact, alias deletion) must use this instead of
+// -level permission checks (redact, alias deletion) must use this instead of
 // PowerLevels.UserLevel directly, or a v12 room creator reads as level 0 (the
 // users_default) and is wrongly denied. Mirrors the userLevel closure in
 // rooms.Authorize.
@@ -2266,44 +2266,44 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 		}); err != nil {
 			return "", err
 		}
-			// A join/leave changes the user's device-list visibility to the room's
-			// other members: their /sync must learn the user in device_lists.changed
-			// (join) or device_lists.left (leave/ban). The change advances the shared
-			// sync stream; notifyRoomMembers below wakes the room's syncing users.
-			// Federating servers sharing the room also need the device list of a
-			// newly-joined local user (spec: m.device_list_update to every server
-			// sharing a room with a local user, including on join).
-			//
-			// A user's OWN join/leave records a change for themselves too: on join
-			// their other devices must learn the room's device lists are now
-			// relevant (Complement's DeviceListUpdateOverFederation expects the
-			// joining user's own ID on their own sync), and on leave/ban their
-			// devices must learn the room was left (device_lists.left).
-			if mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban" {
-				_, _ = a.Store.RecordDeviceListChange(r.Context(), target, mc.Membership != "join")
-				if mc.Membership == "join" {
-					a.broadcastDeviceListForUser(r.Context(), target)
-				} else {
-					a.broadcastDeviceListDelete(r.Context(), target, roomID)
-					// The reverse direction: the user leaving/being banned stops
-					// sharing the room with its remaining members, so their /sync
-					// must report those users in device_lists.left (they can no
-					// longer receive the members' device updates). Only the *other*
-					// members are recorded — never on a join (a joining user learns
-					// the existing members via the sync engine's newly-shared
-					// computation / the members' device-list EDUs, and recording
-					// them globally would pollute the existing members' own syncs
-					// with their own IDs).
-					if members, err := a.Store.Members(r.Context(), roomID, "join"); err == nil {
-						for _, m := range members {
-							if m.UserID == target {
-								continue
-							}
-							_, _ = a.Store.RecordDeviceListChange(r.Context(), m.UserID, true)
+		// A join/leave changes the user's device-list visibility to the room's
+		// other members: their /sync must learn the user in device_lists.changed
+		// (join) or device_lists.left (leave/ban). The change advances the shared
+		// sync stream; notifyRoomMembers below wakes the room's syncing users.
+		// Federating servers sharing the room also need the device list of a
+		// newly-joined local user (spec: m.device_list_update to every server
+		// sharing a room with a local user, including on join).
+		//
+		// A user's OWN join/leave records a change for themselves too: on join
+		// their other devices must learn the room's device lists are now
+		// relevant (Complement's DeviceListUpdateOverFederation expects the
+		// joining user's own ID on their own sync), and on leave/ban their
+		// devices must learn the room was left (device_lists.left).
+		if mc.Membership == "join" || mc.Membership == "leave" || mc.Membership == "ban" {
+			_, _ = a.Store.RecordDeviceListChange(r.Context(), target, mc.Membership != "join")
+			if mc.Membership == "join" {
+				a.broadcastDeviceListForUser(r.Context(), target)
+			} else {
+				a.broadcastDeviceListDelete(r.Context(), target, roomID)
+				// The reverse direction: the user leaving/being banned stops
+				// sharing the room with its remaining members, so their /sync
+				// must report those users in device_lists.left (they can no
+				// longer receive the members' device updates). Only the *other*
+				// members are recorded — never on a join (a joining user learns
+				// the existing members via the sync engine's newly-shared
+				// computation / the members' device-list EDUs, and recording
+				// them globally would pollute the existing members' own syncs
+				// with their own IDs).
+				if members, err := a.Store.Members(r.Context(), roomID, "join"); err == nil {
+					for _, m := range members {
+						if m.UserID == target {
+							continue
 						}
+						_, _ = a.Store.RecordDeviceListChange(r.Context(), m.UserID, true)
 					}
 				}
 			}
+		}
 	}
 	a.notifyRoomMembers(r.Context(), roomID)
 	a.broadcastPDU(r.Context(), roomID, ev)

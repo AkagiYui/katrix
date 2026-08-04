@@ -201,7 +201,7 @@ func (a *API) serverSharesRoom(ctx context.Context, roomID, dest string, raw jso
 		}
 	}
 	var ev struct {
-		Type     string `json:"type"`
+		Type     string  `json:"type"`
 		StateKey *string `json:"state_key"`
 	}
 	if json.Unmarshal(raw, &ev) == nil && ev.Type == "m.room.member" && ev.StateKey != nil {
