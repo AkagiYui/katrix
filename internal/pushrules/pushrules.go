@@ -76,6 +76,13 @@ var Kinds = []string{"override", "underride", "sender", "room", "content"}
 // DefaultRuleset returns the spec default global push ruleset as a JSON object
 // suitable for the content of the m.push_rules account data event. It includes
 // the MSC3930 poll push rules (which are part of the current spec defaults).
+//
+// Per the spec's Actions section, "Actions that have no parameters are
+// represented as a string": `notify` must be the JSON string "notify", not an
+// object like {"notify": {}}. The matrix-rust-sdk (via ruma) treats any object
+// action that is not a set_tweak as an unknown custom action whose
+// should_notify() is false, so an object-form notify silently filters out
+// every event (clients then never see a notification).
 func DefaultRuleset() map[string]any {
 	return map[string]any{
 		"global": map[string]any{
@@ -84,7 +91,7 @@ func DefaultRuleset() map[string]any {
 					"rule_id": ".m.rule.contains_user_name",
 					"enabled": true,
 					"default": true,
-					"actions": []map[string]any{{"set_tweak": "highlight", "value": true}, {"notify": map[string]any{}}},
+					"actions": []any{map[string]any{"set_tweak": "highlight", "value": true}, "notify"},
 					"pattern": "",
 				},
 			},
@@ -108,15 +115,15 @@ func DefaultRuleset() map[string]any {
 			"underride": []map[string]any{
 				{"rule_id": ".m.rule.call", "enabled": true, "default": true,
 					"conditions": []map[string]any{{"kind": "event_match", "key": "type", "pattern": "m.call.invite"}},
-					"actions":    []map[string]any{{"notify": map[string]any{}}, {"set_tweak": "ring", "value": true}}},
+					"actions":    []any{"notify", map[string]any{"set_tweak": "ring", "value": true}}},
 				{"rule_id": ".m.rule.encrypted_room_one_to_one", "enabled": true, "default": true,
-					"actions": []map[string]any{{"notify": map[string]any{}}}},
+					"actions": []string{"notify"}},
 				{"rule_id": ".m.rule.room_one_to_one", "enabled": true, "default": true,
-					"actions": []map[string]any{{"notify": map[string]any{}}}},
+					"actions": []string{"notify"}},
 				{"rule_id": ".m.rule.message", "enabled": true, "default": true,
-					"actions": []map[string]any{{"notify": map[string]any{}}}},
+					"actions": []string{"notify"}},
 				{"rule_id": ".m.rule.encrypted", "enabled": true, "default": true,
-					"actions": []map[string]any{{"notify": map[string]any{}}}},
+					"actions": []string{"notify"}},
 				// MSC3930: one-to-one poll rules take priority over the generic
 				// ones, so they are listed before their generic counterparts.
 				{"rule_id": ".org.matrix.msc3930.rule.poll_start_one_to_one", "enabled": true, "default": true,

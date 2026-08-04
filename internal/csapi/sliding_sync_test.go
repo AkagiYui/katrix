@@ -167,6 +167,63 @@ func TestSlidingSyncIncremental(t *testing.T) {
 	}
 }
 
+// TestSlidingSyncUnreadCounts verifies the flat spec-v5 unread fields
+// (notification_count / highlight_count) are reported on a joined room once
+// another user's message arrives.
+func TestSlidingSyncUnreadCounts(t *testing.T) {
+	_, srv := testAPI(t)
+	alice := registerUser(t, srv, "ss-unread-a", "pw")
+	bob := registerUser(t, srv, "ss-unread-b", "pw")
+	roomID := createRoom(t, srv, alice, map[string]any{"preset": "public_chat"})
+	if code, _ := doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/join/"+roomID, bob, nil); code != 200 {
+		t.Fatalf("join: %d", code)
+	}
+
+	syncForAlice := func() map[string]any {
+		code, body := doSlidingSync(t, srv, alice, "", map[string]any{
+			"lists": map[string]any{
+				"all_rooms": map[string]any{
+					"ranges":         [][2]int{{0, 19}},
+					"timeline_limit": 10,
+				},
+			},
+		})
+		if code != 200 {
+			t.Fatalf("sliding sync: %d %v", code, body)
+		}
+		rooms, _ := body["rooms"].(map[string]any)
+		room, _ := rooms[roomID].(map[string]any)
+		if room == nil {
+			t.Fatalf("room missing: %v", body)
+		}
+		return room
+	}
+
+	// No unread messages yet: alice's own create/join never notify.
+	room := syncForAlice()
+	if n, _ := room["notification_count"].(float64); n != 0 {
+		t.Fatalf("notification_count should be 0 before bob's message: %v", room)
+	}
+	if h, _ := room["highlight_count"].(float64); h != 0 {
+		t.Fatalf("highlight_count should be 0 before bob's message: %v", room)
+	}
+
+	// Bob sends a plain message: the default .m.rule.message underride notifies.
+	if code, _ := doJSON(t, srv, http.MethodPut,
+		"/_matrix/client/v3/rooms/"+roomID+"/send/m.room.message/txn-u1", bob,
+		map[string]any{"msgtype": "m.text", "body": "hello unread"}); code != 200 {
+		t.Fatalf("send: %d", code)
+	}
+
+	room = syncForAlice()
+	if n, _ := room["notification_count"].(float64); n != 1 {
+		t.Fatalf("notification_count should be 1 after bob's message: %v", room)
+	}
+	if h, _ := room["highlight_count"].(float64); h != 0 {
+		t.Fatalf("highlight_count should be 0 (no mention): %v", room)
+	}
+}
+
 // TestSlidingSyncRoomSubscription verifies a room_subscription returns the
 // room even when no list references it, with the subscription's timeline_limit.
 func TestSlidingSyncRoomSubscription(t *testing.T) {

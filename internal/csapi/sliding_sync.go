@@ -112,6 +112,12 @@ type slidingSyncRoomResp struct {
 	InvitedCount  *int              `json:"invited_count,omitempty"`
 	Membership    string            `json:"membership,omitempty"`
 	StrippedState []json.RawMessage `json:"invite_state,omitempty"`
+	// Unread notification counts (flat form, per the sync v5 / sliding-sync
+	// room schema — the spec's UnreadNotificationsCount object is flattened
+	// into the room). The matrix-rust-sdk's NotificationClient reads these to
+	// decide which events to surface as notifications.
+	HighlightCount    int `json:"highlight_count,omitempty"`
+	NotificationCount int `json:"notification_count,omitempty"`
 }
 
 type slidingSyncExtResp struct {
@@ -311,7 +317,7 @@ func (a *API) buildSlidingSync(ctx context.Context, auth *homeserver.Auth, since
 			}
 		}
 		a.ssConns.setSubscribed(auth.UserID, connID, roomID, true)
-		if rr := a.slidingRoomResult(ctx, *entry, auth.UserID, since, maxStream, sub.TimelineLimit, sub.RequiredState, forceInitial); rr != nil {
+		if rr := a.slidingRoomResult(ctx, *entry, auth.UserID, auth.Localpart, since, maxStream, sub.TimelineLimit, sub.RequiredState, forceInitial); rr != nil {
 			resp.Rooms[roomID] = *rr
 			cfg := ssDeliveredConfig{timelineLimit: 1}
 			if sub.TimelineLimit != nil {
@@ -374,7 +380,7 @@ func (a *API) buildSlidingSync(ctx context.Context, auth *homeserver.Auth, since
 							forceInitial = true
 						}
 					}
-					if rr := a.slidingRoomResult(ctx, entry, auth.UserID, since, maxStream, list.TimelineLimit, list.RequiredState, forceInitial); rr != nil {
+					if rr := a.slidingRoomResult(ctx, entry, auth.UserID, auth.Localpart, since, maxStream, list.TimelineLimit, list.RequiredState, forceInitial); rr != nil {
 						resp.Rooms[entry.roomID] = *rr
 						cfg := ssDeliveredConfig{timelineLimit: 1}
 						if list.TimelineLimit != nil {
@@ -472,7 +478,7 @@ func filterRoomEntries(entries []roomEntry, f *slidingSyncFilters) []roomEntry {
 // room to be treated as newly-returned (initial=true with a timeline anchored
 // at the room's latest event) even on an incremental sync — used when a room
 // subscription overrides the config a room was previously delivered with.
-func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID string, since, maxStream int64, timelineLimit *int, requiredState [][2]string, forceInitial bool) *slidingSyncRoomResp {
+func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID, localpart string, since, maxStream int64, timelineLimit *int, requiredState [][2]string, forceInitial bool) *slidingSyncRoomResp {
 	roomID := entry.roomID
 	limit := 1
 	if timelineLimit != nil && *timelineLimit >= 0 {
@@ -507,6 +513,13 @@ func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID str
 		}
 		rr.JoinedCount = &joined
 		rr.InvitedCount = &invited
+
+		// Unread notification counts (flat spec v5 room fields). Computed from
+		// the user's push rules and read receipts, mirroring /v3/sync.
+		if n, h, ok := a.syncEngine.SlidingUnreadCounts(ctx, roomID, userID, localpart); ok && (n > 0 || h > 0) {
+			rr.NotificationCount = n
+			rr.HighlightCount = h
+		}
 
 		// Timeline: on initial sync (or a room newly appearing in the sliding
 		// window) return the most recent `limit` events; on a plain incremental

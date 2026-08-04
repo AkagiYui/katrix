@@ -1217,6 +1217,27 @@ func (e *Engine) unreadCounts(ctx context.Context, roomID string, opts SyncOptio
 	return &UnreadNotifications{NotificationCount: &combinedCount, HighlightCount: &combinedHighlight}, nil
 }
 
+// SlidingUnreadCounts computes a user's combined unread notification and
+// highlight counts for a joined room, for the sliding-sync room response
+// (which carries flat notification_count/highlight_count fields rather than
+// /v3/sync's nested unread_notifications object). It returns false when the
+// counts cannot be computed (no read position, or no push ruleset), in which
+// case the caller omits the fields.
+func (e *Engine) SlidingUnreadCounts(ctx context.Context, roomID, userID, localpart string) (notif, highlight int, ok bool) {
+	main, _ := e.unreadCounts(ctx, roomID, SyncOptions{UserID: userID, Localpart: localpart})
+	if main == nil {
+		return 0, 0, false
+	}
+	n, h := 0, 0
+	if main.NotificationCount != nil {
+		n = *main.NotificationCount
+	}
+	if main.HighlightCount != nil {
+		h = *main.HighlightCount
+	}
+	return n, h, true
+}
+
 // countFor evaluates the unread push actions for one timeline (main or a
 // single thread) and returns the notification and highlight counts.
 func (e *Engine) countFor(ctx context.Context, roomID, root string, since int64, opts SyncOptions, rules map[string]any, joined int64) (int, int) {

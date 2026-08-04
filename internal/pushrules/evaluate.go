@@ -185,7 +185,9 @@ func conditionMatches(cm map[string]any, _ string, ev EventSnapshot, _ string) b
 	}
 }
 
-// applyActions maps a matched rule's actions to notify/highlight.
+// applyActions maps a matched rule's actions to notify/highlight. Per the spec,
+// parameterless actions (notify) are JSON strings, and the only object action
+// is set_tweak; any other object is an unknown action that MUST be ignored.
 func applyActions(rule map[string]any, res *EvalResult) {
 	actions, _ := rule["actions"].([]any)
 	for _, a := range actions {
@@ -195,9 +197,6 @@ func applyActions(rule map[string]any, res *EvalResult) {
 				res.Notifies = true
 			}
 		case map[string]any:
-			if _, ok := act["notify"]; ok {
-				res.Notifies = true
-			}
 			if tw, ok := act["set_tweak"].(string); ok && tw == "highlight" {
 				if val, ok := act["value"].(bool); ok && val {
 					res.Highlights = true

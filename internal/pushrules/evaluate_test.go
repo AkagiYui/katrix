@@ -25,6 +25,34 @@ func TestEvaluate(t *testing.T) {
 	userID := "@alice:hs1"
 	localpart := "alice"
 
+	// The default ruleset must emit actions in the spec's string form: any
+	// notify action is the JSON string "notify", and the only object action is
+	// set_tweak. matrix-rust-sdk treats a {"notify": {}} object as an unknown
+	// custom action that never notifies.
+	notifyObjects := 0
+	checkActions := func(ruleset map[string]any) {
+		global := ruleset["global"].(map[string]any)
+		for _, kind := range []string{"override", "content", "sender", "room", "underride"} {
+			list, _ := global[kind].([]any)
+			for _, e := range list {
+				rule, _ := e.(map[string]any)
+				actions, _ := rule["actions"].([]any)
+				for _, a := range actions {
+					switch act := a.(type) {
+					case map[string]any:
+						if _, ok := act["notify"]; ok {
+							notifyObjects++
+						}
+					}
+				}
+			}
+		}
+	}
+	checkActions(rules)
+	if notifyObjects > 0 {
+		t.Errorf("default ruleset contains %d object-form notify actions; spec requires string \"notify\"", notifyObjects)
+	}
+
 	mention := EventSnapshot{
 		Type:    "m.room.message",
 		Sender:  "@bob:hs1",
