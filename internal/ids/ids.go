@@ -84,6 +84,65 @@ func ParseUserID(s string) (UserID, error) {
 // MakeUserID constructs a user ID from parts.
 func MakeUserID(localpart, domain string) string { return "@" + localpart + ":" + domain }
 
+// validServerNameHost reports whether a server-name host part is syntactically
+// valid (RFC 1035 hostname, mirroring Synapse's VALID_HOST_REGEX).
+func validServerNameHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	for i, c := range host {
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c == '-' && i > 0 && i < len(host)-1:
+		case c == '.' && i > 0 && i < len(host)-1:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ValidServerName reports whether s is a syntactically valid Matrix server
+// name: a hostname (with optional :port) or a bracketed IPv6 literal. The
+// check is deliberately lenient (mirror of Synapse's parse_and_validate_server
+// _name): it exists to reject strings that could not possibly be a server
+// name, not to be an authoritative DNS validation.
+func ValidServerName(s string) bool {
+	if s == "" {
+		return false
+	}
+	if s[0] == '[' {
+		// IPv6 literal: must be "[...]".
+		return len(s) > 2 && s[len(s)-1] == ']'
+	}
+	// Strip an optional trailing :port (rsplit on the last colon).
+	host := s
+	if i := strings.LastIndexByte(s, ':'); i >= 0 {
+		host = s[:i]
+	}
+	return validServerNameHost(host)
+}
+
+// IsLooseUserID reports whether s is syntactically a user ID under the
+// MSC3757 owned-state rule: it must start with '@', have a colon-separated,
+// non-empty domain that is a valid server name, and a non-empty localpart.
+// The localpart is deliberately NOT validated — mirror of Synapse's
+// UserID.is_valid, which only validates the domain (the state-key grammar
+// relies on this looseness to identify the "owner" portion of suffixed keys).
+func IsLooseUserID(s string) bool {
+	if len(s) < 2 || s[0] != '@' {
+		return false
+	}
+	rest := s[1:]
+	idx := strings.IndexByte(rest, ':')
+	if idx <= 0 || idx >= len(rest)-1 {
+		return false // missing or empty localpart/domain
+	}
+	return ValidServerName(rest[idx+1:])
+}
+
 // validLocalpart enforces the historical grammar plus the extended set Matrix
 // permits (a-z 0-9 . _ = - / +).
 func validLocalpart(lp string) bool {

@@ -7,6 +7,8 @@
 // (events, stateres, rooms) consult it rather than hard-coding version checks.
 package roomver
 
+import "strings"
+
 // Version is a room version identifier ("1".."12").
 type Version string
 
@@ -81,6 +83,14 @@ type Rules struct {
 	// partial-state joins (omit_members=true, MSC3706/MSC3902). Enabled from
 	// v2 (when member events stopped being required in send_join state).
 	PartialStateAllowed bool
+
+	// OwnedState (MSC3757): a user may set state whose state_key starts with
+	// their own user ID (optionally suffixed with "_<anything>"), and any user
+	// may set state whose state_key is another user's ID if they hold strictly
+	// more power than that user. Without the flag the strict v10 rule applies:
+	// a state_key starting with @ must equal the sender exactly. Registered as
+	// the unstable room version "org.matrix.msc3757.10".
+	OwnedState bool
 }
 
 var table = map[Version]Rules{}
@@ -156,6 +166,15 @@ func init() {
 	v12.RoomIDIsCreateHash = true
 	v12.CreatorPrivileged = true
 	register(v12)
+
+	// Unstable room version aliases (MSC3757): "org.matrix.msc3757.10" behaves
+	// as room version 10 with the owned-state auth rule (MSC3757) enabled. The
+	// unstable identifier is accepted in createRoom/upgrade and advertised in
+	// /capabilities m.room_versions as "unstable".
+	msc3757 := v10
+	msc3757.Version = "org.matrix.msc3757.10"
+	msc3757.OwnedState = true
+	register(msc3757)
 }
 
 // Default is the room version used for new rooms when the client does not
@@ -199,7 +218,13 @@ func IsSupported(v Version) bool {
 func CapabilityMap() map[string]string {
 	m := make(map[string]string, len(table))
 	for v := range table {
-		m[string(v)] = "stable"
+		stable := "stable"
+		if strings.HasPrefix(string(v), "org.matrix.msc") {
+			// Unstable identifiers are announced as "unstable" so clients know
+			// they may change (spec /capabilities m.room_versions).
+			stable = "unstable"
+		}
+		m[string(v)] = stable
 	}
 	return m
 }

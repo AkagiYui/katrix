@@ -939,32 +939,42 @@ func (a *API) RoomMembers(w http.ResponseWriter, r *http.Request) {
 	// ?at=<token>: return the members as of a historical point in the stream
 	// (each user's latest member event up to that ordering).
 	var rows []storage.MembershipRow
+	var err error
 	if atRaw := q.Get("at"); atRaw != "" {
 		at, err := parseIntToken(atRaw)
 		if err != nil {
 			writeRoomErr(w, err)
 			return
 		}
-		evs, err := a.Store.MemberEventsAt(r.Context(), roomID, at)
-		if err != nil {
-			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		// A room that was partial-state at the requested position has no
+		// authoritative membership for that point in time (the background resync
+		// fetched the members afterwards). Treat the request as "current" —
+		// Synapse does the same for partial-state rooms, and the client has no
+		// baseline to reconstruct a historical view from anyway.
+		if up, uerr := a.Store.RoomUnpartialStateStream(r.Context(), roomID); uerr == nil && up > at {
+			rows, err = a.Store.Members(r.Context(), roomID, "")
+		} else {
+			evs, eerr := a.Store.MemberEventsAt(r.Context(), roomID, at)
+			if eerr != nil {
+				httpx.WriteError(w, httpx.ErrUnknown(eerr.Error()))
+				return
+			}
+			chunk := make([]json.RawMessage, 0, len(evs))
+			for i := range evs {
+				if notMembership != "" && memberOf(&evs[i]) == notMembership {
+					continue
+				}
+				if membershipFilter != "" && memberOf(&evs[i]) != membershipFilter {
+					continue
+				}
+				chunk = append(chunk, clientEvent(&evs[i]))
+			}
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
 			return
 		}
-		chunk := make([]json.RawMessage, 0, len(evs))
-		for i := range evs {
-			if notMembership != "" && memberOf(&evs[i]) == notMembership {
-				continue
-			}
-			if membershipFilter != "" && memberOf(&evs[i]) != membershipFilter {
-				continue
-			}
-			chunk = append(chunk, clientEvent(&evs[i]))
-		}
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
-		return
+	} else {
+		rows, err = a.Store.Members(r.Context(), roomID, membershipFilter)
 	}
-
-	rows, err := a.Store.Members(r.Context(), roomID, membershipFilter)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
@@ -1647,8 +1657,19 @@ func (a *API) DirectoryLookupAlias(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Resolve canonical servers.
+	// Resolve canonical servers: the spec's directory lookup `servers` field
+	// lists the servers that can be used to join the room. For a partial-state
+	// room (MSC3902) those are the servers recorded at the partial send_join
+	// (the room's active servers before the join) plus this server; a peer that
+	// learns the alias from the directory can then join from them.
 	servers := []string{a.ServerName()}
+	if room, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
+		for _, s := range room.ServersInRoom {
+			if s != "" && s != a.ServerName() {
+				servers = append(servers, s)
+			}
+		}
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"room_id": roomID,
 		"servers": servers,
@@ -2418,6 +2439,11 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 		return nil, newRoomError(http.StatusBadRequest, "M_FORBIDDEN", "a room can only be created once")
 	}
 	if err := rooms.Authorize(rules, eventType, stateKey, auth.UserID, content, st); err != nil {
+		if errors.Is(err, rooms.ErrBadStateKey) {
+			// A malformed user-ID state key is a client error (400 M_BAD_JSON),
+			// not a permission failure (MSC3757).
+			return nil, newRoomError(http.StatusBadRequest, "M_BAD_JSON", err.Error())
+		}
 		return nil, newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
 	}
 	// Setting identical state is idempotent: if the current state for this

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -705,7 +706,9 @@ func (a *API) fetchAuthChainFor(ctx context.Context, roomID, eventID, origin str
 		return
 	}
 	for _, rawEv := range out.AuthChain {
-		_ = a.persistVerifiedPDU(ctx, roomID, version, rules, rawEv)
+		if err := a.persistVerifiedPDU(ctx, roomID, version, rules, rawEv); err != nil {
+			log.Printf("katrix: auth chain event for %s from %s failed to persist: %v", eventID, origin, err)
+		}
 	}
 }
 

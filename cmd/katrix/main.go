@@ -167,6 +167,12 @@ func runServe(args []string) error {
 	// on goroutines so the HTTP servers below can start immediately.
 	handler.CSAPI().StartDelayedWorker(ctx)
 	go handler.Federation().RunEDUWorker(ctx)
+	// Resume any partial-state resyncs that were interrupted by a restart
+	// (MSC3902): a room still flagged partial-state must keep fetching its full
+	// state or eager /sync omits it indefinitely.
+	if cfg.FederationEnabled {
+		handler.Federation().ResumePartialStateResyncs(ctx)
+	}
 
 	clientSrv := &http.Server{Addr: cfg.Listen.Client, Handler: handler, ReadHeaderTimeout: 30 * time.Second}
 	fedSrv := &http.Server{Addr: cfg.Listen.Federation, Handler: handler, ReadHeaderTimeout: 30 * time.Second}

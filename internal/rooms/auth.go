@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/roomver"
 )
 
@@ -125,24 +126,19 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 		"m.room.avatar", "m.room.canonical_alias", "m.room.aliases", "m.room.encryption",
 		"m.room.tombstone", "m.room.server_acl", "m.room.guest_access":
 		// Generic state event: sender must be joined and meet the event level.
-		if err := checkOwnedState(rules, stateKey, sender); err != nil {
-			return err
-		}
 		if senderMembership != MembershipJoin {
 			return fmt.Errorf("rooms: %s sender not joined", eventType)
 		}
 		if userLevel(sender) < pl.EventLevel(eventType, true) {
 			return fmt.Errorf("rooms: insufficient power for %s", eventType)
 		}
+		if err := checkOwnedState(rules, stateKey, sender, userLevel); err != nil {
+			return err
+		}
 		return nil
 	default:
 		// State event (has state_key) vs message.
 		isState := stateKey != ""
-		if isState {
-			if err := checkOwnedState(rules, stateKey, sender); err != nil {
-				return err
-			}
-		}
 		if senderMembership != MembershipJoin {
 			return fmt.Errorf("rooms: sender not joined")
 		}
@@ -150,9 +146,20 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 		if userLevel(sender) < needed {
 			return fmt.Errorf("rooms: insufficient power for %s", eventType)
 		}
+		if isState {
+			if err := checkOwnedState(rules, stateKey, sender, userLevel); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 }
+
+// ErrBadStateKey is returned by Authorize when a state event's state_key is a
+// malformed user ID (under the MSC3757 owned-state rule). It is distinct from
+// the plain forbidden error so handlers can map it to 400 M_BAD_JSON (the spec
+// requires a malformed state key to be a client error, not an auth failure).
+var ErrBadStateKey = fmt.Errorf("rooms: state_key is not a valid user ID")
 
 // checkOwnedState enforces the spec's "owned state" auth rule (room versions
 // 10+, MSC3757): "If the event has a state_key that starts with an @ and does
@@ -160,14 +167,43 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 // (or a malformed/foreign user ID) must be rejected regardless of power level,
 // so no user can set state on another user's behalf. m.room.member is exempt —
 // its state_key is the membership target, governed by the membership rules.
-func checkOwnedState(rules roomver.Rules, stateKey, sender string) error {
+//
+// Under the unstable room version "org.matrix.msc3757.10" the rule is relaxed
+// (MSC3757 owned state): a user may set state whose state_key starts with
+// their own user ID (optionally suffixed with "_<anything>"), and any user may
+// set state whose state_key is another user's ID when they hold strictly more
+// power than that user (the room creator — power 100 — may therefore set state
+// on behalf of regular users). A state_key that neither equals a valid user ID
+// nor starts with one plus an underscore is a malformed key (ErrBadStateKey).
+func checkOwnedState(rules roomver.Rules, stateKey, sender string, userLevel func(string) int64) error {
 	if !strings.HasPrefix(stateKey, "@") {
 		return nil
 	}
-	if stateKey != sender {
+	if stateKey == sender {
+		return nil
+	}
+	if !rules.OwnedState {
 		return fmt.Errorf("rooms: state_key %q does not match sender %q", stateKey, sender)
 	}
-	return nil
+	// MSC3757: the state_key may be another user's ID with a "_"-prefixed
+	// suffix appended after the domain (e.g. "@alice:example.com_settings").
+	owner := stateKey
+	if i := strings.IndexByte(stateKey, ':'); i >= 0 {
+		if j := strings.IndexByte(stateKey[i+1:], '_'); j >= 0 {
+			owner = stateKey[:i+1+j]
+		}
+	}
+	// The owner must be a syntactically valid user ID under the loose rule
+	// (mirror of Synapse's UserID.is_valid, which validates only the domain —
+	// not the localpart): a suffixed key whose prefix is not a valid user ID
+	// is malformed (ErrBadStateKey).
+	if !ids.IsLooseUserID(owner) {
+		return fmt.Errorf("%w: %q neither equals a valid user ID, nor starts with one plus an underscore", ErrBadStateKey, stateKey)
+	}
+	if owner == sender || userLevel(sender) > userLevel(owner) {
+		return nil
+	}
+	return fmt.Errorf("rooms: you are not allowed to set others' state")
 }
 
 // guestAccessCanJoin reports whether an m.room.guest_access content value

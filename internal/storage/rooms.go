@@ -53,10 +53,62 @@ func (s *Store) GetRoom(ctx context.Context, roomID string) (*Room, error) {
 }
 
 // SetRoomPartialState marks a room as partial-state (or clears the flag once
-// the background resync completes).
+// the background resync completes). Clearing the flag records the sync-stream
+// position in unpartial_state_stream so eager /sync responses that predate the
+// transition (and therefore omitted the room) can treat it as newly joined on
+// their next poll (mirror of Synapse's forced_newly_joined_room_ids).
 func (s *Store) SetRoomPartialState(ctx context.Context, roomID string, partial bool) error {
+	if !partial {
+		streamID, err := s.NextSyncStream(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = s.pool.Exec(ctx,
+			`UPDATE rooms SET partial_state=$2, unpartial_state_stream=$3 WHERE room_id=$1`,
+			roomID, partial, streamID)
+		return err
+	}
 	_, err := s.pool.Exec(ctx, `UPDATE rooms SET partial_state=$2 WHERE room_id=$1`, roomID, partial)
 	return err
+}
+
+// RoomUnpartialStateStream returns the sync-stream position at which the room
+// was marked fully-stated (0 for rooms that were never partial).
+func (s *Store) RoomUnpartialStateStream(ctx context.Context, roomID string) (int64, error) {
+	var n int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT unpartial_state_stream FROM rooms WHERE room_id=$1`, roomID).Scan(&n)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+	return n, nil
+}
+
+// PartialRooms returns every room still flagged partial-state (whose background
+// resync has not completed), with its server list. Used at startup to resume
+// resyncs that were interrupted by a restart.
+func (s *Store) PartialRooms(ctx context.Context) ([]Room, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT room_id, version, creator, is_public, created_ts, partial_state, COALESCE(servers_in_room,'[]')
+		 FROM rooms WHERE partial_state=TRUE`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Room
+	for rows.Next() {
+		var r Room
+		var servers []byte
+		if err := rows.Scan(&r.RoomID, &r.Version, &r.Creator, &r.IsPublic, &r.CreatedTS, &r.PartialState, &servers); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(servers, &r.ServersInRoom)
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // SetRoomServersInRoom records the servers-in-room list for a partial room.

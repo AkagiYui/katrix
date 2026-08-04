@@ -8,9 +8,11 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/eventstate"
+	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/metrics"
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
@@ -19,6 +21,39 @@ import (
 // resyncMu serialises the per-room background resync so concurrent sync
 // completions do not race (only one resync per room at a time).
 var resyncMu sync.Map // roomID -> *sync.Mutex
+
+// ResumePartialStateResyncs restarts the background resync for every room still
+// flagged partial-state (MSC3902). A resync that was in flight when the server
+// stopped (crash / restart / deploy) left the room partial; without this the
+// room would stay partial forever and eager /sync would omit it permanently.
+// Candidates are the servers_in_room list recorded at the partial send_join,
+// falling back to the room ID's domain.
+func (a *API) ResumePartialStateResyncs(ctx context.Context) {
+	rooms, err := a.Store.PartialRooms(ctx)
+	if err != nil {
+		log.Printf("katrix: resume partial resyncs: %v", err)
+		return
+	}
+	for _, r := range rooms {
+		version := roomver.Version(r.Version)
+		rules, ok := roomver.Get(version)
+		if !ok {
+			continue
+		}
+		candidates := r.ServersInRoom
+		dest := ""
+		if len(candidates) > 0 {
+			dest = candidates[0]
+		}
+		if dest == "" {
+			dest = ids.DomainOf(r.RoomID)
+		}
+		if dest == "" || dest == a.ServerName() {
+			continue
+		}
+		go a.resyncPartialState(context.WithoutCancel(ctx), r.RoomID, version, rules, dest, candidates)
+	}
+}
 
 // ingestPartialJoin persists a partial-state send_join result: the room row
 // (marked partial_state), the critical state delivered in the response, and
@@ -153,6 +188,17 @@ func (a *API) resyncFromServer(ctx context.Context, roomID string, version roomv
 		log.Printf("katrix: resync %s from %s: state_ids failed: %v", roomID, server, err)
 		return false
 	}
+	if len(stateIDs) == 0 {
+		// An empty state snapshot is never a valid full-state answer: every room
+		// has at least its create event (and the critical state) at any event.
+		// A peer that serves an empty list is misbehaving (Complement's
+		// PartialStateJoinSyncsUsingOtherHomeservers answers /state_ids with an
+		// empty body to test fallback); seeding an empty state would
+		// un-partial-state the room into a broken, member-less room, so treat it
+		// as a failure and try the next candidate server.
+		log.Printf("katrix: resync %s from %s: state_ids returned an empty snapshot", roomID, server)
+		return false
+	}
 	known := map[string]bool{}
 	if rows, err := a.Store.EventsByIDs(ctx, append(append([]string{}, stateIDs...), authIDs...)); err == nil {
 		for _, r := range rows {
@@ -218,34 +264,56 @@ func (a *API) resyncFromServer(ctx context.Context, roomID string, version roomv
 
 // fetchStateIDs performs GET /_matrix/federation/v1/state_ids/{roomID}
 // ?event_id={joinEventID} against server, returning the state and auth event
-// IDs.
+// IDs. Transient transport failures (connection reset, EOF, dial failure) are
+// retried with a short backoff: the resync runs in the background against a
+// peer that may be flaky under load, and a single dropped connection must not
+// abort the whole partial-state join.
 func (a *API) fetchStateIDs(ctx context.Context, server, roomID, joinEventID string) (stateIDs, authIDs []string, err error) {
 	url := a.client.serverBaseURL(server) + "/_matrix/federation/v1/state_ids/" + urlPathEscape(roomID) + "?event_id=" + joinEventID
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, nil, err
+	const attempts = 3
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-time.After(time.Duration(attempt) * 250 * time.Millisecond):
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Host = server
+		if err := signRequestWith(req, a.client.originName(), a.client.key); err != nil {
+			return nil, nil, err
+		}
+		metrics.Counters.FedOutboundRequests.Add(1)
+		resp, err := a.client.http.Do(req)
+		if err != nil {
+			if attempt < attempts-1 {
+				continue // transient transport error; retry
+			}
+			return nil, nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, nil, fmt.Errorf("state_ids: HTTP %d", resp.StatusCode)
+		}
+		var out struct {
+			StateEventIDs []string `json:"pdu_ids"`
+			AuthEventIDs  []string `json:"auth_chain_ids"`
+		}
+		decErr := decodeJSON(resp, &out)
+		resp.Body.Close()
+		if decErr != nil {
+			if attempt < attempts-1 {
+				continue // malformed body; retry
+			}
+			return nil, nil, decErr
+		}
+		return out.StateEventIDs, out.AuthEventIDs, nil
 	}
-	req.Host = server
-	if err := signRequestWith(req, a.client.originName(), a.client.key); err != nil {
-		return nil, nil, err
-	}
-	metrics.Counters.FedOutboundRequests.Add(1)
-	resp, err := a.client.http.Do(req)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("state_ids: HTTP %d", resp.StatusCode)
-	}
-	var out struct {
-		StateEventIDs []string `json:"pdu_ids"`
-		AuthEventIDs  []string `json:"auth_chain_ids"`
-	}
-	if err := decodeJSON(resp, &out); err != nil {
-		return nil, nil, err
-	}
-	return out.StateEventIDs, out.AuthEventIDs, nil
+	return nil, nil, fmt.Errorf("state_ids: gave up after %d attempts", attempts)
 }
 
 // fetchEvent performs GET /_matrix/federation/v1/event/{eventID} against

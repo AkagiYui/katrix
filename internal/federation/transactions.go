@@ -265,6 +265,17 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	if origin != "" && !room.PartialState && a.hasUnknownPrevEvents(r.Context(), raw) {
 		return evID, false
 	}
+	// A partial-state room (MSC3902) skips the full authorization check below
+	// (its state — and therefore the auth_events it can vouch for — is
+	// intentionally incomplete until the background resync finishes), but it
+	// must still fetch the auth chain of inbound events: the senders'
+	// membership events live in those auth chains, and lazy-loading /sync
+	// responses are required to include the memberships of timeline senders.
+	// Without this, the membership is nowhere locally until the resync
+	// completes.
+	if origin != "" && room.PartialState && a.hasUnknownAuthEvents(r.Context(), raw) {
+		a.fetchAuthChainFor(r.Context(), ev.RoomID, evID, origin)
+	}
 	// Authorization. An event whose auth_events reference events this server
 	// does not hold is fetched via /event_auth (spec: the receiving server may
 	// ask the sending server for the auth chain of an event it cannot
@@ -289,8 +300,7 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 			// An auth_event that was itself rejected (soft-failed) propagates the
 			// rejection: an event cannot be authorised by a rejected precedent.
 			rejected = true
-		} else if rules, ok := roomver.Get(version); ok {
-			stateKey := ""
+		} else if rules, ok := roomver.Get(version); ok {			stateKey := ""
 			if ev.StateKey != nil {
 				stateKey = *ev.StateKey
 			}

@@ -844,6 +844,17 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		if joined, err := e.store.NewlyJoinedAfter(ctx, roomID, opts.UserID, opts.Since.Stream); err == nil {
 			newlyJoined = joined
 		}
+		// A room that was partial-state and became fully-stated during the sync
+		// window is treated as newly joined (mirror of Synapse's
+		// forced_newly_joined_room_ids): eager syncs deliberately omitted the
+		// room while it was partial, so this poll delivers its full state and a
+		// full-room (limited) timeline instead of an empty delta the client
+		// cannot overlay onto anything.
+		if !newlyJoined {
+			if up, err := e.store.RoomUnpartialStateStream(ctx, roomID); err == nil && up > opts.Since.Stream {
+				newlyJoined = true
+			}
+		}
 	}
 
 	// The upper bound of the window is the room's own latest event (its tail is
@@ -1078,9 +1089,15 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	jr.Timeline = timeline
 
 	// State: full state on initial sync or full_state; otherwise empty (delta).
-	// Lazy-load members replaces the full state with only the m.room.member
-	// events for timeline senders.
-	if opts.Since.Stream == 0 || opts.FullState {
+	// A newly-joined room also carries its full current state in the state
+	// section: the client has never seen the room before, so it needs the state
+	// to render it (spec: "The state updates for the room up to the start of
+	// the timeline" — for a room the user just joined, that is the full state).
+	// A limited (gappy or count-truncated) incremental sync carries the state
+	// too: the client cannot overlay the deltas onto a baseline it never
+	// received (the gap cut its view of the room). Lazy-load members replaces
+	// the full state with only the m.room.member events for timeline senders.
+	if opts.Since.Stream == 0 || opts.FullState || newlyJoined || gapLimited || countLimited {
 		stateRows, err := e.store.GetState(ctx, roomID)
 		if err != nil {
 			return jr, err
@@ -1101,6 +1118,41 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		// An incremental sync with no full_state still renders `state.events` as
 		// an empty array (spec + clients expect the key to exist).
 		jr.State.Events = []json.RawMessage{}
+	}
+	// Lazy-loading: the state section must carry the membership events of every
+	// timeline sender (spec lazy-loading). In a partial-state room the room's
+	// current state may still be missing them (the background resync has not
+	// completed), so backfill from the denormalised membership table — the
+	// senders' member events were persisted when their auth chains were fetched
+	// on ingest (mirror of Synapse's _find_missing_partial_state_memberships).
+	// The syncing user's own membership is always included when they (re)join a
+	// room under lazy-loading (spec requirement).
+	if filter.lazyLoadMembers() {
+		seen := make(map[string]bool, len(jr.State.Events))
+		for _, raw := range jr.State.Events {
+			var sev struct {
+				Type     string `json:"type"`
+				StateKey string `json:"state_key"`
+			}
+			if json.Unmarshal(raw, &sev) == nil && sev.Type == "m.room.member" {
+				seen[sev.StateKey] = true
+			}
+		}
+		senders[opts.UserID] = true
+		for u := range senders {
+			if seen[u] {
+				continue
+			}
+			m, err := e.store.GetMembership(ctx, roomID, u)
+			if err != nil || m == nil || m.EventID == "" {
+				continue
+			}
+			ev, err := e.store.GetEvent(ctx, m.EventID)
+			if err != nil || ev == nil {
+				continue
+			}
+			jr.State.Events = append(jr.State.Events, filter.applyEventFields(prevContent(clientEvent(ev), ev)))
+		}
 	}
 	// MSC4222 use_state_after: the client asks for the room state as of the end
 	// of the timeline instead of the state at the start (state). On an initial
