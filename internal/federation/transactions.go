@@ -273,13 +273,17 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// persisted for DAG continuity but marked rejected and never delivered to
 	// clients or included in room state (mirror of Synapse's soft-fail, and the
 	// regression guard for events smuggling a rejected/outlier event into their
-	// Partial-state rooms (MSC3902) defer the authorization check entirely:
-	// their state (and therefore auth_events) is intentionally incomplete
-	// until the background resync finishes, and membership events
-	// (ban/kick/leave/invite) must keep flowing. The resync re-validates the
-	// events that arrived during the partial window against the full state
-	// once it completes.
+	// Partial-state rooms (MSC3902) defer the authorization decision: their
+	// state (and therefore auth_events) is intentionally incomplete until the
+	// background resync finishes, and membership events (ban/kick/leave/invite)
+	// must keep flowing. The auth chain of inbound events is still fetched
+	// (lazy-loading /sync responses must include timeline senders' memberships,
+	// which live in those chains), but the event is accepted and re-validated
+	// against the full state by the resync once it completes.
 	rejected := false
+	if origin != "" && room.PartialState && a.hasUnknownAuthEvents(r.Context(), raw) {
+		a.fetchAuthChainFor(r.Context(), ev.RoomID, evID, origin)
+	}
 	if origin != "" && !room.PartialState {
 		if a.hasUnknownAuthEvents(r.Context(), raw) {
 			a.fetchAuthChainFor(r.Context(), ev.RoomID, evID, origin)
