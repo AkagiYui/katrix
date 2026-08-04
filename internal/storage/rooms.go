@@ -475,8 +475,8 @@ func (s *Store) LatestEvent(ctx context.Context, roomID string) (*EventRow, erro
 }
 
 // HasEventsBefore reports whether the room holds any events with
-// stream_ordering < stream. Used by /sync to decide whether an initial-sync
-// timeline window (which is capped at the newest `limit` events) was
+// stream_ordering < stream. Used by /sync to decide whether a full-room
+// timeline window (whose fill loop stopped before the room's start) was
 // truncated by the count limit rather than by the room's history.
 func (s *Store) HasEventsBefore(ctx context.Context, roomID string, stream int64) (bool, error) {
 	var one int

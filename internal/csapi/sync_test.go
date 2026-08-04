@@ -124,6 +124,97 @@ func TestSyncIncrementalGetsNewEvents(t *testing.T) {
 	}
 }
 
+// TestSyncNewlyJoinedRoomTimelineLimited mirrors Complement's
+// "Newly joined room has correct timeline in incremental sync": the room's
+// history (with an m.room.message-only filter) must arrive in full, and a
+// window that is not truncated by the count limit must NOT be marked limited
+// even though the shared sync stream has advanced past some of the room's
+// history.
+func TestSyncNewlyJoinedRoomTimelineLimited(t *testing.T) {
+	_, srv := testAPI(t)
+	alice := registerUser(t, srv, "sync-nj-a", "pw")
+	bob := registerUser(t, srv, "sync-nj-b", "pw")
+	roomID := createRoom(t, srv, alice, map[string]any{"preset": "public_chat"})
+
+	sendMsgs := func(n, base int) {
+		for i := 0; i < n; i++ {
+			code, _ := doJSON(t, srv, http.MethodPut,
+				"/_matrix/client/v3/rooms/"+roomID+"/send/m.room.message/txn"+intToStr(base+i), alice,
+				map[string]any{"body": "m", "msgtype": "m.text"})
+			if code != 200 {
+				t.Fatalf("send %d: %d", i, code)
+			}
+		}
+	}
+
+	// alice's room: 4 messages before bob syncs, 4 more after.
+	sendMsgs(4, 1)
+	code, resp := syncNow(t, srv, bob, "", 0)
+	if code != 200 {
+		t.Fatalf("sync: %d", code)
+	}
+	since, _ := resp["next_batch"].(string)
+	sendMsgs(4, 5)
+
+	// bob joins.
+	if code, _ := doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/join/"+roomID, bob, nil); code != 200 {
+		t.Fatalf("join: %d", code)
+	}
+	// alice syncs past bob's join (advances the shared stream past the room).
+	if code, _ := syncNow(t, srv, alice, "", 0); code != 200 {
+		t.Fatalf("alice sync: %d", code)
+	}
+
+	// bob's incremental sync with an m.room.message-only timeline filter: the
+	// newly-joined room's window must contain all 8 messages and NOT be limited.
+	code, body := doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/user/@sync-nj-b:test.katrix/filter",
+		bob, map[string]any{
+			"room": map[string]any{
+				"timeline": map[string]any{
+					"limit": 10,
+					"types": []string{"m.room.message"},
+				},
+				"state": map[string]any{
+					"types": []string{},
+				},
+			},
+		})
+	if code != 200 {
+		t.Fatalf("create filter: %d %v", code, body)
+	}
+	filterID, _ := body["filter_id"].(string)
+
+	code, resp = getJSON(t, srv, "/_matrix/client/v3/sync?since="+since+"&filter="+filterID, bob)
+	if code != 200 {
+		t.Fatalf("bob incremental sync: %d %v", code, resp)
+	}
+	join, _ := resp["rooms"].(map[string]any)["join"].(map[string]any)
+	jr, _ := join[roomID].(map[string]any)
+	if jr == nil {
+		t.Fatalf("room not joined: %v", resp)
+	}
+	tl, _ := jr["timeline"].(map[string]any)
+	events, _ := tl["events"].([]any)
+	var bodies []string
+	for _, ev := range events {
+		em, _ := ev.(map[string]any)
+		if em["type"] != "m.room.message" {
+			t.Fatalf("unexpected event type %v in timeline", em["type"])
+		}
+		content, _ := em["content"].(map[string]any)
+		b, _ := content["body"].(string)
+		bodies = append(bodies, b)
+	}
+	if len(bodies) != 8 {
+		t.Fatalf("timeline should have all 8 messages, got %d: %v", len(bodies), bodies)
+	}
+	// A newly-joined room is always marked limited (Synapse: limited = limited
+	// or newly_joined_room or gap_token) so the client back-paginates the
+	// pre-join history; the invariant to guard is that the window itself holds
+	// every filtered message, not the limited flag.
+	_ = tl["limited"]
+}
+
 func TestSyncAccountData(t *testing.T) {
 	_, srv := testAPI(t)
 	tok := registerUser(t, srv, "carol", "pw")

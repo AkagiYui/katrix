@@ -889,8 +889,32 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	}
 	var evs []storage.EventRow
 	var err error
-	if opts.Since.Stream == 0 && !gapLimited {
+	if (opts.Since.Stream == 0 || newlyJoined) && !gapLimited {
+		// Full-room window: paginate backward from the room's latest event,
+		// accumulating batches until the FILTERED events fill `limit` or the
+		// room's start is reached (mirror of Synapse's _load_filtered_recents
+		// loop). The shared sync stream advances on other rooms' writes, so a
+		// single stream-position anchor (to-limit) can land inside the room's
+		// recent history and drop messages the client should receive; widening
+		// on the filtered count (not the raw count) also keeps rooms whose raw
+		// history is mostly state events from squeezing the message window. The
+		// number of batches is bounded (Synapse's max_repeat = 5) so a room with
+		// mostly filter-blocked history does not paginate to the room's start.
+		const maxFillBatches = 5
 		evs, err = e.store.EventsForRoom(ctx, roomID, from, to, rawLimit, "f")
+		for b := 0; err == nil && filteredCount(evs, filter) < limit && from > 0 && b < maxFillBatches; b++ {
+			prevFrom := from
+			from -= int64(rawLimit)
+			if from < 0 {
+				from = 0
+			}
+			var batch []storage.EventRow
+			batch, err = e.store.EventsForRoom(ctx, roomID, from, prevFrom, rawLimit, "f")
+			if len(batch) == 0 {
+				break
+			}
+			evs = append(batch, evs...)
+		}
 	} else {
 		evs, err = e.store.EventsForRoom(ctx, roomID, from, to, rawLimit, "b")
 		for i, j := 0, len(evs)-1; i < j; i, j = i+1, j-1 {
@@ -905,12 +929,18 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// For initial/full-room windows the raw fetch is wider (above), so a room
 	// whose messages alone exceed the limit is limited while a room whose raw
 	// set merely carries many state events is not. The extra probe row (+1)
-	// for incremental windows reveals truncation directly; an initial window
-	// that started at to-limit checks whether older events exist below it.
+	// for incremental windows reveals truncation directly; a full-room window
+	// is limited when the filtered events still exceed `limit`, or when more
+	// events exist before the window's start (the fill loop stopped short of
+	// the room's start — mirror of Synapse's pagination-limited flag, which
+	// tells the client to back-paginate).
 	countLimited := false
-	if opts.Since.Stream == 0 && !gapLimited {
-		if trunc, terr := e.store.HasEventsBefore(ctx, roomID, from); terr == nil && trunc {
-			countLimited = true
+	if (opts.Since.Stream == 0 || newlyJoined) && !gapLimited {
+		countLimited = filteredCount(evs, filter) > limit
+		if !countLimited {
+			if trunc, terr := e.store.HasEventsBefore(ctx, roomID, from); terr == nil && trunc {
+				countLimited = true
+			}
 		}
 	} else if len(evs) > limit {
 		countLimited = true
@@ -1236,6 +1266,19 @@ func (e *Engine) SlidingUnreadCounts(ctx context.Context, roomID, userID, localp
 		h = *main.HighlightCount
 	}
 	return n, h, true
+}
+
+// filteredCount reports how many events in rows pass the sync filter's
+// timeline keep rule. Used to size full-room windows: only filtered events
+// count toward the timeline limit (see buildJoinedRoom).
+func filteredCount(rows []storage.EventRow, filter *SyncFilter) int {
+	n := 0
+	for i := range rows {
+		if filter.keepTimeline(&rows[i]) {
+			n++
+		}
+	}
+	return n
 }
 
 // countFor evaluates the unread push actions for one timeline (main or a
