@@ -1,12 +1,15 @@
 name: test
 
 # Black-box / integration test suite, modelled on Dendrite's "single workflow,
-# parallel jobs + alls-green gate" layout. All three jobs are informational
-# baselines (continue-on-error) while katrix is still early — they establish a
-# progress baseline rather than blocking PRs. The integration-done gate is
-# therefore effectively a no-op today. Run steps surface failures honestly
-# (set -o pipefail, no `|| true` swallowing), so a failing suite shows a red
-# step with the real exit code; to turn a job into a hard gate, drop its
+# parallel jobs + alls-green gate" layout. Four jobs (Complement runs as two
+# parallel matrix jobs — the root package and the MSC suites — so no single
+# `go test` package binary can hit the per-package timeout and truncate the
+# run; see the complement job below) are informational baselines
+# (continue-on-error) while katrix is still early — they establish a progress
+# baseline rather than blocking PRs. The integration-done gate is therefore
+# effectively a no-op today. Run steps surface failures honestly (set -o
+# pipefail, no `|| true` swallowing), so a failing suite shows a red step with
+# the real exit code; to turn a job into a hard gate, drop its
 # `continue-on-error: true` once its pass rate is high enough.
 #
 # Each job's summary step renders a per-test report (PASS/FAIL/SKIP per suite,
@@ -25,10 +28,21 @@ permissions:
   contents: read
 
 jobs:
+  # Complement runs as two parallel jobs so no single `go test` package binary
+  # can eat the whole suite's budget: the root ./tests package (the largest)
+  # has already hit the go test default 10-minute per-package timeout under
+  # load, truncating the run and silently dropping every not-yet-started test
+  # (a misleadingly low pass count). Splitting gives each group its own runner
+  # and its own log/artifact, and `-timeout 30m` removes the truncation risk
+  # entirely.
   complement:
-    name: Complement (black-box)
+    name: Complement (${{ matrix.group }})
     runs-on: ubuntu-latest
     continue-on-error: true # informational baseline; katrix is early
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [core, msc-suites]
     env:
       COMPLEMENT_BASE_IMAGE: ghcr.io/akagiyui/katrix:complement
     steps:
@@ -75,8 +89,13 @@ jobs:
               pkgs=$(printf '%s\n' "$pkgs" | grep -vE "/msc${suite}$") || true
             done
           fi
-          # shellcheck disable=SC2086  # pkgs is word-split on purpose
-          go test -json -tags="katrix_blacklist" $pkgs ./tests 2>&1 \
+          if [ "${{ matrix.group }}" = "core" ]; then
+            pkgset=./tests
+          else
+            pkgset=${pkgs}
+          fi
+          # shellcheck disable=SC2086  # pkgset is word-split on purpose
+          go test -json -timeout 30m -tags="katrix_blacklist" $pkgset 2>&1 \
             | tee /tmp/complement.log
       - name: summary
         if: always()
@@ -87,7 +106,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: complement-log
+          name: complement-log-${{ matrix.group }}
           path: /tmp/complement.log
 
   sytest:
