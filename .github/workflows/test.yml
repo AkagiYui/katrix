@@ -1,16 +1,19 @@
 name: test
 
 # Black-box / integration test suite, modelled on Dendrite's "single workflow,
-# parallel jobs + alls-green gate" layout. Four jobs (Complement runs as two
-# parallel matrix jobs — the root package and the MSC suites — so no single
-# `go test` package binary can hit the per-package timeout and truncate the
-# run; see the complement job below) are informational baselines
-# (continue-on-error) while katrix is still early — they establish a progress
-# baseline rather than blocking PRs. The integration-done gate is therefore
-# effectively a no-op today. Run steps surface failures honestly (set -o
-# pipefail, no `|| true` swallowing), so a failing suite shows a red step with
-# the real exit code; to turn a job into a hard gate, drop its
-# `continue-on-error: true` once its pass rate is high enough.
+# parallel jobs + alls-green gate" layout. Complement runs as two parallel
+# matrix jobs (root package vs MSC suites), SyTest as two file-group jobs
+# (federation vs everything else — 50federation's files share the mock
+# federation server, so they stay together), and Complement Crypto as two
+# client-direction jobs (jr / rj) — all so no single `go test` package binary
+# or sytest process can hit a per-package timeout and truncate the run. All
+# jobs are informational baselines (continue-on-error) while katrix is still
+# early — they establish a progress baseline rather than blocking PRs. The
+# integration-done gate is therefore effectively a no-op today. Run steps
+# surface failures honestly (set -o pipefail, no `|| true` swallowing), so a
+# failing suite shows a red step with the real exit code; to turn a job into a
+# hard gate, drop its `continue-on-error: true` once its pass rate is high
+# enough.
 #
 # Each job's summary step renders a per-test report (PASS/FAIL/SKIP per suite,
 # plus expected-vs-actual for every failing test) via cmd/testreport, fed by
@@ -110,9 +113,13 @@ jobs:
           path: /tmp/complement.log
 
   sytest:
-    name: SyTest
+    name: SyTest (${{ matrix.group }})
     runs-on: ubuntu-latest
     continue-on-error: true # informational baseline; katrix is early
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [core, federation]
     env:
       DOCKER_BUILDKIT: '1'
     steps:
@@ -149,13 +156,29 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p sytest-logs
+          # Split the suite by file groups so the two halves run on parallel
+          # runners. run-tests.pl takes a file whitelist (only those files'
+          # tests are collected), but every file is still loaded, so fixture
+          # definitions (TEST_SERVER_INFO, INBOUND_SERVER, local_user_fixture,
+          # ...) are always available. The federation group keeps the whole
+          # tests/50federation directory together because its files share the
+          # INBOUND_SERVER/OUTBOUND_CLIENT fixtures from 00prepare.pl; the core
+          # group gets everything else. Paths are rewritten to the in-container
+          # /sytest mount.
+          if [ "${{ matrix.group }}" = "federation" ]; then
+            files=$(find sytest-src/tests/50federation -name '*.pl' | sort)
+          else
+            files=$(find sytest-src/tests -name '*.pl' -not -path '*/50federation/*' | sort)
+          fi
+          files=$(printf '%s\n' "$files" | sed 's|^sytest-src|/sytest|')
+          # shellcheck disable=SC2086  # files is word-split on purpose
           docker run --rm \
             -v "$PWD/sytest-src:/sytest" \
             -v "$PWD:/src" \
             -v "$PWD/sytest-logs:/logs" \
             -e POSTGRES=1 \
             -e SYTEST_DEFAULT_BRANCH=develop \
-            sytest-katrix 2>&1 | tee /tmp/sytest.log
+            sytest-katrix $files 2>&1 | tee /tmp/sytest.log
       - name: summary
         if: always()
         run: |
@@ -188,13 +211,13 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: sytest-logs
+          name: sytest-logs-${{ matrix.group }}
           path: |
             sytest-logs/
             /tmp/sytest.log
 
   complement-crypto:
-    name: Complement Crypto
+    name: Complement Crypto (${{ matrix.axis }})
     # Complement launches headless Chrome (chromedp) for the JS SDK axis;
     # Ubuntu 24.04+ AppArmor blocks unprivileged user namespaces, so Chrome
     # dies with "No usable sandbox!". Upstream complement-crypto pins 22.04
@@ -202,12 +225,22 @@ jobs:
     # patch chrome.go to add --no-sandbox instead).
     runs-on: ubuntu-22.04
     continue-on-error: true # informational baseline; crypto impl is incomplete
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each matrix row runs the whole crypto suite but with a single
+        # client-direction matrix (COMPLEMENT_CRYPTO_TEST_CLIENT_MATRIX): jr =
+        # js client on hs1 + rust client on hs2, rj = the reverse. The two
+        # axes exercise separate code paths (the js-sdk RPC and the rust-sdk
+        # RPC), so splitting halves wall-clock on parallel runners; the build
+        # of both SDKs is shared per row.
+        axis: [jr, rj]
     env:
       # complement-crypto expects the homeserver image at this ref.
       COMPLEMENT_BASE_IMAGE: homeserver
       COMPLEMENT_ENABLE_DIRTY_RUNS: '1'
       COMPLEMENT_SHARE_ENV_PREFIX: PASS_
-      COMPLEMENT_CRYPTO_TEST_CLIENT_MATRIX: jr,rj
+      COMPLEMENT_CRYPTO_TEST_CLIENT_MATRIX: ${{ matrix.axis }}
       COMPLEMENT_CRYPTO_MITMDUMP: mitm.dump
       TESTCONTAINERS_RYUK_DISABLED: 'true'
       DOCKER_BUILDKIT: '1'
@@ -299,7 +332,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: complement-crypto-log
+          name: complement-crypto-log-${{ matrix.axis }}
           path: /tmp/crypto.log
 
   integration-done:
