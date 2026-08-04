@@ -50,6 +50,15 @@ func (a *API) BroadcastEDUToRooms(ctx context.Context, eduType string, content m
 // rooms (the local server name is excluded). Membership is looked up via the
 // denormalised membership table; a room with no remote members contributes
 // nothing.
+//
+// A partial-state room (MSC3902) has an incomplete membership table — only the
+// critical state and the join event were seeded — so its servers_in_room list
+// (delivered in the partial send_join response) is the authoritative source of
+// the servers that must receive device-list updates and other EDUs. The list
+// is consulted alongside the membership table so an update still reaches
+// servers that have since left but were active when the join happened (the
+// joining server cannot know the room's current membership while it is
+// partial, and dropping a server would leak the device list to none).
 func (a *API) serversForRooms(ctx context.Context, rooms []string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -68,6 +77,15 @@ func (a *API) serversForRooms(ctx context.Context, rooms []string) []string {
 			}
 			seen[dom] = true
 			out = append(out, dom)
+		}
+		if room, err := a.Store.GetRoom(ctx, roomID); err == nil && room.PartialState {
+			for _, s := range room.ServersInRoom {
+				if s == "" || s == a.ServerName() || seen[s] {
+					continue
+				}
+				seen[s] = true
+				out = append(out, s)
+			}
 		}
 	}
 	return out

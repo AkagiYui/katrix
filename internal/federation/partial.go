@@ -141,6 +141,13 @@ func (a *API) resyncPartialState(ctx context.Context, roomID string, version roo
 			// so eager /sync responses (and long-polls) pick up the room.
 			_ = a.Store.SetRoomPartialState(ctx, roomID, false)
 			a.notifyRoomMembers(ctx, roomID)
+			// Servers that joined (or were already in) the room while it was
+			// partial may have missed device-list updates broadcast during the
+			// resync window — the membership was incomplete, so the destination
+			// list was wrong. Now that the full state is known, send every local
+			// user's current device list to every server in the room (MSC3902;
+			// mirror of Synapse's handle_room_un_partial_stated).
+			a.broadcastDeviceListStateToRoom(ctx, roomID)
 			return
 		}
 	}
@@ -260,6 +267,37 @@ func (a *API) resyncFromServer(ctx context.Context, roomID string, version roomv
 	}
 	log.Printf("katrix: resync %s from %s: completed with %d state events", roomID, server, len(rows))
 	return true
+}
+
+// broadcastDeviceListStateToRoom sends every local joined user's current device
+// list to every remote server in the room as m.device_list_update EDUs. Called
+// when a partial-state room's resync completes: servers that were in the room
+// (or joined it) while it was partial may have missed earlier device-list
+// updates because the joining server did not know the full membership (MSC3902
+// — the joining server must send device-list updates to every server that was
+// in the room once the state re-sync completes).
+func (a *API) broadcastDeviceListStateToRoom(ctx context.Context, roomID string) {
+	members, err := a.Store.Members(ctx, roomID, "join")
+	if err != nil {
+		return
+	}
+	for _, m := range members {
+		if !a.IsLocalUser(m.UserID) {
+			continue
+		}
+		devices, err := a.Store.ListDevices(ctx, a.LocalpartOf(m.UserID))
+		if err != nil {
+			continue
+		}
+		for _, d := range devices {
+			a.BroadcastEDUToRooms(ctx, "m.device_list_update", map[string]any{
+				"user_id":   m.UserID,
+				"device_id": d.DeviceID,
+				"deleted":   false,
+				"stream_id": a.Now(),
+			}, []string{roomID})
+		}
+	}
 }
 
 // fetchStateIDs performs GET /_matrix/federation/v1/state_ids/{roomID}
