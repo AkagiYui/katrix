@@ -195,6 +195,8 @@ Local users can peek by room alias
 Local users can peek into world_readable rooms by room ID
 Membership event with an invalid displayname in the send_join response should not cause room join to fail
 Message history can be paginated
+Messages that highlight from another user increment unread highlight count
+Messages that notify from another user increment notification_count
 Multiple calls to /sync should not cause 500 errors
 Multiple calls to /sync should not cause 500 errors (6 subtests)
 New account data appears in incremental v2 /sync

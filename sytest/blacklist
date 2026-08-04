@@ -175,8 +175,6 @@ Local device key changes get to remote servers
 Local device key changes get to remote servers with correct prev_id
 Members from the gap are included in gappy incr LL sync
 Message history can be paginated over federation
-Messages that highlight from another user increment unread highlight count
-Messages that notify from another user increment notification_count
 Named room comes with just joined member count summary
 New federated private chats get full presence information (SYN-115)
 Newly joined room includes presence in incremental sync
