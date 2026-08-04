@@ -388,6 +388,45 @@ func (a *API) fetchMissingEventsFor(ctx context.Context, roomID string, eventID 
 	for _, rawEv := range out.Events {
 		_ = a.persistVerifiedPDU(ctx, roomID, version, rules, rawEv)
 	}
+	// The gap is only closed when every pulled event links into the local DAG.
+	// If one of them still references prev_events we do not hold, the sending
+	// server's get_missing_events window stopped short of our known history —
+	// the event chain runs deeper than it was willing to fill. Per the spec, a
+	// server that cannot link an event to its DAG may ask the sending server
+	// for the room state at that event (Synapse does exactly this for a pulled
+	// event whose prevs remain unknown after get_missing_events). Request the
+	// state at the event the dangling chain cannot link *to* (the first unknown
+	// prev of a pulled event), which is the point of divergence from the local
+	// DAG — that is the snapshot the remote server can authoritatively serve
+	// (Complement's TestCorruptedAuthChain asserts exactly this anchor, and the
+	// MSC4297 v2.1 tests depend on the /state_ids round-trip).
+	for _, rawEv := range out.Events {
+		if id := a.firstUnknownPrev(ctx, rawEv); id != "" {
+			a.reconcileStateFrom(ctx, roomID, origin, id)
+			break
+		}
+	}
+}
+
+// firstUnknownPrev returns the first prev_event of the raw event that is not
+// present locally ("" when all are present). It is the point where a pulled
+// event chain stops linking into the local DAG.
+func (a *API) firstUnknownPrev(ctx context.Context, raw json.RawMessage) string {
+	var ev struct {
+		PrevEvents []string `json:"prev_events"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return ""
+	}
+	for _, id := range ev.PrevEvents {
+		if id == "" {
+			continue
+		}
+		if _, err := a.Store.GetEvent(ctx, id); err != nil {
+			return id
+		}
+	}
+	return ""
 }
 
 // authReferencesRejected reports whether any of the event's auth_events was
