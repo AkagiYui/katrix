@@ -142,17 +142,27 @@ func (a *API) RunEDUWorker(ctx context.Context) {
 				return
 			default:
 			}
-			a.deliverPDU(ctx, pdu.ID, pdu.TxnID, pdu.Raw, pdu.Destinations)
+			a.deliverPDU(ctx, pdu.ID, pdu.TxnID, pdu.RoomID, pdu.Raw, pdu.Destinations)
 		}
 	}
 }
 
 // deliverPDU sends one queued PDU to each of its remaining destinations, each
 // in its own transaction. A destination is dropped on success and retried on
-// the next pass on failure.
-func (a *API) deliverPDU(ctx context.Context, id int64, txnID string, raw json.RawMessage, destinations []string) {
+// the next pass on failure. A destination that no longer shares the room is
+// pruned rather than retried (spec transaction delivery is scoped to the
+// servers with users in the room; a server whose last member left must not be
+// sent events it can only reject).
+func (a *API) deliverPDU(ctx context.Context, id int64, txnID, roomID string, raw json.RawMessage, destinations []string) {
 	remaining := false
 	for _, dest := range destinations {
+		if dest == a.ServerName() {
+			continue
+		}
+		if !a.serverSharesRoom(ctx, roomID, dest, raw) {
+			_ = a.Store.RemovePDUDestination(ctx, id, dest)
+			continue
+		}
 		if err := a.sendTransaction(ctx, dest, txnID, []json.RawMessage{raw}, nil); err != nil {
 			remaining = true
 			continue
@@ -162,6 +172,44 @@ func (a *API) deliverPDU(ctx context.Context, id int64, txnID string, raw json.R
 	if !remaining {
 		_ = a.Store.DeleteOutboundPDU(ctx, id)
 	}
+}
+
+// serverSharesRoom reports whether dest still belongs in roomID's delivery
+// set: it hosts at least one member (any membership state, so terminal
+// leave/ban rows keep their server in the set), it is listed in a
+// partial-state room's servers_in_room list, or it is the affected server of
+// the queued event itself (a membership event must always reach the user's
+// server even if the membership row was already removed). A room with no
+// members at all yields true for its historical servers via the membership
+// scan only; empty-room destinations are pruned.
+func (a *API) serverSharesRoom(ctx context.Context, roomID, dest string, raw json.RawMessage) bool {
+	if roomID == "" {
+		return true // no room context: keep the queued destination
+	}
+	if members, err := a.Store.Members(ctx, roomID, ""); err == nil {
+		for _, m := range members {
+			if userDomain(m.UserID) == dest {
+				return true
+			}
+		}
+	}
+	if room, err := a.Store.GetRoom(ctx, roomID); err == nil {
+		for _, s := range room.ServersInRoom {
+			if s == dest {
+				return true
+			}
+		}
+	}
+	var ev struct {
+		Type     string `json:"type"`
+		StateKey *string `json:"state_key"`
+	}
+	if json.Unmarshal(raw, &ev) == nil && ev.Type == "m.room.member" && ev.StateKey != nil {
+		if userDomain(*ev.StateKey) == dest {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- inbound gap filling (get_missing_events) ----

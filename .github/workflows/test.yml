@@ -113,6 +113,11 @@ jobs:
           cp sytest/katrix_sytest.sh sytest-src/scripts/katrix_sytest.sh
           chmod +x sytest-src/scripts/katrix_sytest.sh
           chmod +x sytest/are-we-synapse-yet.py sytest/show-expected-fail-tests.sh
+          # Harden the sytest federation mock: a conforming homeserver may send
+          # transactions for rooms the mock never joined/created, and sytest's
+          # "Unknown room" warning derefs the room_id as a symbol name (strict
+          # refs crash) — see sytest/patches/federation-server-unknown-room.patch.
+          patch -p1 -d sytest-src < sytest/patches/federation-server-unknown-room.patch
       # The summary step below renders the TAP report with the Go tool.
       - uses: actions/setup-go@v7
         with:

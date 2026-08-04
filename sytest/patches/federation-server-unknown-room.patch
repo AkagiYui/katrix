@@ -1,0 +1,24 @@
+Fix a SyTest harness crash: SyTest::Federation::Server::on_request_federation_v1_send
+logs an "Unknown room" warning for any PDU whose room the mock federation
+server's datastore does not know (a conforming homeserver may legitimately
+deliver transactions for rooms the mock never joined or created). The
+interpolation "${ $event->{room_id} }" is a bug under "use strict": it treats
+the room_id string as a symbol name and dies with
+
+    Can't use string ("!...") as a SCALAR ref while "strict refs" in use
+
+killing the whole SyTest process and spuriously failing whichever test happens
+to be running. Interpolate the value as a string instead.
+
+--- a/lib/SyTest/Federation/Server.pm
++++ b/lib/SyTest/Federation/Server.pm
+@@ -567,7 +567,7 @@
+       if ( $room ) {
+          my $event_id = $room->id_for_event( $event );
+          $room->insert_event( $event );
+       } else {
+-         warn "Unknown room ${ $event->{room_id} }"
++         warn "Unknown room " . ( $event->{room_id} // "" )
+       }
+ 
+       next if $self->on_event( $event );
