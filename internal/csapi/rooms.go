@@ -2916,12 +2916,17 @@ func (a *API) notifyRoomMembers(ctx context.Context, roomID string) {
 // parseIntToken parses a pagination token (stream_ordering) from a string.
 // The token may be negative: backfilled events are stored with stream
 // orderings below the room's current minimum, so their pagination tokens are
-// negative ("s-<digits>").
+// negative ("s-<digits>"). A sync next_batch token may carry a trailing
+// to-device cursor ("s<digits>t<digits>"); that suffix is ignored here — the
+// pagination position is the stream part.
 func parseIntToken(s string) (int64, error) {
-	// Pagination tokens share the opaque sync-token format ("s<digits>").
-	// Accept both the prefixed form and a bare integer for robustness.
+	// Pagination tokens share the opaque sync-token format ("s<digits>");
+	// accept both the prefixed form and a bare integer for robustness.
 	if len(s) > 0 && s[0] == 's' {
 		s = s[1:]
+	}
+	if i := strings.IndexByte(s, 't'); i >= 0 {
+		s = s[:i]
 	}
 	neg := false
 	if len(s) > 0 && s[0] == '-' {

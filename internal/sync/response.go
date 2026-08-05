@@ -692,8 +692,10 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 		}
 	}
 
-	// Next batch token is the current max stream.
-	resp.NextBatch = Token{Stream: maxStream}.Encode()
+	// Next batch token is the current max stream (plus the device's to-device
+	// cursor, which is carried across polls so a poll that delivers no to-device
+	// messages does not reset the cursor).
+	resp.NextBatch = Token{Stream: maxStream, ToDevice: opts.Since.ToDevice}.Encode()
 
 	// Per-device E2EE key counts: how many unused one-time keys (and which
 	// fallback key algorithms) the requesting device holds. Clients use the
@@ -717,18 +719,33 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 		}
 	}
 
-	// To-device messages: deliver any queued for this device. DequeueToDevice
-	// deletes on delivery, so each message is received exactly once; pass
-	// since=0 to drain the queue each cycle.
-	td, err := e.store.DequeueToDevice(ctx, opts.UserID, opts.DeviceID, 0)
+	// To-device messages: deliver any queued for this device whose ID exceeds
+	// the device's incoming cursor (the cursor travels in the since token).
+	// Messages are retained until the device acknowledges them (its next sync
+	// prunes up to this batch's cursor), so a client killed before processing a
+	// /sync response gets the messages redelivered on restart (spec: to-device
+	// messages must not be dropped between delivery and processing).
+	tdCursor := opts.Since.ToDevice
+	td, err := e.store.DequeueToDevice(ctx, opts.UserID, opts.DeviceID, tdCursor)
 	if err == nil && len(td) > 0 {
 		events := make([]json.RawMessage, 0, len(td))
 		for _, m := range td {
 			ev := mustMarshalEvent(m.Type, m.Sender, "", m.Content, m.CreatedTS, "")
 			events = append(events, ev)
+			if m.ID > tdCursor {
+				tdCursor = m.ID
+			}
 		}
 		resp.ToDevice = &EventsSection{Events: events}
+		// The next_batch token carries the new to-device cursor so the client
+		// does not redeliver this batch.
+		resp.NextBatch = Token{Stream: maxStream, ToDevice: tdCursor}.Encode()
 	}
+	// Acknowledge the messages the client has already received: its incoming
+	// cursor names the last delivered message, so everything at or below it was
+	// processed (the client advanced its token). Prune those now; anything
+	// above the cursor stays queued for redelivery.
+	_ = e.store.PruneToDevice(ctx, opts.UserID, opts.DeviceID, opts.Since.ToDevice)
 	return resp, nil
 }
 

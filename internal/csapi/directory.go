@@ -3,6 +3,7 @@ package csapi
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
@@ -153,7 +154,8 @@ func (a *API) searchContext(r *http.Request, roomID, eventID string, beforeLimit
 }
 
 // searchFrom parses the next_batch query parameter for search back-pagination
-// into a stream position (0 when absent).
+// into a stream position (0 when absent). A sync next_batch token may carry a
+// trailing to-device cursor ("s<digits>t<digits>"); that suffix is ignored.
 func searchFrom(r *http.Request) int64 {
 	v := r.URL.Query().Get("next_batch")
 	if v == "" {
@@ -161,6 +163,9 @@ func searchFrom(r *http.Request) int64 {
 	}
 	if len(v) > 1 && v[0] == 's' {
 		v = v[1:]
+	}
+	if i := strings.IndexByte(v, 't'); i >= 0 {
+		v = v[:i]
 	}
 	var n int64
 	for _, c := range v {

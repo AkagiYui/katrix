@@ -289,8 +289,14 @@ func (s *Store) EnqueueToDevice(ctx context.Context, msgs []ToDeviceMessage) err
 	return nil
 }
 
-// DequeueToDevice returns and deletes to-device messages for a device since
-// the given id. Returns the new "since" cursor (max id delivered).
+// DequeueToDevice returns to-device messages for a device with id > since
+// (the device's to-device cursor, which travels in the sync token). Messages
+// are NOT deleted here: they are retained until the device's next sync
+// acknowledges them via PruneToDevice, so a client that is killed before
+// processing a /sync response gets the messages redelivered on restart
+// (spec: to-device messages must survive a client restart; mirror of
+// Synapse's device inbox, which only deletes messages once the device has
+// synced past them).
 func (s *Store) DequeueToDevice(ctx context.Context, userID, deviceID string, since int64) ([]ToDeviceMessage, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, target_user, target_device, sender, type, content, created_ts
@@ -309,23 +315,32 @@ func (s *Store) DequeueToDevice(ctx context.Context, userID, deviceID string, si
 		}
 		out = append(out, m)
 	}
-	if err := rows.Err(); err != nil {
-		return out, err
+	return out, rows.Err()
+}
+
+// PruneToDevice deletes a device's to-device messages with id <= upToID. A
+// sync calls this with the device's incoming cursor (from the token): the
+// messages at or below that cursor were delivered in a previous /sync the
+// client has acknowledged by advancing its token, so they are safe to delete.
+// Messages above the cursor are retained for redelivery. A time-bounded GC is
+// included so messages for a device that never syncs again do not accumulate
+// forever.
+func (s *Store) PruneToDevice(ctx context.Context, userID, deviceID string, upToID int64) error {
+	if upToID <= 0 {
+		return nil
 	}
-	// Delete delivered messages.
-	if len(out) > 0 {
-		maxID := out[len(out)-1].ID
-		_, _ = s.pool.Exec(ctx,
-			`DELETE FROM to_device_messages WHERE target_user=$1 AND target_device=$2 AND id<=$3`,
-			userID, deviceID, maxID)
-	}
-	return out, nil
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM to_device_messages WHERE target_user=$1 AND target_device=$2 AND id<=$3`,
+		userID, deviceID, upToID)
+	return err
 }
 
 // DequeueToDeviceSince is the MSC4186 to-device extension variant: it
 // delivers messages with id > since and returns the new cursor (the max
-// delivered id, or since when nothing was delivered). The cursor is opaque to
-// clients and is echoed back as the extension's since on the next request.
+// delivered id, or since when nothing was delivered). Like DequeueToDevice it
+// does NOT delete on delivery — the caller acknowledges the previous batch by
+// pruning up to the incoming cursor (PruneToDevice), so messages survive a
+// client restart until the device has advanced past them.
 func (s *Store) DequeueToDeviceSince(ctx context.Context, userID, deviceID string, since int64) ([]ToDeviceMessage, int64, error) {
 	msgs, err := s.DequeueToDevice(ctx, userID, deviceID, since)
 	if err != nil {

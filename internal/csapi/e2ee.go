@@ -2,10 +2,12 @@ package csapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/AkagiYui/katrix/internal/canonicaljson"
 	"github.com/AkagiYui/katrix/internal/homeserver"
@@ -13,6 +15,17 @@ import (
 	"github.com/AkagiYui/katrix/internal/storage"
 	syncpkg "github.com/AkagiYui/katrix/internal/sync"
 )
+
+// fedKeyFetchTimeout bounds how long a /keys/query or /keys/claim federation
+// round-trip may take before the client request returns empty for the remote
+// user. A remote server that is offline (paused, crashed, unreachable) would
+// otherwise hold the request for the full outbound federation timeout,
+// stalling the calling client's send well past its own budget — the SDK gives
+// up after ~11s and the message is never sent (Complement Crypto's
+// *CannotGetKeysForOfflineServer tests). A bounded fetch returns quickly with
+// no keys; the client's own retry/backoff then re-establishes the session
+// once the remote server returns.
+const fedKeyFetchTimeout = 3 * time.Second
 
 // registerE2EE wires the P7 E2EE relay routes. The server only relays keys,
 // one-time keys, to-device messages and cross-signing material; it never
@@ -200,7 +213,11 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 			if len(query) == 0 {
 				continue
 			}
-			remote, err := a.fed.Client().QueryRemoteKeys(r.Context(), dom, query)
+			// Bound the federation round-trip so an unreachable remote server
+			// does not stall the client's request (see fedKeyFetchTimeout).
+			ctx, cancel := context.WithTimeout(r.Context(), fedKeyFetchTimeout)
+			remote, err := a.fed.Client().QueryRemoteKeys(ctx, dom, query)
+			cancel()
 			if err != nil {
 				continue
 			}
@@ -331,7 +348,11 @@ func (a *API) KeysClaim(w http.ResponseWriter, r *http.Request) {
 	// Remote claims: query each remote user's server once (per domain) and merge.
 	if a.fed != nil {
 		for dom, reqBody := range remoteByDomain {
-			remote, err := a.fed.Client().ClaimRemoteKeys(r.Context(), dom, reqBody)
+			// Bound the federation round-trip so an unreachable remote server
+			// does not stall the client's request (see fedKeyFetchTimeout).
+			ctx, cancel := context.WithTimeout(r.Context(), fedKeyFetchTimeout)
+			remote, err := a.fed.Client().ClaimRemoteKeys(ctx, dom, reqBody)
+			cancel()
 			if err != nil {
 				continue
 			}

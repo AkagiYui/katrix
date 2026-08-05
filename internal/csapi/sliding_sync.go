@@ -242,9 +242,14 @@ func sameRequiredState(a, b [][2]string) bool {
 }
 
 // parsePos decodes a sliding-sync position into a stream value (0 when absent
-// or malformed). The position is the shared sync stream's "s<N>" form.
+// or malformed). The position is the shared sync stream's "s<N>" form; a sync
+// next_batch token may carry a trailing to-device cursor ("s<N>t<M>"), which
+// is ignored here.
 func parsePos(pos string) int64 {
 	pos = strings.TrimPrefix(strings.TrimSpace(pos), "s")
+	if i := strings.IndexByte(pos, 't'); i >= 0 {
+		pos = pos[:i]
+	}
 	if pos == "" {
 		return 0
 	}
@@ -709,6 +714,11 @@ func (a *API) slidingExtensions(ctx context.Context, auth *homeserver.Auth, sinc
 				tdSince = n
 			}
 		}
+		// Prune the messages the client already acknowledged (its incoming
+		// cursor names the last delivered message); anything above the cursor
+		// stays queued so a client killed before processing the previous
+		// response still gets them on restart.
+		_ = a.Store.PruneToDevice(ctx, auth.UserID, auth.DeviceID, tdSince)
 		msgs, next, err := a.Store.DequeueToDeviceSince(ctx, auth.UserID, auth.DeviceID, tdSince)
 		if err == nil {
 			evs := make([]json.RawMessage, 0, len(msgs))

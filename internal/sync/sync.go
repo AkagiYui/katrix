@@ -12,18 +12,34 @@ import (
 )
 
 // Token is an opaque sync pagination token. Internally it encodes the
-// stream_ordering the client has processed up to. The format is "s<digits>".
+// stream_ordering the client has processed up to, plus a per-device to-device
+// message cursor (the last to-device message ID delivered to this device).
+// The format is "s<stream>" with an optional "t<to-device-id>" suffix.
 type Token struct {
 	Stream int64
+	// ToDevice is the device's to-device message cursor: the ID of the last
+	// to-device message delivered to this device. To-device messages are
+	// retained until the device's next sync acknowledges them (the cursor
+	// travels in the token), so a client that is killed before processing its
+	// /sync response gets the messages redelivered on restart instead of
+	// losing them (spec: to-device messages must not be dropped between a
+	// response and its processing; mirror of Synapse's device inbox).
+	ToDevice int64
 }
 
 // Encode renders a token as its opaque string form.
 func (t Token) Encode() string {
-	return "s" + formatInt(t.Stream)
+	s := "s" + formatInt(t.Stream)
+	if t.ToDevice > 0 {
+		s += "t" + formatInt(t.ToDevice)
+	}
+	return s
 }
 
 // DecodeToken parses an opaque sync token string. An empty string yields the
-// zero token (initial sync).
+// zero token (initial sync). The optional "t<digits>" suffix carries the
+// per-device to-device cursor and is ignored by callers that only need the
+// stream position (pagination, /keys/changes).
 func DecodeToken(s string) (Token, bool) {
 	if s == "" {
 		return Token{}, true
@@ -31,14 +47,47 @@ func DecodeToken(s string) (Token, bool) {
 	if len(s) < 2 || s[0] != 's' {
 		return Token{}, false
 	}
-	var n int64
-	for _, c := range s[1:] {
-		if c < '0' || c > '9' {
+	var t Token
+	digits := s[1:]
+	if i := indexByte(digits, 't'); i >= 0 {
+		// Parse the to-device cursor suffix; a malformed suffix invalidates
+		// the whole token.
+		td, ok := parseDigits(digits[i+1:])
+		if !ok {
 			return Token{}, false
+		}
+		t.ToDevice = td
+		digits = digits[:i]
+	}
+	n, ok := parseDigits(digits)
+	if !ok {
+		return Token{}, false
+	}
+	t.Stream = n
+	return t, true
+}
+
+func parseDigits(s string) (int64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	var n int64
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, false
 		}
 		n = n*10 + int64(c-'0')
 	}
-	return Token{Stream: n}, true
+	return n, true
+}
+
+func indexByte(s string, b byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
 }
 
 func formatInt(n int64) string {
