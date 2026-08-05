@@ -94,7 +94,6 @@ Don't get pushed for rooms you've muted
 Enabling an unknown default rule fails with 404
 Ephemeral messages received from clients are correctly expired
 Ephemeral messages received from servers are correctly expired
-Event with an invalid signature in the send_join response should not cause room join to fail
 Events in rooms with AS-hosted room aliases are sent to AS server
 Events whose auth_events are in the wrong room do not mess up the room state
 Federation handles empty auth_events in state_ids sanely
@@ -125,7 +124,6 @@ Inbound /v1/send_join rejects incorrectly-signed joins
 Inbound /v1/send_join rejects joins from other servers
 Inbound /v1/send_leave rejects leaves from other servers
 Inbound federation accepts a second soft-failed event
-Inbound federation can backfill events
 Inbound federation can get public room list
 Inbound federation can query room alias directory
 Inbound federation can receive events
@@ -185,12 +183,10 @@ Only original members of the room can see messages from erased users
 Only see history_visibility changes on boundaries
 Outbound federation can backfill events
 Outbound federation can query v1 /send_join
-Outbound federation can query v2 /send_join
 Outbound federation can request missing events
 Outbound federation can send invites via v1 API
 Outbound federation correctly handles unsupported room versions
 Outbound federation passes make_join failures through to the client
-Outbound federation rejects backfill containing invalid JSON for events in room version 6
 Outbound federation rejects invite response which include invalid JSON for room version 6
 Outbound federation rejects m.room.create events with an unknown room version
 Outbound federation rejects send_join responses with no m.room.create event

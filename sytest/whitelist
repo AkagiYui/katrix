@@ -6,6 +6,11 @@
 #   'Inbound federation rejects receipts from wrong remote', 'The only membership state
 #   included in an initial sync is for all the senders in the timeline', and
 #   'User can invite remote user to room with version 3' all now pass.
+# Extended from the 2026-08-05 run (workflow 31001692156) after emitting legacy
+# [id, hash] refs for room versions 1-2 joins: 'Outbound federation can query v2
+# /send_join', 'Event with an invalid signature in the send_join response ...',
+# 'Inbound federation can backfill events' and 'Outbound federation rejects backfill
+# containing invalid JSON ...' now pass.
 # Regenerate after each run with:
 #   grep -E '^ok ' results.tap | grep -vE '# skip' | sed -E 's/^ok [0-9]+ (\(expected fail\) )?//' | sed -E 's/( \([0-9]+ subtests\))? # TODO passed but expected fail$//' | sort -u
 # One test path per line; lines starting with '#' are ignored.
@@ -135,6 +140,7 @@ Event size limits
 Events come down the correct room
 Existing members see new members' join events
 Existing members see new members' presence
+Event with an invalid signature in the send_join response should not cause room join to fail
 Federation key API allows unsigned requests for keys
 Fetching eventstream a second time doesn't yield the message again
 GET /capabilities is present and well formed for registered user
@@ -186,6 +192,7 @@ If user leaves room, remote user changes device and rejoins we see update in /sy
 Ignore invite in full sync
 Ignore invite in incremental sync
 Inbound federation accepts attempts to join v2 rooms from servers with support
+Inbound federation can backfill events
 Inbound federation can get state for a room
 Inbound federation can get state_ids for a room
 Inbound federation can query profile data
@@ -251,8 +258,10 @@ Newly left rooms appear in the leave section of incremental sync
 Only room members can list aliases of a room
 Outbound federation can query profile data
 Outbound federation can query room alias directory
+Outbound federation can query v2 /send_join
 Outbound federation can send events
 Outbound federation can send invites via v2 API
+Outbound federation rejects backfill containing invalid JSON for events in room version 6
 Peeked rooms only turn up in the sync for the device who peeked them
 POST /createRoom creates a room with the given version
 POST /createRoom ignores attempts to set the room version via creation_content
