@@ -445,7 +445,6 @@ func (a *API) broadcastDeviceListStateToRoom(ctx context.Context, roomID string)
 	}
 }
 
-
 // roomIsPartial reports whether the room is currently partial-state (MSC3902).
 func (a *API) roomIsPartial(ctx context.Context, roomID string) bool {
 	room, err := a.Store.GetRoom(ctx, roomID)
