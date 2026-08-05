@@ -134,10 +134,21 @@ func (a *API) BroadcastPDUToRoomExcept(ctx context.Context, roomID string, ev *e
 	}
 }
 
-// RunEDUWorker delivers queued outbound EDUs and PDUs until ctx is cancelled.
-// It is started once at server startup and also woken by the broadcast
-// helpers. Failed deliveries are retried with an exponential backoff cap; a
-// delivery is only acknowledged after the remote server returns 200.
+// wakeDeliveries nudges the outbound delivery worker so it re-drains the
+// queues promptly (a new EDU/PDU was queued, or an invite was parked for
+// retry). Non-blocking: the worker's backoff timer will pick the queue up
+// anyway if the channel is full.
+func (a *API) wakeDeliveries() {
+	select {
+	case a.eduWake <- struct{}{}:
+	default:
+	}
+}
+
+// RunEDUWorker delivers queued outbound EDUs, PDUs and parked invites until
+// ctx is cancelled. It is started once at server startup and also woken by the
+// broadcast helpers. Failed deliveries are retried with an exponential backoff
+// cap; a delivery is only acknowledged after the remote server returns 200.
 func (a *API) RunEDUWorker(ctx context.Context) {
 	const baseDelay = 2 * time.Second
 	const maxDelay = 5 * time.Minute
@@ -160,7 +171,12 @@ func (a *API) RunEDUWorker(ctx context.Context) {
 			delay = minDuration(delay*2, maxDelay)
 			continue
 		}
-		if len(edus) == 0 && len(pdus) == 0 {
+		invites, err3 := a.Store.PendingOutboundInvites(ctx, 50, a.Now())
+		if err3 != nil {
+			delay = minDuration(delay*2, maxDelay)
+			continue
+		}
+		if len(edus) == 0 && len(pdus) == 0 && len(invites) == 0 {
 			delay = minDuration(delay*2, maxDelay)
 			continue
 		}
@@ -181,7 +197,48 @@ func (a *API) RunEDUWorker(ctx context.Context) {
 			}
 			a.deliverPDU(ctx, pdu.ID, pdu.TxnID, pdu.RoomID, pdu.Raw, pdu.Destinations)
 		}
+		for _, inv := range invites {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			a.deliverInvite(ctx, inv)
+		}
 	}
+}
+
+// deliverInvite retries a parked outbound invite against its destination
+// server. A transport failure advances the retry schedule (exponential
+// backoff, capped); a success or an application-level rejection (the peer has
+// seen and answered the request) ends the retries.
+func (a *API) deliverInvite(ctx context.Context, inv storage.OutboundInvite) {
+	version := roomver.Version("")
+	if room, err := a.Store.GetRoom(ctx, inv.RoomID); err == nil {
+		version = roomver.Version(room.Version)
+	}
+	tctx, cancel := context.WithTimeout(ctx, fedDeliveryTimeout)
+	defer cancel()
+	err := a.sendRemoteInviteOnce(tctx, inv.Destination, inv.RoomID, inv.EventID, inv.Raw, version)
+	if err == nil {
+		_ = a.Store.DeleteOutboundInvite(ctx, inv.ID)
+		return
+	}
+	if !isInviteTransportError(err) {
+		// Rejected (non-200): the peer saw the request; stop retrying.
+		_ = a.Store.DeleteOutboundInvite(ctx, inv.ID)
+		return
+	}
+	backoff := time.Duration(1<<minInt(inv.Attempts, 5)) * time.Second
+	_ = a.Store.BumpOutboundInvite(ctx, inv.ID, a.Now()+int64(backoff/time.Millisecond))
+}
+
+// minInt returns the smaller of two ints.
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // deliverPDU sends one queued PDU to each of its remaining destinations, each

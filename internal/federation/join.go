@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -332,6 +333,16 @@ func (a *API) ingestRemoteKnock(ctx context.Context, roomID string, version room
 // adds its signature and returns the doubly-signed event, which we persist in
 // place of our own (the room's other servers then see the invite signed by
 // both parties).
+//
+// Delivery is best-effort *reliable*: the synchronous attempt runs against
+// the request's own deadline (the client's invite call may 200 and return
+// while the event is still queued, mirroring how Synapse's transaction queue
+// delivers membership events asynchronously). A transport failure — the peer
+// is slow, partitioned, or down — parks the invite in the outbound retry
+// queue instead of dropping it, so a transient failure never loses an invite
+// (the invitee's server would otherwise never learn the room exists). An
+// application-level rejection (the peer returned a non-200, e.g. M_INVITE
+// _BLOCKED) is returned to the caller unchanged, exactly as before.
 func (a *API) SendRemoteInvite(ctx context.Context, roomID, invitee string, ev *events.Event, version roomver.Version) error {
 	dom := userDomain(invitee)
 	if dom == "" || dom == a.ServerName() {
@@ -350,7 +361,47 @@ func (a *API) SendRemoteInvite(ctx context.Context, roomID, invitee string, ev *
 	if err != nil {
 		return err
 	}
-	url := a.client.serverBaseURL(dom) + "/_matrix/federation/v2/invite/" + urlPathEscape(roomID) + "/" + urlPathEscape(ev.EventID())
+	err = a.sendRemoteInviteOnce(ctx, dom, roomID, ev.EventID(), raw, version)
+	if err == nil {
+		return nil
+	}
+	// A rejection by the peer (non-200) must surface to the caller — the client
+	// invite request fails with the remote server's status. Only transport
+	// failures (timeouts, connection errors) are retried.
+	if !isInviteTransportError(err) {
+		return err
+	}
+	log.Printf("katrix: federation invite for %s to %s failed (%v); queued for retry", ev.EventID(), dom, err)
+	_ = a.Store.InsertOutboundInvite(ctx, roomID, ev.EventID(), dom, raw, a.Now())
+	a.wakeDeliveries()
+	return nil
+}
+
+// isInviteTransportError reports whether an invite delivery error was a
+// transport-level failure (the peer never processed the request: timeout,
+// connection refused/reset, TLS) rather than an application-level rejection.
+// Only the former is retryable — a 403 M_INVITE_BLOCKED must propagate to the
+// inviter, and a malformed body would only recur.
+func isInviteTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "M_INVITE_BLOCKED") {
+		return false
+	}
+	if strings.Contains(msg, "HTTP ") {
+		return false
+	}
+	return true
+}
+
+// sendRemoteInviteOnce performs a single signed PUT /_matrix/federation/v2/
+// invite delivery against dom with the pre-built body, and persists the
+// doubly-signed invite event the peer returns (the room's other servers then
+// see the invite signed by both parties).
+func (a *API) sendRemoteInviteOnce(ctx context.Context, dom, roomID, eventID string, raw json.RawMessage, version roomver.Version) error {
+	url := a.client.serverBaseURL(dom) + "/_matrix/federation/v2/invite/" + urlPathEscape(roomID) + "/" + urlPathEscape(eventID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(raw))
 	if err != nil {
 		return err
@@ -378,8 +429,8 @@ func (a *API) SendRemoteInvite(ctx context.Context, roomID, invitee string, ev *
 	}
 	respBody, rerr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if rerr == nil && json.Unmarshal(respBody, &out) == nil && len(out.Event) > 0 {
-		if signedEv, err := events.New(out.Event, version); err == nil && signedEv.EventID() == ev.EventID() {
-			_ = a.Store.UpdateEventRaw(ctx, ev.EventID(), out.Event)
+		if signedEv, err := events.New(out.Event, version); err == nil && signedEv.EventID() == eventID {
+			_ = a.Store.UpdateEventRaw(ctx, eventID, out.Event)
 		}
 	}
 	return nil
