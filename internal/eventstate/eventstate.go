@@ -6,7 +6,7 @@
 // event_state_snapshots table. With that, the current room state can always be
 // recomputed as the state-resolution result over all forward extremities'
 // snapshots -- correctly handling multi-extremity forks -- instead of the
-// last-writer-wins single room_state map that the prior implementation relied
+// single last-writer-wins room_state map that the prior implementation relied
 // on (and which degraded to last-writer-wins for deeper fork histories).
 //
 // Core invariant maintained by this package:
@@ -15,6 +15,14 @@
 //
 // This package is shared by the client-server and federation layers (which do
 // not import each other) so both insert paths maintain snapshots uniformly.
+//
+// Concurrency: every maintenance sequence (Maintain, SeedRemoteJoin) runs
+// inside Store.WithRoomWrite -- a per-room write lock plus a single database
+// transaction. The rewrites of room_state, event_state_snapshots and
+// forward_extremities are DELETE-then-INSERT, and concurrent writers for the
+// same room would otherwise interleave those transactions into a Postgres
+// deadlock (SQLSTATE 40P01) and observe half-applied state. Serialising per
+// room makes each writer see the previous writer's complete result.
 package eventstate
 
 import (
@@ -28,11 +36,26 @@ import (
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/stateres"
 	"github.com/AkagiYui/katrix/internal/storage"
+	"github.com/jackc/pgx/v5"
 )
 
 // stateKeySep separates type and state_key in the composite map key, mirroring
 // the convention used elsewhere in the codebase.
 const stateKeySep = "\x00"
+
+// roomWrite is the subset of the storage layer used inside the per-room write
+// transaction (Store.WithRoomWrite). All reads must go through the transaction
+// so the snapshot base and the extremity set are consistent with the writes.
+type roomWrite interface {
+	TxGetEvent(ctx context.Context, tx pgx.Tx, eventID string) (*storage.EventRow, error)
+	TxEventsByIDs(ctx context.Context, tx pgx.Tx, ids []string) ([]storage.EventRow, error)
+	TxGetStateEvent(ctx context.Context, tx pgx.Tx, roomID, eventType, stateKey string) (string, error)
+	TxGetEventState(ctx context.Context, tx pgx.Tx, eventID string) ([]storage.StateRow, error)
+	TxSaveEventState(ctx context.Context, tx pgx.Tx, eventID, roomID string, state []storage.StateRow) error
+	TxForwardExtremities(ctx context.Context, tx pgx.Tx, roomID string) ([]storage.ForwardExtremity, error)
+	TxSetRoomState(ctx context.Context, tx pgx.Tx, roomID string, state []storage.StateRow) error
+	TxSetForwardExtremities(ctx context.Context, tx pgx.Tx, roomID string, extremities []storage.ForwardExtremity) error
+}
 
 // powerLevelCache holds a parsed power_levels content keyed by event ID, to
 // avoid re-parsing the same event while resolving sender power levels across a
@@ -40,7 +63,8 @@ const stateKeySep = "\x00"
 type powerLevelCache struct {
 	pl    map[string]*rooms.PowerLevels
 	miss  map[string]struct{}
-	store *storage.Store
+	store roomWrite
+	tx    pgx.Tx
 }
 
 // get returns the parsed power_levels content for a power_levels event ID, or
@@ -52,7 +76,7 @@ func (c *powerLevelCache) get(ctx context.Context, id string) *rooms.PowerLevels
 	if _, miss := c.miss[id]; miss {
 		return nil
 	}
-	row, err := c.store.GetEvent(ctx, id)
+	row, err := c.store.TxGetEvent(ctx, c.tx, id)
 	if err != nil || row == nil || row.Type != "m.room.power_levels" {
 		if c.miss == nil {
 			c.miss = map[string]struct{}{}
@@ -79,11 +103,11 @@ func (c *powerLevelCache) get(ctx context.Context, id string) *rooms.PowerLevels
 // own auth_events, mirroring Synapse's _get_power_level_for_sender. For a
 // CreatorPrivileged room version the room creator is treated as having
 // effectively infinite power (MaxCreatorPowerLevel).
-func senderPowerLevel(ctx context.Context, store *storage.Store, meta *stateres.EventMeta, rules roomver.Rules, ev *events.Event, cache *powerLevelCache) int64 {
+func senderPowerLevel(ctx context.Context, store roomWrite, tx pgx.Tx, meta *stateres.EventMeta, rules roomver.Rules, ev *events.Event, cache *powerLevelCache) int64 {
 	createContent := ""
 	var pl *rooms.PowerLevels
 	for _, aid := range ev.AuthEvents() {
-		row, err := store.GetEvent(ctx, aid)
+		row, err := store.TxGetEvent(ctx, tx, aid)
 		if err != nil || row == nil {
 			continue
 		}
@@ -100,8 +124,8 @@ func senderPowerLevel(ctx context.Context, store *storage.Store, meta *stateres.
 	// the room's current state instead. The creator/additional-creator power
 	// check depends on it.
 	if createContent == "" && rules.CreatorPrivileged && ev.RoomID() != "" {
-		if id, err := store.GetStateEvent(ctx, ev.RoomID(), "m.room.create", ""); err == nil {
-			if createEv, err := store.GetEvent(ctx, id); err == nil {
+		if id, err := store.TxGetStateEvent(ctx, tx, ev.RoomID(), "m.room.create", ""); err == nil {
+			if createEv, err := store.TxGetEvent(ctx, tx, id); err == nil {
 				createContent = string(createEv.Content)
 			}
 		}
@@ -131,7 +155,7 @@ func senderPowerLevel(ctx context.Context, store *storage.Store, meta *stateres.
 // buildEventMeta constructs a stateres.EventMeta for a stored event, parsing
 // its auth_events/prev_events from RawJSON and resolving the sender's power
 // level from its auth_events. Non-fatal lookup errors yield a zero power level.
-func buildEventMeta(ctx context.Context, store *storage.Store, row *storage.EventRow, rules roomver.Rules, cache *powerLevelCache) stateres.EventMeta {
+func buildEventMeta(ctx context.Context, store roomWrite, tx pgx.Tx, row *storage.EventRow, rules roomver.Rules, cache *powerLevelCache) stateres.EventMeta {
 	meta := stateres.EventMeta{
 		EventID:        row.EventID,
 		Type:           row.Type,
@@ -144,7 +168,7 @@ func buildEventMeta(ctx context.Context, store *storage.Store, row *storage.Even
 	if ev, err := events.New(row.RawJSON, rules.Version); err == nil {
 		meta.AuthEvents = ev.AuthEvents()
 		meta.PrevEvents = ev.PrevEvents()
-		meta.SenderPowerLevel = senderPowerLevel(ctx, store, &meta, rules, ev, cache)
+		meta.SenderPowerLevel = senderPowerLevel(ctx, store, tx, &meta, rules, ev, cache)
 	}
 	return meta
 }
@@ -186,7 +210,7 @@ func IsStateType(eventType string) bool {
 // set of state-event IDs and folds the result into a (type\x00state_key)->id
 // map. Used both for merge-event snapshots and for re-resolving room_state over
 // multiple extremities.
-func resolveOverCandidates(ctx context.Context, store *storage.Store, candIDs []string, rules roomver.Rules) (map[string]string, error) {
+func resolveOverCandidates(ctx context.Context, store roomWrite, tx pgx.Tx, candIDs []string, rules roomver.Rules) (map[string]string, error) {
 	if len(candIDs) == 0 {
 		return map[string]string{}, nil
 	}
@@ -199,15 +223,15 @@ func resolveOverCandidates(ctx context.Context, store *storage.Store, candIDs []
 			uniq = append(uniq, id)
 		}
 	}
-	rows, err := store.EventsByIDs(ctx, uniq)
+	rows, err := store.TxEventsByIDs(ctx, tx, uniq)
 	if err != nil {
 		return nil, err
 	}
-	cache := &powerLevelCache{store: store}
+	cache := &powerLevelCache{store: store, tx: tx}
 	cands := make([]stateres.EventMeta, 0, len(rows))
 	for i := range rows {
 		r := rows[i]
-		cands = append(cands, buildEventMeta(ctx, store, &r, rules, cache))
+		cands = append(cands, buildEventMeta(ctx, store, tx, &r, rules, cache))
 	}
 	ordered := stateres.Resolve(cands, int(rules.StateResVersion))
 	byID := make(map[string]stateres.EventMeta, len(cands))
@@ -253,8 +277,8 @@ func stateMapToRows(roomID string, m map[string]string) []storage.StateRow {
 	return out
 }
 
-// SnapshotForEvent computes and returns the state-at-event snapshot for the
-// given event under the room-version rules:
+// snapshotForEventTx computes the state-at-event snapshot for the given event
+// inside the room's write transaction:
 //
 //   - 0 prev_events (room create): base = {} plus the event's own state tuple.
 //   - 1 prev_event: base = the prev event's snapshot (copied), plus the event's
@@ -264,9 +288,8 @@ func stateMapToRows(roomID string, m map[string]string) []storage.StateRow {
 //     a state event.
 //
 // A missing prev snapshot (e.g. an event whose prev is not yet snapshotted)
-// degrades to an empty base, matching the prior best-effort behaviour. The
-// caller is expected to persist the result via Store.SaveEventState.
-func SnapshotForEvent(ctx context.Context, store *storage.Store, row *storage.EventRow, rules roomver.Rules) ([]storage.StateRow, error) {
+// degrades to an empty base, matching the prior best-effort behaviour.
+func snapshotForEventTx(ctx context.Context, store roomWrite, tx pgx.Tx, row *storage.EventRow, rules roomver.Rules) ([]storage.StateRow, error) {
 	ev, perr := events.New(row.RawJSON, rules.Version)
 	var prevs []string
 	isState := false
@@ -284,7 +307,7 @@ func SnapshotForEvent(ctx context.Context, store *storage.Store, row *storage.Ev
 	case len(prevs) == 0:
 		base = map[string]string{}
 	case len(prevs) == 1:
-		rows, err := store.GetEventState(ctx, prevs[0])
+		rows, err := store.TxGetEventState(ctx, tx, prevs[0])
 		if err == nil {
 			base = stateRowsToMap(rows)
 		} else if !errors.Is(err, storage.ErrNotFound) {
@@ -296,7 +319,7 @@ func SnapshotForEvent(ctx context.Context, store *storage.Store, row *storage.Ev
 		// Merge: gather the union of state-event IDs across all prev snapshots.
 		var candIDs []string
 		for _, p := range prevs {
-			rows, err := store.GetEventState(ctx, p)
+			rows, err := store.TxGetEventState(ctx, tx, p)
 			if err != nil {
 				if errors.Is(err, storage.ErrNotFound) {
 					continue
@@ -308,7 +331,7 @@ func SnapshotForEvent(ctx context.Context, store *storage.Store, row *storage.Ev
 			}
 		}
 		var err error
-		base, err = resolveOverCandidates(ctx, store, candIDs, rules)
+		base, err = resolveOverCandidates(ctx, store, tx, candIDs, rules)
 		if err != nil {
 			return nil, fmt.Errorf("eventstate: resolve merge: %w", err)
 		}
@@ -322,14 +345,15 @@ func SnapshotForEvent(ctx context.Context, store *storage.Store, row *storage.Ev
 	return stateMapToRows(row.RoomID, base), nil
 }
 
-// RecomputeCurrentState recomputes room_state for a room as the
+// recomputeCurrentStateTx recomputes room_state for a room as the
 // state-resolution result over all forward extremities' snapshots and writes
-// it back atomically. A single-extremity room uses that extremity's snapshot
-// directly (the common fast path, no resolution needed). Missing extremity
-// snapshots degrade to an empty contribution, preserving prior best-effort
-// behaviour. It is a no-op when the room has no recorded extremities.
-func RecomputeCurrentState(ctx context.Context, store *storage.Store, roomID string, rules roomver.Rules) error {
-	exts, err := store.ForwardExtremities(ctx, roomID)
+// it back inside the room's write transaction. A single-extremity room uses
+// that extremity's snapshot directly (the common fast path, no resolution
+// needed). Missing extremity snapshots degrade to an empty contribution,
+// preserving prior best-effort behaviour. It is a no-op when the room has no
+// recorded extremities.
+func recomputeCurrentStateTx(ctx context.Context, store roomWrite, tx pgx.Tx, roomID string, rules roomver.Rules) error {
+	exts, err := store.TxForwardExtremities(ctx, tx, roomID)
 	if err != nil {
 		return fmt.Errorf("eventstate: load extremities: %w", err)
 	}
@@ -339,21 +363,21 @@ func RecomputeCurrentState(ctx context.Context, store *storage.Store, roomID str
 
 	// Fast path: single extremity -- its snapshot IS the current state.
 	if len(exts) == 1 {
-		rows, err := store.GetEventState(ctx, exts[0].EventID)
+		rows, err := store.TxGetEventState(ctx, tx, exts[0].EventID)
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				// No snapshot yet: clear current state to be safe.
-				return store.SetRoomState(ctx, roomID, nil)
+				return store.TxSetRoomState(ctx, tx, roomID, nil)
 			}
 			return fmt.Errorf("eventstate: load extremity snapshot: %w", err)
 		}
-		return store.SetRoomState(ctx, roomID, rows)
+		return store.TxSetRoomState(ctx, tx, roomID, rows)
 	}
 
 	// Fork: union the state-event IDs across all extremity snapshots and resolve.
 	var candIDs []string
 	for _, e := range exts {
-		rows, err := store.GetEventState(ctx, e.EventID)
+		rows, err := store.TxGetEventState(ctx, tx, e.EventID)
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				continue
@@ -364,31 +388,59 @@ func RecomputeCurrentState(ctx context.Context, store *storage.Store, roomID str
 			candIDs = append(candIDs, r.EventID)
 		}
 	}
-	resolved, err := resolveOverCandidates(ctx, store, candIDs, rules)
+	resolved, err := resolveOverCandidates(ctx, store, tx, candIDs, rules)
 	if err != nil {
 		return fmt.Errorf("eventstate: resolve fork: %w", err)
 	}
-	return store.SetRoomState(ctx, roomID, stateMapToRows(roomID, resolved))
+	return store.TxSetRoomState(ctx, tx, roomID, stateMapToRows(roomID, resolved))
 }
 
 // Maintain is the canonical post-insert hook. It computes and persists the
 // state-at-event snapshot for the just-inserted event and then recomputes the
-// room's current state from the forward extremities. Both steps are best-effort
-// in the sense that snapshot computation failure is reported; the caller may
-// choose to log-and-continue (as the federation ingest path does) or propagate
-// (as the csapi path does).
+// room's current state from the forward extremities. The whole sequence runs
+// under the room's write lock and inside one transaction, so concurrent writers
+// for the same room cannot interleave the snapshot / room_state / extremity
+// rewrites (which would deadlock in Postgres) and each writer observes the
+// previous writer's complete state.
 func Maintain(ctx context.Context, store *storage.Store, row *storage.EventRow, rules roomver.Rules) error {
-	snap, err := SnapshotForEvent(ctx, store, row, rules)
+	return store.WithRoomWrite(ctx, row.RoomID, func(tx pgx.Tx) error {
+		snap, err := snapshotForEventTx(ctx, store, tx, row, rules)
+		if err != nil {
+			return err
+		}
+		if err := store.TxSaveEventState(ctx, tx, row.EventID, row.RoomID, snap); err != nil {
+			return fmt.Errorf("eventstate: save snapshot: %w", err)
+		}
+		if err := recomputeCurrentStateTx(ctx, store, tx, row.RoomID, rules); err != nil {
+			return fmt.Errorf("eventstate: recompute state: %w", err)
+		}
+		return nil
+	})
+}
+
+// SnapshotForEvent computes the state-at-event snapshot for an event, opening a
+// short read transaction. Prefer running inside Maintain when the event is
+// being persisted; this pool-level form is retained for callers (and tests)
+// that compute a snapshot in isolation.
+func SnapshotForEvent(ctx context.Context, store *storage.Store, row *storage.EventRow, rules roomver.Rules) ([]storage.StateRow, error) {
+	tx, err := store.Pool().Begin(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := store.SaveEventState(ctx, row.EventID, row.RoomID, snap); err != nil {
-		return fmt.Errorf("eventstate: save snapshot: %w", err)
-	}
-	if err := RecomputeCurrentState(ctx, store, row.RoomID, rules); err != nil {
-		return fmt.Errorf("eventstate: recompute state: %w", err)
-	}
-	return nil
+	defer func() { _ = tx.Rollback(ctx) }()
+	return snapshotForEventTx(ctx, store, tx, row, rules)
+}
+
+// RecomputeCurrentState recomputes room_state for a room as the
+// state-resolution result over all forward extremities' snapshots and writes
+// it back, opening a short transaction. Production maintenance paths run this
+// inside Maintain/SeedRemoteJoin (which already hold the room write lock and
+// transaction); this pool-level form is retained for callers that recompute in
+// isolation (e.g. the MSC3902 resync completion).
+func RecomputeCurrentState(ctx context.Context, store *storage.Store, roomID string, rules roomver.Rules) error {
+	return store.WithRoomWrite(ctx, roomID, func(tx pgx.Tx) error {
+		return recomputeCurrentStateTx(ctx, store, tx, roomID, rules)
+	})
 }
 
 // SeedRemoteJoin persists the room view delivered by a successful outbound
@@ -398,23 +450,26 @@ func Maintain(ctx context.Context, store *storage.Store, row *storage.EventRow, 
 // forward extremity, and room_state is recomputed from it. This makes the room
 // usable locally without ever having received its history. The join event row
 // is expected to already be persisted; stateRows are the (already persisted)
-// state events delivered in the send_join response.
+// state events delivered in the send_join response. The whole sequence runs
+// under the room's write lock and inside one transaction.
 func SeedRemoteJoin(ctx context.Context, store *storage.Store, roomID string, rules roomver.Rules, joinRow *storage.EventRow, stateRows []storage.StateRow) error {
-	base := stateRowsToMap(stateRows)
-	if joinRow.EventID != "" && joinRow.Type != "" {
-		base[joinRow.Type+stateKeySep+joinRow.StateKey] = joinRow.EventID
-	}
-	snap := stateMapToRows(roomID, base)
-	if err := store.SaveEventState(ctx, joinRow.EventID, roomID, snap); err != nil {
-		return fmt.Errorf("eventstate: seed join snapshot: %w", err)
-	}
-	if err := store.SetForwardExtremities(ctx, roomID, []storage.ForwardExtremity{
-		{RoomID: roomID, EventID: joinRow.EventID, Depth: joinRow.Depth},
-	}); err != nil {
-		return fmt.Errorf("eventstate: seed join extremity: %w", err)
-	}
-	if err := RecomputeCurrentState(ctx, store, roomID, rules); err != nil {
-		return fmt.Errorf("eventstate: seed join recompute: %w", err)
-	}
-	return nil
+	return store.WithRoomWrite(ctx, roomID, func(tx pgx.Tx) error {
+		base := stateRowsToMap(stateRows)
+		if joinRow.EventID != "" && joinRow.Type != "" {
+			base[joinRow.Type+stateKeySep+joinRow.StateKey] = joinRow.EventID
+		}
+		snap := stateMapToRows(roomID, base)
+		if err := store.TxSaveEventState(ctx, tx, joinRow.EventID, roomID, snap); err != nil {
+			return fmt.Errorf("eventstate: seed join snapshot: %w", err)
+		}
+		if err := store.TxSetForwardExtremities(ctx, tx, roomID, []storage.ForwardExtremity{
+			{RoomID: roomID, EventID: joinRow.EventID, Depth: joinRow.Depth},
+		}); err != nil {
+			return fmt.Errorf("eventstate: seed join extremity: %w", err)
+		}
+		if err := recomputeCurrentStateTx(ctx, store, tx, roomID, rules); err != nil {
+			return fmt.Errorf("eventstate: seed join recompute: %w", err)
+		}
+		return nil
+	})
 }

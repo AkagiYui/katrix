@@ -21,6 +21,9 @@ var migrationsFS embed.FS
 // Store is the database handle shared across the server.
 type Store struct {
 	pool *pgxpool.Pool
+	// roomLocks serialises per-room write pipelines (event persistence + state
+	// maintenance). See roomwrite.go.
+	roomLocks *roomLocks
 }
 
 // Pool exposes the underlying pool for advanced callers (transactions).
@@ -54,7 +57,7 @@ func OpenWithConfig(ctx context.Context, dsn string, maxConns, minConns int32) (
 		pool.Close()
 		return nil, fmt.Errorf("storage: ping: %w", err)
 	}
-	s := &Store{pool: pool}
+	s := &Store{pool: pool, roomLocks: newRoomLocks(512)}
 	if err := s.migrate(ctx); err != nil {
 		pool.Close()
 		return nil, err
