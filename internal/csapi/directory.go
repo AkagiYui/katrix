@@ -35,7 +35,13 @@ func (a *API) UserDirectorySearch(w http.ResponseWriter, r *http.Request) {
 	}
 	results := make([]map[string]any, 0, len(entries))
 	for _, e := range entries {
-		u := map[string]any{"user_id": a.UserID(e.Localpart)}
+		// A remote directory entry carries its actual user ID; local entries
+		// derive theirs from the localpart + server name.
+		userID := e.FullID
+		if userID == "" {
+			userID = a.UserID(e.Localpart)
+		}
+		u := map[string]any{"user_id": userID}
 		if e.DisplayName != "" {
 			u["display_name"] = e.DisplayName
 		}

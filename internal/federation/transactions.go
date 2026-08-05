@@ -365,18 +365,29 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 				}
 			}
 		}
-	} else if origin != "" && room.PartialState && ev.StateKey != nil && ev.Type != "m.room.member" {
-		// Partial-state room, non-member state event: check against the
-		// partial snapshot. The re-validation after the resync completes
-		// re-checks this event against the full state (an event accepted
-		// only because the state was incomplete is then rejected).
+	} else if origin != "" && room.PartialState && ev.StateKey != nil {
+		// Partial-state room (MSC3902): the room's state is incomplete, so
+		// every event is accepted optimistically and re-validated against the
+		// full state once the resync completes (revalidatePartialWindow).
+		// Non-member state events are checked against the partial snapshot (an
+		// obviously invalid event is rejected now). Member events are also
+		// checked when the SENDER's membership is known from the partial state
+		// (e.g. a banned user's kick is rejected immediately — Complement's
+		// "incorrectly believed to be in room" tests assert the 404); a sender
+		// whose membership is unknown is accepted leniently, because the
+		// partial state cannot vouch for them and their event must be deferred
+		// to revalidation (mirror of Synapse's MSC3902 handling — e.g. a kick
+		// by a user who actually left the room before the join is accepted
+		// during the partial window and rejected once the full state arrives).
 		if rules, ok := roomver.Get(version); ok {
 			stateKey := ""
 			if ev.StateKey != nil {
 				stateKey = *ev.StateKey
 			}
 			st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey)
-			if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, true); err != nil {
+			if ev.Type == "m.room.member" && len(st.SenderMember) == 0 {
+				// Unknown sender membership: accept leniently (revalidated later).
+			} else if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, true); err != nil {
 				rejected = true
 			}
 		}

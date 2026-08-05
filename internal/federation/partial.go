@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -101,8 +102,8 @@ func (a *API) ingestPartialJoin(ctx context.Context, roomID string, version room
 	if _, err := a.Store.InsertEvent(ctx, joinRow); err != nil {
 		return fmt.Errorf("federation: persist partial join event: %w", err)
 	}
-	stateRows := a.persistRemotePDUs(ctx, roomID, rules, sj.State)
-	a.persistRemotePDUs(ctx, roomID, rules, sj.AuthChain)
+	stateRows := a.persistRemotePDUs(ctx, roomID, rules, sj.State, true)
+	a.persistRemotePDUs(ctx, roomID, rules, sj.AuthChain, false)
 
 	// A second partial-state join into an already-partial room (MSC3902): the
 	// remote server's send_join response omits every membership except the new
@@ -351,6 +352,12 @@ func (a *API) revalidatePartialWindow(ctx context.Context, roomID string) {
 	if err != nil || len(rows) == 0 {
 		return
 	}
+	// Revalidate in causal (stream) order: a later event may only be judged
+	// against the state that includes the verdicts of earlier ones (e.g. a kick
+	// whose sender was banned by an earlier — invalid — ban must be re-evaluated
+	// only after the ban has been rejected and the sender's membership
+	// restored).
+	sort.Slice(rows, func(i, j int) bool { return rows[i].StreamOrdering < rows[j].StreamOrdering })
 	version := roomver.Version(room.Version)
 	rules, ok := roomver.Get(version)
 	if !ok {
@@ -397,7 +404,13 @@ func (a *API) revalidatePartialWindow(ctx context.Context, roomID string) {
 }
 
 // restoreMembershipFromState re-applies the membership row for userID from the
-// room's current state after a member event was rejected on revalidation.
+// room's current state after a member event was rejected on revalidation. The
+// membership is FORCED (bypassing the causal-ordering guard): the rejected
+// event — e.g. a kick that was accepted during the partial window but fails
+// against the full state — has a higher depth than the join it reversed, and
+// the depth guard would otherwise keep the stale rejected verdict forever
+// (mirror of Synapse's restore_membership, which restores the state's verdict
+// unconditionally).
 func (a *API) restoreMembershipFromState(ctx context.Context, roomID, userID string) {
 	id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.member", userID)
 	if err != nil {
@@ -407,7 +420,16 @@ func (a *API) restoreMembershipFromState(ctx context.Context, roomID, userID str
 	if err != nil {
 		return
 	}
-	a.applyRemoteMembership(ctx, roomID, userID, ev.Content, ev.EventID, ev.Depth)
+	mc, _ := rooms.ParseMember(ev.Content)
+	membership := ""
+	if mc != nil {
+		membership = mc.Membership
+	}
+	_ = a.Store.ForceUpsertMembership(ctx, storage.MembershipRow{
+		RoomID: roomID, UserID: userID, Membership: membership,
+		EventID: ev.EventID, StreamOrdering: ev.StreamOrdering, Depth: ev.Depth,
+	})
+	a.applyRemoteMembershipNotify(ctx, roomID, userID, membership)
 }
 
 // memberStateSnapshotFromStore builds a rooms.StateSnapshot from the room's

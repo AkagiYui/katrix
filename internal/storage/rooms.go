@@ -820,6 +820,29 @@ func (s *Store) UpsertMembership(ctx context.Context, m MembershipRow) error {
 	return upsertMembershipTx(ctx, s.pool, &m)
 }
 
+// ForceUpsertMembership writes a membership row unconditionally, bypassing the
+// causal-ordering (depth) guard in UpsertMembership. Used when a partial-state
+// revalidation reverses an earlier verdict: a kick/ban that was accepted during
+// the partial window but rejected against the full state must restore the
+// target's membership even though the rejected event had a HIGHER depth than
+// the join it reversed — the rejected event is no longer part of the room, so
+// its depth must not keep winning (mirror of Synapse's restore_membership,
+// which forces the membership back to the state's verdict).
+func (s *Store) ForceUpsertMembership(ctx context.Context, m MembershipRow) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO room_memberships(room_id, user_id, membership, event_id,
+		                              display_name, avatar_url, forgotten, stream_ordering, depth)
+		 VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$8)
+		 ON CONFLICT (room_id, user_id) DO UPDATE SET
+		     membership=EXCLUDED.membership, event_id=EXCLUDED.event_id,
+		     display_name=EXCLUDED.display_name, avatar_url=EXCLUDED.avatar_url,
+		     stream_ordering=EXCLUDED.stream_ordering, depth=EXCLUDED.depth,
+		     forgotten = CASE WHEN EXCLUDED.membership='join' THEN FALSE ELSE room_memberships.forgotten END`,
+		m.RoomID, m.UserID, m.Membership, m.EventID,
+		nullString(m.DisplayName), nullString(m.AvatarURL), m.StreamOrdering, m.Depth)
+	return err
+}
+
 // GetMembership returns a single membership row.
 func (s *Store) GetMembership(ctx context.Context, roomID, userID string) (*MembershipRow, error) {
 	var m MembershipRow

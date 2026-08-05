@@ -13,12 +13,19 @@ type UserDirectoryEntry struct {
 	Localpart   string
 	DisplayName string
 	AvatarURL   string
+	// FullID is the full user ID (only set for remote users; local entries
+	// derive theirs from Localpart + server name).
+	FullID string
 }
 
-// SearchUserDirectory returns local users whose display name, localpart or
-// full user ID matches term (case-insensitive substring match). Only users
-// with a display name, or whose localpart matches, are returned, and only if
-// the user is visible to the searcher.
+// SearchUserDirectory returns users whose display name, localpart or full user
+// ID matches term (case-insensitive substring match). Local users are always
+// candidates (subject to visibility); REMOTE users appear in the directory only
+// when they are a joined member of a "public" room on this server (the spec's
+// directory visibility rule, which is what makes remote members of a public
+// room searchable — mirror of Synapse's user_directory, which indexes remote
+// users in public rooms). Only users with a display name, or whose localpart
+// matches, are returned, and only if the user is visible to the searcher.
 //
 // A user is visible when they are a joined member of a "public" room — one
 // whose m.room.join_rules is `public` or whose m.room.history_visibility is
@@ -59,9 +66,57 @@ func (s *Store) SearchUserDirectory(ctx context.Context, serverName, term, searc
 		return nil, err
 	}
 
+	// Remote users: joined members of a public/world-readable room on this
+	// server, whose localpart (or full user ID) matches the term. A partial-
+	// state room's memberships are applied by the resync, so these rows appear
+	// once the room is fully stated (Complement's "User directory is correctly
+	// updated once state re-sync completes").
+	remoteRows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT rm.user_id
+		 FROM room_memberships rm
+		 JOIN room_state rs ON rs.room_id = rm.room_id
+		  AND rs.type='m.room.join_rules' AND rs.state_key=''
+		 JOIN events je ON je.event_id = rs.event_id
+		  AND je.content->>'join_rule' = 'public'
+		 WHERE rm.membership='join'
+		   AND rm.user_id NOT LIKE '@%@' || $2
+		   AND (LOWER(SUBSTRING(rm.user_id FROM '@([^:]*):')) LIKE '%'||$1||'%'
+		        OR LOWER(rm.user_id) LIKE '%'||$1||'%')
+		 LIMIT 500`, term, serverName)
+	if err == nil {
+		for remoteRows.Next() {
+			var userID string
+			if err := remoteRows.Scan(&userID); err != nil {
+				remoteRows.Close()
+				break
+			}
+			// Extract the localpart (between '@' and ':') for the entry.
+			i := strings.IndexByte(userID, ':')
+			localpart := ""
+			if len(userID) > 1 && userID[0] == '@' && i > 1 {
+				localpart = userID[1:i]
+			}
+			if localpart == "" {
+				continue
+			}
+			candidates = append(candidates, UserDirectoryEntry{Localpart: localpart, FullID: userID})
+		}
+		remoteRows.Close()
+	}
+
 	out := make([]UserDirectoryEntry, 0, len(candidates))
+	seen := map[string]bool{}
 	for _, c := range candidates {
-		userID := "@" + c.Localpart + ":" + serverName
+		// Local candidates' full user ID is derived from the localpart; remote
+		// candidates carry their actual (remote) user ID.
+		userID := c.FullID
+		if userID == "" {
+			userID = "@" + c.Localpart + ":" + serverName
+		}
+		if seen[userID] {
+			continue
+		}
+		seen[userID] = true
 		// The searching user never appears in their own directory results.
 		if userID == searcherUserID {
 			continue

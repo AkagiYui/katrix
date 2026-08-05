@@ -265,7 +265,7 @@ func (a *API) ingestRemoteKnock(ctx context.Context, roomID string, version room
 	if _, err := a.Store.InsertEvent(ctx, knockRow); err != nil {
 		return fmt.Errorf("federation: persist knock event: %w", err)
 	}
-	stateRows := a.persistRemotePDUs(ctx, roomID, rules, state)
+	stateRows := a.persistRemotePDUs(ctx, roomID, rules, state, true)
 	if err := eventstate.SeedRemoteJoin(ctx, a.Store, roomID, rules, knockRow, stateRows); err != nil {
 		return fmt.Errorf("federation: seed remote room state: %w", err)
 	}
@@ -778,8 +778,12 @@ func (a *API) ingestRemoteJoin(ctx context.Context, roomID string, version roomv
 	}
 
 	// Verify + persist the delivered state and auth chain (idempotent inserts).
-	stateRows := a.persistRemotePDUs(ctx, roomID, rules, sj.State)
-	a.persistRemotePDUs(ctx, roomID, rules, sj.AuthChain)
+	// State memberships are authoritative; auth-chain events must NOT update
+	// membership (a full join's auth chain may reference members whose state
+	// was already delivered, and a partial join's auth chain references members
+	// deliberately omitted from the response — see persistRemotePDUs).
+	stateRows := a.persistRemotePDUs(ctx, roomID, rules, sj.State, true)
+	a.persistRemotePDUs(ctx, roomID, rules, sj.AuthChain, false)
 
 	// Seed room_state from the delivered state and make the join event the sole
 	// forward extremity; the room is now fully usable locally.
@@ -862,12 +866,20 @@ func creatorFromState(state []json.RawMessage) string {
 	return ""
 }
 
-// persistRemotePDUs verifies and inserts a set of PDUs (send_join state or
-// auth chain) delivered by a remote server, returning the state-event rows
-// among them. Signed-but-invalid PDUs are skipped; unsigned PDUs are kept
-// (some servers omit signatures on state delivered in send_join). Rows are
-// idempotent inserts: re-joining a room replays the same PDUs harmlessly.
-func (a *API) persistRemotePDUs(ctx context.Context, roomID string, rules roomver.Rules, pdus []json.RawMessage) []storage.StateRow {
+// persistRemotePDUs verifies and persists the PDUs delivered in a send_join
+// response (the state and auth chain), returning the state tuples of the state
+// events (idempotent inserts: re-joining a room replays the same PDUs
+// harmlessly). applyMembership controls whether member events update the
+// denormalised membership table: it is TRUE for the delivered STATE (whose
+// memberships are authoritative — for a full join the complete membership set,
+// for a partial join only the joiner's own) and FALSE for the AUTH CHAIN (a
+// partial join's auth chain may reference members like the power_levels
+// sender whose membership was deliberately omitted from the response; they
+// must not be treated as known room members — mirror of Synapse, which stores
+// auth-chain events as outliers that never update current state or device-list
+// tracking. Applying them would make a pre-existing member appear "tracked"
+// during the partial window, caching their device list before the resync).
+func (a *API) persistRemotePDUs(ctx context.Context, roomID string, rules roomver.Rules, pdus []json.RawMessage, applyMembership bool) []storage.StateRow {
 	var rows []storage.StateRow
 	for _, raw := range pdus {
 		var ev struct {
@@ -912,7 +924,7 @@ func (a *API) persistRemotePDUs(ctx context.Context, roomID string, rules roomve
 		// Update the denormalised membership table for remote member state
 		// events so /joined_members, /members and lazy-loading syncs see them
 		// (without this, remote members never appear as joined locally).
-		if ev.StateKey != nil && ev.Type == "m.room.member" {
+		if applyMembership && ev.StateKey != nil && ev.Type == "m.room.member" {
 			a.applyRemoteMembership(ctx, roomID, *ev.StateKey, ev.Content, id, ev.Depth)
 		}
 		if ev.StateKey != nil {
