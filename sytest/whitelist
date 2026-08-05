@@ -261,7 +261,6 @@ Outbound federation can query room alias directory
 Outbound federation can query v2 /send_join
 Outbound federation can send events
 Outbound federation can send invites via v2 API
-Outbound federation rejects backfill containing invalid JSON for events in room version 6
 Peeked rooms only turn up in the sync for the device who peeked them
 POST /createRoom creates a room with the given version
 POST /createRoom ignores attempts to set the room version via creation_content
