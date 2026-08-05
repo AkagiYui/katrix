@@ -478,3 +478,19 @@ We should see our own leave event, even if history_visibility is restricted (SYN
 Wildcard device messages over federation wake up /sync
 Wildcard device messages wake up /sync
 Will not update keys with worse versions
+
+/state_ids returns M_NOT_FOUND for a rejected message event
+/state_ids returns M_NOT_FOUND for a rejected state event
+A pair of events which redact each other should be ignored
+An event which redacts itself should be ignored
+Backfilled events whose prev_events are in a different room do not allow cross-room back-pagination
+Banned servers cannot /event_auth
+Events whose auth_events are in the wrong room do not mess up the room state
+Federation rejects inbound events where the prev_events cannot be found
+Inbound federation can receive events
+Inbound federation can receive invites via v2 API
+Inbound federation can receive redacted events
+Inbound federation correctly handles soft failed events as extremities
+Inbound federation correctly soft fails events
+Outbound federation rejects backfill containing invalid JSON for events in room version 6
+Outbound federation sends receipts

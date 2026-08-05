@@ -167,3 +167,55 @@ func TestVerifyLegacyEventID(t *testing.T) {
 		t.Fatalf("event id=%s want $legacy:test", res.EventID)
 	}
 }
+
+func TestVerifyOriginFallbackToSenderServerNameWithPort(t *testing.T) {
+	key, err := crypto.GenerateSigningKey("v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := New(&stubResolver{key: key})
+	// An event without an "origin" field (as katrix's own outbound PDUs are
+	// built) whose sender lives on a server name that includes a port
+	// ("localhost:8448", the form SyTest's mock federation server signs under).
+	// The origin must resolve to the sender's full server name, not just the
+	// port: a last-colon split would yield "8448" and miss the signature the
+	// peer published under "localhost:8448", silently rejecting every inbound
+	// PDU from that server.
+	obj := map[string]any{
+		"type":             "m.room.message",
+		"sender":           "@alice:localhost:8448",
+		"room_id":          "!room:localhost:8448",
+		"content":          map[string]string{"body": "hi"},
+		"depth":            1,
+		"origin_server_ts": 1,
+		"prev_events":      []any{},
+		"auth_events":      []any{},
+	}
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules, _ := roomver.Get(roomver.Default)
+	redacted, err := events.Redact(raw, rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	redactedRaw, err := json.Marshal(redacted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed, err := crypto.SignJSON("localhost:8448", key, redactedRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := v.Verify(context.Background(), signed, roomver.Default)
+	if res.Err != nil {
+		t.Fatalf("err: %v", res.Err)
+	}
+	if res.Origin != "localhost:8448" {
+		t.Fatalf("origin=%q, want localhost:8448", res.Origin)
+	}
+	if !res.Signed || !res.Valid {
+		t.Fatalf("expected signed+valid: %+v", res)
+	}
+}

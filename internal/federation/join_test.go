@@ -2,6 +2,8 @@ package federation
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -115,6 +117,44 @@ func TestLegacyTemplateRefs(t *testing.T) {
 	}
 	if len(legacyTemplateRefs(nil)) != 0 {
 		t.Fatal("legacyTemplateRefs(nil) should be empty")
+	}
+}
+
+func TestRequestingServerSupportsVersion(t *testing.T) {
+	mk := func(ver ...string) *http.Request {
+		req := httptest.NewRequest("GET", "/_matrix/federation/v1/make_join/!r:test/@u:test", nil)
+		if len(ver) > 0 {
+			q := req.URL.Query()
+			for _, v := range ver {
+				q.Add("ver", v)
+			}
+			req.URL.RawQuery = q.Encode()
+		}
+		return req
+	}
+	cases := []struct {
+		name    string
+		roomVer string
+		req     *http.Request
+		want    bool
+	}{
+		// Spec: ver "Defaults to [1]". An absent ver declares support for room
+		// version 1 only.
+		{"absent ver on v1 room", "1", mk(), true},
+		{"absent ver on v2 room", "2", mk(), false},
+		{"explicit v1", "1", mk("1"), true},
+		{"explicit v2", "2", mk("2"), true},
+		{"ver without room version", "2", mk("1"), false},
+		{"comma-separated list", "2", mk("1,2,3"), true},
+		{"comma-separated list without room version", "4", mk("1,2,3"), false},
+		{"empty ver element", "1", mk(""), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := requestingServerSupportsVersion(c.req, c.roomVer); got != c.want {
+				t.Fatalf("got %v, want %v", got, c.want)
+			}
+		})
 	}
 }
 

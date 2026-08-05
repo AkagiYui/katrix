@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/events"
@@ -87,8 +88,13 @@ func (v *Verifier) Verify(ctx context.Context, raw []byte, version roomver.Versi
 	}
 	res.Origin = ev.Origin
 	if ev.Origin == "" {
-		// Fall back to the sender's server name.
-		if c := lastIndexByte(ev.Sender, ':'); c >= 0 {
+		// Fall back to the sender's server name (spec: the origin is the server
+		// the event is from, taken from the sender's domain when the event omits
+		// the origin field). A server name may itself contain a port
+		// ("localhost:8448"), so the domain is everything after the FIRST colon —
+		// a last-colon split would yield just the port ("8448") and miss the
+		// signature the peer published under its full server name.
+		if c := strings.IndexByte(ev.Sender, ':'); c >= 0 {
 			res.Origin = ev.Sender[c+1:]
 		}
 	}
@@ -150,14 +156,4 @@ func (v *Verifier) Verify(ctx context.Context, raw []byte, version roomver.Versi
 		res.Err = fmt.Errorf("fedverify: no valid signature from %s: %w", res.Origin, lastErr)
 	}
 	return res
-}
-
-// lastIndexByte is a tiny helper to avoid importing strings just for one call.
-func lastIndexByte(s string, b byte) int {
-	for i := len(s) - 1; i >= 0; i-- {
-		if s[i] == b {
-			return i
-		}
-	}
-	return -1
 }

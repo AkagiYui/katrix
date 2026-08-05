@@ -245,8 +245,7 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	if origin != "" && a.hasUnknownPrevEvents(r.Context(), raw) {
 		gapFetched = true
 		a.fetchMissingEventsFor(r.Context(), ev.RoomID, evID, origin)
-	}
-	// If the near chain is still disconnected — the prevs of the events
+	}	// If the near chain is still disconnected — the prevs of the events
 	// get_missing_events just filled are themselves unknown — reconcile the
 	// room's state from the origin (Synapse's state fetch for a room it cannot
 	// link): the frontier event anchors a /state_ids snapshot whose events are
@@ -1236,15 +1235,17 @@ func (a *API) restrictedRoomJoinRules(ctx context.Context, roomID string) bool {
 }
 
 // requestingServerSupportsVersion reports whether a make_join/make_knock
-// request's ?ver= query parameters include the room's version. Per the spec a
-// requesting server states the room versions it supports via ver; when the
-// room's version is not among them (including when ver is entirely absent —
-// the requesting server has declared no supported versions) the join is
-// refused with 400 M_INCOMPATIBLE_ROOM_VERSION.
+// request's ?ver= query parameters include the room's version. Per the spec the
+// ver parameter "defaults to [1]": a requesting server that omits it declares
+// support for room version 1 only, so a v1 room is joinable without ver while a
+// v2+ room is refused (M_INCOMPATIBLE_ROOM_VERSION) unless ver lists its
+// version. A ver present but not listing the room's version (including
+// entirely-empty list values) is likewise refused.
 func requestingServerSupportsVersion(r *http.Request, roomVersion string) bool {
 	versions := r.URL.Query()["ver"]
 	if len(versions) == 0 {
-		return false
+		// Spec: ver "Defaults to [1]".
+		return roomVersion == "1"
 	}
 	for _, v := range versions {
 		for _, part := range strings.Split(v, ",") {
