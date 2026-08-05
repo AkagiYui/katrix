@@ -72,6 +72,52 @@ func TestTplEventTS(t *testing.T) {
 	}
 }
 
+func TestInferTemplateRoomVersion(t *testing.T) {
+	t.Run("legacy id/hash pairs imply v1", func(t *testing.T) {
+		raw := json.RawMessage(`{"prev_events":[["$a",{"sha256":"x"}]],"auth_events":[["$b",{"sha256":"y"}]],"depth":3}`)
+		if got := inferTemplateRoomVersion(raw); got != "1" {
+			t.Fatalf("inferred version = %q, want \"1\"", got)
+		}
+	})
+	t.Run("plain id arrays imply modern", func(t *testing.T) {
+		raw := json.RawMessage(`{"prev_events":["$a"],"auth_events":["$b"],"depth":3}`)
+		if got := inferTemplateRoomVersion(raw); got != "" {
+			t.Fatalf("inferred version = %q, want \"\" (v3+)", got)
+		}
+	})
+	t.Run("empty refs are inconclusive", func(t *testing.T) {
+		for _, raw := range []json.RawMessage{
+			json.RawMessage(`{"prev_events":[],"auth_events":[]}`),
+			json.RawMessage(`{"content":{"membership":"join"}}`),
+			json.RawMessage(`null`),
+		} {
+			if got := inferTemplateRoomVersion(raw); got != "" {
+				t.Fatalf("inferred version for %s = %q, want \"\"", raw, got)
+			}
+		}
+	})
+}
+
+func TestLegacyTemplateRefs(t *testing.T) {
+	refs := legacyTemplateRefs([]string{"$a", "$b"})
+	if len(refs) != 2 {
+		t.Fatalf("len(refs) = %d, want 2", len(refs))
+	}
+	want := []string{"$a", "$b"}
+	for i, r := range refs {
+		pair, ok := r.([]any)
+		if !ok || len(pair) != 2 {
+			t.Fatalf("ref %d is not a [id, hash] pair: %#v", i, r)
+		}
+		if pair[0] != want[i] {
+			t.Fatalf("ref %d id = %v, want %s", i, pair[0], want[i])
+		}
+	}
+	if len(legacyTemplateRefs(nil)) != 0 {
+		t.Fatal("legacyTemplateRefs(nil) should be empty")
+	}
+}
+
 func TestURLPathEscape(t *testing.T) {
 	if got := urlPathEscape("#room:example.org"); got != "%23room:example.org" {
 		t.Fatalf("escape = %q", got)

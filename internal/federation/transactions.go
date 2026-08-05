@@ -1106,6 +1106,18 @@ func remoteOriginOf(r *http.Request) string {
 	return ""
 }
 
+// legacyTemplateRefs renders a list of event IDs in the [id, hash] pair form
+// mandated by room versions 1-2 (prev_events/auth_events). The hash is an
+// empty object: the serving server has the IDs, and the pair shape — not the
+// hash contents — is what the joining server's version-aware parser requires.
+func legacyTemplateRefs(ids []string) []any {
+	out := make([]any, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, []any{id, map[string]string{}})
+	}
+	return out
+}
+
 // MakeJoin handles GET /_matrix/federation/v1/make_join/{roomID}/{userID}.
 func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
@@ -1142,6 +1154,20 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	prev, depth := a.dagTipFor(r.Context(), roomID)
 	authIDs := a.memberAuthIDs(r, roomID, userID)
+	rules, _ := roomver.Get(roomver.Version(room.Version))
+	// Per the spec, room versions 1-2 reference prev/auth events as [id, hash]
+	// pairs; v3+ use plain ID strings. The template must carry the room
+	// version's native form so the joining server builds a correctly-formatted
+	// event (a v3+ plain-ID array in a v1 template crashes version-aware
+	// parsers that dereference each ref's first element).
+	var prevRefs, authRefs any
+	if rules.EventFormatV1 {
+		prevRefs = legacyTemplateRefs(prev)
+		authRefs = legacyTemplateRefs(authIDs)
+	} else {
+		prevRefs = prev
+		authRefs = authIDs
+	}
 	content := map[string]string{"membership": "join"}
 	// Restricted-rule room (MSC3083): when the room's join_rules allow
 	// restricted joins, the make_join template must carry a
@@ -1181,8 +1207,8 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 		"origin":           a.ServerName(),
 		"origin_server_ts": a.Now(),
 		"depth":            depth,
-		"prev_events":      prev,
-		"auth_events":      authIDs,
+		"prev_events":      prevRefs,
+		"auth_events":      authRefs,
 		"content":          content,
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
@@ -1297,6 +1323,17 @@ func (a *API) MakeKnock(w http.ResponseWriter, r *http.Request) {
 	}
 	prev, depth := a.dagTipFor(r.Context(), roomID)
 	authIDs := a.memberAuthIDs(r, roomID, userID)
+	rules, _ := roomver.Get(roomver.Version(room.Version))
+	// Legacy room versions (1-2) reference prev/auth events as [id, hash]
+	// pairs; v3+ use plain ID strings (see MakeJoin).
+	var prevRefs, authRefs any
+	if rules.EventFormatV1 {
+		prevRefs = legacyTemplateRefs(prev)
+		authRefs = legacyTemplateRefs(authIDs)
+	} else {
+		prevRefs = prev
+		authRefs = authIDs
+	}
 	template := map[string]any{
 		"type":             "m.room.member",
 		"state_key":        userID,
@@ -1305,8 +1342,8 @@ func (a *API) MakeKnock(w http.ResponseWriter, r *http.Request) {
 		"origin":           a.ServerName(),
 		"origin_server_ts": a.Now(),
 		"depth":            depth,
-		"prev_events":      prev,
-		"auth_events":      authIDs,
+		"prev_events":      prevRefs,
+		"auth_events":      authRefs,
 		"content":          map[string]string{"membership": "knock"},
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
@@ -1366,6 +1403,14 @@ func (a *API) MakeLeave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prev, depth := a.dagTipFor(r.Context(), roomID)
+	// Legacy room versions (1-2) reference prev/auth events as [id, hash]
+	// pairs; v3+ use plain ID strings (see MakeJoin).
+	var prevRefs any = prev
+	if room, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
+		if rules, ok := roomver.Get(roomver.Version(room.Version)); ok && rules.EventFormatV1 {
+			prevRefs = legacyTemplateRefs(prev)
+		}
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"origin": a.ServerName(),
 		"event": map[string]any{
@@ -1376,7 +1421,7 @@ func (a *API) MakeLeave(w http.ResponseWriter, r *http.Request) {
 			"origin":           a.ServerName(),
 			"origin_server_ts": a.Now(),
 			"depth":            depth,
-			"prev_events":      prev,
+			"prev_events":      prevRefs,
 			"content":          map[string]string{"membership": "leave"},
 		},
 	})

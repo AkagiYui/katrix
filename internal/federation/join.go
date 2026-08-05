@@ -106,6 +106,37 @@ func (a *API) JoinRemoteRoom(ctx context.Context, userID, roomID string, via []s
 	return false, lastErr
 }
 
+// inferTemplateRoomVersion derives the room version family from a make_join
+// (or make_knock) template when the response omits the mandatory room_version
+// field (the spec requires it, but some implementations — including sytest's
+// mock federation server — omit it). The prev/auth ref format is the reliable
+// signal: room versions 1-2 carry [id, hash] pairs, v3+ carry plain ID
+// strings. A pair-shaped template is returned as "1" (v1 and v2 share the
+// legacy event format and auth rules, so a v1-built event is accepted by a v2
+// room too); a plain-ID template returns "" so the caller falls back to the
+// default modern version. An absent/empty ref list yields "".
+func inferTemplateRoomVersion(raw json.RawMessage) roomver.Version {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return ""
+	}
+	for _, field := range []string{"prev_events", "auth_events"} {
+		v, ok := obj[field]
+		if !ok || len(v) == 0 || string(v) == "null" || string(v) == "[]" {
+			continue
+		}
+		var ids []string
+		if json.Unmarshal(v, &ids) == nil {
+			return "" // plain ID array: v3+
+		}
+		var pairs [][]json.RawMessage
+		if json.Unmarshal(v, &pairs) == nil {
+			return "1" // legacy [id, hash] pairs: room v1/v2
+		}
+	}
+	return ""
+}
+
 // joinRemoteRoomFrom performs a single make_join + send_join cycle against one
 // server and ingests the result.
 func (a *API) joinRemoteRoomFrom(ctx context.Context, userID, roomID, dest string) (bool, error) {
@@ -114,6 +145,11 @@ func (a *API) joinRemoteRoomFrom(ctx context.Context, userID, roomID, dest strin
 		return false, err
 	}
 	version := roomver.Version(tpl.RoomVersion)
+	if version == "" {
+		// A peer that omits room_version (sytest's mock federation server does)
+		// still names its refs in the version's native form; infer from that.
+		version = inferTemplateRoomVersion(tpl.Event)
+	}
 	if version == "" {
 		version = roomver.Default
 	}
@@ -215,6 +251,11 @@ func (a *API) knockRemoteRoomFrom(ctx context.Context, userID, roomID, dest, rea
 		return err
 	}
 	version := roomver.Version(tpl.RoomVersion)
+	if version == "" {
+		// A peer that omits room_version (sytest's mock federation server does)
+		// still names its refs in the version's native form; infer from that.
+		version = inferTemplateRoomVersion(tpl.Event)
+	}
 	if version == "" {
 		version = roomver.Default
 	}
