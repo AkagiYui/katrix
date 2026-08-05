@@ -25,11 +25,14 @@ import (
 // server that stops responding (frozen, partitioned, or merely slow) must not
 // pin the delivery worker: the outbound queues serve every destination in the
 // room, and a single hung PUT /send would otherwise stall all delivery behind
-// the client's 30s HTTP timeout. Complement's offline-server tests pause a
-// peer and expect the queued transactions to drain promptly once it returns;
-// the budget must stay small (2s) so a peer that comes back mid-window is
-// re-delivered within the client's wait time, not after it.
-const fedDeliveryTimeout = 2 * time.Second
+// the client's 30s HTTP timeout. The budget sits at 5s as a balance between
+// responsiveness and headroom: any shorter and a healthy-but-loaded peer (the
+// sytest mock federation server under parallel load) gets its transactions
+// misclassified as hung, the attempts fail, and the retry backlog pushes
+// otherwise-fine tests past their own deadlines. Complement's offline-server
+// tests pause a peer; the immediate-retry loop, not a short budget, is what
+// gets the queued events delivered promptly once the peer returns.
+const fedDeliveryTimeout = 5 * time.Second
 
 // BroadcastPDUToRoom queues a locally-created event for delivery to every
 // remote server with users in the room. The PDU is delivered in a signed
