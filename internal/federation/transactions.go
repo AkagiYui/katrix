@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -1110,6 +1111,7 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 		}
 		if prevMembership != rooms.MembershipJoin && prevMembership != rooms.MembershipInvite {
 			authoriser := a.Store.RestrictedJoinAuthoriser(r.Context(), roomID, a.ServerName())
+			log.Printf("katrix: DEBUG make_join restricted room=%s user=%s authoriser=%q", roomID, userID, authoriser)
 			if authoriser == "" {
 				// No local joined member can issue invites, so this server
 				// cannot generate a correctly-signed join event. Per MSC3083
