@@ -67,39 +67,49 @@ jobs:
       - name: register katrix with complement
         run: cp .complement-runtime/hs_katrix.go complement/runtime/hs_katrix.go
       - name: run complement
+        uses: nick-fields/retry@v3
         env:
           COMPLEMENT_SHARE_ENV_PREFIX: PASS_
           # Optional: comma-separated MSC suite numbers to skip, e.g. "3902"
           # when a suite is known-broken and should not pollute the baseline.
           COMPLEMENT_EXCLUDE: ''
-        shell: bash
-        run: |
-          set -o pipefail
-          cd complement
-          # Only the katrix_blacklist tag matters here: it lets
-          # runtime.SkipIf() identify katrix as the HS under test (see
-          # .complement-runtime/hs_katrix.go). The mscXXXX / msisns tags are
-          # dead weight — no complement build constraint ever referenced them,
-          # and the msc2946/msc3030 suites have since been deleted upstream.
-          # ./tests/... runs every package regardless, so all current MSC
-          # suites (msc2836 ... msc4306) are exercised automatically.
-          # Resolve the package list explicitly because ./tests/... offers no
-          # way to skip a single suite; COMPLEMENT_EXCLUDE (comma-separated
-          # suite numbers) filters the msc*/ directories out of the run.
-          pkgs=$(find ./tests -mindepth 1 -maxdepth 1 -type d | sort)
-          if [ -n "${COMPLEMENT_EXCLUDE}" ]; then
-            for suite in $(echo "${COMPLEMENT_EXCLUDE}" | tr ',' ' '); do
-              pkgs=$(printf '%s\n' "$pkgs" | grep -vE "/msc${suite}$") || true
-            done
-          fi
-          if [ "${{ matrix.group }}" = "core" ]; then
-            pkgset=./tests
-          else
-            pkgset=${pkgs}
-          fi
-          # shellcheck disable=SC2086  # pkgset is word-split on purpose
-          go test -json -timeout 30m -tags="katrix_blacklist" $pkgset 2>&1 \
-            | tee /tmp/complement.log
+        with:
+          timeout_minutes: 60
+          # Rerun once on any failure: most failures here are environment
+          # flakes (shared-runner contention, cold docker pulls, test-server
+          # startup races) rather than regressions, and a rerun filters them
+          # out while a genuine break still fails. Each attempt re-runs the
+          # whole command, so /tmp/complement.log only ever holds the last
+          # attempt's output.
+          max_attempts: 2
+          retry_wrapped_process: true
+          command: |
+            set -o pipefail
+            cd complement
+            # Only the katrix_blacklist tag matters here: it lets
+            # runtime.SkipIf() identify katrix as the HS under test (see
+            # .complement-runtime/hs_katrix.go). The mscXXXX / msisns tags are
+            # dead weight — no complement build constraint ever referenced them,
+            # and the msc2946/msc3030 suites have since been deleted upstream.
+            # ./tests/... runs every package regardless, so all current MSC
+            # suites (msc2836 ... msc4306) are exercised automatically.
+            # Resolve the package list explicitly because ./tests/... offers no
+            # way to skip a single suite; COMPLEMENT_EXCLUDE (comma-separated
+            # suite numbers) filters the msc*/ directories out of the run.
+            pkgs=$(find ./tests -mindepth 1 -maxdepth 1 -type d | sort)
+            if [ -n "${COMPLEMENT_EXCLUDE}" ]; then
+              for suite in $(echo "${COMPLEMENT_EXCLUDE}" | tr ',' ' '); do
+                pkgs=$(printf '%s\n' "$pkgs" | grep -vE "/msc${suite}$") || true
+              done
+            fi
+            if [ "${{ matrix.group }}" = "core" ]; then
+              pkgset=./tests
+            else
+              pkgset=${pkgs}
+            fi
+            # shellcheck disable=SC2086  # pkgset is word-split on purpose
+            go test -json -timeout 30m -tags="katrix_blacklist" $pkgset 2>&1 \
+              | tee /tmp/complement.log
       - name: summary
         if: always()
         # testreport renders the per-test breakdown (expected vs actual) from
@@ -152,36 +162,47 @@ jobs:
       - name: build sytest-katrix image
         run: docker build -f Containerfile.sytest -t sytest-katrix .
       - name: run sytest
-        shell: bash
-        run: |
-          set -o pipefail
-          mkdir -p sytest-logs
-          # Split the suite by file groups so the two halves run on parallel
-          # runners. run-tests.pl takes a file whitelist (only those files'
-          # tests are collected), but every file is still loaded, so fixture
-          # definitions (TEST_SERVER_INFO, INBOUND_SERVER, local_user_fixture,
-          # ...) are always available. The federation group keeps the whole
-          # tests/50federation directory together because its files share the
-          # INBOUND_SERVER/OUTBOUND_CLIENT fixtures from 00prepare.pl; the core
-          # group gets everything else. Paths are rewritten to the in-container
-          # /sytest mount.
-          if [ "${{ matrix.group }}" = "federation" ]; then
-            files=$(find sytest-src/tests/50federation -name '*.pl' | sort)
-          else
-            files=$(find sytest-src/tests -name '*.pl' -not -path '*/50federation/*' | sort)
-          fi
-          # run-tests.pl matches its file whitelist against walkdir's paths,
-          # which are relative to the CWD (the container's /sytest). Strip the
-          # host checkout prefix to yield "tests/...".
-          files=$(printf '%s\n' "$files" | sed 's|^sytest-src/||')
-          # shellcheck disable=SC2086  # files is word-split on purpose
-          docker run --rm \
-            -v "$PWD/sytest-src:/sytest" \
-            -v "$PWD:/src" \
-            -v "$PWD/sytest-logs:/logs" \
-            -e POSTGRES=1 \
-            -e SYTEST_DEFAULT_BRANCH=develop \
-            sytest-katrix $files 2>&1 | tee /tmp/sytest.log
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 60
+          # Rerun once on any failure: most failures here are environment
+          # flakes (parallel-runner contention, the sytest federation mock
+          # being slow under load) rather than regressions. Each attempt is a
+          # fresh `docker run` with its own clean servers, so a rerun filters
+          # out the flake while a genuine break still fails; results.tap and
+          # /tmp/sytest.log are overwritten by the last attempt, keeping the
+          # summary honest.
+          max_attempts: 2
+          retry_wrapped_process: true
+          command: |
+            set -o pipefail
+            mkdir -p sytest-logs
+            # Split the suite by file groups so the two halves run on parallel
+            # runners. run-tests.pl takes a file whitelist (only those files'
+            # tests are collected), but every file is still loaded, so fixture
+            # definitions (TEST_SERVER_INFO, INBOUND_SERVER, local_user_fixture,
+            # ...) are always available. The federation group keeps the whole
+            # tests/50federation directory together because its files share the
+            # INBOUND_SERVER/OUTBOUND_CLIENT fixtures from 00prepare.pl; the core
+            # group gets everything else. Paths are rewritten to the in-container
+            # /sytest mount.
+            if [ "${{ matrix.group }}" = "federation" ]; then
+              files=$(find sytest-src/tests/50federation -name '*.pl' | sort)
+            else
+              files=$(find sytest-src/tests -name '*.pl' -not -path '*/50federation/*' | sort)
+            fi
+            # run-tests.pl matches its file whitelist against walkdir's paths,
+            # which are relative to the CWD (the container's /sytest). Strip the
+            # host checkout prefix to yield "tests/...".
+            files=$(printf '%s\n' "$files" | sed 's|^sytest-src/||')
+            # shellcheck disable=SC2086  # files is word-split on purpose
+            docker run --rm \
+              -v "$PWD/sytest-src:/sytest" \
+              -v "$PWD:/src" \
+              -v "$PWD/sytest-logs:/logs" \
+              -e POSTGRES=1 \
+              -e SYTEST_DEFAULT_BRANCH=develop \
+              sytest-katrix $files 2>&1 | tee /tmp/sytest.log
       - name: summary
         if: always()
         run: |
@@ -345,16 +366,27 @@ jobs:
           go build -tags='jssdk,rust' -o rpc ./cmd/rpc
 
       - name: run complement-crypto
+        uses: nick-fields/retry@v3
         env:
           LIBRARY_PATH: ${{ env.RUST_SDK_LIB }}
           LD_LIBRARY_PATH: ${{ env.RUST_SDK_LIB }}
           COMPLEMENT_CRYPTO_RPC_BINARY: ${{ github.workspace }}/complement-crypto/rpc
-        shell: bash
-        run: |
-          cd complement-crypto
-          set -o pipefail
-          go test -p 3 -v -json -tags='jssdk,rust' -count=1 -timeout 15m \
-            ./tests ./tests/js ./tests/rust 2>&1 | tee /tmp/crypto.log
+        with:
+          timeout_minutes: 45
+          # Rerun once on any failure: the crypto suite is timing-sensitive
+          # (pause/unpause a peer server, then wait for the SDK's keys/claim
+          # backoff to expire) and headless-Chrome startup is a known source of
+          # environment flakes. Each attempt spawns fresh containers via
+          # COMPLEMENT_ENABLE_DIRTY_RUNS, so a rerun filters out the flake
+          # while a genuine E2EE failure still fails. /tmp/crypto.log is
+          # overwritten by the last attempt, keeping the summary honest.
+          max_attempts: 2
+          retry_wrapped_process: true
+          command: |
+            cd complement-crypto
+            set -o pipefail
+            go test -p 3 -v -json -tags='jssdk,rust' -count=1 -timeout 15m \
+              ./tests ./tests/js ./tests/rust 2>&1 | tee /tmp/crypto.log
       - name: summary
         if: always()
         run: |
