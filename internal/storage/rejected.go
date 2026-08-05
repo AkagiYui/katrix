@@ -60,3 +60,20 @@ func (s *Store) RejectedEventIDs(ctx context.Context, ids []string) (map[string]
 	}
 	return out, rows.Err()
 }
+
+// EventAccepted reports whether the event is already persisted and has not been
+// soft-failed. A re-delivery of such an event must be treated as an idempotent
+// accept: its verdict was already established, and re-authorising against the
+// current room state could wrongly downgrade it (e.g. a PDU broadcast of a
+// send_join racing the seed, when the room snapshot is not yet in place).
+func (s *Store) EventAccepted(ctx context.Context, eventID string) (bool, error) {
+	var exists, rejected bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM events WHERE event_id=$1),
+		        EXISTS(SELECT 1 FROM rejected_events WHERE event_id=$1)`,
+		eventID).Scan(&exists, &rejected)
+	if err != nil {
+		return false, err
+	}
+	return exists && !rejected, nil
+}

@@ -269,6 +269,11 @@ func (a *API) ingestRemoteKnock(ctx context.Context, roomID string, version room
 	if err := eventstate.SeedRemoteJoin(ctx, a.Store, roomID, rules, knockRow, stateRows); err != nil {
 		return fmt.Errorf("federation: seed remote room state: %w", err)
 	}
+	// The send_knock response is authoritative for the knock event; clear a
+	// soft-fail a racing PDU broadcast may have recorded (see ingestRemoteJoin).
+	if rejected, err := a.Store.IsEventRejected(ctx, ev.EventID()); err == nil && rejected {
+		a.Store.UnmarkEventRejected(ctx, ev.EventID())
+	}
 	// Mark the knocking user as knocking.
 	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
 		RoomID: roomID, UserID: ev.Sender(), Membership: "knock",
@@ -780,6 +785,16 @@ func (a *API) ingestRemoteJoin(ctx context.Context, roomID string, version roomv
 	// forward extremity; the room is now fully usable locally.
 	if err := eventstate.SeedRemoteJoin(ctx, a.Store, roomID, rules, joinRow, stateRows); err != nil {
 		return fmt.Errorf("federation: seed remote room state: %w", err)
+	}
+
+	// The send_join response is the authoritative word on the join event: the
+	// remote server accepted it and returned the resulting room state. A PDU
+	// broadcast of the same join may have raced the seed (delivered before
+	// room_state was in place) and soft-failed it; that verdict is wrong, and a
+	// rejected join poisons every later event whose auth chain references it
+	// (e.g. a ban). Clear the soft-fail now that the room is fully seeded.
+	if rejected, err := a.Store.IsEventRejected(ctx, ev.EventID()); err == nil && rejected {
+		a.Store.UnmarkEventRejected(ctx, ev.EventID())
 	}
 
 	// Mark the joining user as joined.

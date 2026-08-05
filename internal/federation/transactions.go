@@ -218,6 +218,22 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	if evID == "" {
 		evID = res.EventID
 	}
+	// A re-delivery of an event that was already accepted must not be
+	// re-authorised: its verdict is established, and re-checking against the
+	// current room state could wrongly downgrade it. The canonical race is a
+	// send_join/knock being ingested (which seeds room_state) while the room's
+	// other servers broadcast the same membership PDU back: the PDU path may
+	// observe a still-empty room_state snapshot and soft-fail an event the
+	// send_join path has already accepted — which then poisons every later event
+	// whose auth chain references it (e.g. a ban over a fresh join). Rejections
+	// are re-evaluated on re-delivery (an event that was soft-failed may be
+	// accepted once the events it depends on arrive), so only events currently
+	// marked accepted take this early return.
+	if origin != "" {
+		if accepted, err := a.Store.EventAccepted(r.Context(), evID); err == nil && accepted {
+			return evID, true
+		}
+	}
 	// Gap filling first: if the event's prev_events reference events we do not
 	// have, ask the sending server for them (spec: a server that receives an
 	// event referencing unknown prev_events should request them via

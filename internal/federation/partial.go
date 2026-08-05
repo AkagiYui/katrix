@@ -105,6 +105,11 @@ func (a *API) ingestPartialJoin(ctx context.Context, roomID string, version room
 	if err := eventstate.SeedRemoteJoin(ctx, a.Store, roomID, rules, joinRow, stateRows); err != nil {
 		return fmt.Errorf("federation: seed partial room state: %w", err)
 	}
+	// The send_join response is authoritative for the join event; clear a
+	// soft-fail a racing PDU broadcast may have recorded (see ingestRemoteJoin).
+	if rejected, err := a.Store.IsEventRejected(ctx, ev.EventID()); err == nil && rejected {
+		a.Store.UnmarkEventRejected(ctx, ev.EventID())
+	}
 	// Mark the joining user as joined.
 	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
 		RoomID: roomID, UserID: ev.Sender(), Membership: "join",
