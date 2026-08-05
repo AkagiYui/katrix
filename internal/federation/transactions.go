@@ -258,24 +258,16 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// join whose own prev is pre-join history) is ordinary missing history,
 	// filled lazily by backfill, not reconciled.
 	//
-	// The reconcile runs in the background, mirroring Synapse: it is several
-	// network round-trips against a peer — including a /state_ids request the
-	// peer may deliberately hold open (Complement's partial-state tests block
-	// /state_ids until the resync is released) — and blocking the /send
-	// response on it stalls the sender's transaction past its deadline. The
-	// triggering event is accepted immediately; the reconcile completes the
-	// room's state asynchronously.
-	//
-	// Skipped for partial-state rooms (MSC3902): their local DAG is
-	// intentionally incomplete until the background resync completes, and the
-	// resync fetches the room's full state itself. Reconciling here would race
-	// the resync over the same room_state (concurrent event/state writes
-	// corrupt the snapshots and drop events the synchronous path persists in
-	// order — Complement's half-missing-grandparents and
-	// events-before-their-prevs tests fail on the race).
-	if origin != "" && !room.PartialState && gapFetched && !a.hasUnknownPrevEvents(r.Context(), raw) {
+	// The reconcile runs synchronously so the pulled events are persisted
+	// before the triggering event's state-at-event is computed. Running it
+	// asynchronously races the background partial-state resync over the same
+	// room_state (concurrent event/state writes corrupt the snapshots and drop
+	// events that the synchronous path persists in order — Complement's
+	// half-missing-grandparents and events-before-their-prevs tests fail on
+	// the race).
+	if origin != "" && gapFetched && !a.hasUnknownPrevEvents(r.Context(), raw) {
 		if frontier := a.unknownDeepFrontier(r.Context(), raw); frontier != "" {
-			go a.reconcileStateFrom(context.WithoutCancel(r.Context()), ev.RoomID, origin, frontier)
+			a.reconcileStateFrom(r.Context(), ev.RoomID, origin, frontier)
 		}
 	}
 	// If the prev_events are STILL missing after the fetch (the sending server

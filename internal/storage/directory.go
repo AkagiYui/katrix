@@ -145,18 +145,21 @@ func (s *Store) userVisibleToSearcher(ctx context.Context, userID, searcherUserI
 		if s.roomIsPubliclyVisible(ctx, roomID) {
 			return true
 		}
-		// Shared joined room with the searcher (including the user searching
-		// for themselves).
-		if searcherUserID != "" {
-			var shared bool
-			if err := s.pool.QueryRow(ctx,
-				`SELECT EXISTS(
-				   SELECT 1 FROM room_memberships
-				   WHERE room_id=$1 AND user_id=$2 AND membership='join')`,
-				roomID, searcherUserID).Scan(&shared); err == nil && shared {
-				return true
-			}
+	// Shared joined room with the searcher. The searcher's OWN membership does
+	// not make them visible to themselves: a user is only findable by searching
+	// for themselves when they are in a public/world_readable room (the spec
+	// visibility rule, and what Complement's user-directory tests assert — a
+	// user in a private room must not appear when they search for themselves).
+	if searcherUserID != "" && userID != searcherUserID {
+		var shared bool
+		if err := s.pool.QueryRow(ctx,
+			`SELECT EXISTS(
+			   SELECT 1 FROM room_memberships
+			   WHERE room_id=$1 AND user_id=$2 AND membership='join')`,
+			roomID, searcherUserID).Scan(&shared); err == nil && shared {
+			return true
 		}
+	}
 	}
 	// A user is visible only when at least one joined room passed the public or
 	// shared checks above; having joined rooms alone is not enough.
