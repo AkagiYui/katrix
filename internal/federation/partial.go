@@ -191,6 +191,24 @@ func (a *API) resyncPartialState(ctx context.Context, roomID string, version roo
 				// stale and the next /keys/query re-fetches (Complement's "user
 				// incorrectly believed to be in room" tests).
 				_ = a.Store.EvictUntrackedRemoteDeviceLists(ctx, a.ServerName())
+				// The room's remote members' device lists became fully known only
+				// now (their member events may have been persisted during the
+				// partial window without membership rows, and any device-list
+				// update EDU processed then was recorded at a pre-resync stream
+				// position — both invisible to a post-resync sync). Re-announce
+				// them: bump each remote joined member's device-list change to the
+				// current stream so local users sharing the room see them in
+				// device_lists.changed (mirror of Synapse's
+				// handle_room_un_partial_stated, which replays pending device-list
+				// updates for the room once it is fully stated).
+				if members, err := a.Store.Members(ctx, roomID, "join"); err == nil {
+					for _, m := range members {
+						if !a.IsLocalUser(m.UserID) {
+							_, _ = a.Store.RecordDeviceListChange(ctx, m.UserID, false)
+						}
+					}
+				}
+				a.notifyRoomMembers(ctx, roomID)
 				// Servers that joined (or were already in) the room while it was
 				// partial may have missed device-list updates broadcast during the
 				// resync window — the membership was incomplete, so the destination
@@ -273,8 +291,19 @@ func (a *API) resyncFromServer(ctx context.Context, roomID string, version roomv
 			// state_key, and dropping them from the re-seed would leave the room
 			// without its auth-critical state (every join then fails with
 			// "no m.room.create in state").
+			//
+			// A known MEMBER event also gets its membership applied now: it was
+			// persisted during the partial window (e.g. via the send_join auth
+			// chain) WITHOUT a membership row, because its membership was
+			// deliberately omitted from the partial response and the auth chain
+			// must not be treated as membership. The resync's state list is the
+			// authoritative full membership, so this is where those rows are
+			// created.
 			if ev, err := a.Store.GetEvent(ctx, id); err == nil && ev != nil {
 				rows = append(rows, storage.StateRow{RoomID: roomID, Type: ev.Type, StateKey: ev.StateKey, EventID: ev.EventID})
+				if ev.Type == "m.room.member" && ev.StateKey != "" {
+					a.applyRemoteMembership(ctx, roomID, ev.StateKey, ev.Content, ev.EventID, ev.Depth)
+				}
 			}
 			continue
 		}

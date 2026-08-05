@@ -257,21 +257,9 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// gap): a gap behind already-present prevs (e.g. an event referencing a
 	// join whose own prev is pre-join history) is ordinary missing history,
 	// filled lazily by backfill, not reconciled.
-	//
-	// The reconcile runs synchronously (the pulled events must be persisted
-	// before the triggering event's state-at-event is computed), but its
-	// network fetches are bounded by a deadline (reconcileSyncTimeout) so a
-	// peer that holds /state_ids open — Complement's partial-state suite
-	// deliberately blocks it until the resync is released — cannot stall the
-	// /send response past the sender's transaction budget (its client times
-	// out after 10s). On timeout the triggering event stays accepted; the
-	// state it could not verify is left to the background resync (MSC3902) or
-	// a later reconcile to complete.
 	if origin != "" && gapFetched && !a.hasUnknownPrevEvents(r.Context(), raw) {
 		if frontier := a.unknownDeepFrontier(r.Context(), raw); frontier != "" {
-			rc, cancel := context.WithTimeout(r.Context(), reconcileSyncTimeout)
-			a.reconcileStateFrom(rc, ev.RoomID, origin, frontier)
-			cancel()
+			a.reconcileStateFrom(r.Context(), ev.RoomID, origin, frontier)
 		}
 	}
 	// If the prev_events are STILL missing after the fetch (the sending server

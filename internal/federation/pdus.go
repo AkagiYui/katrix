@@ -513,15 +513,6 @@ func (a *API) unknownDeepFrontier(ctx context.Context, raw json.RawMessage) stri
 	return ""
 }
 
-// reconcileSyncTimeout bounds how long a synchronous state reconciliation may
-// take on the /send hot path. A peer that deliberately holds /state_ids open
-// (or is unreachable) must not stall the triggering /send past the sender's
-// transaction budget (Complement's partial-state suite blocks /state_ids until
-// the resync is released; its /send client times out after 10s). On timeout the
-// triggering event stays accepted; the state it could not verify is left to the
-// background resync (MSC3902) or a later reconcile to complete.
-const reconcileSyncTimeout = 8 * time.Second
-
 // reconcileStateFrom fetches the room's state as of anchorEventID from server
 // (GET /state_ids, then GET /event for each unknown event), persists the
 // events, and applies the verifiable state to the room. When any event in the
