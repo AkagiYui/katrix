@@ -513,6 +513,36 @@ func (a *API) unknownDeepFrontier(ctx context.Context, raw json.RawMessage) stri
 	return ""
 }
 
+// partialResyncAnchorID returns the event the background partial-state resync
+// (MSC3902) anchors its /state_ids fetch on: the join event's first
+// prev_event (the room's latest event before the join, per resyncFromServer).
+// A partial room's peer deliberately holds the /state_ids request for this
+// anchor open until the resync is released, so a gap-reconcile asking for
+// state as of the same anchor would block forever behind it. Non-partial
+// rooms (and partial rooms whose join is not the sole forward extremity)
+// return "", meaning "no resync anchor — reconcile as normal".
+func (a *API) partialResyncAnchorID(ctx context.Context, roomID string) string {
+	room, err := a.Store.GetRoom(ctx, roomID)
+	if err != nil || !room.PartialState {
+		return ""
+	}
+	exts, err := a.Store.ForwardExtremities(ctx, roomID)
+	if err != nil || len(exts) != 1 {
+		return ""
+	}
+	joinRow, err := a.Store.GetEvent(ctx, exts[0].EventID)
+	if err != nil || joinRow == nil {
+		return ""
+	}
+	var prev struct {
+		PrevEvents []string `json:"prev_events"`
+	}
+	if json.Unmarshal(joinRow.RawJSON, &prev) != nil || len(prev.PrevEvents) == 0 {
+		return ""
+	}
+	return prev.PrevEvents[0]
+}
+
 // reconcileStateFrom fetches the room's state as of anchorEventID from server
 // (GET /state_ids, then GET /event for each unknown event), persists the
 // events, and applies the verifiable state to the room. When any event in the

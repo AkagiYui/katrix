@@ -265,9 +265,23 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// events that the synchronous path persists in order — Complement's
 	// half-missing-grandparents and events-before-their-prevs tests fail on
 	// the race).
+	//
+	// One partial-state (MSC3902) exception: when the frontier is the very
+	// event the background resync anchors on (the join event's prev), that
+	// state is already being fetched — and the peer deliberately holds the
+	// /state_ids request for that anchor open until the resync is released
+	// (Complement's partial-state suite blocks it), so reconciling state as of
+	// the same anchor here would block the /send response behind the resync
+	// and blow the sender's transaction deadline
+	// (CanReceiveEventsWithHalfMissingParents...). Skip the redundant fetch;
+	// the resync covers it. Any other frontier (a deeper gap the resync does
+	// not cover, e.g. half-missing grandparents, whose state the peer serves
+	// immediately) is reconciled synchronously as usual.
 	if origin != "" && gapFetched && !a.hasUnknownPrevEvents(r.Context(), raw) {
 		if frontier := a.unknownDeepFrontier(r.Context(), raw); frontier != "" {
-			a.reconcileStateFrom(r.Context(), ev.RoomID, origin, frontier)
+			if anchor := a.partialResyncAnchorID(r.Context(), ev.RoomID); anchor != frontier {
+				a.reconcileStateFrom(r.Context(), ev.RoomID, origin, frontier)
+			}
 		}
 	}
 	// If the prev_events are STILL missing after the fetch (the sending server
