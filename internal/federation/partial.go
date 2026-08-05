@@ -172,52 +172,52 @@ func (a *API) resyncPartialState(ctx context.Context, roomID string, version roo
 		if server == "" || server == a.ServerName() {
 			continue
 		}
-			if a.resyncFromServer(ctx, roomID, version, rules, server) {
-				// Re-check the events that were accepted while the room was partial
-				// against the now-complete state: events that fail authorization are
-				// soft-failed (hidden from clients, not applied to membership).
-				// This runs BEFORE the partial flag is cleared so any concurrent
-				// /sync, /members or /state_ids request (which blocks on the flag)
-				// observes the revalidated state, not the pre-revalidation one.
-				a.revalidatePartialWindow(ctx, roomID)
-				// Clear the partial-state flag and wake the room's members so eager
-				// /sync responses (and long-polls) pick up the room.
-				_ = a.Store.SetRoomPartialState(ctx, roomID, false)
-				a.notifyRoomMembers(ctx, roomID)
-				// The membership table may have been wrong while the room was
-				// partial (a user believed joined who actually left, or vice
-				// versa). Flush every remote device-list cache entry whose user
-				// no longer shares a room with a local user — the cached keys are
-				// stale and the next /keys/query re-fetches (Complement's "user
-				// incorrectly believed to be in room" tests).
-				_ = a.Store.EvictUntrackedRemoteDeviceLists(ctx, a.ServerName())
-				// The room's remote members' device lists became fully known only
-				// now (their member events may have been persisted during the
-				// partial window without membership rows, and any device-list
-				// update EDU processed then was recorded at a pre-resync stream
-				// position — both invisible to a post-resync sync). Re-announce
-				// them: bump each remote joined member's device-list change to the
-				// current stream so local users sharing the room see them in
-				// device_lists.changed (mirror of Synapse's
-				// handle_room_un_partial_stated, which replays pending device-list
-				// updates for the room once it is fully stated).
-				if members, err := a.Store.Members(ctx, roomID, "join"); err == nil {
-					for _, m := range members {
-						if !a.IsLocalUser(m.UserID) {
-							_, _ = a.Store.RecordDeviceListChange(ctx, m.UserID, false)
-						}
+		if a.resyncFromServer(ctx, roomID, version, rules, server) {
+			// Re-check the events that were accepted while the room was partial
+			// against the now-complete state: events that fail authorization are
+			// soft-failed (hidden from clients, not applied to membership).
+			// This runs BEFORE the partial flag is cleared so any concurrent
+			// /sync, /members or /state_ids request (which blocks on the flag)
+			// observes the revalidated state, not the pre-revalidation one.
+			a.revalidatePartialWindow(ctx, roomID)
+			// Clear the partial-state flag and wake the room's members so eager
+			// /sync responses (and long-polls) pick up the room.
+			_ = a.Store.SetRoomPartialState(ctx, roomID, false)
+			a.notifyRoomMembers(ctx, roomID)
+			// The membership table may have been wrong while the room was
+			// partial (a user believed joined who actually left, or vice
+			// versa). Flush every remote device-list cache entry whose user
+			// no longer shares a room with a local user — the cached keys are
+			// stale and the next /keys/query re-fetches (Complement's "user
+			// incorrectly believed to be in room" tests).
+			_ = a.Store.EvictUntrackedRemoteDeviceLists(ctx, a.ServerName())
+			// The room's remote members' device lists became fully known only
+			// now (their member events may have been persisted during the
+			// partial window without membership rows, and any device-list
+			// update EDU processed then was recorded at a pre-resync stream
+			// position — both invisible to a post-resync sync). Re-announce
+			// them: bump each remote joined member's device-list change to the
+			// current stream so local users sharing the room see them in
+			// device_lists.changed (mirror of Synapse's
+			// handle_room_un_partial_stated, which replays pending device-list
+			// updates for the room once it is fully stated).
+			if members, err := a.Store.Members(ctx, roomID, "join"); err == nil {
+				for _, m := range members {
+					if !a.IsLocalUser(m.UserID) {
+						_, _ = a.Store.RecordDeviceListChange(ctx, m.UserID, false)
 					}
 				}
-				a.notifyRoomMembers(ctx, roomID)
-				// Servers that joined (or were already in) the room while it was
-				// partial may have missed device-list updates broadcast during the
-				// resync window — the membership was incomplete, so the destination
-				// list was wrong. Replay the updates that happened during the window
-				// to the servers that might have missed them (MSC3902; mirror of
-				// Synapse's handle_room_un_partial_stated).
-				a.broadcastDeviceListStateToRoom(ctx, roomID)
-				return
 			}
+			a.notifyRoomMembers(ctx, roomID)
+			// Servers that joined (or were already in) the room while it was
+			// partial may have missed device-list updates broadcast during the
+			// resync window — the membership was incomplete, so the destination
+			// list was wrong. Replay the updates that happened during the window
+			// to the servers that might have missed them (MSC3902; mirror of
+			// Synapse's handle_room_un_partial_stated).
+			a.broadcastDeviceListStateToRoom(ctx, roomID)
+			return
+		}
 	}
 	// Every candidate failed; the room stays partial and the resync is retried
 	// on the next join attempt.
