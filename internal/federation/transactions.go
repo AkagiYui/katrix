@@ -258,16 +258,20 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// join whose own prev is pre-join history) is ordinary missing history,
 	// filled lazily by backfill, not reconciled.
 	//
-	// The reconcile runs in the background (mirror of Synapse): it is several
-	// network round-trips against a peer — including a /state_ids request the
-	// peer may deliberately hold open (Complement's partial-state tests block
-	// /state_ids until the resync is released) — and blocking the /send
-	// response on it stalls the sender's transaction past its deadline. The
-	// triggering event is accepted immediately; the reconcile completes the
-	// room's state asynchronously.
+	// The reconcile runs synchronously (the pulled events must be persisted
+	// before the triggering event's state-at-event is computed), but its
+	// network fetches are bounded by a deadline (reconcileSyncTimeout) so a
+	// peer that holds /state_ids open — Complement's partial-state suite
+	// deliberately blocks it until the resync is released — cannot stall the
+	// /send response past the sender's transaction budget (its client times
+	// out after 10s). On timeout the triggering event stays accepted; the
+	// state it could not verify is left to the background resync (MSC3902) or
+	// a later reconcile to complete.
 	if origin != "" && gapFetched && !a.hasUnknownPrevEvents(r.Context(), raw) {
 		if frontier := a.unknownDeepFrontier(r.Context(), raw); frontier != "" {
-			go a.reconcileStateFrom(context.WithoutCancel(r.Context()), ev.RoomID, origin, frontier)
+			rc, cancel := context.WithTimeout(r.Context(), reconcileSyncTimeout)
+			a.reconcileStateFrom(rc, ev.RoomID, origin, frontier)
+			cancel()
 		}
 	}
 	// If the prev_events are STILL missing after the fetch (the sending server
