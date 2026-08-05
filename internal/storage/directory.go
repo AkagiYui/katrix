@@ -79,7 +79,7 @@ func (s *Store) SearchUserDirectory(ctx context.Context, serverName, term, searc
 		 JOIN events je ON je.event_id = rs.event_id
 		  AND je.content->>'join_rule' = 'public'
 		 WHERE rm.membership='join'
-		   AND rm.user_id NOT LIKE '@%@' || $2
+		   AND rm.user_id NOT LIKE '@%:' || $2
 		   AND (LOWER(SUBSTRING(rm.user_id FROM '@([^:]*):')) LIKE '%'||$1||'%'
 		        OR LOWER(rm.user_id) LIKE '%'||$1||'%')
 		 LIMIT 500`, term, serverName)
