@@ -30,6 +30,10 @@ func isEmptyJSONObject(body []byte) bool {
 // registerSync wires P3 sync routes.
 func (a *API) registerSync(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/sync", a.RequireAuth(a.Sync))
+	// Legacy event-stream endpoint (deprecated since r0; sytest's with_events
+	// fixture and old clients still call it). Served under v3; the r0 path is
+	// rewritten by the global r0->v3 middleware.
+	mux.HandleFunc("GET /_matrix/client/v3/events", a.RequireAuth(a.Events))
 	mux.HandleFunc("PUT /_matrix/client/v3/user/{userID}/account_data/{type}", a.RequireAuth(a.PutAccountData))
 	mux.HandleFunc("GET /_matrix/client/v3/user/{userID}/account_data/{type}", a.RequireAuth(a.GetAccountData))
 	mux.HandleFunc("DELETE /_matrix/client/v3/user/{userID}/account_data/{type}", a.RequireAuth(a.DeleteAccountData))
