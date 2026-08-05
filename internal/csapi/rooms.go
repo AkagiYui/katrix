@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -1958,8 +1957,7 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 		// _should_perform_remote_join): when the joining user is not already
 		// joined/invited and no local joined member has invite power, the join
 		// event cannot pass auth locally.
-		localOK := a.canLocalJoin(r.Context(), roomID, auth.UserID)
-		if !localOK && a.fed != nil {
+		if !a.canLocalJoin(r.Context(), roomID, auth.UserID) && a.fed != nil {
 			// The candidate list depends on whether the local server is still
 			// participating in the room, mirroring Synapse's
 			// _should_perform_remote_join:
@@ -1982,7 +1980,6 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 			} else {
 				candidates = via
 			}
-			log.Printf("katrix: DEBUG join %s user=%s REMOTE via %v (canLocal=%v)", roomID, auth.UserID, candidates, localOK)
 			if partial, err := a.fed.JoinRemoteRoom(r.Context(), auth.UserID, roomID, candidates); err == nil {
 				if !partial {
 					a.broadcastDeviceListForUser(r.Context(), auth.UserID)

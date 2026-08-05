@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 	"encoding/json"
-	"log"
 
 	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/rooms"
@@ -68,38 +67,34 @@ func (s *Store) RestrictedJoinAuthorised(ctx context.Context, roomID, joiningUse
 	// answer the membership question and the join must fail over.
 	inAllowed := false
 	participatesInAll := true
-	nonParticipating := ""
-	joiningMembership := ""
 	for _, allowedRoom := range allowedRooms {
 		if !s.ServerHasJoinedMember(ctx, allowedRoom, serverName) {
 			participatesInAll = false
-			nonParticipating = allowedRoom
 			continue
 		}
 		if m, err := s.GetMembership(ctx, allowedRoom, joiningUserID); err == nil && m.Membership == rooms.MembershipJoin {
 			inAllowed = true
 			break
-		} else if err == nil {
-			joiningMembership = m.Membership
 		}
 	}
-	verdict := RestrictedJoinNotAuthorised
 	if !inAllowed {
 		if !participatesInAll {
-			verdict = RestrictedJoinUnableToAuthorise
+			return RestrictedJoinUnableToAuthorise
 		}
-	} else if authorisingUserID == "" {
-		verdict = RestrictedJoinNotAuthorised
-	} else if m, err := s.GetMembership(ctx, roomID, authorisingUserID); err != nil || m.Membership != rooms.MembershipJoin {
-		verdict = RestrictedJoinNotAuthorised
-	} else if !s.authoriserCanInvite(ctx, roomID, authorisingUserID) {
-		verdict = RestrictedJoinNotAuthorised
-	} else {
-		verdict = RestrictedJoinAuthorised
+		return RestrictedJoinNotAuthorised
 	}
-	log.Printf("katrix: restricted join verdict %s by %s via %s authoriser=%s allowed=%v verdict=%d nonPart=%s joiningMem=%s",
-		roomID, joiningUserID, serverName, authorisingUserID, allowedRooms, verdict, nonParticipating, joiningMembership)
-	return verdict
+	// The authorising user must be a joined member of the room being joined,
+	// with enough power to invite.
+	if authorisingUserID == "" {
+		return RestrictedJoinNotAuthorised
+	}
+	if m, err := s.GetMembership(ctx, roomID, authorisingUserID); err != nil || m.Membership != rooms.MembershipJoin {
+		return RestrictedJoinNotAuthorised
+	}
+	if !s.authoriserCanInvite(ctx, roomID, authorisingUserID) {
+		return RestrictedJoinNotAuthorised
+	}
+	return RestrictedJoinAuthorised
 }
 
 // ServerHasJoinedMember reports whether serverName has at least one joined

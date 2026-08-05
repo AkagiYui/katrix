@@ -66,13 +66,16 @@ func TestServerACLBannedMakeJoin(t *testing.T) {
 		t.Fatalf("set acl: code=%d body=%v", code, body)
 	}
 
-	// A federation /make_join request from the denied server.
+	// A federation /make_join request from the denied server. The X-Matrix
+	// Authorization header is sent in the quoted form SyTest emits
+	// (HTTP::Headers::Util::join_header_words → origin="server:port"): the
+	// origin used for server-ACL matching must be the unquoted server name.
 	req, err := http.NewRequest(http.MethodGet,
 		srv.URL+"/_matrix/federation/v1/make_join/"+roomID+"/@bob:evil.example.org?ver=11", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Authorization", "X-Matrix origin=evil.example.org,key=ed25519:1,sig=AAAA,destination=test.katrix")
+	req.Header.Set("Authorization", `X-Matrix origin="evil.example.org", key="ed25519:1", sig=AAAA, destination="test.katrix"`)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

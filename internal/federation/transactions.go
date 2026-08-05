@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -1044,16 +1043,21 @@ func (a *API) roomVersionOf(ctx context.Context, roomID string) string {
 	return ""
 }
 
-// remoteOriginOf returns the origin server of the requesting federation
-// request (from the signed X-Matrix Authorization header, falling back to the
-// room-level origin conventions).
+// remoteOriginOf extracts the requesting server's name from the X-Matrix
+// Authorization header. The header is a comma-separated parameter list
+// (origin, key, destination, sig) whose values may be quoted — SyTest signs
+// with HTTP::Headers::Util::join_header_words, which emits
+// `origin="server:port"` — so surrounding quotes are stripped. The origin is
+// what server-ACL evaluation (and any per-server gate) must match, so a
+// quoted value must not leak its quote characters into the comparison.
 func remoteOriginOf(r *http.Request) string {
 	h := r.Header.Get("Authorization")
 	// X-Matrix origin=<name>,key=<id>,destination=<name>,sig=<sig>
 	if i := strings.Index(h, "origin="); i >= 0 {
 		rest := h[i+len("origin="):]
 		if j := strings.IndexByte(rest, ','); j >= 0 {
-			return rest[:j]
+			v := rest[:j]
+			return strings.Trim(v, `"`)
 		}
 	}
 	return ""
@@ -1111,7 +1115,6 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 		}
 		if prevMembership != rooms.MembershipJoin && prevMembership != rooms.MembershipInvite {
 			authoriser := a.Store.RestrictedJoinAuthoriser(r.Context(), roomID, a.ServerName())
-			log.Printf("katrix: DEBUG make_join restricted room=%s user=%s authoriser=%q", roomID, userID, authoriser)
 			if authoriser == "" {
 				// No local joined member can issue invites, so this server
 				// cannot generate a correctly-signed join event. Per MSC3083
