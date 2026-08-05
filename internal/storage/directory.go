@@ -117,10 +117,6 @@ func (s *Store) SearchUserDirectory(ctx context.Context, serverName, term, searc
 			continue
 		}
 		seen[userID] = true
-		// The searching user never appears in their own directory results.
-		if userID == searcherUserID {
-			continue
-		}
 		if s.userVisibleToSearcher(ctx, userID, searcherUserID) {
 			out = append(out, c)
 			if len(out) >= 50 {
