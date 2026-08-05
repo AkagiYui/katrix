@@ -805,13 +805,14 @@ func (a *API) ingestRemoteJoin(ctx context.Context, roomID string, version roomv
 	// Record a device-list change for the joining user so their own devices
 	// learn of the join (they appear in device_lists.changed in /sync).
 	_, _ = a.Store.RecordDeviceListChange(ctx, ev.Sender(), false)
-	// Per the spec, joining a room makes the user's device list newly-visible
-	// to the room's remote servers: broadcast m.device_list_update EDUs to
-	// every other server sharing the room so their syncing users learn the
-	// joiner's devices (the mirror of the remote-side broadcastLocalDeviceLists
-	// — without this, remote users never receive the joining user's device
-	// list).
-	a.broadcastLocalDeviceListsToRoom(ctx, roomID)
+	// The joining user's device list is advertised to the room's servers by the
+	// join path itself (broadcastDeviceListForUser in the client join handler,
+	// per the spec: a server sends m.device_list_update to every server sharing
+	// a room with a local user when that user joins). The room's existing
+	// members' device lists are NOT re-broadcast here: the joining server
+	// discovers them via its own /sync (device_lists.changed for newly-shared
+	// members) and /keys/query, so an unsolicited EDU would be an unexpected
+	// side effect (Complement's partial-state suite fails the run on one).
 	a.notifyRoomMembers(ctx, roomID)
 	return nil
 }

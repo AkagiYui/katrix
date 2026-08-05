@@ -570,6 +570,29 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 			}
 		}
 	}
+	// Users who stopped sharing a room with the syncer (a joined member left
+	// or was banned after the token) must be reported in `left`: their device
+	// lists are no longer being tracked. The membership deltas are the
+	// authoritative source (a remote user's leave is never recorded as a
+	// device-list change), so these are appended to the recorded `left` list
+	// with dedup (a local leave records the change AND the membership delta).
+	if opts.Since.Stream > 0 {
+		roomIDs2, _ := e.store.RoomsForUser(ctx, opts.UserID)
+		if nl, err := e.store.NewLeftPeersSince(ctx, roomIDs2, opts.Since.Stream); err == nil {
+			for _, u := range nl {
+				dup := false
+				for _, lu := range left {
+					if lu == u {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					left = append(left, u)
+				}
+			}
+		}
+	}
 	if len(ch) > 0 || len(left) > 0 {
 		resp.DeviceLists = &DeviceLists{Changed: ch, Left: left}
 	}

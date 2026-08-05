@@ -78,6 +78,10 @@ func (a *API) ingestPartialJoin(ctx context.Context, roomID string, version room
 			ServersInRoom: sj.ServersInRoom,
 		})
 	}
+	alreadyPartial := false
+	if existing, err := a.Store.GetRoom(ctx, roomID); err == nil && existing.PartialState {
+		alreadyPartial = true
+	}
 	// Record the servers-in-room list for the resync (the sender + any list
 	// the response carried).
 	if len(sj.ServersInRoom) > 0 {
@@ -99,6 +103,31 @@ func (a *API) ingestPartialJoin(ctx context.Context, roomID string, version room
 	}
 	stateRows := a.persistRemotePDUs(ctx, roomID, rules, sj.State)
 	a.persistRemotePDUs(ctx, roomID, rules, sj.AuthChain)
+
+	// A second partial-state join into an already-partial room (MSC3902): the
+	// remote server's send_join response omits every membership except the new
+	// join's own (per the partial-state contract), so re-seeding from the
+	// delivered state alone would drop the memberships already known locally
+	// (e.g. the first joiner). Preserve them: union the delivered state with
+	// the existing room_state tuples, with the delivered (remote-authoritative)
+	// events winning on conflict — mirror of Synapse's process_remote_join,
+	// which resolves the state before the new join from the known prev events
+	// to preserve prior memberships.
+	if alreadyPartial {
+		if existing, err := a.Store.GetState(ctx, roomID); err == nil {
+			have := make(map[string]bool, len(stateRows))
+			for _, r := range stateRows {
+				have[r.Type+"\x00"+r.StateKey] = true
+			}
+			for _, e := range existing {
+				key := e.Type + "\x00" + e.StateKey
+				if !have[key] {
+					have[key] = true
+					stateRows = append(stateRows, e)
+				}
+			}
+		}
+	}
 
 	// Seed the room's state snapshot from the delivered (critical) state and
 	// make the join event the sole forward extremity.
@@ -142,27 +171,34 @@ func (a *API) resyncPartialState(ctx context.Context, roomID string, version roo
 		if server == "" || server == a.ServerName() {
 			continue
 		}
-		if a.resyncFromServer(ctx, roomID, version, rules, server) {
-			// Re-check the events that were accepted while the room was partial
-			// against the now-complete state: events that fail authorization are
-			// soft-failed (hidden from clients, not applied to membership).
-			// This runs BEFORE the partial flag is cleared so any concurrent
-			// /sync, /members or /state_ids request (which blocks on the flag)
-			// observes the revalidated state, not the pre-revalidation one.
-			a.revalidatePartialWindow(ctx, roomID)
-			// Clear the partial-state flag and wake the room's members so eager
-			// /sync responses (and long-polls) pick up the room.
-			_ = a.Store.SetRoomPartialState(ctx, roomID, false)
-			a.notifyRoomMembers(ctx, roomID)
-			// Servers that joined (or were already in) the room while it was
-			// partial may have missed device-list updates broadcast during the
-			// resync window — the membership was incomplete, so the destination
-			// list was wrong. Replay the updates that happened during the window
-			// to every server in the room (MSC3902; mirror of Synapse's
-			// handle_room_un_partial_stated).
-			a.broadcastDeviceListStateToRoom(ctx, roomID)
-			return
-		}
+			if a.resyncFromServer(ctx, roomID, version, rules, server) {
+				// Re-check the events that were accepted while the room was partial
+				// against the now-complete state: events that fail authorization are
+				// soft-failed (hidden from clients, not applied to membership).
+				// This runs BEFORE the partial flag is cleared so any concurrent
+				// /sync, /members or /state_ids request (which blocks on the flag)
+				// observes the revalidated state, not the pre-revalidation one.
+				a.revalidatePartialWindow(ctx, roomID)
+				// Clear the partial-state flag and wake the room's members so eager
+				// /sync responses (and long-polls) pick up the room.
+				_ = a.Store.SetRoomPartialState(ctx, roomID, false)
+				a.notifyRoomMembers(ctx, roomID)
+				// The membership table may have been wrong while the room was
+				// partial (a user believed joined who actually left, or vice
+				// versa). Flush every remote device-list cache entry whose user
+				// no longer shares a room with a local user — the cached keys are
+				// stale and the next /keys/query re-fetches (Complement's "user
+				// incorrectly believed to be in room" tests).
+				_ = a.Store.EvictUntrackedRemoteDeviceLists(ctx, a.ServerName())
+				// Servers that joined (or were already in) the room while it was
+				// partial may have missed device-list updates broadcast during the
+				// resync window — the membership was incomplete, so the destination
+				// list was wrong. Replay the updates that happened during the window
+				// to the servers that might have missed them (MSC3902; mirror of
+				// Synapse's handle_room_un_partial_stated).
+				a.broadcastDeviceListStateToRoom(ctx, roomID)
+				return
+			}
 	}
 	// Every candidate failed; the room stays partial and the resync is retried
 	// on the next join attempt.
@@ -405,12 +441,20 @@ func (a *API) memberStateSnapshotFromStore(ctx context.Context, roomID, sender, 
 }
 
 // broadcastDeviceListStateToRoom replays the device-list updates that were
-// broadcast while the room was partial but could not reach its (unknown)
-// servers. Only local users whose device list changed during the partial
-// window are sent — mirror of Synapse's handle_room_un_partial_stated, which
-// replays exactly the updates that happened since the partial join started
-// (an unconditional broadcast would spam the room's servers with unchanged
-// device lists).
+// broadcast while the room was partial but could not reach the servers that
+// (as the resync reveals) should have received them. Only local users whose
+// device list changed during the partial window are sent — mirror of Synapse's
+// handle_room_un_partial_stated, which replays exactly the updates that
+// happened since the partial join started (an unconditional broadcast would
+// spam the room's servers with unchanged device lists).
+//
+// The destination set is NOT the room's current membership: the whole point is
+// that the membership was wrong while the room was partial. It is the union of
+// (a) the servers of users whose membership changed during the window (a
+// server whose user joined then was incorrectly "kicked" must still get the
+// missed updates — the user is really still in the room), (b) the servers
+// currently joined to the room, minus (c) the servers known at join (which
+// were already sent to) — mirror of Synapse's potentially_changed_hosts.
 func (a *API) broadcastDeviceListStateToRoom(ctx context.Context, roomID string) {
 	// The join event's stream position is the start of the partial window.
 	var since int64
@@ -419,10 +463,14 @@ func (a *API) broadcastDeviceListStateToRoom(ctx context.Context, roomID string)
 			since = jr.StreamOrdering
 		}
 	}
+	// Local users whose device list changed during the partial window.
 	changed, _, err := a.Store.DeviceListChangesSince(ctx, since)
 	if err != nil {
 		return
 	}
+	// Only users who are actually in the room (per the full state) are
+	// re-sent: a user who left during the window must not be re-advertised as
+	// a room member (Synapse filters local_changes the same way).
 	inRoom := map[string]bool{}
 	members, err := a.Store.Members(ctx, roomID, "join")
 	if err != nil {
@@ -431,21 +479,68 @@ func (a *API) broadcastDeviceListStateToRoom(ctx context.Context, roomID string)
 	for _, m := range members {
 		inRoom[m.UserID] = true
 	}
+	localChanged := map[string]bool{}
 	for _, userID := range changed {
-		if !inRoom[userID] || !a.IsLocalUser(userID) {
-			continue
+		if inRoom[userID] && a.IsLocalUser(userID) {
+			localChanged[userID] = true
 		}
+	}
+	if len(localChanged) == 0 {
+		return
+	}
+
+	// Compute the destination servers (potentially_changed_hosts).
+	dests := map[string]bool{}
+	// (a) Servers whose users' membership changed during the window.
+	if hosts, err := a.Store.RoomMembershipChangedHostsSince(ctx, roomID, since); err == nil {
+		for _, h := range hosts {
+			dests[h] = true
+		}
+	}
+	// (b) Servers currently joined to the room.
+	for _, m := range members {
+		if dom := userDomain(m.UserID); dom != "" {
+			dests[dom] = true
+		}
+	}
+	// (c) Remove the servers known at join (they were already sent to).
+	if room, err := a.Store.GetRoom(ctx, roomID); err == nil {
+		for _, s := range room.ServersInRoom {
+			delete(dests, s)
+		}
+	}
+	delete(dests, a.ServerName())
+	var servers []string
+	for d := range dests {
+		if d != "" {
+			servers = append(servers, d)
+		}
+	}
+	if len(servers) == 0 {
+		return
+	}
+
+	for userID := range localChanged {
 		devices, err := a.Store.ListDevices(ctx, a.LocalpartOf(userID))
 		if err != nil {
 			continue
 		}
 		for _, d := range devices {
-			a.BroadcastEDUToRooms(ctx, "m.device_list_update", map[string]any{
+			content := map[string]any{
 				"user_id":   userID,
 				"device_id": d.DeviceID,
 				"deleted":   false,
 				"stream_id": a.Now(),
-			}, []string{roomID})
+			}
+			if keys, err := a.Store.DeviceKeysForUsers(ctx, []string{userID}); err == nil {
+				for _, k := range keys {
+					if k.DeviceID == d.DeviceID {
+						content["keys"] = k.KeyJSON
+						break
+					}
+				}
+			}
+			a.BroadcastEDUToServers(ctx, "m.device_list_update", content, servers)
 		}
 	}
 }

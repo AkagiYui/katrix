@@ -29,6 +29,16 @@ import (
 // list is also consulted: events must reach the servers the room is known to
 // span even before the resync completes.
 func (a *API) BroadcastPDUToRoom(ctx context.Context, roomID string, ev *events.Event) {
+	a.BroadcastPDUToRoomExcept(ctx, roomID, ev, "")
+}
+
+// BroadcastPDUToRoomExcept is BroadcastPDUToRoom with the origin server
+// excluded from the destination set. It is used when relaying a membership
+// event received over federation (a send_join or transaction): the origin
+// server authored the event and already holds it, so echoing it back would be
+// a duplicate the origin must not be burdened with (mirror of Synapse's
+// per-destination queue, which skips the event's origin).
+func (a *API) BroadcastPDUToRoomExcept(ctx context.Context, roomID string, ev *events.Event, exceptServer string) {
 	servers := a.serversForRooms(ctx, []string{roomID})
 	if room, err := a.Store.GetRoom(ctx, roomID); err == nil && len(room.ServersInRoom) > 0 {
 		seen := make(map[string]bool, len(servers))
@@ -91,6 +101,18 @@ func (a *API) BroadcastPDUToRoom(ctx context.Context, roomID string, ev *events.
 	}
 	if len(servers) == 0 {
 		return
+	}
+	if exceptServer != "" {
+		out := servers[:0]
+		for _, s := range servers {
+			if s != exceptServer {
+				out = append(out, s)
+			}
+		}
+		servers = out
+		if len(servers) == 0 {
+			return
+		}
 	}
 	_ = a.Store.InsertOutboundPDU(ctx, ids.RandomTxnSuffix(), roomID, ev.EventID(), ev.Raw(), servers, a.Now())
 	select {

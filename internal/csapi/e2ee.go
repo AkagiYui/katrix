@@ -120,6 +120,7 @@ func (a *API) KeysUpload(w http.ResponseWriter, r *http.Request) {
 
 // KeysQuery handles POST /_matrix/client/v3/keys/query.
 func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
 	var req struct {
 		DeviceKeys map[string][]string `json:"device_keys"`
 	}
@@ -169,12 +170,35 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Remote keys: query each remote user's server once (per domain) and merge
-	// the returned device keys into the response.
+	// the returned device keys into the response. Device lists that are being
+	// tracked (the user shares a room with the requester) are served from the
+	// local cache when present, and the fetched keys are cached for the next
+	// query — a tracked user's keys are fetched from federation once and reused
+	// until an m.device_list_update EDU (or the user leaving) invalidates them.
+	// A user who is NOT tracked (e.g. a pre-existing member of a partial-state
+	// room whose membership is not yet known) is always fetched, never cached.
 	if a.fed != nil {
 		for dom, domUsers := range remoteByDomain {
 			query := map[string][]string{}
+			var tracked []string
 			for _, u := range domUsers {
 				query[u] = req.DeviceKeys[u]
+				if !a.Store.DeviceListTracked(r.Context(), auth.UserID, u) {
+					continue
+				}
+				tracked = append(tracked, u)
+				if cached, err := a.Store.GetCachedRemoteDeviceList(r.Context(), u); err == nil && len(cached) > 0 {
+					var cachedKeys map[string]any
+					if json.Unmarshal(cached, &cachedKeys) == nil {
+						for did, keyObj := range cachedKeys {
+							out[u][did] = keyObj
+						}
+						delete(query, u)
+					}
+				}
+			}
+			if len(query) == 0 {
+				continue
 			}
 			remote, err := a.fed.Client().QueryRemoteKeys(r.Context(), dom, query)
 			if err != nil {
@@ -182,10 +206,18 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 			}
 			for uid, devs := range remote.DeviceKeys {
 				merged := out[uid]
+				keys := map[string]any{}
 				for did, keyJSON := range devs {
 					var keyObj map[string]any
 					_ = json.Unmarshal(keyJSON, &keyObj)
+					keys[did] = keyObj
 					merged[did] = keyObj
+				}
+				// Cache the fetched device keys for users that are being tracked.
+				if contains(tracked, uid) {
+					if raw, err := json.Marshal(keys); err == nil {
+						_ = a.Store.CacheRemoteDeviceList(r.Context(), uid, raw)
+					}
 				}
 			}
 		}
@@ -323,6 +355,7 @@ func (a *API) KeysClaim(w http.ResponseWriter, r *http.Request) {
 
 // KeysChanges handles GET /_matrix/client/v3/keys/changes.
 func (a *API) KeysChanges(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
 	from, okFrom := syncpkg.DecodeToken(r.URL.Query().Get("from"))
 	if !okFrom {
 		from = syncpkg.Token{}
@@ -335,6 +368,33 @@ func (a *API) KeysChanges(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
+	}
+	// The spec requires the response to mirror the /sync device_lists section:
+	// in addition to users whose device lists changed, users who newly share a
+	// room with the caller (their devices became newly-visible) appear in
+	// `changed`, and users who stopped sharing a room (their devices are no
+	// longer tracked) appear in `left` — the same membership-delta computation
+	// the sync engine uses (mirror of Synapse's get_user_ids_changed /
+	// generate_sync_entry_for_device_list).
+	roomIDs, _ := a.Store.RoomsForUser(r.Context(), auth.UserID)
+	if from.Stream > 0 && len(roomIDs) > 0 {
+		if newPeers, err := a.Store.NewRoomPeersSince(r.Context(), roomIDs, from.Stream, auth.UserID); err == nil {
+			for _, u := range newPeers {
+				if u == auth.UserID {
+					continue
+				}
+				if !contains(changed, u) {
+					changed = append(changed, u)
+				}
+			}
+		}
+		if newLeft, err := a.Store.NewLeftPeersSince(r.Context(), roomIDs, from.Stream); err == nil {
+			for _, u := range newLeft {
+				if !contains(left, u) {
+					left = append(left, u)
+				}
+			}
+		}
 	}
 	// The spec requires changed/left to be arrays (clients iterate them); a nil
 	// slice would serialise as null.

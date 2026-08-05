@@ -257,9 +257,17 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// gap): a gap behind already-present prevs (e.g. an event referencing a
 	// join whose own prev is pre-join history) is ordinary missing history,
 	// filled lazily by backfill, not reconciled.
+	//
+	// The reconcile runs in the background (mirror of Synapse): it is several
+	// network round-trips against a peer — including a /state_ids request the
+	// peer may deliberately hold open (Complement's partial-state tests block
+	// /state_ids until the resync is released) — and blocking the /send
+	// response on it stalls the sender's transaction past its deadline. The
+	// triggering event is accepted immediately; the reconcile completes the
+	// room's state asynchronously.
 	if origin != "" && gapFetched && !a.hasUnknownPrevEvents(r.Context(), raw) {
 		if frontier := a.unknownDeepFrontier(r.Context(), raw); frontier != "" {
-			a.reconcileStateFrom(r.Context(), ev.RoomID, origin, frontier)
+			go a.reconcileStateFrom(context.WithoutCancel(r.Context()), ev.RoomID, origin, frontier)
 		}
 	}
 	// If the prev_events are STILL missing after the fetch (the sending server
@@ -423,12 +431,8 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 		}
 	}
 	// A re-delivered PDU (a server restarting re-sends already-acknowledged
-	// transactions) must not re-trigger side effects. Capture whether the event
-	// was already known before the insert below.
-	wasKnown := false
-	if _, err := a.Store.GetEvent(r.Context(), evID); err == nil {
-		wasKnown = true
-	}
+	// transactions) must not re-trigger side effects; the accepted-event early
+	// return above covers the common case.
 	if _, err := a.Store.InsertEventWithMembership(r.Context(), row, membershipRow); err != nil {
 		return evID, false
 	}
@@ -481,6 +485,14 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 			}
 			_ = json.Unmarshal(ev.Content, &mc)
 			a.applyRemoteMembershipNotify(r.Context(), ev.RoomID, *ev.StateKey, mc.Membership)
+			// A remote user's leave/ban ends the shared-room relationship with
+			// the local users: evict their cached device keys so the next
+			// /keys/query re-fetches (the user's device list is no longer being
+			// tracked; the cached keys belong to a relationship that just ended —
+			// Complement's device-list tracking asserts the re-fetch).
+			if (mc.Membership == "leave" || mc.Membership == "ban") && !a.IsLocalUser(*ev.StateKey) {
+				_ = a.Store.EvictRemoteDeviceList(r.Context(), *ev.StateKey)
+			}
 			// A remote user's join/leave does NOT record a device-list change
 			// here: per the spec, remote users' device lists are learned via
 			// m.device_list_update EDUs (which the joining server sends for its
@@ -489,17 +501,12 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 			// independent signals with different stream positions). The sync
 			// engine's "newly shared room" computation covers the join case.
 			//
-			// A remote user's join makes the room's local users' device lists
-			// newly-visible to the joining server: send them m.device_list_update
-			// EDUs so the joining server can sync device lists for its users
-			// sharing this room (mirror of the send_join path in
-			// ingestRemoteMember — a join delivered as a PDU, e.g. a local join on
-			// the remote side broadcast to the room, never passes through
-			// ingestRemoteMember). Without this, the joining server's users never
-			// learn the room's existing members' device lists.
-			if !wasKnown && mc.Membership == "join" {
-				a.broadcastLocalDeviceListsToRoom(r.Context(), ev.RoomID)
-			}
+			// The room's local users' device lists are NOT re-broadcast for a
+			// remote user's join: the joining server discovers the existing
+			// members' device lists via its own sync (device_lists.changed for
+			// newly-shared members) and /keys/query, so an unsolicited
+			// m.device_list_update EDU would be an unexpected side effect
+			// (Complement's partial-state suite fails the run on one).
 		}
 	}
 	// An inbound m.room.tombstone means the room was upgraded (locally or on a
@@ -1884,21 +1891,18 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 		}
 	}
 	statePDUs, _ := a.roomStatePDUs(r, ev.RoomID)
-	// A newly-joined remote user makes the room's local users' device lists
-	// visible to the joining server: send them m.device_list_update EDUs so the
-	// remote server can sync device lists for its users sharing this room.
-	if wantMembership == "join" {
-		a.broadcastLocalDeviceListsToRoom(r.Context(), ev.RoomID)
-	}
-	// Re-broadcast the accepted membership event to the room's other servers
+	// Re-broadcast the accepted membership event to the room's OTHER servers
 	// (spec transaction delivery: a server that receives an event must forward
-	// it to every server with users in the room). The send_knock/send_join
-	// handshake reaches only this server; the room's remaining servers (e.g. a
-	// third server whose user is joined) must still learn of the membership
-	// change so their syncing users see it.
+	// it to every server with users in the room, except the server that sent
+	// it — the origin relays its own users' events onwards). The
+	// send_knock/send_join handshake reaches only this server; the room's
+	// remaining servers (e.g. a third server whose user is joined) must still
+	// learn of the membership change so their syncing users see it. The origin
+	// is excluded because it already holds the event (echoing it back is a
+	// duplicate; Complement's partial-state suite fails the run on one).
 	if ev.Type == "m.room.member" && ev.StateKey != nil {
 		if e, err := events.New(eventJSON, version); err == nil {
-			a.BroadcastPDUToRoom(r.Context(), ev.RoomID, e)
+			a.BroadcastPDUToRoomExcept(r.Context(), ev.RoomID, e, userDomain(ev.Sender))
 		}
 	}
 	// Per the spec (MSC2409) the send_knock response carries the room's state
@@ -1916,51 +1920,6 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 		"auth_chain": a.authChain(r, ev.RoomID),
 		"event":      eventJSON,
 	})
-}
-
-// broadcastLocalDeviceListsToRoom sends an m.device_list_update EDU to every
-// remote server sharing the room for each local user joined to it. Called when
-// a remote user joins the room, so the joining server (and other remote
-// servers) learn the device lists of the room's local members.
-func (a *API) broadcastLocalDeviceListsToRoom(ctx context.Context, roomID string) {
-	// Deferred for partial-state rooms (MSC3902): the room's servers are not
-	// reliably known while the membership is incomplete. The unpartial replay
-	// (broadcastDeviceListStateToRoom) sends the room's local users' device
-	// lists once the resync completes, so nothing is lost — and no stale
-	// destination set is used in the meantime.
-	if a.roomIsPartial(ctx, roomID) {
-		return
-	}
-	members, err := a.Store.Members(ctx, roomID, "join")
-	if err != nil {
-		return
-	}
-	for _, m := range members {
-		if !a.IsLocalUser(m.UserID) {
-			continue
-		}
-		devices, err := a.Store.ListDevices(ctx, a.LocalpartOf(m.UserID))
-		if err != nil {
-			continue
-		}
-		for _, d := range devices {
-			content := map[string]any{
-				"user_id":   m.UserID,
-				"device_id": d.DeviceID,
-				"deleted":   false,
-				"stream_id": a.Now(),
-			}
-			if keys, err := a.Store.DeviceKeysForUsers(ctx, []string{m.UserID}); err == nil {
-				for _, k := range keys {
-					if k.DeviceID == d.DeviceID {
-						content["keys"] = k.KeyJSON
-						break
-					}
-				}
-			}
-			a.BroadcastEDUToRooms(ctx, eduDeviceListUpdate, content, []string{roomID})
-		}
-	}
 }
 
 // memberStateSnapshot builds the room state snapshot needed to authorize a

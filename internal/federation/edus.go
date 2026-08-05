@@ -46,6 +46,33 @@ func (a *API) BroadcastEDUToRooms(ctx context.Context, eduType string, content m
 	}
 }
 
+// BroadcastEDUToServers queues an EDU for delivery to exactly the given
+// servers (no room-based destination computation). Used by the partial-state
+// un-partial replay, which must send missed device-list updates to a
+// destination set that cannot be derived from the room's current membership
+// (servers whose users were present at any point during the resync window).
+func (a *API) BroadcastEDUToServers(ctx context.Context, eduType string, content map[string]any, servers []string) {
+	var out []string
+	for _, s := range servers {
+		if s == "" || s == a.ServerName() {
+			continue
+		}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return
+	}
+	raw, err := json.Marshal(content)
+	if err != nil {
+		return
+	}
+	_ = a.Store.InsertOutboundEDU(ctx, ids.RandomTxnSuffix(), eduType, raw, out, a.Now())
+	select {
+	case a.eduWake <- struct{}{}:
+	default:
+	}
+}
+
 // serversForRooms returns the server names of all remote members in the given
 // rooms (the local server name is excluded). Membership is looked up via the
 // denormalised membership table; a room with no remote members contributes
@@ -330,6 +357,13 @@ func (a *API) applyDeviceListEDU(ctx context.Context, origin string, content jso
 			return nil
 		}
 	}
+	// An incoming device-list update invalidates the local cache entry for the
+	// user: the cached keys are stale (the user's device list changed), so the
+	// next /keys/query must re-fetch from the user's server. A `deleted` update
+	// additionally means the user left the shared room — the cache entry is
+	// dropped rather than refreshed (mirror of Synapse, which resyncs remote
+	// device lists on an update EDU).
+	_ = a.Store.EvictRemoteDeviceList(ctx, c.UserID)
 	if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, c.Deleted != nil && *c.Deleted); err != nil {
 		return err
 	}

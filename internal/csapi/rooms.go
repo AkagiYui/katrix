@@ -2033,9 +2033,23 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 // can authorise (has invite power). When false and federation is available,
 // the join must be delegated to a remote server.
 func (a *API) canLocalJoin(ctx context.Context, roomID, userID string) bool {
-	// Already joined/invited: the auth rules allow the transition without an
-	// authoriser (accepting an invite, or a re-join by a current member).
-	if m, err := a.Store.GetMembership(ctx, roomID, userID); err == nil && (m.Membership == rooms.MembershipJoin || m.Membership == rooms.MembershipInvite) {
+	// Already joined: the auth rules allow the transition (a re-join by a
+	// current member) without an authoriser.
+	if m, err := a.Store.GetMembership(ctx, roomID, userID); err == nil && m.Membership == rooms.MembershipJoin {
+		return true
+	}
+	// A partial-state room (MSC3902) cannot authoritatively validate a join of a
+	// user who is not already joined: the room's state is incomplete, so a local
+	// join event could be wrongly authorised (e.g. a banned user, or a join
+	// failing a restricted-rule check), and the event would be authored against
+	// the incomplete local DAG. Delegate to a remote server that holds the full
+	// state (mirror of Synapse's _should_perform_remote_join, which returns
+	// remote for `is_partial_state_room and previous_membership != JOIN`).
+	if a.roomIsPartial(ctx, roomID) {
+		return false
+	}
+	// Accepting an invite: the auth rules allow the transition locally.
+	if m, err := a.Store.GetMembership(ctx, roomID, userID); err == nil && m.Membership == rooms.MembershipInvite {
 		return true
 	}
 	// The local server must actually be in the room to author a local join.
