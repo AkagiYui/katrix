@@ -445,6 +445,13 @@ func (a *API) broadcastDeviceListStateToRoom(ctx context.Context, roomID string)
 	}
 }
 
+
+// roomIsPartial reports whether the room is currently partial-state (MSC3902).
+func (a *API) roomIsPartial(ctx context.Context, roomID string) bool {
+	room, err := a.Store.GetRoom(ctx, roomID)
+	return err == nil && room.PartialState
+}
+
 // fetchStateIDs performs GET /_matrix/federation/v1/state_ids/{roomID}
 // ?event_id={joinEventID} against server, returning the state and auth event
 // IDs. Transient transport failures (connection reset, EOF, dial failure) are

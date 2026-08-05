@@ -23,12 +23,21 @@ func (a *API) broadcastPDU(ctx context.Context, roomID string, ev *events.Event)
 // (logout, device deletion). The receiver treats the EDU as a hint to query
 // /keys/query; the device's key bundle is included when known so it can skip
 // the round-trip.
+//
+// Partial-state rooms (MSC3902) are excluded: while a room's membership is
+// incomplete the set of servers to notify is unreliable, so the EDU is deferred
+// and replayed once the resync completes (broadcastDeviceListStateToRoom) —
+// mirror of Synapse, which delays device-list updates for partial-state rooms.
 func (a *API) broadcastDeviceListUpdate(ctx context.Context, userID, deviceID string, deleted bool) {
 	if a.fed == nil {
 		return
 	}
 	rooms, err := a.Store.RoomsForUser(ctx, userID)
 	if err != nil || len(rooms) == 0 {
+		return
+	}
+	rooms = a.filterPartialRooms(ctx, rooms)
+	if len(rooms) == 0 {
 		return
 	}
 	content := map[string]any{
@@ -53,6 +62,26 @@ func (a *API) broadcastDeviceListUpdate(ctx context.Context, userID, deviceID st
 	a.fed.BroadcastEDUToRooms(ctx, "m.device_list_update", content, rooms)
 }
 
+// filterPartialRooms drops partial-state rooms (MSC3902) from a room list.
+// Device-list EDUs to such rooms are deferred until the resync completes and
+// the unpartial replay re-sends them with a correct destination set.
+func (a *API) filterPartialRooms(ctx context.Context, rooms []string) []string {
+	out := make([]string, 0, len(rooms))
+	for _, roomID := range rooms {
+		if a.roomIsPartial(ctx, roomID) {
+			continue
+		}
+		out = append(out, roomID)
+	}
+	return out
+}
+
+// roomIsPartial reports whether the room is currently partial-state (MSC3902).
+func (a *API) roomIsPartial(ctx context.Context, roomID string) bool {
+	room, err := a.Store.GetRoom(ctx, roomID)
+	return err == nil && room.PartialState
+}
+
 // broadcastDeviceListForUser queues one m.device_list_update EDU per device of
 // a local user to every remote server sharing a room with them. Used when the
 // user joins a room whose membership makes their device list newly visible to
@@ -70,6 +99,8 @@ func (a *API) broadcastDeviceListForUser(ctx context.Context, userID string) {
 	if err != nil {
 		return
 	}
+	// The per-device broadcast itself re-checks partial rooms per room, so this
+	// is a plain fan-out over the user's devices.
 	for _, d := range devices {
 		a.broadcastDeviceListUpdate(ctx, userID, d.DeviceID, false)
 	}
@@ -84,6 +115,13 @@ func (a *API) broadcastDeviceListForUser(ctx context.Context, userID string) {
 // longer sharing the room.
 func (a *API) broadcastDeviceListDelete(ctx context.Context, userID, roomID string) {
 	if a.fed == nil {
+		return
+	}
+	// Defer leave/bans EDUs for partial-state rooms: the room's servers are not
+	// reliably known while the membership is incomplete, and the unpartial
+	// replay re-sends the change once the resync completes (the leaving user is
+	// simply not re-sent, matching Synapse's deferred-updates behaviour).
+	if a.roomIsPartial(ctx, roomID) {
 		return
 	}
 	content := map[string]any{

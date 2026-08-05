@@ -1938,6 +1938,20 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 	// request body are copied into the event content", e.g. `foo: bar`).
 	extra := joinCustomContent(r)
 	if _, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
+		// A user whose membership state is known locally as "ban" must be refused
+		// the join outright, regardless of federation: the ban is the room's
+		// current state as far as this server knows (it may have been ingested as
+		// a PDU during a partial-state window before the resync completed), and
+		// the spec auth rules forbid a banned user from joining until unbanned.
+		// Synapse enforces this in update_membership before any remote-join
+		// delegation (_local_membership_update raises 403 M_FORBIDDEN when
+		// current_membership is ban). Without this check a join would be
+		// delegated to a remote server whose make_join/send_join may not
+		// re-verify the ban (Complement's test server applies no join auth),
+		// silently letting a banned user back into the room.
+		if m, err := a.Store.GetMembership(r.Context(), roomID, auth.UserID); err == nil && m.Membership == rooms.MembershipBan {
+			return nil, newRoomError(http.StatusForbidden, "M_FORBIDDEN", "banned user cannot join")
+		}
 		// A restricted-rule join (MSC3083) the local server cannot authorise
 		// must be delegated to a remote server that can (Synapse's
 		// _should_perform_remote_join): when the joining user is not already

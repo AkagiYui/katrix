@@ -336,6 +336,14 @@ func (a *API) KeysChanges(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	// The spec requires changed/left to be arrays (clients iterate them); a nil
+	// slice would serialise as null.
+	if changed == nil {
+		changed = []string{}
+	}
+	if left == nil {
+		left = []string{}
+	}
 	_ = to
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"changed": changed, "left": left})
 }

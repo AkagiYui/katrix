@@ -1891,6 +1891,14 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 // a remote user joins the room, so the joining server (and other remote
 // servers) learn the device lists of the room's local members.
 func (a *API) broadcastLocalDeviceListsToRoom(ctx context.Context, roomID string) {
+	// Deferred for partial-state rooms (MSC3902): the room's servers are not
+	// reliably known while the membership is incomplete. The unpartial replay
+	// (broadcastDeviceListStateToRoom) sends the room's local users' device
+	// lists once the resync completes, so nothing is lost — and no stale
+	// destination set is used in the meantime.
+	if a.roomIsPartial(ctx, roomID) {
+		return
+	}
 	members, err := a.Store.Members(ctx, roomID, "join")
 	if err != nil {
 		return
