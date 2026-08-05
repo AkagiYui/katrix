@@ -492,5 +492,11 @@ Inbound federation can receive invites via v2 API
 Inbound federation can receive redacted events
 Inbound federation correctly handles soft failed events as extremities
 Inbound federation correctly soft fails events
-Outbound federation rejects backfill containing invalid JSON for events in room version 6
 Outbound federation sends receipts
+Presence can be set from sync
+Presence changes are reported to local room members
+Presence changes to UNAVAILABLE are reported to local room members
+Rooms can be created with an initial invite list (SYN-205)
+Typing can be explicitly stopped
+Typing notification sent to local room members
+Typing notifications don't leak
