@@ -21,6 +21,16 @@ import (
 
 // ---- outbound PDU delivery (spec "Transaction delivery") ----
 
+// fedDeliveryTimeout bounds a single outbound transaction attempt. A remote
+// server that stops responding (frozen, partitioned, or merely slow) must not
+// pin the delivery worker: the outbound queues serve every destination in the
+// room, and a single hung PUT /send would otherwise stall all delivery behind
+// the client's 30s HTTP timeout. Complement's offline-server tests pause a
+// peer and expect the queued transactions to drain promptly once it returns;
+// without a per-attempt bound the first attempt after the pause blocks the
+// whole worker past the client's wait window.
+const fedDeliveryTimeout = 5 * time.Second
+
 // BroadcastPDUToRoom queues a locally-created event for delivery to every
 // remote server with users in the room. The PDU is delivered in a signed
 // PUT /_matrix/federation/v1/send/{txnID} transaction with retries (the same
@@ -177,22 +187,41 @@ func (a *API) RunEDUWorker(ctx context.Context) {
 // pruned rather than retried (spec transaction delivery is scoped to the
 // servers with users in the room; a server whose last member left must not be
 // sent events it can only reject).
+//
+// Destinations are delivered concurrently, each attempt bounded by
+// fedDeliveryTimeout, so one unresponsive server cannot block the others (or
+// the rest of the queue): the worker re-enters its retry loop as soon as the
+// slowest attempt times out.
 func (a *API) deliverPDU(ctx context.Context, id int64, txnID, roomID string, raw json.RawMessage, destinations []string) {
-	remaining := false
+	var (
+		remaining bool
+		mu        sync.Mutex
+		wg        sync.WaitGroup
+	)
 	for _, dest := range destinations {
 		if dest == a.ServerName() {
 			continue
 		}
-		if !a.serverSharesRoom(ctx, roomID, dest, raw) {
+		dest := dest
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !a.serverSharesRoom(ctx, roomID, dest, raw) {
+				_ = a.Store.RemovePDUDestination(ctx, id, dest)
+				return
+			}
+			tctx, cancel := context.WithTimeout(ctx, fedDeliveryTimeout)
+			defer cancel()
+			if err := a.sendTransaction(tctx, dest, txnID, []json.RawMessage{raw}, nil); err != nil {
+				mu.Lock()
+				remaining = true
+				mu.Unlock()
+				return
+			}
 			_ = a.Store.RemovePDUDestination(ctx, id, dest)
-			continue
-		}
-		if err := a.sendTransaction(ctx, dest, txnID, []json.RawMessage{raw}, nil); err != nil {
-			remaining = true
-			continue
-		}
-		_ = a.Store.RemovePDUDestination(ctx, id, dest)
+		}()
 	}
+	wg.Wait()
 	if !remaining {
 		_ = a.Store.DeleteOutboundPDU(ctx, id)
 	}
