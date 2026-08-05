@@ -1,7 +1,7 @@
 # SyTest blacklist: tests expected to FAIL. A test listed here that passes is
 # flagged as "passed but expected fail" (prompts you to move it to the
-# whitelist). Populated from the 2026-08-04 test run (workflow 30891659603):
-# regenerate after each run with:
+# whitelist). Regenerated from the 2026-08-05 run (workflow 30976291254).
+# Regenerate after each run with:
 #   grep -E '^not ok ' results.tap | sed -E 's/^not ok [0-9]+ (\(expected fail\) )?//' | sed -E 's/( \([0-9]+ subtests\))? # TODO expected fail$//' | sort -u
 # One test path per line; lines starting with '#' are ignored.
 /context/ returns correct number of events
@@ -19,6 +19,9 @@ A change to displayname should not result in a full state sync
 A filtered timeline reaches its limit
 A full_state incremental update returns all state
 A pair of events which redact each other should be ignored
+Accesing an AS-hosted room alias asks the AS server
+An event which redacts an event in a different room should be ignored
+An event which redacts itself should be ignored
 AS and main public room lists are separate
 AS can create a user
 AS can create a user with an underscore
@@ -33,21 +36,9 @@ AS user (not ghost) can join room without registering
 AS user (not ghost) can join room without registering, with user_id query param
 AS-ghosted users can use rooms themselves
 AS-ghosted users can use rooms via AS
-Accesing an AS-hosted room alias asks the AS server
-An event which redacts an event in a different room should be ignored
-An event which redacts itself should be ignored
 Asking for a remote rooms list, but supplying the local server's name, returns the local rooms list
 Backfilled events whose prev_events are in a different room do not allow cross-room back-pagination
 Banned servers cannot /event_auth
-Banned servers cannot /invite
-Banned servers cannot /make_join
-Banned servers cannot /make_leave
-Banned servers cannot /send_join
-Banned servers cannot /send_leave
-Banned servers cannot backfill
-Banned servers cannot get missing events
-Banned servers cannot get room state
-Banned servers cannot get room state ids
 Banned servers cannot send events
 Banned user is kicked and may not rejoin until unbanned
 Can accept third party invite with /join
@@ -88,7 +79,6 @@ Can recv a device message using /sync
 Can register using an email address
 Can reject invites over federation for rooms with version 1
 Can reject invites over federation for rooms with version 2
-Can reject invites over federation for rooms with version 3
 Can remove tag
 Can request federation format via the filter
 Can sync a joined room
@@ -114,12 +104,12 @@ Federation publicRoom Name/topic keys are correct
 Federation rejects inbound events where the prev_events cannot be found
 Forward extremities remain so even after the next events are populated as outliers
 Full state sync includes joined rooms
+Gapped incremental syncs include all state changes
 GET /rooms/:room_id/messages lazy loads members correctly
 GET /rooms/:room_id/messages returns a message
-Gapped incremental syncs include all state changes
 Get presence for newly joined members in incremental sync
-Getting state IDs checks the events requested belong to the room
 Getting state checks the events requested belong to the room
+Getting state IDs checks the events requested belong to the room
 Ghost user must register before joining room
 Guest non-joined users can get individual state for world_readable rooms
 Guest non-joined users can get state for world_readable rooms
@@ -132,6 +122,8 @@ Ignore user in existing room
 Inbound /make_join rejects attempts to join rooms where all users have left
 Inbound /v1/make_join rejects remote attempts to join local users to rooms
 Inbound /v1/send_join rejects incorrectly-signed joins
+Inbound /v1/send_join rejects joins from other servers
+Inbound /v1/send_leave rejects leaves from other servers
 Inbound federation accepts a second soft-failed event
 Inbound federation can backfill events
 Inbound federation can get public room list
@@ -157,7 +149,6 @@ Inbound federation rejects incorrectly-signed invite rejections
 Inbound federation rejects invite rejections which include invalid JSON for room version 6
 Inbound federation rejects invites which are not signed by the sender
 Inbound federation rejects invites which include invalid JSON for room version 6
-Inbound federation rejects receipts from wrong remote
 Inbound federation rejects remote attempts to kick local users to rooms
 Inbound: send_join rejects invalid JSON for room version 6
 Invalid openid access tokens are rejected
@@ -169,10 +160,17 @@ Key notary server must not overwrite a valid key with a spurious result from the
 Key notary server should return an expired key if it can't find any others
 Latest account data appears in v2 /sync
 Lazy loading parameters in the filter are strictly boolean
-Leaves are present in non-gapped incremental syncs
 Local delete device changes appear in v2 /sync
 Local device key changes get to remote servers
 Local device key changes get to remote servers with correct prev_id
+local user has push rules copied to upgraded room
+login types include SSO
+m.room.history_visibility == "invited" allows/forbids appropriately for Guest users
+m.room.history_visibility == "invited" allows/forbids appropriately for Real users
+m.room.history_visibility == "joined" allows/forbids appropriately for Guest users
+m.room.history_visibility == "joined" allows/forbids appropriately for Real users
+m.room.history_visibility == "world_readable" allows/forbids appropriately for Guest users
+m.room.history_visibility == "world_readable" allows/forbids appropriately for Real users
 Members from the gap are included in gappy incr LL sync
 Message history can be paginated over federation
 Named room comes with just joined member count summary
@@ -190,15 +188,16 @@ Outbound federation can query v1 /send_join
 Outbound federation can query v2 /send_join
 Outbound federation can request missing events
 Outbound federation can send invites via v1 API
-Outbound federation rejects backfill containing invalid JSON for events in room version 6
 Outbound federation correctly handles unsupported room versions
 Outbound federation passes make_join failures through to the client
+Outbound federation rejects backfill containing invalid JSON for events in room version 6
 Outbound federation rejects invite response which include invalid JSON for room version 6
 Outbound federation rejects m.room.create events with an unknown room version
 Outbound federation rejects send_join responses with no m.room.create event
 Outbound federation requests missing prev_events and then asks for /state_ids and resolves the state
 Outbound federation sends receipts
 Outbound federation will ignore a missing event with bad JSON for room version 6
+outliers whose auth_events are in a different room are correctly rejected
 Presence can be set from sync
 Presence changes are reported to local room members
 Presence changes to UNAVAILABLE are reported to local room members
@@ -208,6 +207,10 @@ Real users can sync from invited guest_access rooms if joined
 Real users can sync from joined guest_access rooms if joined
 Receipts must be m.read
 Register with a recaptcha
+registration is idempotent, with username specified
+registration is idempotent, without username specified
+registration remembers parameters
+registration with inhibit_login inhibits login
 Regular users cannot create room aliases within the AS namespace
 Regular users cannot register within the AS namespace
 Rejected events are not pushed
@@ -215,6 +218,9 @@ Remote servers cannot set power levels in rooms without existing powerlevels
 Remote servers should reject attempts by non-creators to set the power levels
 Remote user can backfill in a room with version 1
 Remote user can backfill in a room with version 2
+remote user can join room with version 1
+remote user can join room with version 2
+remote user has push rules copied to upgraded room
 Remote users can join room by alias
 Remote users may not join unfederated rooms
 Requests to userinfo without access tokens are rejected
@@ -237,22 +243,21 @@ State from remote users is included in the state in the initial sync
 State is included in the timeline in the initial sync
 Sync is woken up for leaves
 Syncing a new room with a large timeline limit isn't limited
-Test URL preview
 Test that a message is pushed
 Test that rejected pushers are removed.
+Test URL preview
 The only membership state included in a gapped incremental sync is for senders in the timeline
 The only membership state included in an incremental sync is for senders in the timeline
-The only membership state included in an initial sync is for all the senders in the timeline
 The operation must be consistent through an interactive authentication session
 Typing can be explicitly stopped
 Typing notification sent to local room members
 Typing notifications don't leak
 Unnamed room comes with a name summary
+uploading signed devices gets propagated over federation
 User can create and send/receive messages in a room with version 1
 User can create and send/receive messages in a room with version 2
 User can invite remote user to room with version 1
 User can invite remote user to room with version 2
-User can invite remote user to room with version 3
 User directory correctly update on display name change
 User in remote room doesn't appear in user directory after server left room
 User joining then leaving public room appears and dissappears from directory
@@ -266,20 +271,3 @@ When user joins a room the state is included in a gapped sync
 When user joins a room the state is included in the next sync
 When user joins and leaves a room in the same batch, the full state is still included in the next sync
 Will not back up to an old backup version
-local user has push rules copied to upgraded room
-login types include SSO
-m.room.history_visibility == "invited" allows/forbids appropriately for Guest users
-m.room.history_visibility == "invited" allows/forbids appropriately for Real users
-m.room.history_visibility == "joined" allows/forbids appropriately for Guest users
-m.room.history_visibility == "joined" allows/forbids appropriately for Real users
-m.room.history_visibility == "world_readable" allows/forbids appropriately for Guest users
-m.room.history_visibility == "world_readable" allows/forbids appropriately for Real users
-outliers whose auth_events are in a different room are correctly rejected
-registration is idempotent, with username specified
-registration is idempotent, without username specified
-registration remembers parameters
-registration with inhibit_login inhibits login
-remote user can join room with version 1
-remote user can join room with version 2
-remote user has push rules copied to upgraded room
-uploading signed devices gets propagated over federation
