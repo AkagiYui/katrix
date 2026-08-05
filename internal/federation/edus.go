@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -157,16 +156,13 @@ func minDuration(a, b time.Duration) time.Duration {
 //
 // Destinations are delivered concurrently, each attempt bounded by
 // fedDeliveryTimeout, so one unresponsive server cannot block the others (or
-// the rest of the queue). The returned bools report whether any destination
-// remains undelivered (pending) and whether any attempt hit its timeout
-// rather than failing fast — the worker uses the latter to decide whether to
-// retry immediately (a hung peer may be back) or on the backoff timer.
-func (a *API) deliverEDU(ctx context.Context, id int64, txnID, eduType string, content json.RawMessage, destinations []string) (pending, timedOut bool) {
+// the rest of the queue): the worker re-enters its retry loop as soon as the
+// slowest attempt times out.
+func (a *API) deliverEDU(ctx context.Context, id int64, txnID, eduType string, content json.RawMessage, destinations []string) {
 	var (
-		anyPending bool
-		anyTimeout bool
-		mu         sync.Mutex
-		wg         sync.WaitGroup
+		remaining bool
+		mu        sync.Mutex
+		wg        sync.WaitGroup
 	)
 	for _, dest := range destinations {
 		if dest == a.ServerName() {
@@ -182,10 +178,7 @@ func (a *API) deliverEDU(ctx context.Context, id int64, txnID, eduType string, c
 				mustJSON(map[string]any{"edu_type": eduType, "content": json.RawMessage(content)}),
 			}); err != nil {
 				mu.Lock()
-				anyPending = true
-				if errors.Is(err, context.DeadlineExceeded) {
-					anyTimeout = true
-				}
+				remaining = true
 				mu.Unlock()
 				return
 			}
@@ -193,10 +186,9 @@ func (a *API) deliverEDU(ctx context.Context, id int64, txnID, eduType string, c
 		}()
 	}
 	wg.Wait()
-	if !anyPending {
+	if !remaining {
 		_ = a.Store.DeleteOutboundEDU(ctx, id)
 	}
-	return anyPending, anyTimeout
 }
 
 // mustJSON marshals a value into json.RawMessage, best-effort.

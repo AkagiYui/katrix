@@ -165,19 +165,13 @@ func (a *API) RunEDUWorker(ctx context.Context) {
 			continue
 		}
 		delay = baseDelay
-		// Track whether any attempt in this batch timed out: a hung (rather than
-		// refused) destination may have just come back, so the retry loop re-runs
-		// immediately instead of parking on the backoff timer.
-		anyTimeout := false
 		for _, edu := range edus {
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
-			if _, timedOut := a.deliverEDU(ctx, edu.ID, edu.TxnID, edu.EduType, edu.Content, edu.Destinations); timedOut {
-				anyTimeout = true
-			}
+			a.deliverEDU(ctx, edu.ID, edu.TxnID, edu.EduType, edu.Content, edu.Destinations)
 		}
 		for _, pdu := range pdus {
 			select {
@@ -185,18 +179,7 @@ func (a *API) RunEDUWorker(ctx context.Context) {
 				return
 			default:
 			}
-			if _, timedOut := a.deliverPDU(ctx, pdu.ID, pdu.TxnID, pdu.RoomID, pdu.Raw, pdu.Destinations); timedOut {
-				anyTimeout = true
-			}
-		}
-		// A peer that was hung (and may now be back) gets retried on the next loop
-		// iteration immediately. A peer that failed fast (connection refused) is
-		// retried on the backoff timer, so a down server is not hammered.
-		if anyTimeout {
-			select {
-			case a.eduWake <- struct{}{}:
-			default:
-			}
+			a.deliverPDU(ctx, pdu.ID, pdu.TxnID, pdu.RoomID, pdu.Raw, pdu.Destinations)
 		}
 	}
 }
@@ -210,16 +193,13 @@ func (a *API) RunEDUWorker(ctx context.Context) {
 //
 // Destinations are delivered concurrently, each attempt bounded by
 // fedDeliveryTimeout, so one unresponsive server cannot block the others (or
-// the rest of the queue). The returned bools report whether any destination
-// remains undelivered (pending) and whether any attempt hit its timeout
-// rather than failing fast — the worker uses the latter to decide whether to
-// retry immediately (a hung peer may be back) or on the backoff timer.
-func (a *API) deliverPDU(ctx context.Context, id int64, txnID, roomID string, raw json.RawMessage, destinations []string) (pending, timedOut bool) {
+// the rest of the queue): the worker re-enters its retry loop as soon as the
+// slowest attempt times out.
+func (a *API) deliverPDU(ctx context.Context, id int64, txnID, roomID string, raw json.RawMessage, destinations []string) {
 	var (
-		anyPending bool
-		anyTimeout bool
-		mu         sync.Mutex
-		wg         sync.WaitGroup
+		remaining bool
+		mu        sync.Mutex
+		wg        sync.WaitGroup
 	)
 	for _, dest := range destinations {
 		if dest == a.ServerName() {
@@ -237,10 +217,7 @@ func (a *API) deliverPDU(ctx context.Context, id int64, txnID, roomID string, ra
 			defer cancel()
 			if err := a.sendTransaction(tctx, dest, txnID, []json.RawMessage{raw}, nil); err != nil {
 				mu.Lock()
-				anyPending = true
-				if errors.Is(err, context.DeadlineExceeded) {
-					anyTimeout = true
-				}
+				remaining = true
 				mu.Unlock()
 				return
 			}
@@ -248,10 +225,9 @@ func (a *API) deliverPDU(ctx context.Context, id int64, txnID, roomID string, ra
 		}()
 	}
 	wg.Wait()
-	if !anyPending {
+	if !remaining {
 		_ = a.Store.DeleteOutboundPDU(ctx, id)
 	}
-	return anyPending, anyTimeout
 }
 
 // serverSharesRoom reports whether dest still belongs in roomID's delivery
