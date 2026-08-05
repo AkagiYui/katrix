@@ -547,19 +547,42 @@ func (a *API) unknownDeepFrontier(ctx context.Context, raw json.RawMessage) stri
 // prev_event (the room's latest event before the join, per resyncFromServer).
 // A partial room's peer deliberately holds the /state_ids request for this
 // anchor open until the resync is released, so a gap-reconcile asking for
-// state as of the same anchor would block forever behind it. Non-partial
-// rooms (and partial rooms whose join is not the sole forward extremity)
-// return "", meaning "no resync anchor — reconcile as normal".
+// state as of the same anchor would block forever behind it (Complement's
+// half-missing-parents test). Any other frontier — a post-join event, which
+// the peer serves immediately — must still be reconciled synchronously, so
+// the room's DAG and auth chains stay contiguous during the partial window
+// (half-missing-grandparents and events-before-their-prevs rely on it).
+//
+// The join event is located via the room's local joined members rather than
+// the forward extremities: as post-join events are ingested they displace the
+// join from the extremity set, but the join event itself (and its prev) never
+// change. Non-partial rooms return "", meaning "reconcile as normal".
 func (a *API) partialResyncAnchorID(ctx context.Context, roomID string) string {
 	room, err := a.Store.GetRoom(ctx, roomID)
 	if err != nil || !room.PartialState {
 		return ""
 	}
-	exts, err := a.Store.ForwardExtremities(ctx, roomID)
-	if err != nil || len(exts) != 1 {
+	// The earliest local join seeded the room's partial state; its prev is the
+	// resync anchor. Later local joins (and all remote joins) are not.
+	members, err := a.Store.Members(ctx, roomID, "join")
+	if err != nil {
 		return ""
 	}
-	joinRow, err := a.Store.GetEvent(ctx, exts[0].EventID)
+	joinID := ""
+	var joinStream int64
+	for _, m := range members {
+		if !a.IsLocalUser(m.UserID) {
+			continue
+		}
+		if joinID == "" || m.StreamOrdering < joinStream {
+			joinID = m.EventID
+			joinStream = m.StreamOrdering
+		}
+	}
+	if joinID == "" {
+		return ""
+	}
+	joinRow, err := a.Store.GetEvent(ctx, joinID)
 	if err != nil || joinRow == nil {
 		return ""
 	}
