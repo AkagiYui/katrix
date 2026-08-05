@@ -946,26 +946,32 @@ func (a *API) GetMissingEvents(w http.ResponseWriter, r *http.Request) {
 		evs = append(evs, e)
 	}
 	sort.Slice(evs, func(i, j int) bool { return evs[i].Depth < evs[j].Depth })
-	// Does the requester have any joined users in this room? (Only then may they
-	// see unredacted events that predate the room's history_visibility.)
+	// History visibility governs how much pre-join history the requester may
+	// see unredacted. "world_readable" and "shared" hand out pre-join events in
+	// full; "joined" and "invited" restrict members to events at-or-after their
+	// join point (spec history_visibility: "members can see events that
+	// happened after they joined/invited"), so events predating the requester's
+	// earliest join are redacted — even when the requester now has a joined
+	// member in the room (the join point is the boundary, not current
+	// membership). A requester with no member in the room gets everything
+	// redacted for joined/invited.
 	requester := remoteOriginOf(r)
-	joinedRemote := false
-	if requester != "" {
+	vis := a.historyVisibility(r.Context(), roomID)
+	restricted := vis == "invited" || vis == "joined"
+	joinPoint := int64(0)
+	if restricted && requester != "" {
 		members, err := a.Store.Members(r.Context(), roomID, "join")
 		if err == nil {
 			for _, m := range members {
-				if userDomain(m.UserID) == requester {
-					joinedRemote = true
-					break
+				if userDomain(m.UserID) != requester {
+					continue
+				}
+				if joinPoint == 0 || m.Depth < joinPoint {
+					joinPoint = m.Depth
 				}
 			}
 		}
 	}
-	// history_visibility: "world_readable" and "shared" events predating the
-	// requester's join are visible unredacted; "joined"/"invited" require the
-	// requester to have a member in the room for pre-join events.
-	vis := a.historyVisibility(r.Context(), roomID)
-	needRedaction := (vis == "invited" || vis == "joined") && !joinedRemote
 
 	pdus := make([]json.RawMessage, 0, len(evs))
 	redactRules, haveRules := roomver.Get(roomver.Version(a.roomVersionOf(r.Context(), roomID)))
@@ -973,7 +979,12 @@ func (a *API) GetMissingEvents(w http.ResponseWriter, r *http.Request) {
 		if len(pdus) >= limit {
 			break
 		}
-		if needRedaction {
+		// Redact events that fall outside the requester's visibility window:
+		// joined/invited rooms redact everything when the requester has no
+		// member, and events strictly before the requester's join point when it
+		// does.
+		redact := restricted && (joinPoint == 0 || e.Depth < joinPoint)
+		if redact {
 			if haveRules {
 				if red, err := events.Redact(e.RawJSON, redactRules); err == nil {
 					if b, err := json.Marshal(red); err == nil {
