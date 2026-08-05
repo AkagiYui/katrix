@@ -227,7 +227,7 @@ jobs:
     # for the same reason. Revisit when GitHub retires the 22.04 image (then
     # patch chrome.go to add --no-sandbox instead).
     runs-on: ubuntu-22.04
-    continue-on-error: true # informational baseline; crypto impl is incomplete
+    continue-on-error: true # informational baseline; katrix is early
     strategy:
       fail-fast: false
       matrix:

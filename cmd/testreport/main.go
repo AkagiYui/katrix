@@ -431,10 +431,6 @@ func reportGoSuite(title string, data []byte, mode string) {
 	// intended rather than as a bug.
 	fmt.Println("_PASS/FAIL/SKIP count test cases (each subtest individually); the failure table below collapses to top-level tests._")
 	fmt.Println()
-	if mode == "crypto" {
-		fmt.Println("Note: baseline run, crypto implementation is incomplete; failures expected.")
-		fmt.Println()
-	}
 	fmt.Println("| PASS | FAIL | SKIP | Pass rate |")
 	fmt.Println("|---|---|---|---|")
 	fmt.Printf("| %d | %d | %d | %.1f%% (%d / %d) |\n", s.Pass, s.Fail, s.Skip, rate, s.Pass, total)
