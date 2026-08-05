@@ -826,10 +826,14 @@ func fedHostPort(serverName string) string {
 	return serverName + ":8448"
 }
 
-// urlPathEscape escapes a single path segment for use inside a URL. '#' is the
-// only Matrix identifier sigil that needs it.
+// urlPathEscape escapes a single path segment for use inside a URL. Matrix
+// event IDs are standard base64, so they can carry '/' and '+' which must be
+// percent-encoded or they would split the URL path into extra segments (a
+// v2/invite for such an event would 404 on the receiving server). The
+// receiving server's path wildcards ({roomID}, {eventID}) URL-decode the
+// segment back, so the round-trip is lossless.
 func urlPathEscape(s string) string {
-	return strings.ReplaceAll(s, "#", "%23")
+	return url.PathEscape(s)
 }
 
 // ingestRemoteJoin persists the room view returned by send_join: the room row,
