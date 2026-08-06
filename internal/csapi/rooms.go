@@ -1978,6 +1978,10 @@ type roomError struct {
 	status int
 	code   string
 	msg    string
+	// extra carries additional top-level response keys (e.g. the remote's
+	// room_version for M_INCOMPATIBLE_ROOM_VERSION) — spec: a make_join
+	// failure is passed through to the client verbatim.
+	extra map[string]string
 }
 
 func (e *roomError) Error() string { return e.code + ": " + e.msg }
@@ -1986,11 +1990,21 @@ func newRoomError(status int, code, msg string) *roomError {
 	return &roomError{status: status, code: code, msg: msg}
 }
 
+// newRoomErrorExtra builds a roomError with additional top-level response
+// fields (the remote's error body keys, e.g. room_version).
+func newRoomErrorExtra(status int, code, msg string, extra map[string]string) *roomError {
+	return &roomError{status: status, code: code, msg: msg, extra: extra}
+}
+
 // writeRoomErr converts a roomError into a Matrix error response.
 func writeRoomErr(w http.ResponseWriter, err error) {
 	var re *roomError
 	if errors.As(err, &re) {
-		httpx.WriteJSON(w, re.status, map[string]string{"errcode": re.code, "error": re.msg})
+		body := map[string]string{"errcode": re.code, "error": re.msg}
+		for k, v := range re.extra {
+			body[k] = v
+		}
+		httpx.WriteJSON(w, re.status, body)
 		return
 	}
 	if errors.Is(err, storage.ErrNotFound) {
@@ -2170,13 +2184,22 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 			// body, its status and errcode are passed through verbatim (spec:
 			// a make_join failure is returned to the client — sytest's
 			// "Outbound federation passes make_join failures through to the
-			// client" expects the remote's 400 M_TEST_ERROR_CODE).
+			// client" expects the remote's 400 M_TEST_ERROR_CODE; an
+			// M_INCOMPATIBLE_ROOM_VERSION error also carries the remote's
+			// room_version in the response body).
 			if code := fedHTTPStatusCode(err); code >= 400 && code < 500 {
 				fallback := "M_FORBIDDEN"
 				if code == http.StatusNotFound {
 					fallback = "M_NOT_FOUND"
 				}
-				return nil, newRoomError(code, fedHTTPErrCode(err, fallback), err.Error())
+				extra := map[string]string{}
+				var ferr interface{ RoomVersion() string }
+				if errors.As(err, &ferr) {
+					if rv := ferr.RoomVersion(); rv != "" {
+						extra["room_version"] = rv
+					}
+				}
+				return nil, newRoomErrorExtra(code, fedHTTPErrCode(err, fallback), err.Error(), extra)
 			}
 			return nil, newRoomError(http.StatusNotFound, fedHTTPErrCode(err, "M_NOT_FOUND"), err.Error())
 		}

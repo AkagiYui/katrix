@@ -47,11 +47,14 @@ type sendJoinResponse struct {
 // HTTP status and, when the response body was a Matrix error, its errcode — so
 // callers can surface the remote's rejection to the client verbatim (spec: a
 // join failure is passed through; sytest's "Outbound federation passes make_join
-// failures through to the client" expects the remote's M_TEST_ERROR_CODE).
+// failures through to the client" expects the remote's M_TEST_ERROR_CODE). The
+// optional room_version (returned with M_INCOMPATIBLE_ROOM_VERSION) is kept so
+// callers can reproduce it in the client-facing error.
 type FedHTTPError struct {
-	code    int
-	errcode string
-	msg     string
+	code        int
+	errcode     string
+	roomVersion string
+	msg         string
 }
 
 func (e *FedHTTPError) Error() string { return e.msg }
@@ -63,19 +66,26 @@ func (e *FedHTTPError) HTTPCode() int { return e.code }
 // not a Matrix error).
 func (e *FedHTTPError) ErrCode() string { return e.errcode }
 
+// RoomVersion returns the room_version the remote error body carried ("" when
+// absent).
+func (e *FedHTTPError) RoomVersion() string { return e.roomVersion }
+
 // newFedHTTPError builds a FedHTTPError for a non-2xx federation response,
-// extracting the errcode from a Matrix error body when present.
+// extracting the errcode (and room_version) from a Matrix error body when
+// present.
 func newFedHTTPError(code int, msg string, body []byte) error {
-	errcode := ""
+	errcode, roomVersion := "", ""
 	if len(body) > 0 {
 		var e struct {
-			ErrCode string `json:"errcode"`
+			ErrCode     string `json:"errcode"`
+			RoomVersion string `json:"room_version"`
 		}
 		if json.Unmarshal(body, &e) == nil {
 			errcode = e.ErrCode
+			roomVersion = e.RoomVersion
 		}
 	}
-	return &FedHTTPError{code: code, errcode: errcode, msg: msg}
+	return &FedHTTPError{code: code, errcode: errcode, roomVersion: roomVersion, msg: msg}
 }
 
 // JoinRemoteRoom joins userID to roomID by federating with the server(s) in
