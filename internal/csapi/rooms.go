@@ -2167,12 +2167,16 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 			// A remote rejection (e.g. the room's join_rule is knock, or the
 			// user is banned) surfaces as the remote's 403; an unreachable or
 			// unknown room is a 404. When the remote returned a Matrix error
-			// body, its errcode is passed through verbatim (spec: a make_join
-			// failure is returned to the client — sytest's "Outbound federation
-			// passes make_join failures through to the client" expects the
-			// remote's M_TEST_ERROR_CODE).
-			if code := fedHTTPStatusCode(err); code == http.StatusForbidden {
-				return nil, newRoomError(http.StatusForbidden, fedHTTPErrCode(err, "M_FORBIDDEN"), err.Error())
+			// body, its status and errcode are passed through verbatim (spec:
+			// a make_join failure is returned to the client — sytest's
+			// "Outbound federation passes make_join failures through to the
+			// client" expects the remote's 400 M_TEST_ERROR_CODE).
+			if code := fedHTTPStatusCode(err); code >= 400 && code < 500 {
+				fallback := "M_FORBIDDEN"
+				if code == http.StatusNotFound {
+					fallback = "M_NOT_FOUND"
+				}
+				return nil, newRoomError(code, fedHTTPErrCode(err, fallback), err.Error())
 			}
 			return nil, newRoomError(http.StatusNotFound, fedHTTPErrCode(err, "M_NOT_FOUND"), err.Error())
 		}
