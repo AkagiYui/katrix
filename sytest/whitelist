@@ -14,6 +14,8 @@
 # Regenerate after each run with:
 #   grep -E '^ok ' results.tap | grep -vE '# skip' | sed -E 's/^ok [0-9]+ (\(expected fail\) )?//' | sed -E 's/( \([0-9]+ subtests\))? # TODO passed but expected fail$//' | sort -u
 # One test path per line; lines starting with '#' are ignored.
+An event which redacts an event in a different room should be ignored
+Inbound federation ignores redactions from invalid servers room > v3
 User directory correctly update on display name change
 User joining then leaving public room appears and dissappears from directory
 Users appear/disappear from directory when history_visibility are changed
