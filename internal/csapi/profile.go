@@ -95,7 +95,11 @@ type setDisplayNameRequest struct {
 
 // SetDisplayName handles PUT /_matrix/client/v3/profile/{userId}/displayname.
 func (a *API) SetDisplayName(w http.ResponseWriter, r *http.Request) {
-	auth, _ := homeserver.AuthFrom(r.Context())
+	auth, err := a.actingAuth(r)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
 	userID := r.PathValue("userId")
 	if auth.UserID != userID {
 		httpx.WriteError(w, httpx.ErrForbidden("can only set own display name"))
@@ -141,7 +145,11 @@ type setAvatarURLRequest struct {
 
 // SetAvatarURL handles PUT /_matrix/client/v3/profile/{userId}/avatar_url.
 func (a *API) SetAvatarURL(w http.ResponseWriter, r *http.Request) {
-	auth, _ := homeserver.AuthFrom(r.Context())
+	auth, err := a.actingAuth(r)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
 	userID := r.PathValue("userId")
 	if auth.UserID != userID {
 		httpx.WriteError(w, httpx.ErrForbidden("can only set own avatar"))

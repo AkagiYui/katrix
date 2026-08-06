@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -25,14 +26,104 @@ type Registration struct {
 	ASToken         string `yaml:"as_token"`
 	HSToken         string `yaml:"hs_token"`
 	SenderLocalpart string `yaml:"sender_localpart"`
+
+	// Namespaces (spec "Application services"): the regexes the AS is
+	// exclusively (exclusive=true) or non-exclusively (exclusive=false)
+	// responsible for. A ghost user/alias matching an exclusive namespace may
+	// only be created by that AS; a regular user may not register within it.
+	Namespaces struct {
+		Users   []Namespace `yaml:"users"`
+		Aliases []Namespace `yaml:"aliases"`
+		Rooms   []Namespace `yaml:"rooms"`
+	} `yaml:"namespaces"`
 }
 
-// LoadDir reads every *.yaml/*.yml registration file in dir and seeds the
-// store: the sender-localpart user is created (if absent) and the as_token is
-// registered as a valid access token for it (its own device). Files that fail
-// to parse or lack a token/localpart are skipped (best-effort). A missing or
-// unreadable dir is not an error (no appservices configured).
-func LoadDir(ctx context.Context, store *storage.Store, dir string) error {
+// Namespace is one regex (plus its exclusivity flag) in an appservice
+// registration's namespace list.
+type Namespace struct {
+	Regex     string `yaml:"regex"`
+	Exclusive bool   `yaml:"exclusive"`
+}
+
+// Registry is the in-memory collection of loaded appservice registrations. It
+// lets the client-server handlers answer "which appservice (if any) owns this
+// user/alias namespace" and "is this token an appservice token" without
+// re-reading the registration files on every request.
+type Registry struct {
+	byToken  map[string]*Registration // as_token -> registration
+	bySender map[string]*Registration // sender_localpart -> registration
+}
+
+// NewRegistry returns an empty registry.
+func NewRegistry() *Registry {
+	return &Registry{byToken: map[string]*Registration{}, bySender: map[string]*Registration{}}
+}
+
+// Add records a loaded registration.
+func (r *Registry) Add(reg *Registration) {
+	r.byToken[reg.ASToken] = reg
+	r.bySender[reg.SenderLocalpart] = reg
+}
+
+// ForToken returns the registration whose as_token matches, or nil.
+func (r *Registry) ForToken(token string) *Registration {
+	return r.byToken[token]
+}
+
+// ForSender returns the registration whose sender_localpart matches, or nil.
+func (r *Registry) ForSender(localpart string) *Registration {
+	return r.bySender[localpart]
+}
+
+// ExclusiveUserMatch returns the appservice that exclusively owns the given
+// localpart (its namespace regex matches and exclusive=true), or nil. Used to
+// reject a regular user registering within an AS's exclusive namespace, and to
+// reject an AS creating a user in another AS's exclusive namespace.
+func (r *Registry) ExclusiveUserMatch(localpart string) *Registration {
+	for _, reg := range r.bySender {
+		for _, ns := range reg.Namespaces.Users {
+			if ns.Exclusive && regexMatches(ns.Regex, localpart) {
+				return reg
+			}
+		}
+	}
+	return nil
+}
+
+// ExclusiveAliasMatch returns the appservice that exclusively owns the given
+// alias localpart (the part after "#"), or nil. A regular user may not create
+// an alias in an AS's exclusive alias namespace.
+func (r *Registry) ExclusiveAliasMatch(aliasLocalpart string) *Registration {
+	for _, reg := range r.bySender {
+		for _, ns := range reg.Namespaces.Aliases {
+			if ns.Exclusive && regexMatches(ns.Regex, aliasLocalpart) {
+				return reg
+			}
+		}
+	}
+	return nil
+}
+
+// regexMatches reports whether re matches s (the localpart, without sigil).
+// The registration's namespace regexes may be written with or without the
+// leading sigil ("@astest-.*" vs "astest-.*"): try both the raw localpart and
+// the "@"-prefixed form so either convention works (sytest writes the sigil,
+// Complement does not). A malformed regex never matches.
+func regexMatches(re, s string) bool {
+	compiled, err := regexp.Compile("^(?:" + re + ")$")
+	if err != nil {
+		return false
+	}
+	return compiled.MatchString(s) || compiled.MatchString("@"+s)
+}
+
+// LoadDir reads every *.yaml/*.yml registration file in dir, seeds the store
+// and records each registration in the registry: the sender-localpart user is
+// created (if absent) and the as_token is registered as a valid access token
+// for it (its own device). Files that fail to parse or lack a token/localpart
+// are skipped (best-effort). A missing or unreadable dir is not an error (no
+// appservices configured).
+func LoadDir(ctx context.Context, store *storage.Store, reg *Registry, dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
@@ -48,16 +139,17 @@ func LoadDir(ctx context.Context, store *storage.Store, dir string) error {
 		if err != nil {
 			continue
 		}
-		var reg Registration
-		if err := yaml.Unmarshal(raw, &reg); err != nil {
+		var r Registration
+		if err := yaml.Unmarshal(raw, &r); err != nil {
 			continue
 		}
-		if reg.ASToken == "" || reg.SenderLocalpart == "" {
+		if r.ASToken == "" || r.SenderLocalpart == "" {
 			continue
 		}
-		if err := seed(ctx, store, reg); err != nil {
+		if err := seed(ctx, store, r); err != nil {
 			continue
 		}
+		reg.Add(&r)
 	}
 	return nil
 }

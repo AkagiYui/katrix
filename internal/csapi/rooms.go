@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/AkagiYui/katrix/internal/appservice"
 	"github.com/AkagiYui/katrix/internal/canonicaljson"
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/eventstate"
@@ -404,10 +406,14 @@ func (a *API) knockRoom(r *http.Request, auth *homeserver.Auth, roomID string, v
 
 // RoomJoin handles POST /_matrix/client/v3/rooms/{roomID}/join.
 func (a *API) RoomJoin(w http.ResponseWriter, r *http.Request) {
-	auth, _ := homeserver.AuthFrom(r.Context())
+	auth, err := a.actingAuth(r)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
 	roomID := r.PathValue("roomID")
 	via := joinVia(r)
-	_, err := a.joinRoom(r, auth, roomID, via)
+	_, err = a.joinRoom(r, auth, roomID, via)
 	if err != nil {
 		writeRoomErr(w, err)
 		return
@@ -591,7 +597,11 @@ func (a *API) RoomUnban(w http.ResponseWriter, r *http.Request) {
 
 // RoomSend handles PUT /_matrix/client/v3/rooms/{roomID}/send/{eventType}/{txnID}.
 func (a *API) RoomSend(w http.ResponseWriter, r *http.Request) {
-	auth, _ := homeserver.AuthFrom(r.Context())
+	auth, err := a.actingAuth(r)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
 	roomID := r.PathValue("roomID")
 	eventType := r.PathValue("eventType")
 	txnID := r.PathValue("txnID")
@@ -606,7 +616,7 @@ func (a *API) RoomSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var content json.RawMessage
-	content, err := readEventContent(r)
+	content, err = readEventContent(r)
 	if err != nil {
 		httpx.WriteError(w, err)
 		return
@@ -1722,11 +1732,53 @@ func (a *API) DirectoryPutAlias(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrMissingParam("room_id required"))
 		return
 	}
+	// Alias namespaces (spec "Application services"): an alias inside an
+	// appservice's exclusive alias namespace may only be created by that
+	// appservice; a regular user is refused (sytest's "Regular users cannot
+	// create room aliases within the AS namespace"). An appservice may only
+	// create aliases within its own alias namespaces.
+	aliasLocalpart := strings.TrimPrefix(alias, "#")
+	if a.HS.AppServices != nil {
+		if !auth.IsAppService {
+			if reg := a.HS.AppServices.ExclusiveAliasMatch(aliasLocalpart); reg != nil {
+				httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_EXCLUSIVE",
+					"alias is reserved by an application service"))
+				return
+			}
+		} else {
+			reg := a.HS.AppServices.ForSender(auth.Localpart)
+			if reg == nil || !appserviceAliasInNamespaces(reg, aliasLocalpart) {
+				httpx.WriteError(w, httpx.ErrForbidden("alias not in the appservice's namespace"))
+				return
+			}
+		}
+	}
 	if err := a.Store.CreateAlias(r.Context(), alias, req.RoomID, auth.UserID, a.Now()); err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// appserviceAliasInNamespaces reports whether aliasLocalpart matches any alias
+// namespace regex of the appservice's registration (trying both the raw
+// localpart and the "#"-prefixed form).
+func appserviceAliasInNamespaces(reg *appservice.Registration, aliasLocalpart string) bool {
+	for _, ns := range reg.Namespaces.Aliases {
+		if aliasRegexpMatch(ns.Regex, aliasLocalpart) {
+			return true
+		}
+	}
+	return false
+}
+
+// aliasRegexpMatch is regexpMatch for alias namespaces (the "#" sigil).
+func aliasRegexpMatch(re, s string) bool {
+	compiled, err := regexp.Compile("^(?:" + re + ")$")
+	if err != nil {
+		return false
+	}
+	return compiled.MatchString(s) || compiled.MatchString("#"+s)
 }
 
 // DirectoryDeleteAlias handles DELETE /_matrix/client/v3/directory/room/{roomAlias}.

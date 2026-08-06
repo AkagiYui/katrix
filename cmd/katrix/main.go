@@ -150,13 +150,15 @@ func runServe(args []string) error {
 	// Load application-service registrations (spec "Application services"): the
 	// registered as_tokens become valid access tokens for their sender
 	// localparts, letting bridge users act through the normal client API.
+	asRegistry := appservice.NewRegistry()
 	if cfg.AppServiceDir != "" {
-		if err := appservice.LoadDir(ctx, store, cfg.AppServiceDir); err != nil {
+		if err := appservice.LoadDir(ctx, store, asRegistry, cfg.AppServiceDir); err != nil {
 			return fmt.Errorf("appservice: %w", err)
 		}
 	}
 
 	hs := homeserver.New(cfg, store, key)
+	hs.SetAppServices(asRegistry)
 	handler, err := httpserver.New(hs)
 	if err != nil {
 		return err

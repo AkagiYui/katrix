@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/AkagiYui/katrix/internal/appservice"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/ids"
@@ -39,7 +41,63 @@ type registerRequest struct {
 	InhibitLogin             bool            `json:"inhibit_login"`
 	RefreshToken             bool            `json:"refresh_token"`
 	GuestAccessToken         string          `json:"guest_access_token"`
+	Type                     string          `json:"type"`
 	Auth                     json.RawMessage `json:"auth"`
+}
+
+// appServiceRegister handles POST /register with type m.login.application_service
+// (spec "Application services"): the request is authenticated by the
+// registration's as_token, and the username being created must lie within the
+// appservice's user namespace. The created user is a regular account; an
+// inhibit_login request returns the user ID without an access token (the AS
+// acts on the ghost's behalf via its own token).
+func (a *API) appServiceRegister(w http.ResponseWriter, r *http.Request, req registerRequest) {
+	// The request must be authenticated by an appservice as_token.
+	if _, err := a.HS.Authenticate(r); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	reg := a.HS.AppServices.ForToken(homeserver.AccessToken(r))
+	if reg == nil {
+		httpx.WriteError(w, httpx.ErrForbidden("this endpoint requires appservice authentication"))
+		return
+	}
+	// The username must match the AS's user namespace (spec: an appservice may
+	// only create users within its namespaces). The sender may create users in
+	// its own exclusive namespace; a namespace regex match is required.
+	localpart := strings.ToLower(req.Username)
+	if localpart == "" || !ids.ValidLocalpart(localpart) {
+		httpx.WriteError(w, httpx.ErrInvalidUsername("invalid username"))
+		return
+	}
+	if !appserviceUserInNamespaces(reg, localpart) {
+		httpx.WriteError(w, httpx.ErrForbidden("username not in the appservice's namespace"))
+		return
+	}
+	a.completeRegistration(w, r, localpart, req)
+}
+
+// appserviceUserInNamespaces reports whether localpart matches any user
+// namespace regex of the appservice's registration (spec: the registration's
+// user namespaces define which users the AS may create/control).
+func appserviceUserInNamespaces(reg *appservice.Registration, localpart string) bool {
+	for _, ns := range reg.Namespaces.Users {
+		if regexpMatch(ns.Regex, localpart) {
+			return true
+		}
+	}
+	return false
+}
+
+// regexpMatch reports whether re matches s (anchored), trying both the raw
+// localpart and the "@"-prefixed form (the registration's regex may include
+// the sigil).
+func regexpMatch(re, s string) bool {
+	compiled, err := regexp.Compile("^(?:" + re + ")$")
+	if err != nil {
+		return false
+	}
+	return compiled.MatchString(s) || compiled.MatchString("@"+s)
 }
 
 // wellKnown returns the m.homeserver well_known object injected into
@@ -97,6 +155,16 @@ func (a *API) RegisterAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Appservice registration (spec "Application services": POST /register with
+	// type m.login.application_service, authenticated by the AS's as_token). The
+	// AS may create users in its own (exclusive) namespace; the created user is
+	// a regular account. Any other request — a regular user, or an AS without a
+	// valid token — is refused.
+	if req.Type == "m.login.application_service" {
+		a.appServiceRegister(w, r, req)
+		return
+	}
+
 	// Guest upgrade (spec: registering with a guest_access_token converts the
 	// guest session to a full account). The username must name an existing guest
 	// whose access token matches; after UIA the guest's is_guest flag is cleared
@@ -112,6 +180,16 @@ func (a *API) RegisterAccount(w http.ResponseWriter, r *http.Request) {
 		if !ids.ValidLocalpart(localpart) {
 			httpx.WriteError(w, httpx.ErrInvalidUsername("invalid username"))
 			return
+		}
+		// A username inside an appservice's exclusive user namespace may only be
+		// created by that appservice (spec "Application services"; sytest's
+		// "Regular users cannot register within the AS namespace").
+		if a.HS.AppServices != nil {
+			if reg := a.HS.AppServices.ExclusiveUserMatch(localpart); reg != nil {
+				httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_EXCLUSIVE",
+					"username is reserved by an application service"))
+				return
+			}
 		}
 		exists, err := a.Store.UserExists(r.Context(), localpart)
 		if err != nil {
@@ -558,6 +636,22 @@ func (a *API) Deactivate(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
+	// An appservice may deactivate a user in its namespaces by passing the
+	// user_id query parameter (spec "Application services"); the AS itself is
+	// not subject to UIA.
+	auth, err := a.actingAuth(r)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	if auth.IsAppService {
+		if err := a.Store.Deactivate(r.Context(), auth.Localpart); err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"id_server_unbind_result": "no-support"})
+		return
+	}
 	ok, err := a.checkPasswordUIA(w, r, body)
 	if err != nil {
 		httpx.WriteError(w, err)
@@ -566,7 +660,6 @@ func (a *API) Deactivate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	auth, _ := homeserver.AuthFrom(r.Context())
 	if err := a.Store.Deactivate(r.Context(), auth.Localpart); err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return

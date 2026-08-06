@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AkagiYui/katrix/internal/appservice"
 	"github.com/AkagiYui/katrix/internal/config"
 	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/httpx"
@@ -23,6 +24,11 @@ type HS struct {
 	Store    *storage.Store
 	Key      *crypto.SigningKey
 	Notifier *Notifier
+	// AppServices holds the loaded application-service registrations (spec
+	// "Application services"): the as_tokens that may act as the bridge users,
+	// and the exclusive namespaces regular users may not register within. nil
+	// when no appservices are configured.
+	AppServices *appservice.Registry
 	// Typing holds ephemeral per-room typing state. It lives on the HS (rather
 	// than inside one API surface) because both the client-server handlers and
 	// the federation EDU ingest path need to read and write it.
@@ -37,6 +43,15 @@ func New(cfg *config.Config, store *storage.Store, key *crypto.SigningKey) *HS {
 		Key:      key,
 		Notifier: NewNotifier(),
 		Typing:   syncpkg.NewTypingTracker(30 * time.Second),
+	}
+}
+
+// SetAppServices records the loaded appservice registry (called by cmd/katrix
+// after appservice.LoadDir). A nil registry is ignored so servers without
+// appservices behave as before.
+func (h *HS) SetAppServices(reg *appservice.Registry) {
+	if reg != nil {
+		h.AppServices = reg
 	}
 }
 
@@ -87,6 +102,10 @@ type Auth struct {
 	Localpart string
 	DeviceID  string
 	IsGuest   bool
+	// IsAppService marks an appservice (bridge user) session: the access token
+	// is the registration's as_token. The AS may act as its own sender user and
+	// (via the user_id query parameter) on behalf of users in its namespaces.
+	IsAppService bool
 }
 
 // authKeyType is the context key type for the resolved Auth.
@@ -141,12 +160,20 @@ func (h *HS) Authenticate(r *http.Request) (*Auth, error) {
 	if user.Deactivated {
 		return nil, httpx.ErrUnknownToken(false)
 	}
-	return &Auth{
+	auth := &Auth{
 		UserID:    h.UserID(tok.UserLocalpart),
 		Localpart: tok.UserLocalpart,
 		DeviceID:  tok.DeviceID,
 		IsGuest:   user.IsGuest,
-	}, nil
+	}
+	// An appservice as_token is a normal access token for the bridge user (it
+	// was registered by appservice.LoadDir). Tag the session so handlers can
+	// offer the appservice-specific flows (user_id impersonation, exclusive
+	// namespaces).
+	if h.AppServices != nil && h.AppServices.ForToken(token) != nil {
+		auth.IsAppService = true
+	}
+	return auth, nil
 }
 
 // RequireAuth is middleware that authenticates and injects Auth into context.
