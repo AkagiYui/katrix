@@ -1514,13 +1514,16 @@ func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	content := body
-	// Inject redacts into content.
+	// The redaction target is a top-level `redacts` field per the spec (not part
+	// of content). Strip a client-supplied redacts from the content and carry the
+	// target on the builder instead, so the stored/broadcast PDU has the correct
+	// shape (the CS API /messages rendering exposes it as a top-level key).
 	var c map[string]any
 	_ = json.Unmarshal(content, &c)
 	if c == nil {
 		c = map[string]any{}
 	}
-	c["redacts"] = eventID
+	delete(c, "redacts")
 	content, _ = json.Marshal(c)
 
 	room, err := a.Store.GetRoom(r.Context(), roomID)
@@ -1529,7 +1532,7 @@ func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	version := roomver.Version(room.Version)
-	ev, err := a.buildEvent(r, auth, roomID, version, "m.room.redaction", "", txnID, false, content)
+	ev, err := a.buildEvent(r, auth, roomID, version, "m.room.redaction", "", txnID, false, content, eventID)
 	if err != nil {
 		writeRoomErr(w, err)
 		return
@@ -1539,7 +1542,10 @@ func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = a.Store.RecordTxnEventID(r.Context(), auth.Localpart, roomID, txnID, ev.EventID(), a.Now())
-	_ = a.Store.SetEventRedacted(r.Context(), eventID)
+	// The redaction's target is applied by persistEventInRoom (via
+	// eventstate.ApplyRedaction): the target event is marked redacted when the
+	// sender meets the redact power level or shares a domain with the target's
+	// sender, per the spec's Handling redactions rules.
 	a.notifyRoomMembers(r.Context(), roomID)
 	a.broadcastPDU(r.Context(), roomID, ev)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": ev.EventID()})
@@ -2704,7 +2710,7 @@ func validateAliasForRoom(ctx context.Context, store *storage.Store, alias, room
 // buildEvent constructs a signed event for the room, computing prev_events and
 // depth from the room's latest extremity. isState distinguishes a state event
 // (state_key may be "") from a message event (no state_key).
-func (a *API) buildEvent(r *http.Request, auth *homeserver.Auth, roomID string, version roomver.Version, eventType, stateKey, txnID string, isState bool, content json.RawMessage) (*events.Event, error) {
+func (a *API) buildEvent(r *http.Request, auth *homeserver.Auth, roomID string, version roomver.Version, eventType, stateKey, txnID string, isState bool, content json.RawMessage, redacts ...string) (*events.Event, error) {
 	now := a.Now()
 	// MSC3030 / MSC2176: an application-service bridge user may set an event's
 	// origin_server_ts via the ?ts= query parameter (used to import historical
@@ -2727,6 +2733,9 @@ func (a *API) buildEvent(r *http.Request, auth *homeserver.Auth, roomID string, 
 		OriginServerTS: now,
 		PrevEvents:     prev,
 		AuthEvents:     authIDs,
+	}
+	if len(redacts) > 0 {
+		b.Redacts = redacts[0]
 	}
 	if isState {
 		sk := stateKey
@@ -2875,10 +2884,26 @@ func persistEventInRoom(ctx context.Context, store *storage.Store, ev *events.Ev
 		RawJSON:        ev.Raw(),
 		AuthEvents:     ev.AuthEvents(),
 		PrevEvents:     ev.PrevEvents(),
+		Redacts:        ev.Redacts(),
 	}
 	stream, err := store.InsertEvent(ctx, row)
 	if err != nil {
 		return 0, err
+	}
+	// Apply a redaction to its target when this event is a redaction: the target
+	// (when known) is marked redacted per the spec's Handling redactions rules
+	// (redact power level, or same sender domain). A target not yet stored is
+	// left for the reverse check below once it arrives.
+	if row.Redacts != "" && row.Type == "m.room.redaction" {
+		_, _ = eventstate.ApplyRedaction(ctx, store, row)
+	}
+	// The reverse order: a target event persisting after its redaction already
+	// arrived is marked redacted by the pending redaction (RedactionForEvent
+	// resolves it; the same power/domain rule applies).
+	if row.Redacts == "" && row.Type != "m.room.redaction" {
+		if red, err := store.RedactionForEvent(ctx, row.EventID); err == nil && red != nil {
+			_, _ = eventstate.ApplyRedaction(ctx, store, red)
+		}
 	}
 	// Index the event's relates_to relation (if any) so /relations and
 	// /threads can answer from the index. Best-effort: a malformed relates_to

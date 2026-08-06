@@ -1478,8 +1478,19 @@ func (e *Engine) membershipAnnotator(ctx context.Context, roomID, userID string,
 		if err := json.Unmarshal(ev, &obj); err != nil {
 			return ev
 		}
-		unsigned, _ := json.Marshal(map[string]any{"membership": membership})
-		obj["unsigned"] = unsigned
+		// Merge into any existing unsigned object (e.g. unsigned.redacted_by from
+		// clientEvent) rather than replacing it, mirroring annotateTxn.
+		unsigned := map[string]any{"membership": membership}
+		if existing, ok := obj["unsigned"]; ok {
+			var m map[string]json.RawMessage
+			if err := json.Unmarshal(existing, &m); err == nil {
+				for k, v := range m {
+					unsigned[k] = v
+				}
+			}
+		}
+		unsignedJSON, _ := json.Marshal(unsigned)
+		obj["unsigned"] = unsignedJSON
 		b, _ := json.Marshal(obj)
 		return b
 	}
@@ -1754,7 +1765,9 @@ func mustMarshalEvent(eventType, sender, stateKey string, content []byte, ts int
 // never auth_events, hashes, prev_events, or signatures.
 //
 // If the event has been redacted, the content is replaced with its pruned
-// redacted form (per the default room version redaction rules).
+// redacted form (per the default room version redaction rules), and the
+// redaction's event ID is exposed as unsigned.redacted_by (spec: a redacted
+// event tells clients which redaction redacted it).
 func clientEvent(row *storage.EventRow) json.RawMessage {
 	m := map[string]any{
 		"type":             row.Type,
@@ -1774,6 +1787,13 @@ func clientEvent(row *storage.EventRow) json.RawMessage {
 				}
 			}
 		}
+		if row.RedactedBy != "" {
+			unsigned, _ := json.Marshal(map[string]any{"redacted_by": row.RedactedBy})
+			m["unsigned"] = unsigned
+		}
+	}
+	if row.Redacts != "" {
+		m["redacts"] = row.Redacts
 	}
 	b, _ := json.Marshal(m)
 	return b

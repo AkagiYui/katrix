@@ -163,6 +163,7 @@ type EventRow struct {
 	RawJSON        []byte
 	Redacts        string
 	Redacted       bool
+	RedactedBy     string // event ID of the redaction event that redacted this event
 	Outlier        bool
 	AuthEvents     []string // parsed from RawJSON for convenience
 	PrevEvents     []string // parsed from RawJSON for convenience
@@ -403,7 +404,7 @@ func (s *Store) GetEvent(ctx context.Context, eventID string) (*EventRow, error)
 	return scanEvent(s.pool.QueryRow(ctx,
 		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
 		 FROM events WHERE event_id=$1`, eventID))
 }
 
@@ -451,7 +452,7 @@ func (s *Store) EventsForRoom(ctx context.Context, roomID string, from, to int64
 	}
 	q := `SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 	              origin_server_ts, stream_ordering, content, json,
-	              COALESCE(redacts,''), redacted, outlier
+	              COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
 	       FROM events
 	       WHERE room_id=$1 AND stream_ordering>$2 AND stream_ordering<=$3`
 	// `from` is exclusive (events at or before the token were already seen);
@@ -496,7 +497,7 @@ func (s *Store) EventsForRoom(ctx context.Context, roomID string, from, to int64
 func (s *Store) EventByTimestamp(ctx context.Context, roomID string, ts int64, dir string) (*EventRow, error) {
 	q := `SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 	              origin_server_ts, stream_ordering, content, json,
-	              COALESCE(redacts,''), redacted, outlier
+	              COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
 	       FROM events WHERE room_id=$1`
 	args := []any{roomID}
 	// MSC3030: when multiple events share the same timestamp the "next event"
@@ -528,7 +529,7 @@ func (s *Store) LatestEvent(ctx context.Context, roomID string) (*EventRow, erro
 	return scanEvent(s.pool.QueryRow(ctx,
 		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
 		 FROM events WHERE room_id=$1
 		 ORDER BY stream_ordering DESC LIMIT 1`, roomID))
 }
@@ -698,7 +699,7 @@ func (s *Store) EventsByIDs(ctx context.Context, ids []string) ([]EventRow, erro
 	rows, err := s.pool.Query(ctx,
 		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
 		 FROM events WHERE event_id = ANY($1)`, ids)
 	if err != nil {
 		return nil, err
@@ -721,12 +722,19 @@ func (s *Store) SetEventRedacted(ctx context.Context, eventID string) error {
 	return err
 }
 
+// SetEventRedactedBy marks an event as redacted and records the redaction event
+// that did it, so the client-visible rendering can emit unsigned.redacted_by.
+func (s *Store) SetEventRedactedBy(ctx context.Context, eventID, redactionEventID string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE events SET redacted=TRUE, redacted_by=$2 WHERE event_id=$1`, eventID, redactionEventID)
+	return err
+}
+
 // RedactionForEvent returns the redaction event that redacts the given event, if any.
 func (s *Store) RedactionForEvent(ctx context.Context, redactedEventID string) (*EventRow, error) {
 	return scanEvent(s.pool.QueryRow(ctx,
 		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
 		 FROM events WHERE redacts=$1 LIMIT 1`, redactedEventID))
 }
 
@@ -876,7 +884,7 @@ func (s *Store) LatestMembershipEvent(ctx context.Context, roomID, userID string
 	row := s.pool.QueryRow(ctx,
 		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
 		 FROM events
 		 WHERE room_id=$1 AND type='m.room.member' AND state_key=$2
 		 ORDER BY stream_ordering DESC LIMIT 1`, roomID, userID)
@@ -1044,7 +1052,7 @@ func (s *Store) MemberEventsAt(ctx context.Context, roomID string, at int64) ([]
 	rows, err := s.pool.Query(ctx,
 		`SELECT DISTINCT ON (state_key) event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
 		 FROM events
 		 WHERE room_id=$1 AND type='m.room.member' AND stream_ordering <= $2
 		 ORDER BY state_key, stream_ordering DESC`, roomID, at)
@@ -1172,9 +1180,9 @@ func (s *Store) DeleteAlias(ctx context.Context, alias string) error {
 // scanEvent scans a single event row from a QueryRow.
 func scanEvent(row pgx.Row) (*EventRow, error) {
 	var e EventRow
-	var stateKey, redacts *string
+	var stateKey, redacts, redactedBy *string
 	err := row.Scan(&e.EventID, &e.RoomID, &e.Type, &stateKey, &e.Sender, &e.Depth,
-		&e.OriginServerTS, &e.StreamOrdering, &e.Content, &e.RawJSON, &redacts, &e.Redacted, &e.Outlier)
+		&e.OriginServerTS, &e.StreamOrdering, &e.Content, &e.RawJSON, &redacts, &e.Redacted, &redactedBy, &e.Outlier)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -1187,15 +1195,18 @@ func scanEvent(row pgx.Row) (*EventRow, error) {
 	if redacts != nil {
 		e.Redacts = *redacts
 	}
+	if redactedBy != nil {
+		e.RedactedBy = *redactedBy
+	}
 	return &e, nil
 }
 
 // scanEventRows scans one event row from a Rows iterator.
 func scanEventRows(rows pgx.Rows) (EventRow, error) {
 	var e EventRow
-	var stateKey, redacts *string
+	var stateKey, redacts, redactedBy *string
 	err := rows.Scan(&e.EventID, &e.RoomID, &e.Type, &stateKey, &e.Sender, &e.Depth,
-		&e.OriginServerTS, &e.StreamOrdering, &e.Content, &e.RawJSON, &redacts, &e.Redacted, &e.Outlier)
+		&e.OriginServerTS, &e.StreamOrdering, &e.Content, &e.RawJSON, &redacts, &e.Redacted, &redactedBy, &e.Outlier)
 	if err != nil {
 		return EventRow{}, err
 	}
@@ -1204,6 +1215,9 @@ func scanEventRows(rows pgx.Rows) (EventRow, error) {
 	}
 	if redacts != nil {
 		e.Redacts = *redacts
+	}
+	if redactedBy != nil {
+		e.RedactedBy = *redactedBy
 	}
 	return e, nil
 }

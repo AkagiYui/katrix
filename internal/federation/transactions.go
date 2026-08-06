@@ -180,6 +180,7 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 		Depth      int64                        `json:"depth"`
 		OSTS       int64                        `json:"origin_server_ts"`
 		Content    json.RawMessage              `json:"content"`
+		Redacts    string                       `json:"redacts"`
 		StateKey   *string                      `json:"state_key"`
 		Signatures map[string]map[string]string `json:"signatures"`
 	}
@@ -388,17 +389,28 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 		// to revalidation (mirror of Synapse's MSC3902 handling — e.g. a kick
 		// by a user who actually left the room before the join is accepted
 		// during the partial window and rejected once the full state arrives).
-		if rules, ok := roomver.Get(version); ok {
-			stateKey := ""
-			if ev.StateKey != nil {
-				stateKey = *ev.StateKey
+			if rules, ok := roomver.Get(version); ok {
+				stateKey := ""
+				if ev.StateKey != nil {
+					stateKey = *ev.StateKey
+				}
+				st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey)
+				if ev.Type == "m.room.member" && len(st.SenderMember) == 0 {
+					// Unknown sender membership: accept leniently (revalidated later).
+				} else if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, true); err != nil {
+					rejected = true
+				}
 			}
-			st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey)
-			if ev.Type == "m.room.member" && len(st.SenderMember) == 0 {
-				// Unknown sender membership: accept leniently (revalidated later).
-			} else if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, true); err != nil {
-				rejected = true
-			}
+		}
+	// A redaction whose target is a known event of a DIFFERENT room is
+	// rejected (soft-failed): the redaction cannot reach across rooms, and
+	// delivering it would tell clients an event was redacted when it was not
+	// (mirror of Synapse; sytest "An event which redacts an event in a
+	// different room should be ignored" asserts the redaction never surfaces).
+	// An unknown target is accepted and applied once the partner event arrives.
+	if ev.Type == "m.room.redaction" && ev.Redacts != "" {
+		if t, err := a.Store.GetEvent(r.Context(), ev.Redacts); err == nil && t.RoomID != ev.RoomID {
+			rejected = true
 		}
 	}
 	// Invite rescission (spec / Synapse #18823): a leave event sent by someone
@@ -438,6 +450,7 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	row := &storage.EventRow{
 		EventID: evID, RoomID: ev.RoomID, Type: ev.Type, Sender: ev.Sender,
 		Depth: ev.Depth, OriginServerTS: ev.OSTS, Content: ev.Content, RawJSON: raw,
+		Redacts: ev.Redacts,
 	}
 	if ev.StateKey != nil {
 		row.StateKey = *ev.StateKey
@@ -459,6 +472,20 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// return above covers the common case.
 	if _, err := a.Store.InsertEventWithMembership(r.Context(), row, membershipRow); err != nil {
 		return evID, false
+	}
+	// Apply a redaction to its target (spec Handling redactions): the target is
+	// marked redacted when the redaction's sender meets the room's redact power
+	// level or shares a domain with the target's sender. A rejected (soft-failed)
+	// redaction never applies. A target not yet stored is left for the reverse
+	// check in persistReconcilePDU / the target's own ingest below.
+	if !rejected && ev.Redacts != "" && ev.Type == "m.room.redaction" {
+		_, _ = eventstate.ApplyRedaction(r.Context(), a.Store, row)
+	} else if !rejected && ev.Redacts == "" && ev.Type != "m.room.redaction" {
+		// The target arrived before its redaction: a pending redaction (already
+		// persisted) is applied now that the partner event is here.
+		if red, err := a.Store.RedactionForEvent(r.Context(), evID); err == nil && red != nil {
+			_, _ = eventstate.ApplyRedaction(r.Context(), a.Store, red)
+		}
 	}
 	// Record a state event accepted while the room was partial (MSC3902) so the
 	// background resync can re-validate it against the full state. Only inbound

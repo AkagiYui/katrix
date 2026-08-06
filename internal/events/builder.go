@@ -16,6 +16,10 @@ type Builder struct {
 	Sender         string
 	RoomID         string
 	Content        json.RawMessage
+	// Redacts is the event ID a redaction event targets. Per the spec it is a
+	// top-level event field (not part of content), so it is lifted onto the
+	// built PDU alongside content.
+	Redacts        string
 	Unsigned       json.RawMessage
 	PrevEvents     []string
 	AuthEvents     []string
@@ -58,6 +62,9 @@ func (b *Builder) Build(serverName string, key *crypto.SigningKey, version roomv
 	obj["origin_server_ts"] = mustJSON(b.OriginServerTS)
 	obj["prev_events"] = mustJSON(nonNilSlice(b.PrevEvents))
 	obj["auth_events"] = mustJSON(nonNilSlice(b.AuthEvents))
+	if b.Redacts != "" {
+		setString(obj, "redacts", b.Redacts)
+	}
 	if b.StateKey != nil {
 		setString(obj, "state_key", *b.StateKey)
 	}
@@ -116,6 +123,9 @@ func (b *Builder) BuildLegacy(serverName string, key *crypto.SigningKey, version
 	obj["content"] = nonNil(b.Content, `{}`)
 	obj["depth"] = mustJSON(b.Depth)
 	obj["origin_server_ts"] = mustJSON(b.OriginServerTS)
+	if b.Redacts != "" {
+		setString(obj, "redacts", b.Redacts)
+	}
 	// Legacy prev/auth events are [id, hash] pairs; we emit the IDs with empty
 	// hash objects since the hash is only required for federation verification.
 	obj["prev_events"] = mustJSON(legacyRefs(b.PrevEvents))

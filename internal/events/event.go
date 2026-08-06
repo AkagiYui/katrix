@@ -115,6 +115,10 @@ func (e *Event) Content() json.RawMessage {
 	return json.RawMessage(`{}`)
 }
 
+// Redacts returns the event ID the event redacts ("" for non-redaction events).
+// Per the spec it is a top-level field of the PDU, not part of content.
+func (e *Event) Redacts() string { return e.stringField("redacts") }
+
 // Unsigned returns the raw unsigned object (may be nil).
 func (e *Event) Unsigned() json.RawMessage { return e.fields["unsigned"] }
 

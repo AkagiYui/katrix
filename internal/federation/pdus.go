@@ -781,6 +781,7 @@ func (a *API) persistReconcilePDU(ctx context.Context, roomID string, version ro
 		Depth    int64           `json:"depth"`
 		OSTS     int64           `json:"origin_server_ts"`
 		Content  json.RawMessage `json:"content"`
+		Redacts  string          `json:"redacts"`
 		StateKey *string         `json:"state_key"`
 	}
 	if err := json.Unmarshal(raw, &ev); err != nil {
@@ -803,6 +804,7 @@ func (a *API) persistReconcilePDU(ctx context.Context, roomID string, version ro
 	row := &storage.EventRow{
 		EventID: id, RoomID: roomID, Type: ev.Type, Sender: ev.Sender,
 		Depth: ev.Depth, OriginServerTS: ev.OSTS, Content: ev.Content, RawJSON: raw,
+		Redacts: ev.Redacts,
 	}
 	if ev.StateKey != nil {
 		row.StateKey = *ev.StateKey
@@ -812,6 +814,15 @@ func (a *API) persistReconcilePDU(ctx context.Context, roomID string, version ro
 	}
 	if rejected {
 		a.Store.MarkEventRejected(ctx, id)
+	}
+	// Apply a redaction to its target (spec Handling redactions), mirroring the
+	// transaction ingest path.
+	if !rejected && ev.Redacts != "" && ev.Type == "m.room.redaction" {
+		_, _ = eventstate.ApplyRedaction(ctx, a.Store, row)
+	} else if !rejected && ev.Redacts == "" && ev.Type != "m.room.redaction" {
+		if red, err := a.Store.RedactionForEvent(ctx, id); err == nil && red != nil {
+			_, _ = eventstate.ApplyRedaction(ctx, a.Store, red)
+		}
 	}
 	a.Store.IndexRelationFromRow(ctx, row)
 	if rejected {
@@ -891,6 +902,7 @@ func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roo
 		Depth    int64           `json:"depth"`
 		OSTS     int64           `json:"origin_server_ts"`
 		Content  json.RawMessage `json:"content"`
+		Redacts  string          `json:"redacts"`
 		StateKey *string         `json:"state_key"`
 	}
 	if err := json.Unmarshal(raw, &ev); err != nil {
@@ -913,6 +925,7 @@ func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roo
 	row := &storage.EventRow{
 		EventID: id, RoomID: roomID, Type: ev.Type, Sender: ev.Sender,
 		Depth: ev.Depth, OriginServerTS: ev.OSTS, Content: ev.Content, RawJSON: raw,
+		Redacts: ev.Redacts,
 	}
 	if ev.StateKey != nil {
 		row.StateKey = *ev.StateKey
@@ -925,6 +938,15 @@ func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roo
 	// the timeline limited at this position.
 	if a.hasUnknownPrevEvents(ctx, raw) {
 		a.Store.RecordTimelineGap(ctx, roomID, row.StreamOrdering)
+	}
+	// Apply a redaction to its target (spec Handling redactions), mirroring the
+	// transaction ingest path.
+	if ev.Redacts != "" && ev.Type == "m.room.redaction" {
+		_, _ = eventstate.ApplyRedaction(ctx, a.Store, row)
+	} else if ev.Redacts == "" && ev.Type != "m.room.redaction" {
+		if red, err := a.Store.RedactionForEvent(ctx, id); err == nil && red != nil {
+			_, _ = eventstate.ApplyRedaction(ctx, a.Store, red)
+		}
 	}
 	// Rejection propagates through auth_events: a fetched event whose own
 	// auth_events reference a soft-failed event is itself rejected (an event

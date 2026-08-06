@@ -42,9 +42,15 @@ func clientEvent(row *storage.EventRow) json.RawMessage {
 				}
 			}
 		}
+		// Per the spec, a redacted event carries the redaction's event ID in
+		// unsigned.redacted_by so clients can show who/what redacted it.
+		if row.RedactedBy != "" {
+			unsigned, _ := json.Marshal(map[string]any{"redacted_by": row.RedactedBy})
+			m["unsigned"] = unsigned
+		}
 	}
 	if row.Redacts != "" {
-		m["redacts_because"] = nil // handled by callers if needed
+		m["redacts"] = row.Redacts
 	}
 	b, _ := json.Marshal(m)
 	return b
