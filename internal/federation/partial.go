@@ -576,12 +576,19 @@ func (a *API) broadcastDeviceListStateToRoom(ctx context.Context, roomID string)
 		if err != nil {
 			continue
 		}
+		prevID, streamID, err := a.Store.NextDeviceListSendStream(ctx, userID)
+		if err != nil {
+			streamID = a.Now()
+		}
 		for _, d := range devices {
 			content := map[string]any{
 				"user_id":   userID,
 				"device_id": d.DeviceID,
 				"deleted":   false,
-				"stream_id": a.Now(),
+				"stream_id": streamID,
+			}
+			if prevID > 0 {
+				content["prev_id"] = []int64{prevID}
 			}
 			if keys, err := a.Store.DeviceKeysForUsers(ctx, []string{userID}); err == nil {
 				for _, k := range keys {
