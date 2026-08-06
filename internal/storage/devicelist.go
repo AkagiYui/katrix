@@ -105,6 +105,25 @@ func (s *Store) EvictUntrackedRemoteDeviceLists(ctx context.Context, serverName 
 	return err
 }
 
+// NextDeviceListSendStream atomically advances this server's per-user
+// outbound device-list stream counter and returns the previous value (the
+// `prev_id` to attach to the EDU being sent now) plus the new `stream_id`.
+// The first update for a user returns prevID 0, signalling "no previous
+// update" — the EDU must omit prev_id (spec: the first EDU for a user has no
+// prev_id; every subsequent one names its predecessor so receivers can detect
+// lost updates).
+func (s *Store) NextDeviceListSendStream(ctx context.Context, userID string) (prevID, streamID int64, err error) {
+	err = s.pool.QueryRow(ctx,
+		`WITH upd AS (
+		   INSERT INTO device_list_streams(user_id, stream_id) VALUES ($1, 1)
+		   ON CONFLICT (user_id) DO UPDATE SET stream_id = device_list_streams.stream_id + 1
+		   RETURNING stream_id
+		 )
+		 SELECT stream_id - 1, stream_id FROM upd`,
+		userID).Scan(&prevID, &streamID)
+	return prevID, streamID, err
+}
+
 // NewLeftPeersSince returns the user IDs who were joined members of any of the
 // given rooms but left (or were banned from) them after `since` — i.e. users
 // who newly stopped sharing a room with the syncing user. This is the

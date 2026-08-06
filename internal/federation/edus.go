@@ -148,6 +148,13 @@ func minDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
+// fedKeyFetchTimeout bounds a single outbound federation key/device fetch
+// (GET /user/devices resync). A remote server that is offline (paused,
+// crashed, unreachable) would otherwise hold the resync for the full outbound
+// federation timeout; a bounded fetch returns quickly and the device list is
+// re-fetched on the next /keys/query.
+const fedKeyFetchTimeout = 3 * time.Second
+
 // deliverEDU sends one queued EDU to each of its remaining destinations. Each
 // destination is delivered in its own transaction (transaction IDs are
 // per-destination); a destination is dropped on success and retried on the
@@ -358,15 +365,30 @@ func (a *API) applyPresenceEDU(ctx context.Context, content json.RawMessage) {
 // EDU marks the user as deleted) in their next /sync, and wakes those users'
 // long-polls. The EDU's `deleted` flag distinguishes a user leaving all shared
 // rooms (device_lists.left) from a device-list change (device_lists.changed).
+//
+// The EDU also carries the sender's per-user `stream_id` and `prev_id`. When
+// the prev_id does not chain onto the previous update this server saw, an
+// update was lost and the user's device list is re-fetched in full via GET
+// /user/devices (mirror of Synapse's _need_to_do_resync). A server that
+// receives no prev_id (the sender's very first update for the user) applies
+// the update directly: its keys describe the user's only device so far.
 func (a *API) applyDeviceListEDU(ctx context.Context, origin string, content json.RawMessage) error {
 	var c struct {
-		UserID   string `json:"user_id"`
-		Deleted  *bool  `json:"deleted"`
-		StreamID int64  `json:"stream_id"`
+		UserID            string          `json:"user_id"`
+		DeviceID          string          `json:"device_id"`
+		DeviceDisplayName string          `json:"device_display_name"`
+		Deleted           *bool           `json:"deleted"`
+		StreamID          int64           `json:"stream_id"`
+		PrevID            []int64         `json:"prev_id"`
+		DeviceKeys        json.RawMessage `json:"keys"`
 	}
 	if err := json.Unmarshal(content, &c); err != nil || c.UserID == "" {
 		return fmt.Errorf("device_list_update missing user_id")
-	} // monotonic per-user counter. A stale re-delivery (an outbound-queue retry
+	} // The last stream_id this server saw for the user, read BEFORE the new EDU
+	// is recorded: the gap check compares the EDU's prev_id against the
+	// previous update, not the one being processed now.
+	lastSeen, _ := a.Store.LastSeenRemoteDeviceStream(ctx, origin, c.UserID)
+	// monotonic per-user counter. A stale re-delivery (an outbound-queue retry
 	// after a restart re-sends an already-acknowledged transaction) must not
 	// re-record the user in the local device-list stream — that would surface
 	// them in a /sync window they were already reported in. Remember the last
@@ -377,18 +399,117 @@ func (a *API) applyDeviceListEDU(ctx context.Context, origin string, content jso
 			return nil
 		}
 	}
-	// An incoming device-list update invalidates the local cache entry for the
-	// user: the cached keys are stale (the user's device list changed), so the
-	// next /keys/query must re-fetch from the user's server. A `deleted` update
-	// additionally means the user left the shared room — the cache entry is
-	// dropped rather than refreshed (mirror of Synapse, which resyncs remote
-	// device lists on an update EDU).
+	// The `deleted` flag is authoritative and does not need a resync: the user
+	// is gone from every shared room, so their cached device list is dropped
+	// and their local devices learn device_lists.left.
+	if c.Deleted != nil && *c.Deleted {
+		_ = a.Store.EvictRemoteDeviceList(ctx, c.UserID)
+		if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, true); err != nil {
+			return err
+		}
+		a.wakeSharedRoomLocals(ctx, c.UserID)
+		return nil
+	}
+	// A non-deleted update invalidates the cached device list (the user's
+	// devices changed, so the next /keys/query must not serve stale keys).
 	_ = a.Store.EvictRemoteDeviceList(ctx, c.UserID)
-	if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, c.Deleted != nil && *c.Deleted); err != nil {
+	// Decide whether to re-fetch the user's device list in full (mirror of
+	// Synapse's _need_to_do_resync). A lost update is detected when the EDU
+	// carries no prev_id (this server cannot chain it onto the previous update)
+	// or when its prev_id does not equal the last stream_id this server saw for
+	// the user. Otherwise the EDU is applied directly: its keys/display-name
+	// describe the only change, so no round-trip is needed.
+	needResync := false
+	for _, p := range c.PrevID {
+		if p != lastSeen {
+			needResync = true
+			break
+		}
+	}
+	if len(c.PrevID) == 0 {
+		needResync = true
+	}
+	if needResync {
+		a.resyncRemoteDeviceList(ctx, c.UserID)
+	} else {
+		// Apply the EDU content directly to the cache: the device's key bundle
+		// (content.keys, when present) and display name (content.device_display_name)
+		// are the authoritative description of the change (mirror of Synapse's
+		// update_remote_device_list_cache_entry).
+		if c.DeviceID != "" {
+			var keysObj map[string]any
+			if len(c.DeviceKeys) > 0 {
+				if err := json.Unmarshal(c.DeviceKeys, &keysObj); err != nil {
+					keysObj = nil
+				}
+			}
+			if keysObj == nil {
+				keysObj = map[string]any{}
+			}
+			if c.DeviceDisplayName != "" {
+				unsigned, _ := keysObj["unsigned"].(map[string]any)
+				if unsigned == nil {
+					unsigned = map[string]any{}
+				}
+				unsigned["device_display_name"] = c.DeviceDisplayName
+				keysObj["unsigned"] = unsigned
+			}
+			entry := map[string]any{c.DeviceID: keysObj}
+			if raw, err := json.Marshal(entry); err == nil {
+				_ = a.Store.CacheRemoteDeviceList(ctx, c.UserID, raw)
+			}
+		}
+	}
+	if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, false); err != nil {
 		return err
 	}
 	a.wakeSharedRoomLocals(ctx, c.UserID)
 	return nil
+}
+
+// resyncRemoteDeviceList re-fetches a remote user's full device list via GET
+// /user/devices (spec §Device lists) and caches it, so the next /keys/query is
+// answered without a further round-trip. Called when an m.device_list_update
+// EDU reveals a lost update, and from the client-server /keys/query handler
+// when a tracked user's keys are not cached. The fetched list replaces any
+// stale cache entry (the caller evicted it before resyncing).
+func (a *API) resyncRemoteDeviceList(ctx context.Context, userID string) {
+	dom := userDomain(userID)
+	if dom == "" || dom == a.ServerName() {
+		return
+	}
+	fctx, cancel := context.WithTimeout(ctx, fedKeyFetchTimeout)
+	defer cancel()
+	devs, err := a.client.QueryRemoteUserDevices(fctx, dom, userID)
+	if err != nil {
+		return
+	}
+	// A fetched /user/devices entry carries the device's keys and display name
+	// separately; fold the display name into the key bundle's unsigned section
+	// so a cache hit yields the same shape as /keys/query (which injects
+	// unsigned.device_display_name for its own devices).
+	keyObj := map[string]any{}
+	for _, d := range devs.Devices {
+		if d.DeviceID == "" || len(d.Keys) == 0 {
+			continue
+		}
+		var k map[string]any
+		if err := json.Unmarshal(d.Keys, &k); err != nil {
+			continue
+		}
+		if d.DisplayName != "" {
+			unsigned, _ := k["unsigned"].(map[string]any)
+			if unsigned == nil {
+				unsigned = map[string]any{}
+			}
+			unsigned["device_display_name"] = d.DisplayName
+			k["unsigned"] = unsigned
+		}
+		keyObj[d.DeviceID] = k
+	}
+	if raw, err := json.Marshal(keyObj); err == nil && len(keyObj) > 0 {
+		_ = a.Store.CacheRemoteDeviceList(ctx, userID, raw)
+	}
 }
 
 // applyDirectToDeviceEDU applies an inbound m.direct_to_device EDU: it

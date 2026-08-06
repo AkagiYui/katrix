@@ -265,6 +265,65 @@ func (c *Client) QueryRemoteKeys(ctx context.Context, serverName string, users m
 	return &out, nil
 }
 
+// RemoteUserDevices is the response to an outbound GET /user/devices: the
+// remote server's view of one user's devices plus their cross-signing keys
+// (spec §Device lists — the "resync" endpoint used to fetch a device list from
+// scratch after an update was missed or the local cache was evicted).
+type RemoteUserDevices struct {
+	UserID         string             `json:"user_id"`
+	StreamID       int64              `json:"stream_id"`
+	Devices        []RemoteUserDevice `json:"devices"`
+	MasterKey      json.RawMessage    `json:"master_key"`
+	SelfSigningKey json.RawMessage    `json:"self_signing_key"`
+}
+
+// RemoteUserDevice is one device in a /user/devices response. keys is the
+// device's key bundle (the object /keys/query returns per device, including
+// its own user_id/device_id/algorithms/keys/signatures); display_name is the
+// device display name carried separately by the endpoint.
+type RemoteUserDevice struct {
+	DeviceID    string          `json:"device_id"`
+	DisplayName string          `json:"display_name"`
+	Keys        json.RawMessage `json:"keys"`
+}
+
+// QueryRemoteUserDevices performs GET /_matrix/federation/v1/user/devices/
+// {userID} against serverName (spec §Device lists). A server that needs a
+// remote user's full device list — because an m.device_list_update EDU was
+// missed, the cache was evicted, or a client queried a user it newly shares a
+// room with — fetches it here rather than via /keys/query, which only returns
+// the devices explicitly asked for.
+func (c *Client) QueryRemoteUserDevices(ctx context.Context, serverName, userID string) (*RemoteUserDevices, error) {
+	url := c.serverBaseURL(serverName) + "/_matrix/federation/v1/user/devices/" + urlPathEscape(userID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Host = serverName
+	if err := signRequestWith(req, c.originName(), c.key); err != nil {
+		return nil, err
+	}
+	metrics.Counters.FedOutboundRequests.Add(1)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("federation: user/devices %s: %w", serverName, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("federation: user/devices %s: HTTP %d: %s", serverName, resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	var out RemoteUserDevices
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("federation: decode user/devices from %s: %w", serverName, err)
+	}
+	return &out, nil
+}
+
 // ClaimRemoteKeys performs POST /_matrix/federation/v1/user/keys/claim against
 // serverName for the given one-time key requests (user -> device -> algorithm).
 func (c *Client) ClaimRemoteKeys(ctx context.Context, serverName string, oneTimeKeys map[string]map[string]string) (map[string]map[string]map[string]json.RawMessage, error) {

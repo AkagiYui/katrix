@@ -24,6 +24,14 @@ func (a *API) broadcastPDU(ctx context.Context, roomID string, ev *events.Event)
 // /keys/query; the device's key bundle is included when known so it can skip
 // the round-trip.
 //
+// Each EDU carries a per-user monotonic `stream_id` (advancing the local
+// outbound counter) and, on every update after the user's first, a `prev_id`
+// naming the stream_id of the previous update (spec "Device lists": the EDU's
+// prev_id lets a receiving server detect a lost update and re-fetch the
+// device list). A remote server that joins mid-stream has no baseline and
+// simply re-fetches; the prev_id contract matters to servers that were already
+// tracking the user.
+//
 // Partial-state rooms (MSC3902) are included with a destination set derived
 // from the send_join's servers_in_room list ∪ the known membership (see
 // serversForRooms): while the membership is incomplete, the room's servers
@@ -40,13 +48,26 @@ func (a *API) broadcastDeviceListUpdate(ctx context.Context, userID, deviceID st
 	if err != nil || len(rooms) == 0 {
 		return
 	}
+	prevID, streamID, err := a.Store.NextDeviceListSendStream(ctx, userID)
+	if err != nil {
+		// Fall back to the wall clock so a broadcast is never silently dropped:
+		// the receiver only treats stream_id as an ordering hint (mirror of the
+		// pre-counter behaviour).
+		streamID = a.Now()
+	}
 	content := map[string]any{
 		"user_id":   userID,
 		"device_id": deviceID,
 		"deleted":   deleted,
 		// An opaque, monotonically increasing ordering hint per the spec
 		// ("stream_id" must increase between updates for the same device).
-		"stream_id": a.Now(),
+		"stream_id": streamID,
+	}
+	// The spec's prev_id contract: every update after the first names its
+	// predecessor, so receivers can detect a lost EDU. The very first update
+	// omits prev_id entirely.
+	if prevID > 0 {
+		content["prev_id"] = []int64{prevID}
 	}
 	if !deleted && deviceID != "" {
 		keys, err := a.Store.DeviceKeysForUsers(ctx, []string{userID})
@@ -57,6 +78,12 @@ func (a *API) broadcastDeviceListUpdate(ctx context.Context, userID, deviceID st
 					break
 				}
 			}
+		}
+		// The receiver may skip a /keys/query round-trip entirely; include the
+		// device display name so the fetched key bundle is complete (mirror of
+		// the key upload flow in sytest's device-list tests).
+		if d, err := a.Store.GetDevice(ctx, a.LocalpartOf(userID), deviceID); err == nil && d.DisplayName != "" {
+			content["device_display_name"] = d.DisplayName
 		}
 	}
 	a.fed.BroadcastEDUToRooms(ctx, "m.device_list_update", content, rooms)
@@ -113,11 +140,21 @@ func (a *API) broadcastDeviceListDelete(ctx context.Context, userID, roomID stri
 	if a.roomIsPartial(ctx, roomID) {
 		return
 	}
+	prevID, streamID, err := a.Store.NextDeviceListSendStream(ctx, userID)
+	if err != nil {
+		streamID = a.Now()
+	}
 	content := map[string]any{
 		"user_id":   userID,
 		"device_id": "",
 		"deleted":   true,
-		"stream_id": a.Now(),
+		"stream_id": streamID,
+	}
+	// A deleted-EDU is a per-user device-list update like any other: it carries
+	// the per-user stream counter and names its predecessor so receivers can
+	// detect a lost update.
+	if prevID > 0 {
+		content["prev_id"] = []int64{prevID}
 	}
 	a.fed.BroadcastEDUToRooms(ctx, "m.device_list_update", content, []string{roomID})
 }

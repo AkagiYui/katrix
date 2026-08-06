@@ -414,6 +414,24 @@ func (s *Store) DeviceListChangesSince(ctx context.Context, since int64) (change
 	return changed, left, rows.Err()
 }
 
+// LastSeenRemoteDeviceStream returns the highest m.device_list_update stream_id
+// seen so far from origin for userID (0 when none). Used to detect gaps when a
+// fresh EDU carries a prev_id: if prev_id does not equal the last seen
+// stream_id, an update was lost and the user's device list must be re-fetched.
+func (s *Store) LastSeenRemoteDeviceStream(ctx context.Context, origin, userID string) (int64, error) {
+	var streamID int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT stream_id FROM device_list_edu_seen WHERE origin=$1 AND user_id=$2`,
+		origin, userID).Scan(&streamID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return streamID, nil
+}
+
 // RecordDeviceListEDUSeen records that an m.device_list_update EDU from origin
 // with the sender's per-user stream_id was processed. It returns true when the
 // EDU is new (the caller should apply it) and false when a stale re-delivery

@@ -190,24 +190,77 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 	// until an m.device_list_update EDU (or the user leaving) invalidates them.
 	// A user who is NOT tracked (e.g. a pre-existing member of a partial-state
 	// room whose membership is not yet known) is always fetched, never cached.
+	//
+	// A tracked user whose keys are not cached and who is queried with an empty
+	// device list (the client wants the whole device list) is resynced via GET
+	// /user/devices (spec §Device lists) and the result cached — mirror of
+	// Synapse's users_to_resync_devices, which uses the same endpoint so a
+	// device list is fetched wholesale rather than device-by-device.
 	if a.fed != nil {
 		for dom, domUsers := range remoteByDomain {
-			query := map[string][]string{}
-			var tracked []string
+			query := map[string][]string{} // users to fetch via POST /keys/query
+			var resyncUsers []string       // tracked users to resync via GET /user/devices
 			for _, u := range domUsers {
 				query[u] = req.DeviceKeys[u]
 				if !a.Store.DeviceListTracked(r.Context(), auth.UserID, u) {
 					continue
 				}
-				tracked = append(tracked, u)
 				if cached, err := a.Store.GetCachedRemoteDeviceList(r.Context(), u); err == nil && len(cached) > 0 {
 					var cachedKeys map[string]any
 					if json.Unmarshal(cached, &cachedKeys) == nil {
 						for did, keyObj := range cachedKeys {
 							out[u][did] = keyObj
 						}
-						delete(query, u)
 					}
+					// Served from cache: no federation round-trip (a cached list
+					// survives a remote server outage).
+					delete(query, u)
+					continue
+				}
+				// Tracked but not cached. An empty device filter asks for the
+				// user's whole device list: resync it. A specific device list
+				// falls through to the batched /keys/query below.
+				if len(req.DeviceKeys[u]) == 0 {
+					resyncUsers = append(resyncUsers, u)
+					delete(query, u)
+				}
+			}
+			// Resync each tracked-but-uncached user's full device list. Each
+			// fetched device's keys and display name (which /user/devices
+			// carries separately) are folded into the response and the cache.
+			for _, u := range resyncUsers {
+				// Bound the federation round-trip so an unreachable remote
+				// server does not stall the client's request.
+				fctx, cancel := context.WithTimeout(r.Context(), fedKeyFetchTimeout)
+				devs, err := a.fed.Client().QueryRemoteUserDevices(fctx, dom, u)
+				cancel()
+				if err != nil {
+					continue
+				}
+				keys := map[string]any{}
+				merged := out[u]
+				for _, d := range devs.Devices {
+					var keyObj map[string]any
+					if len(d.Keys) > 0 {
+						if err := json.Unmarshal(d.Keys, &keyObj); err != nil {
+							continue
+						}
+					} else {
+						keyObj = map[string]any{}
+					}
+					if d.DisplayName != "" {
+						unsigned, _ := keyObj["unsigned"].(map[string]any)
+						if unsigned == nil {
+							unsigned = map[string]any{}
+						}
+						unsigned["device_display_name"] = d.DisplayName
+						keyObj["unsigned"] = unsigned
+					}
+					keys[d.DeviceID] = keyObj
+					merged[d.DeviceID] = keyObj
+				}
+				if raw, err := json.Marshal(keys); err == nil {
+					_ = a.Store.CacheRemoteDeviceList(r.Context(), u, raw)
 				}
 			}
 			if len(query) == 0 {
@@ -231,7 +284,7 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 					merged[did] = keyObj
 				}
 				// Cache the fetched device keys for users that are being tracked.
-				if contains(tracked, uid) {
+				if a.Store.DeviceListTracked(r.Context(), auth.UserID, uid) {
 					if raw, err := json.Marshal(keys); err == nil {
 						_ = a.Store.CacheRemoteDeviceList(r.Context(), uid, raw)
 					}
@@ -265,6 +318,7 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"device_keys":       out,
+		"failures":          map[string]any{},
 		"master_keys":       masterKeys,
 		"self_signing_keys": selfSigningKeys,
 		"user_signing_keys": userSigningKeys,
