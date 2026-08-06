@@ -17,3 +17,6 @@ internal/webui/dist/assets/
 
 # ZCode local session/plan artifacts
 .zcode/
+
+# Compiled helper binaries
+/testreport
