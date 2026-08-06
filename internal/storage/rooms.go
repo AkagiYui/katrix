@@ -970,7 +970,22 @@ func (s *Store) NewlyJoinedAfter(ctx context.Context, roomID, userID string, sin
 		 WHERE room_id=$1 AND type='m.room.member' AND state_key=$2 AND stream_ordering<=$3
 		 ORDER BY stream_ordering DESC LIMIT 1`, roomID, userID, since).Scan(&priorMembership)
 	if priorMembership != nil && *priorMembership == "join" {
-		return false, nil // profile update; already joined before the token
+		// Already joined before the token: a plain profile update is NOT a
+		// newly-joined window. But if the user LEFT and rejoined within the
+		// window (a non-join membership event after the token), the room must
+		// still be presented as newly joined — the client's baseline predates
+		// the leave, so it needs the full room state again (Synapse: "If there
+		// are non-join member events, but we are still in the room, then the
+		// user must have left and joined" → newly_joined_rooms).
+		var hasNonJoin bool
+		_ = s.pool.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM events
+			 WHERE room_id=$1 AND type='m.room.member' AND state_key=$2
+			   AND stream_ordering>$3 AND content->>'membership'<>'join')`,
+			roomID, userID, since).Scan(&hasNonJoin)
+		if !hasNonJoin {
+			return false, nil
+		}
 	}
 	return true, nil
 }
