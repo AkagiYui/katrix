@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AkagiYui/katrix/internal/canonicaljson"
 	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/eventstate"
@@ -2080,6 +2081,19 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 			version = roomver.Version(room.Version)
 		} else {
 			version = roomver.Default
+		}
+	}
+
+	// Room version 6+ requires events to be Canonical JSON (spec §room version
+	// 6: "homeservers should strictly enforce canonical JSON on PDUs").
+	// send_join is a PDU submission: a non-canonical body (e.g. a fractional
+	// number, which Canonical JSON forbids) is rejected with 400 M_BAD_JSON
+	// (sytest "Inbound: send_join rejects invalid JSON for room version 6").
+	if roomver.AtLeast(version, 6) {
+		if _, cerr := canonicaljson.Canonical(eventJSON); cerr != nil {
+			httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON",
+				"send_* event is not Canonical JSON"))
+			return
 		}
 	}
 

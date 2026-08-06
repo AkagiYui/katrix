@@ -7,7 +7,10 @@
 // (events, stateres, rooms) consult it rather than hard-coding version checks.
 package roomver
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // Version is a room version identifier ("1".."12").
 type Version string
@@ -195,6 +198,22 @@ func Supported() []Version {
 func Get(v Version) (Rules, bool) {
 	r, ok := table[v]
 	return r, ok
+}
+
+// AtLeast reports whether v is a numeric room version at least major (an
+// unstable version identifier, e.g. "org.matrix.msc3757.10", compares by its
+// trailing major). Non-numeric versions without a usable major are treated as
+// less than any numeric version.
+func AtLeast(v Version, major int) bool {
+	u := string(v)
+	if i := strings.LastIndexByte(u, '.'); i >= 0 {
+		u = u[i+1:]
+	}
+	var n int
+	if _, err := fmt.Sscanf(u, "%d", &n); err != nil {
+		return false
+	}
+	return n >= major
 }
 
 // MustGet returns the rules for a known version, panicking otherwise. Callers
