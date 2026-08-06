@@ -148,17 +148,17 @@ sub _get_config
    # as_token never becomes a valid access token and every appservice request
    # 401s.
    if ( my $confs = $self->{app_service_config_files} ) {
-      my $as_dir = "$hs_dir/appservices";
-      make_path( $as_dir ) unless -d $as_dir;
+      my $as_dir = "$self->{hs_dir}/appservices";
+      mkdir $as_dir unless -d $as_dir;
 
       foreach my $idx ( 0 .. $#$confs ) {
          my $src = $confs->[$idx];
          next unless defined $src && -f $src;
-         open my $fh, '<', $src or next;
-         local $/;
-         my $content = <$fh>;
-         close $fh;
-         write_binary( "$as_dir/appserv-$idx.yaml", $content );
+         open my $in, '<', $src or next;
+         open my $out, '>', "$as_dir/appserv-$idx.yaml" or do { close $in; next };
+         while ( my $line = <$in> ) { print $out $line; }
+         close $in;
+         close $out;
       }
       $config->{appservice_dir} = $as_dir;
    }
