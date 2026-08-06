@@ -233,13 +233,8 @@ User can create and send/receive messages in a room with version 1
 User can create and send/receive messages in a room with version 2
 User can invite remote user to room with version 1
 User can invite remote user to room with version 2
-User directory correctly update on display name change
 User in remote room doesn't appear in user directory after server left room
-User joining then leaving public room appears and dissappears from directory
 User sees updates to presence from other users in the incremental sync.
-Users appear/disappear from directory when history_visibility are changed
-Users appear/disappear from directory when join_rules are changed
-Users stay in directory when join_rules are changed but history_visibility is world_readable
 We do send redundant membership state across incremental syncs if asked
 We don't send redundant membership state across incremental syncs by default
 When user joins a room the state is included in a gapped sync
