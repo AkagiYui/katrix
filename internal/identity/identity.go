@@ -85,6 +85,71 @@ func (c *Client) Lookup(ctx context.Context, medium, address string) (string, er
 	return out.Mxid, nil
 }
 
+// Bind performs the identity server's 3PID bind (spec §3PID binding): it
+// submits the validation session (sid + client_secret) along with the binding
+// user ID, and returns the signed binding response. The identity server
+// records the (medium, address) -> mxid mapping so future lookups resolve.
+func (c *Client) Bind(ctx context.Context, medium, address, sid, clientSecret, mxid, idAccessToken string) error {
+	body, _ := json.Marshal(map[string]any{
+		"medium":        medium,
+		"address":       address,
+		"sid":           sid,
+		"client_secret": clientSecret,
+		"mxid":          mxid,
+	})
+	// v2 bind requires the access token in the Authorization header.
+	u := c.baseURL() + "/_matrix/identity/v2/3pid/bind"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if idAccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+idAccessToken)
+	}
+	req.Host = c.serverName
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("identity: bind: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("identity: bind: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	return nil
+}
+
+// Unbind removes a (medium, address) binding for the given user from the
+// identity server (spec §3PID unbinding). A binding that does not exist yields
+// a 404 from the identity server.
+func (c *Client) Unbind(ctx context.Context, medium, address, mxid string) error {
+	body, _ := json.Marshal(map[string]any{
+		"mxid": mxid,
+		"threepid": map[string]string{
+			"medium":  medium,
+			"address": address,
+		},
+	})
+	u := c.baseURL() + "/_matrix/identity/v2/3pid/unbind"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = c.serverName
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("identity: unbind: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("identity: unbind: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	return nil
+}
+
 // StoreInvite stores a pending 3PID invite on the identity server (v2
 // store-invite), returning the invite token and the public key material the
 // server will use to sign the eventual m.room.third_party_invite. The stored

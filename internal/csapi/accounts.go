@@ -33,6 +33,7 @@ func (a *API) registerAccounts(mux *http.ServeMux) {
 	a.registerDevices(mux)
 	a.registerProfile(mux)
 	a.registerTags(mux)
+	a.register3PID(mux)
 }
 
 type registerRequest struct {
