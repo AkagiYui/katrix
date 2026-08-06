@@ -443,14 +443,13 @@ func buildAndSign(serverName string, key *crypto.SigningKey, version roomver.Ver
 	b.StateKey = &sk
 	if rules.EventFormatV1 {
 		// Room versions 1-2 use the legacy event format: explicit event_id
-		// field and [id, hash] prev/auth references. Derive a stable event ID
-		// localpart from the event type + depth so initial events are
-		// deterministic across re-runs.
-		localpart := ids.RandomTxnSuffix()
-		if eventType == "m.room.create" {
-			localpart = "create0"
-		}
-		return b.BuildLegacy(serverName, key, version, localpart)
+		// field and [id, hash] prev/auth references. The event ID localpart
+		// must be unique per room: a deterministic "create0" would collide
+		// across every v1/v2 room on the same server — the second room's
+		// create INSERT would conflict on the primary key and silently keep
+		// the first room's row, leaving the second room without an
+		// m.room.create (which breaks joins, the timeline and room state).
+		return b.BuildLegacy(serverName, key, version, ids.RandomTxnSuffix())
 	}
 	return b.Build(serverName, key, version)
 }
