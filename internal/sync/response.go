@@ -1000,11 +1000,17 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		// (Synapse's max_repeat = 5) so a room with mostly filter-blocked history
 		// does not paginate to the room's start.
 		const maxFillBatches = 5
+		// The window's depth ceiling is the room's MAX depth, not the depth of
+		// the highest-stream event: a late-arriving fork or partial-state critical
+		// event (low depth, high stream position) must not shrink the window and
+		// drop genuinely-newer (higher-depth) events — e.g. the joining user's own
+		// join event (Complement's TestDeviceListUpdates
+		// /when_joining_a_room_with_a_remote_user syncs for the join).
 		maxDepth := int64(0)
-		if latest, lerr := e.store.LatestEvent(ctx, roomID); lerr == nil && latest != nil {
-			maxDepth = latest.Depth
-		} else if md, mderr := e.store.MaxDepth(ctx, roomID); mderr == nil && md > 0 {
+		if md, mderr := e.store.MaxDepth(ctx, roomID); mderr == nil && md > 0 {
 			maxDepth = md
+		} else if latest, lerr := e.store.LatestEvent(ctx, roomID); lerr == nil && latest != nil {
+			maxDepth = latest.Depth
 		}
 		evs, err = e.store.EventsForRoomByDepth(ctx, roomID, maxDepth, rawLimit)
 		minDepth := int64(0)
