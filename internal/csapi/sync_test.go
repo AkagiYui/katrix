@@ -67,18 +67,29 @@ func TestSyncInitialReturnsJoinedRoom(t *testing.T) {
 			t.Fatalf("no timeline or state events for room: %v", jr)
 		}
 	}
-	// State should include m.room.create.
+	// The m.room.create event must appear either in the timeline or in the
+	// state section (spec + sytest: state events already delivered in the
+	// timeline are NOT duplicated in the state dictionary, so on an initial
+	// sync the create — which is in the full-room timeline window — lives in
+	// the timeline, while the state section carries the remaining state).
+	foundCreate := false
 	state, _ := jr["state"].(map[string]any)
 	stateEvents, _ := state["events"].([]any)
-	foundCreate := false
 	for _, ev := range stateEvents {
 		em, _ := ev.(map[string]any)
 		if em["type"] == "m.room.create" {
 			foundCreate = true
 		}
 	}
+	timelineEvents, _ := tl["events"].([]any)
+	for _, ev := range timelineEvents {
+		em, _ := ev.(map[string]any)
+		if em["type"] == "m.room.create" {
+			foundCreate = true
+		}
+	}
 	if !foundCreate {
-		t.Fatalf("no m.room.create in state: %v", stateEvents)
+		t.Fatalf("no m.room.create in timeline or state: %v", stateEvents)
 	}
 }
 

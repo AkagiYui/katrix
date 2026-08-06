@@ -204,6 +204,11 @@ type SyncFilter struct {
 	// TimelineLimitSet distinguishes an explicit `limit: 0` (empty timeline)
 	// from an unset limit (default).
 	TimelineLimitSet bool
+	// Room state filters (spec room.state): applied to the state section.
+	StateTypes      []string
+	StateNotTypes   []string
+	StateSenders    []string
+	StateNotSenders []string
 	// Lazy-load members: only include membership state events, and only for
 	// senders present in the timeline.
 	LazyLoadMembers bool
@@ -235,7 +240,11 @@ func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
 				UnreadThreadNotifications bool `json:"unread_thread_notifications"`
 			} `json:"timeline"`
 			State struct {
-				LazyLoadMembers bool `json:"lazy_load_members"`
+				Types           []string `json:"types"`
+				NotTypes        []string `json:"not_types"`
+				Senders         []string `json:"senders"`
+				NotSenders      []string `json:"not_senders"`
+				LazyLoadMembers bool     `json:"lazy_load_members"`
 			} `json:"state"`
 			IncludeLeave bool `json:"include_leave"`
 		} `json:"room"`
@@ -249,6 +258,10 @@ func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
 		TimelineNotTypes:          obj.Room.Timeline.NotTypes,
 		TimelineSenders:           obj.Room.Timeline.Senders,
 		TimelineNotSenders:        obj.Room.Timeline.NotSenders,
+		StateTypes:                obj.Room.State.Types,
+		StateNotTypes:             obj.Room.State.NotTypes,
+		StateSenders:              obj.Room.State.Senders,
+		StateNotSenders:           obj.Room.State.NotSenders,
 		LazyLoadMembers:           obj.Room.State.LazyLoadMembers,
 		UnreadThreadNotifications: obj.Room.Timeline.UnreadThreadNotifications,
 		IncludeLeave:              obj.Room.IncludeLeave,
@@ -269,7 +282,31 @@ func (f *SyncFilter) anySet() bool {
 	return f.TimelineLimitSet || f.TimelineLimit > 0 || f.LazyLoadMembers || f.UnreadThreadNotifications || f.IncludeLeave ||
 		len(f.TimelineTypes) > 0 || len(f.TimelineNotTypes) > 0 ||
 		len(f.TimelineSenders) > 0 || len(f.TimelineNotSenders) > 0 ||
+		len(f.StateTypes) > 0 || len(f.StateNotTypes) > 0 ||
+		len(f.StateSenders) > 0 || len(f.StateNotSenders) > 0 ||
 		len(f.EventFields) > 0
+}
+
+// keepState reports whether a room state event passes the filter's state
+// section rules (spec room.state.types/not_types/senders/not_senders). A
+// filter with no state restrictions keeps everything.
+func (f *SyncFilter) keepState(ev *storage.EventRow) bool {
+	if f == nil {
+		return true
+	}
+	if strIn(f.StateNotTypes, ev.Type) {
+		return false
+	}
+	if len(f.StateTypes) > 0 && !strIn(f.StateTypes, ev.Type) {
+		return false
+	}
+	if strIn(f.StateNotSenders, ev.Sender) {
+		return false
+	}
+	if len(f.StateSenders) > 0 && !strIn(f.StateSenders, ev.Sender) {
+		return false
+	}
+	return true
 }
 
 // keepTimeline reports whether a timeline event passes the filter.
@@ -1130,14 +1167,18 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// set even when the timeline is not limited (so clients that page backwards
 	// from a full window get an empty page rather than a missing token), and
 	// doubles as the `at` anchor for /members?at= and /messages back-pagination.
-	if len(evs) > 0 {
-		limited := newlyJoined || gapLimited || countLimited
-		timeline.Limited = limited
-		if limited {
+	// A full_state / initial sync with an empty window still carries prev_batch
+	// (sytest "Full state sync includes joined rooms" requires the key).
+	limited := newlyJoined || gapLimited || countLimited
+	timeline.Limited = limited
+	if limited {
+		if len(evs) > 0 {
 			timeline.PrevBatch = Token{Stream: earliest - 1}.Encode()
 		} else {
 			timeline.PrevBatch = Token{Stream: to - 1}.Encode()
 		}
+	} else {
+		timeline.PrevBatch = Token{Stream: to - 1}.Encode()
 	}
 	jr.Timeline = timeline
 
@@ -1154,6 +1195,12 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// baseline it never received (the gap cut its view of the room). Lazy-load
 	// members replaces the full state with only the m.room.member events for
 	// timeline senders.
+	//
+	// The state section obeys the filter's room.state rules
+	// (state.types/not_types/senders/not_senders), and events already delivered
+	// in the timeline are not duplicated here (spec + Synapse: "state from the
+	// timeline should not appear in the state dictionary" — sytest "State is
+	// included in the timeline in the initial sync").
 	if opts.Since.Stream == 0 || opts.FullState || unpartialStated || gapLimited || countLimited {
 		stateRows, err := e.store.GetState(ctx, roomID)
 		if err != nil {
@@ -1164,8 +1211,24 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 			ids = append(ids, s.EventID)
 		}
 		stateEvs, _ := e.store.EventsByIDs(ctx, ids)
+		inTimeline := map[string]bool{}
+		for _, re := range rendered {
+			var obj map[string]json.RawMessage
+			if json.Unmarshal(re.raw, &obj) == nil {
+				var id string
+				if json.Unmarshal(obj["event_id"], &id) == nil {
+					inTimeline[id] = true
+				}
+			}
+		}
 		jr.State.Events = make([]json.RawMessage, 0, len(stateEvs))
 		for _, se := range stateEvs {
+			if inTimeline[se.EventID] {
+				continue
+			}
+			if !filter.keepState(&se) {
+				continue
+			}
 			if filter.lazyLoadMembers() && !lazyLoadMemberEvent(&se, senders) {
 				continue
 			}
@@ -1228,6 +1291,9 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		stateEvs, _ := e.store.EventsByIDs(ctx, ids)
 		sa := StateSet{Events: make([]json.RawMessage, 0, len(stateEvs))}
 		for _, se := range stateEvs {
+			if !filter.keepState(&se) {
+				continue
+			}
 			if filter.lazyLoadMembers() && !lazyLoadMemberEvent(&se, senders) {
 				continue
 			}
