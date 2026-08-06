@@ -528,7 +528,7 @@ func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID, lo
 
 		// Timeline: on initial sync (or a room newly appearing in the sliding
 		// window) return the most recent `limit` events; on a plain incremental
-		// sync the events after `since`. The window is anchored at the room's own
+		// sync every event after `since`. The window is anchored at the room's own
 		// latest event for new rooms — the shared sync stream advances globally
 		// (key uploads, other rooms' events), so a `since` based on it can already
 		// be past this room's newest events and would otherwise yield an empty
@@ -547,11 +547,21 @@ func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID, lo
 			}
 			evs, _ = a.Store.EventsForRoom(ctx, roomID, from, roomMax, limit+1, "f")
 		} else {
-			evs, _ = a.Store.EventsForRoom(ctx, roomID, since, maxStream, limit+1, "f")
+			// An incremental delta is never bounded by timeline_limit (the limit
+			// only caps the initial window of a newly-delivered room, mirroring
+			// the reference sliding-sync implementation, which appends every live
+			// event to the timeline). The client must receive all missed events —
+			// including membership transitions — or its view of the room drifts:
+			// a member whose join was truncated out of the window is never
+			// surfaced again (the timeline never re-delivers it, and $LAZY only
+			// covers senders of the returned timeline).
+			evs, _ = a.Store.EventsForRoom(ctx, roomID, since, maxStream, 1<<30, "f")
 		}
 		// Keep only the most recent `limit` events (the window is anchored at
-		// the newest, so the extra event is the oldest).
-		if len(evs) > limit {
+		// the newest, so the extra event is the oldest). Truncation marks the
+		// room limited=true and only applies to the initial window: an
+		// incremental delta carries the full set of missed events.
+		if newRoom && len(evs) > limit {
 			rr.Limited = true
 			evs = evs[len(evs)-limit:]
 		}
