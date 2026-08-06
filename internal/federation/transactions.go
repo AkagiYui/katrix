@@ -246,7 +246,7 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	if origin != "" && a.hasUnknownPrevEvents(r.Context(), raw) {
 		gapFetched = true
 		a.fetchMissingEventsFor(r.Context(), ev.RoomID, evID, origin)
-	}	// If the near chain is still disconnected — the prevs of the events
+	} // If the near chain is still disconnected — the prevs of the events
 	// get_missing_events just filled are themselves unknown — reconcile the
 	// room's state from the origin (Synapse's state fetch for a room it cannot
 	// link): the frontier event anchors a /state_ids snapshot whose events are
@@ -389,19 +389,19 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 		// to revalidation (mirror of Synapse's MSC3902 handling — e.g. a kick
 		// by a user who actually left the room before the join is accepted
 		// during the partial window and rejected once the full state arrives).
-			if rules, ok := roomver.Get(version); ok {
-				stateKey := ""
-				if ev.StateKey != nil {
-					stateKey = *ev.StateKey
-				}
-				st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey)
-				if ev.Type == "m.room.member" && len(st.SenderMember) == 0 {
-					// Unknown sender membership: accept leniently (revalidated later).
-				} else if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, true); err != nil {
-					rejected = true
-				}
+		if rules, ok := roomver.Get(version); ok {
+			stateKey := ""
+			if ev.StateKey != nil {
+				stateKey = *ev.StateKey
+			}
+			st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey)
+			if ev.Type == "m.room.member" && len(st.SenderMember) == 0 {
+				// Unknown sender membership: accept leniently (revalidated later).
+			} else if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, true); err != nil {
+				rejected = true
 			}
 		}
+	}
 	// A redaction whose target is a known event of a DIFFERENT room is
 	// rejected (soft-failed): the redaction cannot reach across rooms, and
 	// delivering it would tell clients an event was redacted when it was not

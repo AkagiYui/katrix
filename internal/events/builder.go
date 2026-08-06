@@ -11,11 +11,11 @@ import (
 
 // Builder assembles an unsigned event prior to hashing and signing.
 type Builder struct {
-	Type           string
-	StateKey       *string
-	Sender         string
-	RoomID         string
-	Content        json.RawMessage
+	Type     string
+	StateKey *string
+	Sender   string
+	RoomID   string
+	Content  json.RawMessage
 	// Redacts is the event ID a redaction event targets. Per the spec it is a
 	// top-level event field (not part of content), so it is lifted onto the
 	// built PDU alongside content.

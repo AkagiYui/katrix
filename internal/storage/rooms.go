@@ -487,6 +487,49 @@ func (s *Store) EventsForRoom(ctx context.Context, roomID string, from, to int64
 	return out, rows.Err()
 }
 
+// EventsForRoomByDepth returns a room's events ordered by DAG depth (then
+// stream_ordering as a tiebreak), newest-first, bounded by events with depth <=
+// uptoDepth and limited to `limit` rows. Full-room sync windows (initial sync,
+// newly-joined rooms) use topological (depth) ordering rather than stream
+// ordering, mirroring Synapse's paginate_room_events_by_topological_ordering:
+// a late-arriving fork event (low depth, high stream position) must not
+// displace genuinely-newer events from the window.
+func (s *Store) EventsForRoomByDepth(ctx context.Context, roomID string, uptoDepth int64, limit int) ([]EventRow, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
+		        origin_server_ts, stream_ordering, content, json,
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
+		 FROM events
+		 WHERE room_id=$1 AND depth<=$2 AND outlier=false
+		 ORDER BY depth DESC, stream_ordering DESC LIMIT $3`, roomID, uptoDepth, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EventRow
+	for rows.Next() {
+		e, err := scanEventRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// HasEventsBelowDepth reports whether the room has any (non-outlier) event with
+// depth strictly below the given value.
+func (s *Store) HasEventsBelowDepth(ctx context.Context, roomID string, depth int64) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM events WHERE room_id=$1 AND depth<$2 AND outlier=false LIMIT 1)`,
+		roomID, depth).Scan(&exists)
+	return exists, err
+}
+
 // EventByTimestamp returns the event closest to the given origin_server_ts in a
 // room (MSC3030 / GET /timestamp_to_event). dir "f" (forwards) returns the
 // earliest event with origin_server_ts >= ts; dir "b" (backwards) returns the

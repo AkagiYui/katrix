@@ -981,30 +981,51 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	var evs []storage.EventRow
 	var err error
 	if (opts.Since.Stream == 0 || newlyJoined) && !gapLimited {
-		// Full-room window: paginate backward from the room's latest event,
-		// accumulating batches until the FILTERED events fill `limit` or the
-		// room's start is reached (mirror of Synapse's _load_filtered_recents
-		// loop). The shared sync stream advances on other rooms' writes, so a
-		// single stream-position anchor (to-limit) can land inside the room's
-		// recent history and drop messages the client should receive; widening
-		// on the filtered count (not the raw count) also keeps rooms whose raw
-		// history is mostly state events from squeezing the message window. The
-		// number of batches is bounded (Synapse's max_repeat = 5) so a room with
-		// mostly filter-blocked history does not paginate to the room's start.
+		// Full-room window: paginate backward in DAG (topological) order —
+		// depth, then stream_ordering — accumulating batches until the FILTERED
+		// events fill `limit` or the room's start is reached (mirror of
+		// Synapse's _load_filtered_recents loop, which uses
+		// paginate_room_events_by_topological_ordering for initial / newly-joined
+		// windows). Depth ordering matters: a late-arriving fork event (low
+		// depth, high stream position) must not displace genuinely-newer events
+		// from the window (Complement's TestSyncOmitsStateChangeOnFilteredEvents
+		// forks the DAG and expects the newest message in the limit-1 timeline,
+		// with the fork's state event in the state section). The fill loop widens
+		// the window down the depth axis; the number of batches is bounded
+		// (Synapse's max_repeat = 5) so a room with mostly filter-blocked history
+		// does not paginate to the room's start.
 		const maxFillBatches = 5
-		evs, err = e.store.EventsForRoom(ctx, roomID, from, to, rawLimit, "f")
-		for b := 0; err == nil && filteredCount(evs, filter) < limit && from > 0 && b < maxFillBatches; b++ {
-			prevFrom := from
-			from -= int64(rawLimit)
-			if from < 0 {
-				from = 0
+		maxDepth := int64(0)
+		if latest, lerr := e.store.LatestEvent(ctx, roomID); lerr == nil && latest != nil {
+			maxDepth = latest.Depth
+		} else if md, mderr := e.store.MaxDepth(ctx, roomID); mderr == nil && md > 0 {
+			maxDepth = md
+		}
+		evs, err = e.store.EventsForRoomByDepth(ctx, roomID, maxDepth, rawLimit)
+		minDepth := int64(0)
+		if len(evs) > 0 {
+			minDepth = evs[len(evs)-1].Depth // newest-first: last is the oldest
+		}
+		for b := 0; err == nil && filteredCount(evs, filter) < limit && b < maxFillBatches; b++ {
+			if len(evs) == 0 {
+				break
 			}
-			var batch []storage.EventRow
-			batch, err = e.store.EventsForRoom(ctx, roomID, from, prevFrom, rawLimit, "f")
+			// Fetch the batch strictly below the current oldest fetched depth.
+			batch, berr := e.store.EventsForRoomByDepth(ctx, roomID, minDepth-1, rawLimit)
+			if berr != nil {
+				err = berr
+				break
+			}
 			if len(batch) == 0 {
 				break
 			}
+			// batch is newest-first; append before evs (which is newest-first too).
 			evs = append(batch, evs...)
+			minDepth = batch[len(batch)-1].Depth
+		}
+		// Newest-first (depth DESC) → oldest-first (depth ASC).
+		for i, j := 0, len(evs)-1; i < j; i, j = i+1, j-1 {
+			evs[i], evs[j] = evs[j], evs[i]
 		}
 	} else {
 		evs, err = e.store.EventsForRoom(ctx, roomID, from, to, rawLimit, "b")
@@ -1029,8 +1050,10 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	if (opts.Since.Stream == 0 || newlyJoined) && !gapLimited {
 		countLimited = filteredCount(evs, filter) > limit
 		if !countLimited {
-			if trunc, terr := e.store.HasEventsBefore(ctx, roomID, from); terr == nil && trunc {
-				countLimited = true
+			if len(evs) > 0 {
+				if trunc, terr := e.store.HasEventsBelowDepth(ctx, roomID, evs[0].Depth); terr == nil && trunc {
+					countLimited = true
+				}
 			}
 		}
 	} else if len(evs) > limit {
@@ -1071,6 +1094,24 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// more permissive visibility). The evaluator's histories are bounded by the
 	// room's latest stream so a newly-joined user's full-room window filters
 	// pre-boundary history correctly.
+	//
+	// Events in the room's CURRENT state bypass the visibility check (Synapse's
+	// always_include_ids=current_state_ids passed to
+	// filter_and_transform_events_for_client): current state is what the client
+	// needs to render the room, and in a private (joined) room the events that
+	// establish it — e.g. an invitee's join member event — must still surface in
+	// a limited/newly-joined timeline even though the syncing user was not
+	// joined at the time they were sent (sytest "Current state appears in
+	// timeline in private history").
+	limited := newlyJoined || gapLimited || countLimited
+	currentState := map[string]bool{}
+	if limited {
+		if stateRows, serr := e.store.GetState(ctx, roomID); serr == nil {
+			for _, s := range stateRows {
+				currentState[s.EventID] = true
+			}
+		}
+	}
 	vis, _ := eventstate.NewVisibilityEvaluator(ctx, e.store, roomID, opts.UserID, maxStream)
 	type renderedEvent struct {
 		raw    json.RawMessage
@@ -1082,7 +1123,7 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		if !filter.keepTimeline(&ev) {
 			continue
 		}
-		if vis != nil && !vis.CanSeeRow(&ev) {
+		if vis != nil && !currentState[ev.EventID] && !vis.CanSeeRow(&ev) {
 			continue
 		}
 		raw := filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(clientEvent(&ev), &ev), &ev), ev.EventID))
@@ -1121,7 +1162,6 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// doubles as the `at` anchor for /members?at= and /messages back-pagination.
 	// A full_state / initial sync with an empty window still carries prev_batch
 	// (sytest "Full state sync includes joined rooms" requires the key).
-	limited := newlyJoined || gapLimited || countLimited
 	timeline.Limited = limited
 	if limited {
 		if len(evs) > 0 {
@@ -1153,6 +1193,14 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// in the timeline are not duplicated here (spec + Synapse: "state from the
 	// timeline should not appear in the state dictionary" — sytest "State is
 	// included in the timeline in the initial sync").
+	//
+	// A room that just de-partial-stated is the exception: the resync's fetched
+	// state events were persisted as part of the room's history (unlike Synapse,
+	// which stores them as outliers outside the timeline stream), so deduping
+	// them out of the state section would empty it entirely (Complement's
+	// TestPartialStateJoin expects the resync'd members in state.events). For
+	// such rooms the state section carries the full current state regardless of
+	// the timeline.
 	if opts.Since.Stream == 0 || opts.FullState || unpartialStated || gapLimited || countLimited {
 		stateRows, err := e.store.GetState(ctx, roomID)
 		if err != nil {
@@ -1164,12 +1212,14 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		}
 		stateEvs, _ := e.store.EventsByIDs(ctx, ids)
 		inTimeline := map[string]bool{}
-		for _, re := range rendered {
-			var obj map[string]json.RawMessage
-			if json.Unmarshal(re.raw, &obj) == nil {
-				var id string
-				if json.Unmarshal(obj["event_id"], &id) == nil {
-					inTimeline[id] = true
+		if !unpartialStated {
+			for _, re := range rendered {
+				var obj map[string]json.RawMessage
+				if json.Unmarshal(re.raw, &obj) == nil {
+					var id string
+					if json.Unmarshal(obj["event_id"], &id) == nil {
+						inTimeline[id] = true
+					}
 				}
 			}
 		}
