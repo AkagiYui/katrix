@@ -46,7 +46,9 @@ func clientEvent(row *storage.EventRow) json.RawMessage {
 		// unsigned.redacted_by so clients can show who/what redacted it.
 		if row.RedactedBy != "" {
 			unsigned, _ := json.Marshal(map[string]any{"redacted_by": row.RedactedBy})
-			m["unsigned"] = unsigned
+			// json.RawMessage (not []byte) so the marshalled unsigned object is
+			// embedded as JSON rather than base64-encoded by the outer Marshal.
+			m["unsigned"] = json.RawMessage(unsigned)
 		}
 	}
 	if row.Redacts != "" {

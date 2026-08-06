@@ -349,11 +349,26 @@ func TestRedactEvent(t *testing.T) {
 	}
 	eventID := body["event_id"].(string)
 	// Redact it.
-	code, _ = doJSON(t, srv, http.MethodPut,
+	code, redBody := doJSON(t, srv, http.MethodPut,
 		"/_matrix/client/v3/rooms/"+roomID+"/redact/"+eventID+"/r1", tok,
 		map[string]any{"reason": "spam"})
 	if code != 200 {
 		t.Fatalf("redact: code=%d", code)
+	}
+	redactionID := redBody["event_id"].(string)
+	// The redacted event must be served with pruned content and
+	// unsigned.redacted_by naming the redaction (spec).
+	code, ev := getJSON(t, srv, "/_matrix/client/v3/rooms/"+roomID+"/event/"+eventID, tok)
+	if code != 200 {
+		t.Fatalf("get event: code=%d", code)
+	}
+	unsigned, _ := ev["unsigned"].(map[string]any)
+	if unsigned["redacted_by"] != redactionID {
+		t.Fatalf("unsigned.redacted_by = %v, want %s", unsigned["redacted_by"], redactionID)
+	}
+	content, _ := ev["content"].(map[string]any)
+	if _, hasBody := content["body"]; hasBody {
+		t.Fatalf("redacted content still has body: %v", content)
 	}
 }
 
