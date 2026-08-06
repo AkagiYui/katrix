@@ -213,6 +213,14 @@ func (a *API) PutPushRuleEnabled(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrInvalidParam("malformed push rule path"))
 		return
 	}
+	// Enabling/disabling a rule that does not exist is a 404 (spec §PUT
+	// /pushrules/.../enabled: the rule must exist; sytest's "Enabling an
+	// unknown default rule fails with 404"). Unlike PUT of a whole rule, the
+	// enabled sub-resource cannot create a rule.
+	if !a.pushRuleExists(auth.Localpart, r.PathValue("kind"), r.PathValue("ruleID")) {
+		httpx.WriteError(w, httpx.ErrNotFound("push rule not found"))
+		return
+	}
 	var req struct {
 		Enabled bool `json:"enabled"`
 	}
@@ -251,6 +259,14 @@ func (a *API) PutPushRuleActions(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrInvalidParam("malformed push rule path"))
 		return
 	}
+	// Changing the actions of a rule that does not exist is a 404 (spec §PUT
+	// /pushrules/.../actions: the rule must exist; sytest's "Changing the
+	// actions of an unknown [default] rule fails with 404"). Unlike PUT of a
+	// whole rule, the actions sub-resource cannot create a rule.
+	if !a.pushRuleExists(auth.Localpart, r.PathValue("kind"), r.PathValue("ruleID")) {
+		httpx.WriteError(w, httpx.ErrNotFound("push rule not found"))
+		return
+	}
 	var req struct {
 		Actions []json.RawMessage `json:"actions"`
 	}
@@ -264,6 +280,20 @@ func (a *API) PutPushRuleActions(w http.ResponseWriter, r *http.Request) {
 		a.Notifier.NotifyUser(auth.UserID)
 	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// pushRuleExists reports whether a rule with the given kind/rule_id exists in
+// the user's global ruleset.
+func (a *API) pushRuleExists(localpart, kind, ruleID string) bool {
+	rules := a.loadRules(localpart)
+	global, _ := rules["global"].(map[string]any)
+	list, _ := global[kind].([]any)
+	for _, e := range list {
+		if em, ok := e.(map[string]any); ok && em["rule_id"] == ruleID {
+			return true
+		}
+	}
+	return false
 }
 
 // PutPushRule handles PUT a single rule. The optional before/after query

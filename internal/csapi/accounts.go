@@ -28,9 +28,11 @@ func (a *API) registerAccounts(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/account/whoami", a.RequireAuth(a.Whoami))
 	mux.HandleFunc("POST /_matrix/client/v3/account/password", a.RequireUserAuth(a.ChangePassword))
 	mux.HandleFunc("POST /_matrix/client/v3/account/deactivate", a.RequireUserAuth(a.Deactivate))
+	mux.HandleFunc("POST /_matrix/client/v3/user/{userID}/openid/request_token", a.RequireAuth(a.OpenIDRequestToken))
 
 	a.registerDevices(mux)
 	a.registerProfile(mux)
+	a.registerTags(mux)
 }
 
 type registerRequest struct {

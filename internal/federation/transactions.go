@@ -101,6 +101,7 @@ func (a *API) registerTransactions(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/federation/v1/query/directory/{roomAlias}", a.QueryDirectory)
 	mux.HandleFunc("GET /_matrix/federation/v1/query/profile", a.QueryProfile)
 	a.registerPublicRooms(mux)
+	a.registerOpenID(mux)
 }
 
 // txnBody is the PUT /send/{txnId} request body.
