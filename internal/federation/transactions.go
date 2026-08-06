@@ -16,6 +16,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/eventstate"
 	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/metrics"
 	"github.com/AkagiYui/katrix/internal/pushrules"
 	"github.com/AkagiYui/katrix/internal/rooms"
@@ -791,8 +792,9 @@ func (a *API) GetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"origin": a.ServerName(),
-		"pdus":   []json.RawMessage{ev.RawJSON},
+		"origin":           a.ServerName(),
+		"origin_server_ts": ev.OriginServerTS,
+		"pdus":             []json.RawMessage{ev.RawJSON},
 	})
 }
 
@@ -1955,7 +1957,15 @@ func (a *API) QueryDirectory(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrNotFound("room alias not found"))
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"room_id": roomID})
+	// The response carries the servers hosting the room: the distinct domains
+	// of the room's joined members (spec §query/directory — the servers a
+	// client should try to join the room through). sytest asserts a non-empty
+	// "servers" list.
+	servers := a.roomServers(r.Context(), roomID)
+	if len(servers) == 0 {
+		servers = []string{ids.DomainOf(roomID)}
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"room_id": roomID, "servers": servers})
 }
 
 // QueryProfile handles GET /_matrix/federation/v1/query/profile?user_id=...
