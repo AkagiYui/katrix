@@ -130,10 +130,13 @@ type EphemeralSection struct {
 	Events []json.RawMessage `json:"events"`
 }
 
-// RoomSummary carries the room's member counts (joined + invited).
+// RoomSummary carries the room's member counts (joined + invited) and, for
+// rooms without a name or canonical alias, up to five hero user IDs. The
+// counts are always present — including 0 — per the spec (sytest asserts an
+// empty invited count appears as 0, not an absent key).
 type RoomSummary struct {
-	JoinedMembers  int      `json:"m.joined_member_count,omitempty"`
-	InvitedMembers int      `json:"m.invited_member_count,omitempty"`
+	JoinedMembers  int      `json:"m.joined_member_count"`
+	InvitedMembers int      `json:"m.invited_member_count"`
 	Heroes         []string `json:"m.heroes,omitempty"`
 }
 
@@ -1670,7 +1673,13 @@ func (e *Engine) annotateTxn(ctx context.Context, rendered json.RawMessage, even
 	return b
 }
 
-// roomSummary builds the room summary section (member counts + heroes).
+// roomSummary builds the room summary section (member counts + heroes). The
+// joined/invited counts are always present; heroes are included only when the
+// room has no name and no canonical alias (spec Room Summaries: "The heroes
+// are the users which are most likely to be correct when rendering a room
+// without a name", and are omitted when the room has a name — sytest's
+// "Named room comes with just joined member count summary" asserts the absence
+// of m.heroes).
 func (e *Engine) roomSummary(ctx context.Context, roomID, selfUserID string) *RoomSummary {
 	members, err := e.store.Members(ctx, roomID, "")
 	if err != nil {
@@ -1692,11 +1701,40 @@ func (e *Engine) roomSummary(ctx context.Context, roomID, selfUserID string) *Ro
 			}
 		}
 	}
-	return &RoomSummary{
-		JoinedMembers:  joined,
-		InvitedMembers: invited,
-		Heroes:         heroes,
+	s := &RoomSummary{JoinedMembers: joined, InvitedMembers: invited}
+	if e.roomHasName(ctx, roomID) {
+		return s
 	}
+	s.Heroes = heroes
+	return s
+}
+
+// roomHasName reports whether the room carries a non-empty m.room.name or
+// m.room.canonical_alias (either suppresses the heroes in the room summary —
+// mirror of Synapse's sync handler, which skips hero computation when a name
+// or canonical alias is set).
+func (e *Engine) roomHasName(ctx context.Context, roomID string) bool {
+	if id, err := e.store.GetStateEvent(ctx, roomID, "m.room.name", ""); err == nil {
+		if ev, err := e.store.GetEvent(ctx, id); err == nil {
+			var c struct {
+				Name string `json:"name"`
+			}
+			if json.Unmarshal(ev.Content, &c) == nil && c.Name != "" {
+				return true
+			}
+		}
+	}
+	if id, err := e.store.GetStateEvent(ctx, roomID, "m.room.canonical_alias", ""); err == nil {
+		if ev, err := e.store.GetEvent(ctx, id); err == nil {
+			var c struct {
+				Alias string `json:"alias"`
+			}
+			if json.Unmarshal(ev.Content, &c) == nil && c.Alias != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // buildInvitedRoom constructs the InvitedRoom section (just the invite state).
