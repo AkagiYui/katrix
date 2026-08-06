@@ -863,7 +863,13 @@ func (a *API) serveStateContent(w http.ResponseWriter, r *http.Request, stateKey
 // a departed user under history_visibility=joined that is the state snapshot
 // at the user's leave event; everyone else sees the current room state.
 func (a *API) stateRowsForReader(ctx context.Context, roomID, userID string) ([]storage.StateRow, error) {
-	if vis := a.historyVisibility(ctx, roomID); vis == "joined" {
+	// SPEC-216: a user who has left a room only sees the room as it was when
+	// they left — later state changes must not leak through. In any room that
+	// is not world_readable the departed user's view is frozen at their leave
+	// event (the state-at-leave snapshot; Synapse serves the departed user the
+	// state up to their leave position). A world_readable room is open to
+	// everyone, leavers included, and serves the current state.
+	if vis := a.historyVisibility(ctx, roomID); vis != "world_readable" {
 		if m, err := a.Store.GetMembership(ctx, roomID, userID); err == nil && m.Membership == rooms.MembershipLeave && m.EventID != "" {
 			if rows, err := a.Store.GetEventState(ctx, m.EventID); err == nil {
 				return rows, nil
@@ -1285,9 +1291,12 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("to"); v != "" {
 		to, _ = parseIntToken(v)
 	}
-	// history_visibility=joined: a departed user may only see events sent
-	// before they left; cap the pagination window at their leave position.
-	if vis := a.historyVisibility(r.Context(), roomID); vis == "joined" {
+	// SPEC-216: a user who has left a room may only see events sent before
+	// they left; cap the pagination window at their leave position. Applies to
+	// every room that is not world_readable (a world_readable room stays open
+	// to departed users — sytest's "non-joined users can get individual state
+	// for world_readable rooms after leaving").
+	if vis := a.historyVisibility(r.Context(), roomID); vis != "world_readable" {
 		if m, err := a.Store.GetMembership(r.Context(), roomID, auth.UserID); err == nil && m.Membership == rooms.MembershipLeave && m.StreamOrdering > 0 {
 			if to == 0 || m.StreamOrdering < to {
 				to = m.StreamOrdering
