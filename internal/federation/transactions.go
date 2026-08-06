@@ -1959,14 +1959,36 @@ func (a *API) QueryDirectory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The response carries the servers hosting the room: the distinct domains
-	// of the room's joined members (spec §query/directory — the servers a
-	// client should try to join the room through). sytest asserts a non-empty
-	// "servers" list.
-	servers := a.roomServers(r.Context(), roomID)
+	// of the room's joined members, INCLUDING this server's own domain (the
+	// directory response lists every server a client could join the room
+	// through — mirror of Synapse's get_joined_hosts_for_room, which does not
+	// exclude the responding server; excluding it would hand a remote joiner a
+	// candidate list that skips this server and, when the room is local-only,
+	// an empty list). sytest asserts a non-empty "servers" list and uses it as
+	// join candidates.
+	servers := a.roomJoinedDomains(r.Context(), roomID)
 	if len(servers) == 0 {
 		servers = []string{ids.DomainOf(roomID)}
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"room_id": roomID, "servers": servers})
+}
+
+// roomJoinedDomains returns the distinct domains of the room's joined members,
+// including this server's own domain.
+func (a *API) roomJoinedDomains(ctx context.Context, roomID string) []string {
+	seen := map[string]bool{}
+	var out []string
+	members, err := a.Store.Members(ctx, roomID, "join")
+	if err != nil {
+		return nil
+	}
+	for _, m := range members {
+		if dom := userDomain(m.UserID); dom != "" && !seen[dom] {
+			seen[dom] = true
+			out = append(out, dom)
+		}
+	}
+	return out
 }
 
 // QueryProfile handles GET /_matrix/federation/v1/query/profile?user_id=...
