@@ -201,8 +201,16 @@ func writeMatrixNotFound(w http.ResponseWriter) {
 func withMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Server", "Katrix/"+homeserver.Version)
+		// Every response is readable cross-origin. The client API is consumed by
+		// browser-based clients (matrix-js-sdk fetches account data, filters and
+		// key backups before the first sync, and media is rendered via <img>),
+		// and the spec's client-server API is served with CORS enabled. Set it
+		// here so no handler can forget it: a response without
+		// Access-Control-Allow-Origin makes Chrome reject the fetch with
+		// "Failed to fetch" even when the server returned 200 (complement-crypto's
+		// TestCanBackupKeys hit exactly this on the js restorer path).
+		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if r.Method == http.MethodOptions {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization")
 			w.WriteHeader(http.StatusOK)
