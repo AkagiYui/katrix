@@ -56,7 +56,7 @@ func TestParseGoVerbose(t *testing.T) {
 	}
 }
 
-func TestReportTAPSplitsExpectedFail(t *testing.T) {
+func TestReportTAPCountsAllFails(t *testing.T) {
 	tap := `1..5
 ok 1 POST /register works
 not ok 2 Broken feature # TODO expected fail
@@ -66,21 +66,25 @@ not ok 5 (expected fail) Third broken
 `
 	out := runTAP(t, tap)
 	for _, want := range []string{
-		"| ok | not ok | expected fail | unexpected fail | Pass rate |",
-		"| 1 | 4 | 3 | 1 |",
+		"| PASS | FAIL | SKIP | Pass rate |",
+		"| 1 | 4 | 0 |",
 		"`Real regression`",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q:\n%s", want, out)
 		}
 	}
+	// Nothing is masked as expected fail anymore: every "not ok" is a FAIL.
+	if strings.Contains(out, "expected fail | unexpected fail") {
+		t.Fatalf("expected-fail columns should be gone, got:\n%s", out)
+	}
 }
 
 func TestReportTAPDoesNotCountSkipAsFail(t *testing.T) {
 	tap := "1..2\nok 1 Foo\nok 2 Bar # skip lack of can_post_room_receipts\n"
 	out := runTAP(t, tap)
-	if !strings.Contains(out, "| 2 | 0 | 0 | 0 |") {
-		t.Fatalf("expected ok=2 notOk=0, got:\n%s", out)
+	if !strings.Contains(out, "| 1 | 0 | 1 |") {
+		t.Fatalf("expected ok=1 skip=1 notOk=0, got:\n%s", out)
 	}
 }
 
