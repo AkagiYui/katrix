@@ -429,16 +429,17 @@ func (a *API) applyDeviceListEDU(ctx context.Context, origin string, content jso
 	if len(c.PrevID) == 0 {
 		needResync = true
 	}
-	// Partial-state rooms (MSC3902) defer the resync: the membership set is
-	// still being fetched, and a GET /user/devices fired mid-resync would be an
-	// unexpected request to the remote server (Complement's partial-state suite
-	// asserts exactly this — the mock federation server registers no /user/devices
-	// handler and flags any request to it as an error). The device-list change is
-	// still recorded so /sync wakes, and the cache stays empty so the next
-	// /keys/query (once the room is fully-resynced) re-fetches the user's keys
-	// (mirror of Synapse's add_remote_device_list_to_pending during a partial
-	// join).
-	if needResync && a.deviceListUserInPartialRoom(ctx, c.UserID) {
+	// Partial-state rooms (MSC3902) defer the resync: while any room is still
+	// being resynced the membership set is incomplete (a pre-existing member
+	// whose membership row was never seeded is not known to be in any room), so
+	// a GET /user/devices fired now would be an unexpected request to the
+	// remote server (Complement's partial-state suite asserts exactly this — the
+	// mock federation server registers no /user/devices handler and flags any
+	// request to it as an error). The device-list change is still recorded so
+	// /sync wakes, and the cache stays empty so the next /keys/query (once the
+	// resync completes) re-fetches the user's keys (mirror of Synapse's
+	// get_partial_state_room_resync_info + add_remote_device_list_to_pending).
+	if needResync && a.anyPartialRoom(ctx) {
 		if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, false); err != nil {
 			return err
 		}
@@ -483,21 +484,21 @@ func (a *API) applyDeviceListEDU(ctx context.Context, origin string, content jso
 	return nil
 }
 
-// deviceListUserInPartialRoom reports whether any room the user belongs to is
-// currently partial-state (MSC3902). Used by the device-list EDU handler to
-// defer a /user/devices resync while the room's membership is still being
-// fetched.
-func (a *API) deviceListUserInPartialRoom(ctx context.Context, userID string) bool {
-	rooms, err := a.Store.RoomsForUser(ctx, userID)
-	if err != nil {
-		return false
-	}
-	for _, roomID := range rooms {
-		if a.roomIsPartial(ctx, roomID) {
-			return true
-		}
-	}
-	return false
+// anyPartialRoom reports whether any room this server participates in is
+// currently partial-state (MSC3902). While a partial-state join is in flight
+// the server's view of room membership is incomplete — a user like a
+// pre-existing member whose membership row was never seeded is not known to be
+// in any room — so a GET /user/devices fired mid-resync would be an unexpected
+// request to the remote server (Complement's partial-state suite asserts
+// exactly this: the mock federation server registers no /user/devices handler
+// and flags any request to it as an error). Mirror of Synapse's
+// get_partial_state_room_resync_info gate, which defers every device-list
+// update while a partial join is in progress.
+func (a *API) anyPartialRoom(ctx context.Context) bool {
+	var one bool
+	_ = a.Store.Pool().QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM rooms WHERE partial_state=TRUE LIMIT 1)`).Scan(&one)
+	return one
 }
 
 // resyncRemoteDeviceList re-fetches a remote user's full device list via GET
