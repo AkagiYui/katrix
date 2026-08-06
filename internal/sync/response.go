@@ -1106,54 +1106,6 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 			earliest = re.stream
 		}
 	}
-	// A limited timeline that contains any state event must also carry the
-	// room's CURRENT state: Synapse's "always include current state in the
-	// timeline" behaviour (filter_and_transform_events_for_client with
-	// always_include_ids=current_state_ids) — when a limited window drops
-	// events, clients still need the current state events to render the room
-	// correctly. This covers both count-truncated windows and newly-joined /
-	// full-room windows: a room whose join event predates a window that drops
-	// to the newest `limit` events would otherwise never surface the user's own
-	// membership (Complement's syncMembershipIn checks the timeline).
-	// The current-state events not already in the timeline are appended (they
-	// are the newest authoritative values).
-	if (newlyJoined || countLimited) && len(evs) > 0 {
-		hasState := false
-		for _, ev := range evs {
-			if ev.StateKey != "" {
-				hasState = true
-				break
-			}
-		}
-		if hasState {
-			if stateRows, err := e.store.GetState(ctx, roomID); err == nil {
-				ids := make([]string, 0, len(stateRows))
-				for _, s := range stateRows {
-					ids = append(ids, s.EventID)
-				}
-				stateEvs, _ := e.store.EventsByIDs(ctx, ids)
-				inTimeline := map[string]bool{}
-				for _, re := range rendered {
-					var obj map[string]json.RawMessage
-					if json.Unmarshal(re.raw, &obj) == nil {
-						var id string
-						if json.Unmarshal(obj["event_id"], &id) == nil {
-							inTimeline[id] = true
-						}
-					}
-				}
-				for _, se := range stateEvs {
-					if inTimeline[se.EventID] {
-						continue
-					}
-					if !filter.keepTimeline(&se) {
-						continue
-					}
-					rendered = append(rendered, renderedEvent{raw: filter.applyEventFields(prevContent(clientEvent(&se), &se)), send: se.Sender, stream: se.StreamOrdering})
-				}
-			}
-		}
-	}
 	timeline := Timeline{Events: make([]json.RawMessage, 0, len(rendered))}
 	senders := map[string]bool{}
 	for _, re := range rendered {
