@@ -212,7 +212,7 @@ func (s *Store) InsertEvent(ctx context.Context, e *EventRow) (int64, error) {
 	// Maintain forward extremities. Parse prev events from the row if not set.
 	prevs := e.PrevEvents
 	if prevs == nil {
-		prevs = parsePrevEvents(e.RawJSON)
+		prevs = ParsePrevEvents(e.RawJSON)
 	}
 	if err := s.UpdateExtremitiesForEvent(ctx, e.RoomID, e.EventID, prevs, e.Depth); err != nil {
 		// Extremity maintenance is best-effort; a failure must not roll back the
@@ -330,7 +330,7 @@ func (s *Store) InsertEventWithMembership(ctx context.Context, e *EventRow, m *M
 	e.StreamOrdering = stream
 	prevs := e.PrevEvents
 	if prevs == nil {
-		prevs = parsePrevEvents(e.RawJSON)
+		prevs = ParsePrevEvents(e.RawJSON)
 	}
 	if err := s.UpdateExtremitiesForEvent(ctx, e.RoomID, e.EventID, prevs, e.Depth); err != nil {
 		_ = err
@@ -387,9 +387,9 @@ func upsertMembershipTx(ctx context.Context, ex execer, m *MembershipRow) error 
 	return err
 }
 
-// parsePrevEvents extracts prev_events IDs from a raw event JSON for the
+// ParsePrevEvents extracts prev_events IDs from a raw event JSON for the
 // extremity update. Returns nil for legacy [id, hash] pairs (flattened to IDs).
-func parsePrevEvents(raw []byte) []string {
+func ParsePrevEvents(raw []byte) []string {
 	var ev struct {
 		PrevEvents []string `json:"prev_events"`
 	}

@@ -123,5 +123,34 @@ func (s *Store) EventIsDAGLeaf(ctx context.Context, roomID, eventID string) (boo
 	return true, rows.Err()
 }
 
+// UndoExtremitiesForRejected reverts the forward-extremity bookkeeping done at
+// insert time for an event that is subsequently soft-failed (rejected). A
+// rejected event must never become a forward extremity, nor displace its
+// prev_events from the extremity set: the room's real extremities stay the
+// accepted leaves, so later events build on them (mirror of Synapse #5090 —
+// "Inbound federation accepts a second soft-failed event" asserts M1 stays an
+// extremity after two soft-failed siblings reference it). Each prev is restored
+// only when it is still a DAG leaf (a prev referenced by another accepted event
+// must not be resurrected as an extremity).
+func (s *Store) UndoExtremitiesForRejected(ctx context.Context, roomID, eventID string, prevEvents []string) error {
+	if err := s.RemoveForwardExtremity(ctx, roomID, eventID); err != nil {
+		return err
+	}
+	for _, prev := range prevEvents {
+		leaf, err := s.EventIsDAGLeaf(ctx, roomID, prev)
+		if err != nil || !leaf {
+			continue
+		}
+		ev, err := s.GetEvent(ctx, prev)
+		if err != nil {
+			continue
+		}
+		if err := s.AddForwardExtremity(ctx, roomID, prev, ev.Depth); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ErrNoExtremities is returned when a room has no recorded extremities.
 var ErrNoExtremities = errors.New("storage: no forward extremities")

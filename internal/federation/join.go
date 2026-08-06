@@ -975,14 +975,29 @@ func (a *API) ingestRemoteJoin(ctx context.Context, roomID string, version roomv
 func (a *API) stateContainsVerifiableCreate(ctx context.Context, state []json.RawMessage, rules roomver.Rules) bool {
 	for _, raw := range state {
 		var ev struct {
-			Type     string  `json:"type"`
-			StateKey *string `json:"state_key"`
+			Type     string          `json:"type"`
+			StateKey *string         `json:"state_key"`
+			Content  json.RawMessage `json:"content"`
 		}
 		if err := json.Unmarshal(raw, &ev); err != nil {
 			continue
 		}
 		if ev.Type != "m.room.create" || ev.StateKey == nil || *ev.StateKey != "" {
 			continue
+		}
+		// The create event declares the room's version; a server must not join
+		// a room whose version it does not support (spec: a server that does not
+		// know the room version cannot participate). sytest's "Outbound
+		// federation rejects m.room.create events with an unknown room version"
+		// sends a create declaring "sytest-room-ver" and expects the join to
+		// fail.
+		var content struct {
+			RoomVersion string `json:"room_version"`
+		}
+		if json.Unmarshal(ev.Content, &content) == nil && content.RoomVersion != "" {
+			if _, ok := roomver.Get(roomver.Version(content.RoomVersion)); !ok {
+				return false
+			}
 		}
 		vres := a.verifier.Verify(ctx, raw, rules.Version)
 		return vres.Err == nil && (!vres.Signed || vres.Valid)

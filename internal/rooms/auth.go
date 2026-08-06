@@ -86,7 +86,12 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 		return fmt.Errorf("rooms: empty sender")
 	}
 
-	// Parse power levels; an absent power_levels event means everyone is 0.
+	// Parse power levels; an absent power_levels event is treated as the spec's
+	// default (state_default/ban/kick/redact = 50, users_default/events_default
+	// = 0, and the room creator holding power 100 — mirror of Synapse's
+	// get_power_levels). A zero-valued PowerLevels would wrongly give every
+	// joined member state power (state_default 0) and let non-creators set
+	// power_levels in rooms that never had the event.
 	var pl *PowerLevels
 	if len(st.PowerLevel) > 0 {
 		pl, err = ParsePowerLevels(st.PowerLevel)
@@ -94,7 +99,14 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 			return err
 		}
 	} else {
-		pl = &PowerLevels{}
+		pl = &PowerLevels{
+			Users:        map[string]int64{create.Creator: 100},
+			UsersDefault: 0,
+			StateDefault: 50,
+			Ban:          50,
+			Kick:         50,
+			Redact:       50,
+		}
 	}
 
 	// userLevel applies the v12 creator privilege: in room version 12 the
@@ -324,6 +336,19 @@ func authorizeMember(rules roomver.Rules, sender, stateKey string, content json.
 		return fmt.Errorf("rooms: m.room.member requires state_key")
 	}
 
+	// A join or invite whose target is on a different domain than the room's
+	// creator is a federated membership change. Per the spec auth rules such a
+	// change is only authorised when the room is federating — a room whose
+	// create event carries `m.federate: false` rejects remote members outright
+	// (Synapse: "This room has been marked as unfederatable"). sytest "Remote
+	// users may not join unfederated rooms" expects exactly this 403.
+	if (mc.Membership == MembershipJoin || mc.Membership == MembershipInvite) &&
+		create.MSCFederate != nil && !*create.MSCFederate {
+		if tdom, cdom := ids.DomainOf(stateKey), ids.DomainOf(create.Creator); tdom != "" && cdom != "" && tdom != cdom {
+			return fmt.Errorf("rooms: this room has been marked as unfederatable")
+		}
+	}
+
 	// Target's current membership (from state, "" if absent). When the sender
 	// is the target (self join/leave), the target membership equals the
 	// sender's membership, captured in SenderMember.
@@ -421,19 +446,19 @@ func authorizeMember(rules roomver.Rules, sender, stateKey string, content json.
 			}
 			return fmt.Errorf("rooms: third-party invite signature invalid")
 		}
-		// Invite: sender must be joined; if target is banned, sender needs
-		// power to ban (i.e. >= ban level). Otherwise any joined member may
-		// invite (subject to the invite power level, default 0).
+		// Invite: sender must be joined and meet the invite power level. A
+		// banned target can never be invited — not even by a user with ban
+		// power; the ban must be lifted first (spec auth rules / Synapse:
+		// "Invites are valid iff caller is in the room and target isn't"; a
+		// banned target is rejected unconditionally, before the power check).
 		if senderMembership != MembershipJoin {
 			return fmt.Errorf("rooms: invite sender not joined")
 		}
+		if targetMembership == MembershipBan {
+			return fmt.Errorf("rooms: user is banned from the room")
+		}
 		if senderLevel < pl.Invite {
 			return fmt.Errorf("rooms: insufficient power to invite")
-		}
-		if targetMembership == MembershipBan {
-			if senderLevel < pl.Ban {
-				return fmt.Errorf("rooms: cannot invite over ban without ban power")
-			}
 		}
 		if targetMembership == MembershipJoin {
 			return fmt.Errorf("rooms: user already joined")

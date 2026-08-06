@@ -120,6 +120,14 @@ func (a *API) SendTransaction(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
+	// The spec caps a transaction at 50 PDUs: a peer exceeding the limit is
+	// rejected with 400 (spec §transactions; sytest "Server correctly handles
+	// transactions that break edu limits" sends 51 PDUs and expects 400).
+	if len(body.PDUs) > 50 {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON",
+			"transaction exceeds the 50 PDU limit"))
+		return
+	}
 	seen, err := a.Store.FederationTxnSeen(r.Context(), body.Origin, txnID)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
@@ -197,13 +205,6 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	if err != nil || !exists {
 		return "", false
 	}
-	// Server ACLs (spec "Server Access Control Lists"): an event sent by a
-	// server denied by the room's m.room.server_acl must not be accepted.
-	// The sender's origin is the transaction origin (the server vouching for
-	// the PDU).
-	if acl := a.serverACLForRoom(r.Context(), ev.RoomID); acl != nil && !acl.allows(origin) {
-		return "", false
-	}
 	room, err := a.Store.GetRoom(r.Context(), ev.RoomID)
 	if err != nil {
 		return "", false
@@ -224,6 +225,16 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	evID := ev.EventID
 	if evID == "" {
 		evID = res.EventID
+	}
+	// Server ACLs (spec "Server Access Control Lists"): an event sent by a
+	// server denied by the room's m.room.server_acl must not be accepted. The
+	// event ID is returned with accept=false so the /send response reports the
+	// rejected PDU with an error (spec /send semantics — sytest's "Banned
+	// servers cannot send events" asserts the banned PDU's result carries an
+	// "error" key). The sender's origin is the transaction origin (the server
+	// vouching for the PDU).
+	if acl := a.serverACLForRoom(r.Context(), ev.RoomID); acl != nil && !acl.allows(origin) {
+		return evID, false
 	}
 	// A re-delivery of an event that was already accepted must not be
 	// re-authorised: its verdict is established, and re-checking against the
@@ -507,9 +518,14 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	}
 	// A soft-failed event is persisted (so the DAG stays connected) but marked
 	// rejected: it is excluded from client delivery, state snapshots and state
-	// resolution below.
+	// resolution below. It must also not become a forward extremity nor
+	// displace its prev_events — a rejected event is not part of the room's
+	// real DAG surface, so later events must still build on the accepted
+	// leaves (Synapse #5090; sytest "Inbound federation accepts a second
+	// soft-failed event").
 	if rejected {
 		a.Store.MarkEventRejected(r.Context(), evID)
+		a.Store.UndoExtremitiesForRejected(r.Context(), ev.RoomID, evID, storage.ParsePrevEvents(raw))
 	}
 	// Index the event's relates_to relation so /relations, /threads and the
 	// MSC2836 /event_relationships walk can answer for events ingested over

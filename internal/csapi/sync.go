@@ -315,6 +315,17 @@ func (a *API) Receipt(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
 	receiptType := r.PathValue("receiptType")
 	eventID := r.PathValue("eventID")
+	// Only the spec's receipt types are accepted (Synapse's known set:
+	// m.read, m.read.private, m.fully_read). An unknown type is a 400 — the
+	// spec endpoint is defined for these types only (sytest "Receipts must be
+	// m.read" asserts an unknown type yields 400).
+	switch receiptType {
+	case "m.read", "m.read.private", "m.fully_read":
+	default:
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM",
+			"Receipt type must be one of m.read, m.read.private, m.fully_read"))
+		return
+	}
 	if err := a.checkMembership(r.Context(), roomID, auth.UserID, rooms.MembershipJoin); err != nil {
 		httpx.WriteError(w, httpx.ErrForbidden("not joined to room"))
 		return
