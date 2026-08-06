@@ -82,6 +82,20 @@ func New(hs *homeserver.HS) (*Server, error) {
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		for _, p := range apiPrefixes {
 			if strings.HasPrefix(r.URL.Path, p) {
+				// Federation requests carry their origin in the X-Matrix
+				// Authorization header. A malformed origin (e.g. a server name
+				// with a non-numeric port) is refused with 400 M_INVALID_PARAM
+				// before any handler runs — mirror of Synapse, whose
+				// BaseFederationServlet parses the origin server name and
+				// rejects an invalid one (spec §Server names; sytest's
+				// "Non-numeric ports in server names are rejected").
+				if strings.HasPrefix(r.URL.Path, "/_matrix/federation") {
+					if origin := fedOriginFrom(r); origin != "" && !validServerName(origin) {
+						httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM",
+							"invalid server name in Authorization header"))
+						return
+					}
+				}
 				mw := &matrixErrorWriter{ResponseWriter: w}
 				apiMux.ServeHTTP(mw, r)
 				return
@@ -130,6 +144,47 @@ func serveIndex(w http.ResponseWriter, index []byte) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, strings.NewReader(string(index)))
+}
+
+// fedOriginFrom extracts the requesting server's name from the X-Matrix
+// Authorization header ("origin=<name>,key=<id>,destination=<name>,sig=<sig>").
+// An absent header yields "".
+func fedOriginFrom(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if i := strings.Index(h, "origin="); i >= 0 {
+		rest := h[i+len("origin="):]
+		if j := strings.IndexByte(rest, ','); j >= 0 {
+			v := rest[:j]
+			return strings.Trim(v, `"`)
+		}
+	}
+	return ""
+}
+
+// validServerName reports whether a Matrix server name is well-formed (spec
+// §Server names): a non-empty host, optionally followed by a port which must
+// be numeric. A name like "localhost:http" — a port that is not digits — is
+// invalid and such requests are rejected before being processed.
+func validServerName(name string) bool {
+	if name == "" {
+		return false
+	}
+	host, port, hasPort := strings.Cut(name, ":")
+	if host == "" {
+		return false
+	}
+	if !hasPort {
+		return true
+	}
+	if port == "" {
+		return false
+	}
+	for _, c := range port {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // writeMatrixNotFound responds with the Matrix error format for an unknown

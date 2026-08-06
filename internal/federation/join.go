@@ -44,12 +44,14 @@ type sendJoinResponse struct {
 }
 
 // FedHTTPError is a federation request failure carrying the remote server's
-// HTTP status, so callers can distinguish a rejection (403) from a not-found
-// (404). A remote server refusing a join/membership transition (e.g. a room
-// with join_rule knock) should surface to the client as the same 403.
+// HTTP status and, when the response body was a Matrix error, its errcode — so
+// callers can surface the remote's rejection to the client verbatim (spec: a
+// join failure is passed through; sytest's "Outbound federation passes make_join
+// failures through to the client" expects the remote's M_TEST_ERROR_CODE).
 type FedHTTPError struct {
-	code int
-	msg  string
+	code    int
+	errcode string
+	msg     string
 }
 
 func (e *FedHTTPError) Error() string { return e.msg }
@@ -57,9 +59,23 @@ func (e *FedHTTPError) Error() string { return e.msg }
 // HTTPCode returns the remote server's HTTP status code.
 func (e *FedHTTPError) HTTPCode() int { return e.code }
 
-// newFedHTTPError builds a FedHTTPError for a non-2xx federation response.
-func newFedHTTPError(code int, msg string) error {
-	return &FedHTTPError{code: code, msg: msg}
+// ErrCode returns the remote server's Matrix error code ("" when the body was
+// not a Matrix error).
+func (e *FedHTTPError) ErrCode() string { return e.errcode }
+
+// newFedHTTPError builds a FedHTTPError for a non-2xx federation response,
+// extracting the errcode from a Matrix error body when present.
+func newFedHTTPError(code int, msg string, body []byte) error {
+	errcode := ""
+	if len(body) > 0 {
+		var e struct {
+			ErrCode string `json:"errcode"`
+		}
+		if json.Unmarshal(body, &e) == nil {
+			errcode = e.ErrCode
+		}
+	}
+	return &FedHTTPError{code: code, errcode: errcode, msg: msg}
 }
 
 // JoinRemoteRoom joins userID to roomID by federating with the server(s) in
@@ -640,7 +656,7 @@ func (c *Client) makeJoin(ctx context.Context, dest, roomID, userID string) (*ma
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: make_join %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))))
+		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: make_join %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
@@ -663,9 +679,38 @@ func (c *Client) makeJoin(ctx context.Context, dest, roomID, userID string) (*ma
 // wrapping it. partial requests omit_members=true (MSC3706), signalling that
 // only the critical room state is required.
 func (c *Client) sendJoin(ctx context.Context, dest, roomID, userID string, ev *events.Event, partial bool) (*sendJoinResponse, error) {
-	url := c.serverBaseURL(dest) + "/_matrix/federation/v2/send_join/" + roomID + "/" + userID
-	if partial {
-		url += "?omit_members=true"
+	// v2 send_join first (spec §send_join: PUT /v2/send_join/{roomId}/{userId}).
+	// A peer that does not know the v2 endpoint (404/405 with no Matrix error
+	// body, or M_UNRECOGNIZED) is retried against the legacy v1 endpoint
+	// (PUT /v1/send_join/{roomId}/{eventId}) — mirror of Synapse's
+	// _do_send_join fallback, and of sytest's await_request_v1_send_join_reject_v2
+	// (which refuses v2 with an empty 404 and expects the v1 request).
+	resp, err := c.sendJoinRequest(ctx, dest, "v2", roomID, userID, ev, partial)
+	if err != nil {
+		if fe, ok := err.(*FedHTTPError); ok && fe.code == http.StatusNotFound && fe.errcode == "" {
+			resp, err = c.sendJoinRequest(ctx, dest, "v1", roomID, ev.EventID(), ev, false)
+		} else {
+			return nil, err
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// sendJoinRequest performs one send_join attempt against the given version
+// path. The v2 response is the plain send_join body; the v1 response is the
+// legacy 2-element [code, body] array (MSC1802) and is unwrapped.
+func (c *Client) sendJoinRequest(ctx context.Context, dest, version, roomID, idPart string, ev *events.Event, partial bool) (*sendJoinResponse, error) {
+	var url string
+	if version == "v1" {
+		url = c.serverBaseURL(dest) + "/_matrix/federation/v1/send_join/" + urlPathEscape(roomID) + "/" + urlPathEscape(idPart)
+	} else {
+		url = c.serverBaseURL(dest) + "/_matrix/federation/v2/send_join/" + urlPathEscape(roomID) + "/" + urlPathEscape(idPart)
+		if partial {
+			url += "?omit_members=true"
+		}
 	}
 	body := ev.Raw()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
@@ -686,11 +731,18 @@ func (c *Client) sendJoin(ctx context.Context, dest, roomID, userID string, ev *
 	if resp.StatusCode != http.StatusOK {
 		// Surface the remote error body when the server returned one.
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: send_join %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))))
+		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: send_join %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
 		return nil, err
+	}
+	if version == "v1" {
+		// v1 wraps the body in [200, {...}].
+		var arr []json.RawMessage
+		if json.Unmarshal(raw, &arr) == nil && len(arr) == 2 {
+			raw = arr[1]
+		}
 	}
 	var out sendJoinResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -720,7 +772,7 @@ func (c *Client) makeKnock(ctx context.Context, dest, roomID, userID string) (*m
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: make_knock %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))))
+		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: make_knock %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
@@ -758,7 +810,7 @@ func (c *Client) sendKnock(ctx context.Context, dest, roomID, userID string, ev 
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: send_knock %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))))
+		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: send_knock %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {

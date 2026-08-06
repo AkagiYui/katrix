@@ -3,6 +3,7 @@ package federation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -80,6 +81,9 @@ func (a *API) registerTransactions(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/federation/v2/send_leave/{roomID}/{userID}", a.MakeSendLeave)
 	mux.HandleFunc("PUT /_matrix/federation/v2/send_leave/{roomID}/{userID}", a.SendLeave)
 	mux.HandleFunc("PUT /_matrix/federation/v2/invite/{roomID}/{eventID}", a.Invite)
+	// v1 invite (legacy): same semantics as v2 but the response is a 2-element
+	// JSON array [code, body] (MSC1802, mirror of the v1 send_join/leave).
+	mux.HandleFunc("PUT /_matrix/federation/v1/invite/{roomID}/{eventID}", a.InviteV1)
 	// v1 send_join/send_leave (legacy): same semantics as v2 but the response
 	// is a 2-element JSON array [code, body].
 	mux.HandleFunc("PUT /_matrix/federation/v1/send_join/{roomID}/{eventID}", a.SendJoinV1)
@@ -96,6 +100,7 @@ func (a *API) registerTransactions(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/federation/v1/query/directory", a.QueryDirectory)
 	mux.HandleFunc("GET /_matrix/federation/v1/query/directory/{roomAlias}", a.QueryDirectory)
 	mux.HandleFunc("GET /_matrix/federation/v1/query/profile", a.QueryProfile)
+	a.registerPublicRooms(mux)
 }
 
 // txnBody is the PUT /send/{txnId} request body.
@@ -775,14 +780,24 @@ func (a *API) GetEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetState handles GET /_matrix/federation/v1/state/{roomID}.
+// GetState handles GET /_matrix/federation/v1/state/{roomID}.
 func (a *API) GetState(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
 	if a.checkServerACL(w, r, roomID) {
 		return
 	}
-	pdus, _ := a.roomStatePDUs(r, roomID)
-	if pdus == nil {
-		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
+	// The event_id query parameter is mandatory (spec §GET /_matrix/federation
+	// /v1/state): the state returned is that at the referenced event. A missing
+	// event_id is a 400 M_BAD_JSON (mirror of Synapse, and of sytest's
+	// "Inbound federation of state requires event_id as a mandatory parameter").
+	eventID := r.URL.Query().Get("event_id")
+	if eventID == "" {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON", "event_id is required"))
+		return
+	}
+	pdus, err := a.stateAtEventPDUs(r, roomID, eventID)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrNotFound("room or event not found"))
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
@@ -796,6 +811,14 @@ func (a *API) GetState(w http.ResponseWriter, r *http.Request) {
 func (a *API) GetStateIDs(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
 	if a.checkServerACL(w, r, roomID) {
+		return
+	}
+	// The event_id query parameter is mandatory (spec §GET /_matrix/federation
+	// /v1/state_ids; mirror of Synapse and of sytest's "Inbound federation of
+	// state_ids requires event_id as a mandatory parameter").
+	eventID := r.URL.Query().Get("event_id")
+	if eventID == "" {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON", "event_id is required"))
 		return
 	}
 	// A partial-state room (MSC3902) does not have its full state yet: the
@@ -830,9 +853,9 @@ func (a *API) GetStateIDs(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	stateRows, err := a.Store.GetState(r.Context(), roomID)
+	stateRows, err := a.stateAtEvent(r, roomID, eventID)
 	if err != nil || len(stateRows) == 0 {
-		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
+		httpx.WriteError(w, httpx.ErrNotFound("room or event not found"))
 		return
 	}
 	pduIDs := make([]string, 0, len(stateRows))
@@ -844,6 +867,55 @@ func (a *API) GetStateIDs(w http.ResponseWriter, r *http.Request) {
 		"pdu_ids":        pduIDs,
 		"auth_chain_ids": a.authChainIDs(r, roomID),
 	})
+}
+
+// stateAtEvent returns the room state as of eventID: the state-at-event
+// snapshot recorded for the event when it was persisted, falling back to the
+// room's current state for the room's latest event. The event must exist and
+// belong to the room; a rejected or outlier event has no snapshot, so the
+// caller answers M_NOT_FOUND (mirror of Synapse's get_state_at_event /
+// _on_state_request).
+func (a *API) stateAtEvent(r *http.Request, roomID, eventID string) ([]storage.StateRow, error) {
+	ev, err := a.Store.GetEvent(r.Context(), eventID)
+	if err != nil || ev == nil || ev.RoomID != roomID {
+		return nil, errors.New("event not found or not in room")
+	}
+	if rejected, _ := a.Store.IsEventRejected(r.Context(), eventID); rejected {
+		return nil, errors.New("event is rejected")
+	}
+	if ev.Outlier {
+		return nil, errors.New("event is an outlier")
+	}
+	// The state at the event: the per-event snapshot when recorded, else the
+	// room's current state when the event is the room's latest.
+	if rows, err := a.Store.GetEventState(r.Context(), eventID); err == nil && len(rows) > 0 {
+		return rows, nil
+	}
+	if latest, lerr := a.Store.LatestEvent(r.Context(), roomID); lerr == nil && latest != nil && latest.EventID == eventID {
+		return a.Store.GetState(r.Context(), roomID)
+	}
+	return nil, errors.New("no state snapshot for event")
+}
+
+// stateAtEventPDUs is stateAtEvent rendered as PDUs.
+func (a *API) stateAtEventPDUs(r *http.Request, roomID, eventID string) ([]json.RawMessage, error) {
+	rows, err := a.stateAtEvent(r, roomID, eventID)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(rows))
+	for _, s := range rows {
+		ids = append(ids, s.EventID)
+	}
+	evs, err := a.Store.EventsByIDs(r.Context(), ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]json.RawMessage, 0, len(evs))
+	for _, e := range evs {
+		out = append(out, e.RawJSON)
+	}
+	return out, nil
 }
 
 // Backfill handles GET /_matrix/federation/v1/backfill/{roomID}.
@@ -1132,6 +1204,23 @@ func remoteOriginOf(r *http.Request) string {
 	return ""
 }
 
+// hostInRoom reports whether any local user is currently a joined member of
+// roomID — i.e. whether this server is (or believes itself to be) in the room.
+// It is the mirror of Synapse's is_host_in_room, used to refuse /make_join for
+// rooms every local user has left ("not an active room on this server").
+func (a *API) hostInRoom(ctx context.Context, roomID string) bool {
+	members, err := a.Store.JoinedUserIDs(ctx, roomID)
+	if err != nil {
+		return false
+	}
+	for _, u := range members {
+		if a.IsLocalUser(u) {
+			return true
+		}
+	}
+	return false
+}
+
 // legacyTemplateRefs renders a list of event IDs in the [id, hash] pair form
 // mandated by room versions 1-2 (prev_events/auth_events). The hash is an
 // empty object: the serving server has the IDs, and the pair shape — not the
@@ -1148,6 +1237,15 @@ func legacyTemplateRefs(ids []string) []any {
 func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
 	userID := r.PathValue("userID")
+	// The join template is built for a user on the requesting server: a remote
+	// server may not request a join on behalf of a user hosted elsewhere (spec
+	// §make_join; mirror of Synapse's on_make_join_request, which rejects with
+	// 403 M_FORBIDDEN "User not from origin"). The origin is the signed
+	// X-Matrix request's origin server.
+	if userDomain(userID) != remoteOriginOf(r) {
+		httpx.WriteError(w, httpx.ErrForbidden("User not from origin"))
+		return
+	}
 	room, err := a.Store.GetRoom(r.Context(), roomID)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrNotFound("room not found"))
@@ -1160,6 +1258,16 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 	// (mirror of Synapse's on_make_join_request).
 	if room.PartialState {
 		httpx.WriteError(w, httpx.ErrNotFound("this server is not fully joined to the room"))
+		return
+	}
+	// The server must still be in the room to serve a join template for it: a
+	// room every local user has left is not an active room on this server, so
+	// /make_join is refused with 404 (mirror of Synapse's is_host_in_room /
+	// NotFoundError "Not an active room on this server"). Without this, a
+	// stray request would build a join template against a room katrix no longer
+	// participates in.
+	if !a.hostInRoom(r.Context(), roomID) {
+		httpx.WriteError(w, httpx.ErrNotFound("Not an active room on this server"))
 		return
 	}
 	// Server ACLs: a banned server may not join (spec server_acl).
@@ -1427,6 +1535,17 @@ func (a *API) SendJoin(w http.ResponseWriter, r *http.Request) {
 func (a *API) MakeLeave(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
 	userID := r.PathValue("userID")
+	// A leave template is only served to the leaving user's own server: a
+	// remote server may not manufacture a leave event for a local user (or for
+	// a user hosted on a third server), which would let it kick the user from
+	// the room (mirror of Synapse's on_make_leave_request, which raises 403
+	// "User not from origin"). This also covers the kick path — a kick is a
+	// leave whose sender is a room member other than the target, and sytest's
+	// "rejects remote attempts to kick local users" drives the same check.
+	if userDomain(userID) != remoteOriginOf(r) {
+		httpx.WriteError(w, httpx.ErrForbidden("User not from origin"))
+		return
+	}
 	if a.checkServerACL(w, r, roomID) {
 		return
 	}
@@ -1529,8 +1648,14 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM", "invite event membership must be invite"))
 		return
 	}
-	// The sender must be on the origin server; the invitee (state_key) must be
-	// a local user.
+	// The sender (inviter) must be on the origin server (spec §invite; mirror
+	// of Synapse's on_invite_request, which raises 400 when the sender is not
+	// from the requesting server). The invitee (state_key) must be a local user.
+	if userDomain(ev.Sender) != remoteOriginOf(r) {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM",
+			"The invite event was not from the server sending it"))
+		return
+	}
 	if !a.IsLocalUser(*ev.StateKey) {
 		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM", "invite state_key must be a local user"))
 		return
@@ -1553,8 +1678,13 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify the invite event's signature against its origin server's keys.
+	// An invite whose signature does not verify — unsigned, or signed with a
+	// key that fails — is refused with 403 M_FORBIDDEN (spec §invite; mirror of
+	// Synapse's _check_sigs_and_hash / on_invite_request, which raises
+	// SynapseError(403) — sytest's "rejects invites which are not signed by the
+	// sender" strips the signature and expects exactly this).
 	vres := a.verifier.Verify(r.Context(), req.Event, version)
-	if vres.Err != nil || (vres.Signed && !vres.Valid) {
+	if !vres.Valid {
 		httpx.WriteError(w, httpx.NewError(http.StatusForbidden, "M_FORBIDDEN", "invite event failed signature verification"))
 		return
 	}
@@ -1638,6 +1768,26 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) {
 		"origin": a.ServerName(),
 		"event":  json.RawMessage(signed),
 	})
+}
+
+// InviteV1 handles PUT /_matrix/federation/v1/invite/{roomID}/{eventID}
+// (legacy). The v1 invite body is the bare signed invite event (no envelope)
+// and the response is a 2-element JSON array [code, body] per MSC1802, like
+// the v1 send_join/send_leave endpoints.
+func (a *API) InviteV1(w http.ResponseWriter, r *http.Request) {
+	rec := &responseRecorder{header: w.Header()}
+	a.Invite(rec, r)
+	if rec.status == 0 {
+		return // already written to w by the inner handler
+	}
+	// The inner handler wrote to rec; replay as [status, body] if it succeeded.
+	if rec.status != http.StatusOK {
+		w.WriteHeader(rec.status)
+		_, _ = w.Write(rec.body)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(append([]byte(`[200,`), append(rec.body, ']')...))
 }
 
 // persistStrippedState verifies and persists a single invite_room_state entry,
@@ -1856,6 +2006,26 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 	}
 	_ = json.Unmarshal(eventJSON, &ev)
 
+	// The event's room_id must match the room in the request path (spec
+	// §send_join; mirror of Synapse's _on_send_membership_event, which raises
+	// 400 M_BAD_JSON on a mismatch).
+	if ev.RoomID != r.PathValue("roomID") {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON",
+			"Room ID in body does not match that in request path"))
+		return
+	}
+
+	// The send_* endpoints only ever carry a self-membership event for a user
+	// on the requesting server: a remote server may not join/leave a user
+	// hosted on another server (mirror of Synapse's on_send_membership_event,
+	// which raises 403 M_FORBIDDEN "User not from origin" — sytest's "rejects
+	// joins from other servers" replays a stale join for a user who has since
+	// left, and the origin check is what refuses it).
+	if userDomain(ev.Sender) != remoteOriginOf(r) {
+		httpx.WriteError(w, httpx.ErrForbidden("User not from origin"))
+		return
+	}
+
 	// Server ACLs (spec server_acl): a server banned from the room may not
 	// join/leave/knock it; refuse before persisting anything.
 	if a.checkServerACL(w, r, ev.RoomID) {
@@ -1908,8 +2078,17 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 
 	// Verify the event signature. For send_join/send_leave the remote server is
 	// vouching for the event; we still must validate its signature before
-	// trusting it locally.
+	// trusting it locally. An event whose signature does not verify — unsigned,
+	// or signed with a key that fails — is refused with 403 M_FORBIDDEN (spec
+	// §send_join; mirror of Synapse's _check_sigs_and_hash, which raises
+	// SynapseError(403) — sytest's "rejects incorrectly-signed joins" sends an
+	// unsigned event and then one with a fake signature, expecting 403 both
+	// times).
 	vres := a.verifier.Verify(r.Context(), eventJSON, version)
+	if !vres.Valid {
+		httpx.WriteError(w, httpx.ErrForbidden("send_* event failed signature verification"))
+		return
+	}
 	evID := ev.EventID
 	if evID == "" {
 		evID = vres.EventID
@@ -1969,22 +2148,20 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 			return
 		}
 	}
-	// Persist even unsigned join/leave events that pass verification; the
-	// signature check above establishes authenticity.
-	if vres.Valid || vres.Signed {
-		if evID != "" {
-			if _, err := a.Store.InsertEvent(r.Context(), row); err == nil {
-				a.Store.IndexRelationFromRow(r.Context(), row)
-				// Maintain the per-event state snapshot and recompute room_state
-				// from the forward extremities (handles fork resolution).
-				if rules, ok := roomver.Get(version); ok {
-					if err := eventstate.Maintain(r.Context(), a.Store, row, rules); err != nil {
-						_ = err
-					}
+	// The signature was verified above (an invalid signature already returned
+	// 403), so the event is persisted as authenticated.
+	if evID != "" {
+		if _, err := a.Store.InsertEvent(r.Context(), row); err == nil {
+			a.Store.IndexRelationFromRow(r.Context(), row)
+			// Maintain the per-event state snapshot and recompute room_state
+			// from the forward extremities (handles fork resolution).
+			if rules, ok := roomver.Get(version); ok {
+				if err := eventstate.Maintain(r.Context(), a.Store, row, rules); err != nil {
+					_ = err
 				}
-				if ev.StateKey != nil && ev.Type == "m.room.member" {
-					a.applyRemoteMembership(r.Context(), ev.RoomID, *ev.StateKey, ev.Content, evID, ev.Depth)
-				}
+			}
+			if ev.StateKey != nil && ev.Type == "m.room.member" {
+				a.applyRemoteMembership(r.Context(), ev.RoomID, *ev.StateKey, ev.Content, evID, ev.Depth)
 			}
 		}
 	}

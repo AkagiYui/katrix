@@ -388,8 +388,11 @@ func (a *API) knockRoom(r *http.Request, auth *homeserver.Auth, roomID string, v
 			var fe *federation.FedHTTPError
 			if errors.As(err, &fe) {
 				status = fe.HTTPCode()
-				if status == http.StatusForbidden {
-					code = "M_FORBIDDEN"
+				if code = fe.ErrCode(); code == "" {
+					code = "M_NOT_FOUND"
+					if status == http.StatusForbidden {
+						code = "M_FORBIDDEN"
+					}
 				}
 			}
 			return newRoomError(status, code, err.Error())
@@ -2035,11 +2038,15 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 		if err != nil {
 			// A remote rejection (e.g. the room's join_rule is knock, or the
 			// user is banned) surfaces as the remote's 403; an unreachable or
-			// unknown room is a 404.
+			// unknown room is a 404. When the remote returned a Matrix error
+			// body, its errcode is passed through verbatim (spec: a make_join
+			// failure is returned to the client — sytest's "Outbound federation
+			// passes make_join failures through to the client" expects the
+			// remote's M_TEST_ERROR_CODE).
 			if code := fedHTTPStatusCode(err); code == http.StatusForbidden {
-				return nil, newRoomError(http.StatusForbidden, "M_FORBIDDEN", err.Error())
+				return nil, newRoomError(http.StatusForbidden, fedHTTPErrCode(err, "M_FORBIDDEN"), err.Error())
 			}
-			return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", err.Error())
+			return nil, newRoomError(http.StatusNotFound, fedHTTPErrCode(err, "M_NOT_FOUND"), err.Error())
 		}
 		// The join makes the user's device list newly visible to the room's
 		// remote servers: send them m.device_list_update EDUs (spec: servers
@@ -2129,6 +2136,19 @@ func fedHTTPStatusCode(err error) int {
 		return ferr.HTTPCode()
 	}
 	return 0
+}
+
+// fedHTTPErrCode extracts the remote server's Matrix errcode from a federation
+// error, returning fallback when the error does not carry one (the remote
+// response was not a Matrix error body).
+func fedHTTPErrCode(err error, fallback string) string {
+	var ferr interface{ ErrCode() string }
+	if errors.As(err, &ferr) {
+		if c := ferr.ErrCode(); c != "" {
+			return c
+		}
+	}
+	return fallback
 }
 
 // isUniqueViolationErr reports whether err is a Postgres unique_violation
