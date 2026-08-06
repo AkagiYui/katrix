@@ -14,6 +14,34 @@
 # Regenerate after each run with:
 #   grep -E '^ok ' results.tap | grep -vE '# skip' | sed -E 's/^ok [0-9]+ (\(expected fail\) )?//' | sed -E 's/( \([0-9]+ subtests\))? # TODO passed but expected fail$//' | sort -u
 # One test path per line; lines starting with '#' are ignored.
+Can receive redactions from regular users over federation in room version 10
+Can receive redactions from regular users over federation in room version 11
+Can receive redactions from regular users over federation in room version 12
+Can receive redactions from regular users over federation in room version 3
+Can receive redactions from regular users over federation in room version 4
+Can receive redactions from regular users over federation in room version 5
+Can receive redactions from regular users over federation in room version 6
+Can receive redactions from regular users over federation in room version 7
+Can receive redactions from regular users over federation in room version 8
+Can receive redactions from regular users over federation in room version 9
+Full state sync includes joined rooms
+Guest non-joined users can get individual state for world_readable rooms
+Guest non-joined users can get state for world_readable rooms
+Guest users can sync from invited guest_access rooms if joined
+Guest users can sync from joined guest_access rooms if joined
+Only see history_visibility changes on boundaries
+Real non-joined users can get individual state for world_readable rooms
+Real non-joined users can get state for world_readable rooms
+Real users can sync from invited guest_access rooms if joined
+Real users can sync from joined guest_access rooms if joined
+State is included in the timeline in the initial sync
+Syncing a new room with a large timeline limit isn't limited
+m.room.history_visibility == "invited" allows/forbids appropriately for Guest users
+m.room.history_visibility == "invited" allows/forbids appropriately for Real users
+m.room.history_visibility == "joined" allows/forbids appropriately for Guest users
+m.room.history_visibility == "joined" allows/forbids appropriately for Real users
+m.room.history_visibility == "world_readable" allows/forbids appropriately for Guest users
+m.room.history_visibility == "world_readable" allows/forbids appropriately for Real users
 An event which redacts an event in a different room should be ignored
 Inbound federation ignores redactions from invalid servers room > v3
 User directory correctly update on display name change
