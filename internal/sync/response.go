@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/AkagiYui/katrix/internal/events"
+	"github.com/AkagiYui/katrix/internal/eventstate"
 	"github.com/AkagiYui/katrix/internal/pushrules"
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
@@ -1027,6 +1028,13 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// unsigned.prev_content (and unsigned.prev_sender) so clients can render
 	// transitions (e.g. invite -> join, join -> leave).
 	prevContent := e.prevContentAnnotator(ctx, roomID, maxStream)
+	// Per-event history_visibility filtering: in invited/joined rooms the user
+	// only sees events from their invite/join boundary onward (events sent
+	// before the room became invited/joined stay visible under the earlier,
+	// more permissive visibility). The evaluator's histories are bounded by the
+	// room's latest stream so a newly-joined user's full-room window filters
+	// pre-boundary history correctly.
+	vis, _ := eventstate.NewVisibilityEvaluator(ctx, e.store, roomID, opts.UserID, maxStream)
 	type renderedEvent struct {
 		raw    json.RawMessage
 		send   string
@@ -1035,6 +1043,9 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	var rendered []renderedEvent
 	for _, ev := range evs {
 		if !filter.keepTimeline(&ev) {
+			continue
+		}
+		if vis != nil && !vis.CanSee(ev.StreamOrdering, ev.Type) {
 			continue
 		}
 		raw := filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(clientEvent(&ev), &ev), &ev), ev.EventID))

@@ -1283,9 +1283,29 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	chunk := make([]json.RawMessage, 0, len(evs))
 	var minTok, maxTok int64
 	senders := map[string]bool{}
+	// Per-event history_visibility filtering: in invited/joined rooms a member
+	// only sees events from their invite/join boundary onward (and events sent
+	// before the room became invited/joined stay visible under the earlier,
+	// more permissive visibility). A non-member in a world_readable room sees
+	// everything. The evaluator is built once per request (its histories are
+	// bounded by the room's latest stream).
+	vis := (*eventstate.VisibilityEvaluator)(nil)
+	if len(evs) > 0 {
+		if room, rerr := a.Store.GetRoom(r.Context(), roomID); rerr == nil {
+			if latest, lerr := a.Store.LatestEvent(r.Context(), roomID); lerr == nil && latest != nil {
+				if v, verr := eventstate.NewVisibilityEvaluator(r.Context(), a.Store, roomID, auth.UserID, latest.StreamOrdering); verr == nil {
+					vis = v
+				}
+			}
+			_ = room
+		}
+	}
 	for i := range evs {
 		e := evs[i]
 		if !flt.keep(&e) {
+			continue
+		}
+		if vis != nil && !vis.CanSee(e.StreamOrdering, e.Type) {
 			continue
 		}
 		chunk = append(chunk, clientEvent(&e))
@@ -1909,6 +1929,12 @@ func (a *API) checkMembershipAny(ctx context.Context, roomID, userID, allowed st
 func (a *API) checkCanReadRoom(ctx context.Context, roomID, userID string) error {
 	m, err := a.Store.GetMembership(ctx, roomID, userID)
 	if err != nil {
+		// Not a member at all: a world_readable room may be read by anyone (spec
+		// history_visibility: "world_readable: all events are visible to anyone,
+		// even those not joined"). Other visibilities deny non-members.
+		if a.historyVisibility(ctx, roomID) == "world_readable" {
+			return nil
+		}
 		return newRoomError(http.StatusForbidden, "M_FORBIDDEN", "not a member of the room")
 	}
 	if m.Forgotten {

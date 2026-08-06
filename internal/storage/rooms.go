@@ -966,6 +966,70 @@ type MemberHistoryRow struct {
 	StreamOrdering int64
 }
 
+// HistoryVisibilityRow is one m.room.history_visibility change event in a room
+// (state_key ""), with the visibility value it set.
+type HistoryVisibilityRow struct {
+	Visibility     string
+	StreamOrdering int64
+}
+
+// HistoryVisibilityChanges returns the m.room.history_visibility change events
+// for a room (state_key ""), ordered by stream, with the value each set. Used
+// to evaluate per-event history visibility: the effective visibility of an
+// event is the value of the most recent change at-or-before its stream position
+// ("shared" when none precedes it).
+func (s *Store) HistoryVisibilityChanges(ctx context.Context, roomID string) ([]HistoryVisibilityRow, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT content->>'history_visibility', stream_ordering
+		 FROM events
+		 WHERE room_id=$1 AND type='m.room.history_visibility' AND (state_key='' OR state_key IS NULL)
+		 ORDER BY stream_ordering ASC`, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []HistoryVisibilityRow
+	for rows.Next() {
+		var h HistoryVisibilityRow
+		if err := rows.Scan(&h.Visibility, &h.StreamOrdering); err != nil {
+			return nil, err
+		}
+		if h.Visibility == "" {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+// MemberEventsForUser returns the m.room.member events for a single user in a
+// room up to (and including) a stream position, ordered by stream. It is the
+// per-user slice of MemberHistory used by the history-visibility filter.
+func (s *Store) MemberEventsForUser(ctx context.Context, roomID, userID string, upto int64) ([]MemberHistoryRow, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT state_key, content->>'membership', stream_ordering
+		 FROM events
+		 WHERE room_id=$1 AND type='m.room.member' AND state_key=$2
+		   AND stream_ordering<=$3
+		 ORDER BY stream_ordering ASC`, roomID, userID, upto)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MemberHistoryRow
+	for rows.Next() {
+		var h MemberHistoryRow
+		if err := rows.Scan(&h.UserID, &h.Membership, &h.StreamOrdering); err != nil {
+			return nil, err
+		}
+		if h.Membership == "" {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
 // MemberEventRow is a historical m.room.member event with enough detail to
 // render unsigned.prev_content / prev_sender for a later member event of the
 // same state_key.
