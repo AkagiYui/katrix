@@ -9,20 +9,30 @@ import (
 )
 
 // register3PID wires the 3PID management endpoints (spec §3PID binding): bind a
-// validated 3PID to the user's account via the identity server, and delete
-// existing bindings.
+// validated 3PID to the user's account via the identity server, and delete or
+// unbind existing bindings.
 func (a *API) register3PID(mux *http.ServeMux) {
 	mux.HandleFunc("POST /_matrix/client/unstable/account/3pid/bind", a.RequireUserAuth(a.Bind3PID))
+	mux.HandleFunc("POST /_matrix/client/v3/account/3pid/bind", a.RequireUserAuth(a.Bind3PID))
 	mux.HandleFunc("POST /_matrix/client/v3/account/3pid/delete", a.RequireUserAuth(a.Delete3PID))
+	mux.HandleFunc("POST /_matrix/client/unstable/account/3pid/unbind", a.RequireUserAuth(a.Unbind3PID))
+	mux.HandleFunc("POST /_matrix/client/v3/account/3pid/unbind", a.RequireUserAuth(a.Unbind3PID))
+	// Federation 3PID onbind (spec §3PID invites): the identity server
+	// notifies this homeserver when a stored 3PID invite's address gets bound,
+	// so the pending invite can be exchanged for a real member invite.
+	mux.HandleFunc("POST /_matrix/federation/v1/3pid/onbind", a.OnBind3PID)
 }
 
-// Bind3PID handles POST /_matrix/client/unstable/account/3pid/bind.
+// Bind3PID handles POST /_matrix/client/{unstable,v3}/account/3pid/bind.
 // The body names the identity server plus the validation session (sid and
 // client_secret) obtained from the identity server's 3PID validation flow. The
 // homeserver resolves the validated (medium, address) from the session via the
 // identity server (the client does not send them), then forwards the bind to
 // the identity server, which records the (medium, address) -> user mapping
-// (spec §3PID binding).
+// (spec §3PID binding). The homeserver records the binding (and the identity
+// server it was made at) so a later unbind can target the same server even when
+// the client omits id_server (spec: an unbind without id_server is performed at
+// the server the 3PID was bound to).
 func (a *API) Bind3PID(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	var req struct {
@@ -58,14 +68,16 @@ func (a *API) Bind3PID(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_UNKNOWN", err.Error()))
 		return
 	}
+	// Record the binding so unbind/deactivation can target the identity server
+	// the client used even when later requests omit id_server.
+	_ = a.Store.StoreThreePIDBinding(r.Context(), auth.Localpart, medium, address, req.IDServer, a.Now())
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
 // Delete3PID handles POST /_matrix/client/v3/account/3pid/delete.
 // It unbinds the (medium, address) from the user's account at the identity
-// server (the request body names the id_server; when absent the server's
-// configured identity server is used). The response reports the unbind result
-// per the spec.
+// server (the request body names the id_server; when absent the server recorded
+// at bind time is used). The response reports the unbind result per the spec.
 func (a *API) Delete3PID(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	var req struct {
@@ -81,18 +93,44 @@ func (a *API) Delete3PID(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrMissingParam("medium and address are required"))
 		return
 	}
-	idServer := req.IDServer
+	result := a.unbindAtRecordedServer(r, auth, req.Medium, req.Address, req.IDServer)
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"id_server_unbind_result": result})
+}
+
+// Unbind3PID handles POST /_matrix/client/{unstable,v3}/account/3pid/unbind.
+// Same semantics as Delete3PID (the spec endpoints differ only in path); the
+// response mirrors Delete3PID's id_server_unbind_result.
+func (a *API) Unbind3PID(w http.ResponseWriter, r *http.Request) {
+	a.Delete3PID(w, r)
+}
+
+// unbindAtRecordedServer unbinds a 3PID at the named identity server, or (when
+// none is named) at the identity server the homeserver recorded when the 3PID
+// was bound. It returns the id_server_unbind_result string for the response:
+// "success" when the unbind succeeded or the 3PID was never bound, "no-support"
+// when the homeserver cannot contact an identity server for this 3PID.
+func (a *API) unbindAtRecordedServer(r *http.Request, auth *homeserver.Auth, medium, address, idServer string) string {
 	if idServer == "" {
-		// No identity server named: nothing to unbind remotely.
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"id_server_unbind_result": "no-support"})
-		return
+		if bs, err := a.Store.ThreePIDBindings(r.Context(), auth.Localpart); err == nil {
+			for _, b := range bs {
+				if b.Medium == medium && b.Address == address {
+					idServer = b.IDServer
+					break
+				}
+			}
+		}
 	}
-	if err := identity.New(idServer, a.Config.IdentityServerInsecure).Unbind(r.Context(), req.Medium, req.Address, auth.UserID); err != nil {
+	if idServer == "" {
+		// No identity server named and none recorded: nothing to unbind remotely.
+		return "no-support"
+	}
+	err := identity.New(idServer, a.Config.IdentityServerInsecure).Unbind(r.Context(), medium, address, auth.UserID)
+	if err != nil {
 		// A binding that does not exist at the identity server still unbinds
 		// locally: report success (spec: unbinding a non-existent 3PID is not
 		// an error).
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"id_server_unbind_result": "success"})
-		return
+		return "success"
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"id_server_unbind_result": "success"})
+	_ = a.Store.DeleteThreePIDBinding(r.Context(), auth.Localpart, medium, address)
+	return "success"
 }

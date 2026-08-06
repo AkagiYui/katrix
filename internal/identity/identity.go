@@ -98,9 +98,12 @@ type Validated3PID struct {
 }
 
 // GetValidated3PID performs GET /_matrix/identity/v2/3pid/getValidated3pid.
+// The v2 identity API authenticates with an access_token query parameter (the
+// client's id_access_token is forwarded as-is; the identity server ignores the
+// "id_" prefix of the field name the client used).
 func (c *Client) GetValidated3PID(ctx context.Context, sid, clientSecret, idAccessToken string) (*Validated3PID, error) {
 	u := c.baseURL() + "/_matrix/identity/v2/3pid/getValidated3pid?sid=" + url.QueryEscape(sid) +
-		"&client_secret=" + url.QueryEscape(clientSecret) + "&id_access_token=" + url.QueryEscape(idAccessToken)
+		"&client_secret=" + url.QueryEscape(clientSecret) + "&access_token=" + url.QueryEscape(idAccessToken)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -224,6 +227,11 @@ func (c *Client) StoreInvite(ctx context.Context, medium, address, sender, roomI
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// v2 store-invite requires the access token (query param or Authorization
+	// header); the body's id_access_token is not an authenticated v2 channel.
+	if idAccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+idAccessToken)
+	}
 	req.Host = c.serverName
 	resp, err := c.http.Do(req)
 	if err != nil {

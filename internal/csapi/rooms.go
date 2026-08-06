@@ -478,22 +478,47 @@ func (a *API) RoomInvite(w http.ResponseWriter, r *http.Request) {
 	}
 	target := req.UserID
 	if target == "" && req.Address != "" {
-		// 3PID invite: resolve the address to a Matrix user ID via the identity
-		// server. A bound 3PID invites that user (the "existing 3pid" flow); an
-		// unbound one uses the store-invite + third-party invite flow (deferred:
-		// requires the invitee to complete the signed third-party membership).
+		// 3PID invite (spec §3PID invites): resolve the address to a Matrix user
+		// ID via the identity server. A bound 3PID invites that user (the
+		// "existing 3pid" flow); an unbound one uses the store-invite + signed
+		// third-party invite flow: the homeserver asks the identity server to
+		// store the pending invite, then emits an m.room.third_party_invite
+		// state event (state_key = the returned token). When the invitee later
+		// binds the 3PID the identity server notifies this homeserver
+		// (federation /3pid/onbind) to convert the stored invite into a member
+		// invite; the invitee then joins with a signed third_party_signed block.
 		bound, err := a.lookup3PID(r.Context(), req.IDServer, req.Medium, req.Address)
-		if err != nil || bound == "" {
-			// The sytest identity server stores invites for unbound 3PIDs; we
-			// cannot complete the third-party invite flow without signing-key
-			// verification of the returned public key, so reject with 403 to
-			// avoid silently "succeeding" without creating an invite. A lookup
-			// failure (unreachable identity server) is also a 403 per the spec's
-			// "the identity server must be reachable" requirement.
+		if err == nil && bound != "" {
+			target = bound
+		} else if req.IDServer != "" {
+			// Unbound: ask the identity server to store the pending invite. The
+			// identity server must be reachable (spec: "the homeserver must be
+			// able to reach the identity server"), else the invite fails.
+			si, serr := identity.New(req.IDServer, a.Config.IdentityServerInsecure).
+				StoreInvite(r.Context(), req.Medium, req.Address, auth.UserID, roomID, req.IDAccessToken)
+			if serr != nil {
+				httpx.WriteError(w, httpx.ErrForbidden("the identity server could not be reached"))
+				return
+			}
+			if si.Token == "" {
+				httpx.WriteError(w, httpx.ErrForbidden("the identity server did not return an invite token"))
+				return
+			}
+			if err := a.persistThirdPartyInvite(r, auth, roomID, si); err != nil {
+				writeRoomErr(w, err)
+				return
+			}
+			httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+			return
+		} else if err != nil {
+			// A lookup failure (unreachable identity server) is a 403 per the
+			// spec's "the identity server must be reachable" requirement.
 			httpx.WriteError(w, httpx.ErrForbidden("cannot resolve 3PID address"))
 			return
+		} else {
+			httpx.WriteError(w, httpx.ErrBadJSON("invite requires user_id or a 3PID address"))
+			return
 		}
-		target = bound
 	}
 	if target == "" {
 		httpx.WriteError(w, httpx.ErrBadJSON("invite requires user_id or a 3PID address"))
@@ -504,6 +529,36 @@ func (a *API) RoomInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// persistThirdPartyInvite builds and persists an m.room.third_party_invite
+// state event (state_key = the identity server's invite token) after the
+// identity server stored the pending 3PID invite. The event's content records
+// the public key material the identity server will use to sign the eventual
+// third-party membership.
+func (a *API) persistThirdPartyInvite(r *http.Request, auth *homeserver.Auth, roomID string, si *identity.StoredInvite) error {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	room, err := a.Store.GetRoom(r.Context(), roomID)
+	if err != nil {
+		return newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
+	}
+	version := roomver.Version(room.Version)
+	content := map[string]any{
+		"display_name": si.DisplayName,
+		"public_key":   si.PublicKey,
+		"public_keys":  si.PublicKeys,
+	}
+	contentRaw, _ := json.Marshal(content)
+	ev, err := a.buildEvent(r, auth, roomID, version, "m.room.third_party_invite", si.Token, ids.RandomTxnSuffix(), true, contentRaw)
+	if err != nil {
+		return err
+	}
+	if _, err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
+		return err
+	}
+	a.notifyRoomMembers(r.Context(), roomID)
+	return nil
 }
 
 // lookup3PID resolves a (medium, address) 3PID to a Matrix user ID using the
@@ -2023,7 +2078,19 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 	// Custom join content: the request body may carry extra fields which are
 	// merged into the m.room.member content (spec: "any additional keys in the
 	// request body are copied into the event content", e.g. `foo: bar`).
+	// third_party_signed (spec §3PID invites) is consumed first and turned into
+	// a verified third-party invite before the join is attempted.
+	tps := thirdPartySignedFromJoin(r)
 	extra := joinCustomContent(r)
+	if len(tps) > 0 {
+		// A join authorized by a verified third-party invite: the exchange turns
+		// the pending third-party invite into a member invite, and the join
+		// content carries the signed block so the auth rules can authorise it.
+		if err := a.exchangeAndJoinWithThirdParty(r, auth, roomID, tps, extra); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
 	if _, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
 		// A user whose membership state is known locally as "ban" must be refused
 		// the join outright, regardless of federation: the ban is the room's
@@ -2326,7 +2393,7 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 			return "", newRoomError(http.StatusForbidden, "M_INVITE_BLOCKED", "the invite was blocked by the invitee's permission settings")
 		}
 	}
-	st, err := a.buildStateSnapshot(r.Context(), roomID, target, auth.UserID)
+	st, err := a.buildStateSnapshot(r.Context(), roomID, target, auth.UserID, contentRaw)
 	if err != nil {
 		return "", err
 	}
@@ -2541,7 +2608,7 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 		return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
 	}
 	version := roomver.Version(room.Version)
-	st, err := a.buildStateSnapshot(r.Context(), roomID, stateKey, auth.UserID)
+	st, err := a.buildStateSnapshot(r.Context(), roomID, stateKey, auth.UserID, content)
 	if err != nil {
 		return nil, err
 	}
@@ -2906,11 +2973,33 @@ func (a *API) authEventIDs(ctx context.Context, roomID, sender, stateKey string)
 			out = append(out, id)
 		}
 	}
+	// A member event authorized by a third-party invite also references the
+	// matching m.room.third_party_invite event (spec auth-event selection).
+	if stateKey != "" && len(out) > 0 {
+		if ev, err := a.Store.GetEvent(ctx, out[len(out)-1]); err == nil && ev.Type == "m.room.member" {
+			if mc, err := rooms.ParseMember(ev.Content); err == nil && len(mc.ThirdParty) > 0 {
+				var tp struct {
+					Signed struct {
+						Token string `json:"token"`
+					} `json:"signed"`
+				}
+				if err := json.Unmarshal(mc.ThirdParty, &tp); err == nil && tp.Signed.Token != "" {
+					if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.third_party_invite", tp.Signed.Token); err == nil {
+						out = append(out, id)
+					}
+				}
+			}
+		}
+	}
 	return out
 }
 
 // buildStateSnapshot assembles the StateSnapshot needed by Authorize.
-func (a *API) buildStateSnapshot(ctx context.Context, roomID, target, sender string) (rooms.StateSnapshot, error) {
+// When content is non-nil (the member event content being authored) and it
+// carries a third_party_invite, the matching m.room.third_party_invite event
+// is also fetched — the member event being built does not exist in state yet,
+// so the target-member lookup alone cannot discover the token.
+func (a *API) buildStateSnapshot(ctx context.Context, roomID, target, sender string, content ...json.RawMessage) (rooms.StateSnapshot, error) {
 	var st rooms.StateSnapshot
 	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.create", ""); err == nil {
 		if ev, err := a.Store.GetEvent(ctx, id); err == nil {
@@ -2946,6 +3035,36 @@ func (a *API) buildStateSnapshot(ctx context.Context, roomID, target, sender str
 		if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.member", target); err == nil {
 			if ev, err := a.Store.GetEvent(ctx, id); err == nil {
 				st.TargetMember = ev.Content
+			}
+		}
+	}
+	// A member event authorized by a third-party invite names its
+	// m.room.third_party_invite via content.third_party_invite.signed.token
+	// (spec auth-event selection); fetch that event so the auth rules can
+	// verify the identity server's signature against the published keys.
+	// The content being authored takes precedence over the stored member
+	// state (the former covers member events that do not exist in state yet).
+	var mc *rooms.MemberContent
+	if len(content) > 0 && len(content[0]) > 0 {
+		mc, _ = rooms.ParseMember(content[0])
+	}
+	if mc == nil && len(st.TargetMember) > 0 {
+		mc, _ = rooms.ParseMember(st.TargetMember)
+	}
+	if mc == nil && len(st.SenderMember) > 0 {
+		mc, _ = rooms.ParseMember(st.SenderMember)
+	}
+	if mc != nil && len(mc.ThirdParty) > 0 {
+		var tp struct {
+			Signed struct {
+				Token string `json:"token"`
+			} `json:"signed"`
+		}
+		if err := json.Unmarshal(mc.ThirdParty, &tp); err == nil && tp.Signed.Token != "" {
+			if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.third_party_invite", tp.Signed.Token); err == nil {
+				if ev, err := a.Store.GetEvent(ctx, id); err == nil {
+					st.ThirdPartyInvite = ev.Content
+				}
 			}
 		}
 	}

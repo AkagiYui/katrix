@@ -1,10 +1,13 @@
 package rooms
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
 
+	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/roomver"
 )
@@ -224,6 +227,89 @@ func guestAccessCanJoin(content json.RawMessage) bool {
 	return ga.GuestAccess == "can_join"
 }
 
+// thirdPartySigned is the parsed "signed" object inside an m.room.member
+// event's third_party_invite content: the identity server's signed statement
+// that the joining/invited user was validated (spec §3PID invites).
+type thirdPartySigned struct {
+	Token      string                      `json:"token"`
+	Mxid       string                      `json:"mxid"`
+	Signatures map[string]map[string]string `json:"signatures"`
+}
+
+// thirdPartyInviteContent is the content of an m.room.third_party_invite state
+// event: the public key material the identity server will use to sign eventual
+// third-party memberships.
+type thirdPartyInviteContent struct {
+	PublicKey  string `json:"public_key"`
+	PublicKeys []struct {
+		PublicKey string `json:"public_key"`
+	} `json:"public_keys"`
+}
+
+// verifyThirdPartyInvite checks that the signed third_party_invite block of a
+// member event verifies against one of the public keys recorded in the room's
+// matching m.room.third_party_invite event (spec auth rules: a join or invite
+// carrying a third_party_invite is authorized when the signature validates).
+// The signature is an ed25519 signature made by the identity server over the
+// "signed" object; it must verify against at least one of the keys the invite
+// event published (the identity server may rotate keys, and an invite lists
+// every key it will sign with).
+func verifyThirdPartyInvite(memberThirdParty json.RawMessage, inviteContent json.RawMessage) bool {
+	if len(memberThirdParty) == 0 || len(inviteContent) == 0 {
+		return false
+	}
+	var m struct {
+		Signed thirdPartySigned `json:"signed"`
+	}
+	if err := json.Unmarshal(memberThirdParty, &m); err != nil {
+		return false
+	}
+	signed := m.Signed
+	if signed.Token == "" || len(signed.Signatures) == 0 {
+		return false
+	}
+	var inv thirdPartyInviteContent
+	if err := json.Unmarshal(inviteContent, &inv); err != nil {
+		return false
+	}
+	var keys []string
+	if inv.PublicKey != "" {
+		keys = append(keys, inv.PublicKey)
+	}
+	for _, pk := range inv.PublicKeys {
+		if pk.PublicKey != "" {
+			keys = append(keys, pk.PublicKey)
+		}
+	}
+	if len(keys) == 0 {
+		return false
+	}
+	raw, _ := json.Marshal(signed)
+	for _, b64 := range keys {
+		pub, err := base64.RawStdEncoding.DecodeString(b64)
+		if err != nil {
+			continue
+		}
+		if len(pub) != ed25519.PublicKeySize {
+			continue
+		}
+		// Try every signature (any entity, any ed25519 key id) against this
+		// public key: the identity server may sign under its stable or an
+		// ephemeral key id.
+		for _, sigBlock := range signed.Signatures {
+			for keyID, sigB64 := range sigBlock {
+				if !strings.HasPrefix(keyID, "ed25519:") {
+					continue
+				}
+				if err := crypto.VerifyJSONWith(sigB64, "", crypto.KeyID(keyID), ed25519.PublicKey(pub), raw); err == nil {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // authorizeMember applies the m.room.member authorization rules (the
 // membership state machine). userLevel is the closure that already applies
 // creator-privilege (v12) so member rules use it consistently. stateKey is the
@@ -271,6 +357,23 @@ func authorizeMember(rules roomver.Rules, sender, stateKey string, content json.
 				return fmt.Errorf("rooms: cannot re-join for another user")
 			}
 		case "", MembershipLeave:
+			// A join authorized by a valid third-party invite signature (spec
+			// auth rules: "if the content contains a third_party_invite
+			// property, the event is authorized if the third_party_invite has a
+			// valid signature") is allowed regardless of the join rule — the
+			// identity server vouches for the join. Banned users stay banned.
+			if len(mc.ThirdParty) > 0 {
+				if targetMembership == MembershipBan {
+					return fmt.Errorf("rooms: banned user cannot join")
+				}
+				if sender != stateKey {
+					return fmt.Errorf("rooms: cannot join for another user")
+				}
+				if verifyThirdPartyInvite(mc.ThirdParty, st.ThirdPartyInvite) {
+					return nil
+				}
+				return fmt.Errorf("rooms: third-party invite signature invalid")
+			}
 			joinRule := JoinRule(st.JoinRules)
 			if sender != stateKey {
 				// Joining on behalf of another user requires it be a public room
@@ -303,6 +406,21 @@ func authorizeMember(rules roomver.Rules, sender, stateKey string, content json.
 		}
 		return nil
 	case MembershipInvite:
+		// A third-party invite (spec auth rules): an invite whose content
+		// carries a third_party_invite signed by the identity server is
+		// authorized by that signature alone — the sender need not be a joined
+		// member of the room. This is what lets the identity server's onbind
+		// callback turn a stored 3PID invite into a member invite even after
+		// the inviter left the room. A banned target still cannot be invited.
+		if len(mc.ThirdParty) > 0 {
+			if verifyThirdPartyInvite(mc.ThirdParty, st.ThirdPartyInvite) {
+				if targetMembership == MembershipBan {
+					return fmt.Errorf("rooms: cannot invite a banned user")
+				}
+				return nil
+			}
+			return fmt.Errorf("rooms: third-party invite signature invalid")
+		}
 		// Invite: sender must be joined; if target is banned, sender needs
 		// power to ban (i.e. >= ban level). Otherwise any joined member may
 		// invite (subject to the invite power level, default 0).

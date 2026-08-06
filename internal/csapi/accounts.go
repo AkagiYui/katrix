@@ -11,6 +11,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/appservice"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/identity"
 	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/pushrules"
 	"github.com/AkagiYui/katrix/internal/storage"
@@ -667,5 +668,19 @@ func (a *API) Deactivate(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"id_server_unbind_result": "no-support"})
+	// Deactivation unbinds every 3PID the user bound through this homeserver at
+	// its identity server (spec: "the homeserver will unbind the 3PIDs from the
+	// identity server"); bindings that fail to unbind (identity server down)
+	// are best-effort.
+	result := "success"
+	if bs, err := a.Store.ThreePIDBindings(r.Context(), auth.Localpart); err == nil {
+		for _, b := range bs {
+			if err := identity.New(b.IDServer, a.Config.IdentityServerInsecure).Unbind(r.Context(), b.Medium, b.Address, auth.UserID); err == nil {
+				_ = a.Store.DeleteThreePIDBinding(r.Context(), auth.Localpart, b.Medium, b.Address)
+			} else {
+				result = "no-support"
+			}
+		}
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"id_server_unbind_result": result})
 }
