@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/jackc/pgx/v5"
@@ -86,6 +87,40 @@ func (s *Store) UpdateExtremitiesForEvent(ctx context.Context, roomID, eventID s
 		return err
 	}
 	return nil
+}
+
+// EventIsDAGLeaf reports whether eventID is a DAG leaf in roomID — no other
+// event in the room references it as a prev_event. The room's forward
+// extremities table is authoritative for most rooms, but a partial-state resync
+// (MSC3902) re-seeds the extremities to the join event even when later events
+// were ingested during the partial window, so a leaf check against the events
+// table (parsing each event's prev_events from its JSON) is the robust way to
+// recognise "the state at this event is the room's current state".
+func (s *Store) EventIsDAGLeaf(ctx context.Context, roomID, eventID string) (bool, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT json FROM events WHERE room_id=$1`, roomID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return false, err
+		}
+		var ev struct {
+			PrevEvents []string `json:"prev_events"`
+		}
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			continue
+		}
+		for _, p := range ev.PrevEvents {
+			if p == eventID {
+				return false, nil
+			}
+		}
+	}
+	return true, rows.Err()
 }
 
 // ErrNoExtremities is returned when a room has no recorded extremities.

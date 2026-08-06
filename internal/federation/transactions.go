@@ -887,20 +887,18 @@ func (a *API) stateAtEvent(r *http.Request, roomID, eventID string) ([]storage.S
 	if ev.Outlier {
 		return nil, errors.New("event is an outlier")
 	}
-	// A forward extremity (an event with no children — the DAG tip) has no
-	// state *after* it, so its state is the room's current state. This is
-	// checked before the per-event snapshot: in a partial-state room (MSC3902)
-	// an event persisted mid-resync carries a snapshot taken against the
-	// incomplete state, and returning that stale snapshot after the resync
-	// completes would serve a state missing the resynced members (Complement's
-	// partial-state suite asserts the tips' state equals the full current state
-	// once the room is fully-stated).
-	if exts, err := a.Store.ForwardExtremities(r.Context(), roomID); err == nil {
-		for _, ex := range exts {
-			if ex.EventID == eventID {
-				return a.Store.GetState(r.Context(), roomID)
-			}
-		}
+	// A DAG leaf (an event no other event references as a prev_event — the
+	// room's true forward extremity) has no state *after* it, so its state is
+	// the room's current state. This is checked before the per-event snapshot:
+	// in a partial-state room (MSC3902) an event persisted mid-resync carries a
+	// snapshot taken against the incomplete state, and returning that stale
+	// snapshot after the resync completes would serve a state missing the
+	// resynced members (Complement's partial-state suite asserts each tip's
+	// state equals the full current state once the room is fully-stated). The
+	// events-table leaf check is used rather than the forward_extremities table,
+	// which a resync re-seeds to the join event.
+	if leaf, lerr := a.Store.EventIsDAGLeaf(r.Context(), roomID, eventID); lerr == nil && leaf {
+		return a.Store.GetState(r.Context(), roomID)
 	}
 	// The state at the event: the per-event snapshot when recorded, else the
 	// room's current state when the event is the room's latest.
