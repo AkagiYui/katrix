@@ -923,18 +923,23 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		if joined, err := e.store.NewlyJoinedAfter(ctx, roomID, opts.UserID, opts.Since.Stream); err == nil {
 			newlyJoined = joined
 		}
-		// A room that was partial-state and became fully-stated during the sync
-		// window is treated as newly joined (mirror of Synapse's
-		// forced_newly_joined_room_ids): eager syncs deliberately omitted the
-		// room while it was partial, so this poll delivers its full state and a
-		// full-room (limited) timeline instead of an empty delta the client
-		// cannot overlay onto anything. unpartialStated distinguishes this case
-		// from an ordinary join (e.g. accepting an invite), where the client
-		// already holds the invite_state and the state section stays empty.
-		if up, err := e.store.RoomUnpartialStateStream(ctx, roomID); err == nil && up > opts.Since.Stream {
-			newlyJoined = true
-			unpartialStated = true
-		}
+	}
+	// A room that was partial-state and became fully-stated is treated as newly
+	// joined (mirror of Synapse's forced_newly_joined_room_ids): eager syncs
+	// deliberately omitted the room while it was partial, so the first sync
+	// whose baseline predates the resync delivers its full state and a full-room
+	// (limited) timeline instead of an empty delta the client cannot overlay
+	// onto anything. This applies to initial syncs too (Since == 0, i.e. a fresh
+	// baseline): the resync'd state events were persisted into the room's
+	// history, so without the flag the state section would dedup them out
+	// (Complement's TestPartialStateJoin/EagerInitialSyncDuringPartialStateJoin
+	// expects the resynced members in state.events). unpartialStated
+	// distinguishes this case from an ordinary join (e.g. accepting an invite),
+	// where the client already holds the invite_state and the state section
+	// stays empty.
+	if up, err := e.store.RoomUnpartialStateStream(ctx, roomID); err == nil && up > opts.Since.Stream {
+		newlyJoined = true
+		unpartialStated = true
 	}
 
 	// The upper bound of the window is the room's own latest event (its tail is
