@@ -162,52 +162,53 @@ jobs:
       - name: build sytest-katrix image
         run: docker build -f Containerfile.sytest -t sytest-katrix .
       - name: run sytest
-        uses: nick-fields/retry@v3
-        with:
-          timeout_minutes: 60
-          # Rerun once on any failure: most failures here are environment
-          # flakes (parallel-runner contention, the sytest federation mock
-          # being slow under load) rather than regressions. Each attempt is a
-          # fresh `docker run` with its own clean servers, so a rerun filters
-          # out the flake while a genuine break still fails; results.tap and
-          # /tmp/sytest.log are overwritten by the last attempt, keeping the
-          # summary honest.
-          max_attempts: 2
-          retry_wrapped_process: true
-          command: |
-            set -o pipefail
-            mkdir -p sytest-logs
-            # Split the suite by file groups so the two halves run on parallel
-            # runners. run-tests.pl takes a file whitelist (only those files'
-            # tests are collected), but every file is still loaded, so fixture
-            # definitions (TEST_SERVER_INFO, INBOUND_SERVER, local_user_fixture,
-            # ...) are always available. The federation group keeps the whole
-            # tests/50federation directory together because its files share the
-            # INBOUND_SERVER/OUTBOUND_CLIENT fixtures from 00prepare.pl; the core
-            # group gets everything else. Paths are rewritten to the in-container
-            # /sytest mount.
-            if [ "${{ matrix.group }}" = "federation" ]; then
-              files=$(find sytest-src/tests/50federation -name '*.pl' | sort)
-            else
-              files=$(find sytest-src/tests -name '*.pl' -not -path '*/50federation/*' | sort)
-            fi
-            # run-tests.pl matches its file whitelist against walkdir's paths,
-            # which are relative to the CWD (the container's /sytest). Strip the
-            # host checkout prefix to yield "tests/...".
-            files=$(printf '%s\n' "$files" | sed 's|^sytest-src/||')
-            # shellcheck disable=SC2086  # files is word-split on purpose
-            docker run --rm \
-              -v "$PWD/sytest-src:/sytest" \
-              -v "$PWD:/src" \
-              -v "$PWD/sytest-logs:/logs" \
-              -e POSTGRES=1 \
-              -e SYTEST_DEFAULT_BRANCH=develop \
-              sytest-katrix $files 2>&1 | tee /tmp/sytest.log
+        # No retry here anymore: since the whitelist unmask every failing test
+        # is a real failure (run-tests.pl exits non-zero), and the failing set
+        # is ~100% stable between runs — retrying just re-ran the same
+        # failures. The "vs previous baseline" diff rendered by the summary
+        # step (testreport --baseline) is the flake/regression detector
+        # instead: tests that were passing and now fail show up as "new
+        # failures" even though they failed only once, and a baseline test that
+        # passes is "fixed". `timeout` guards the docker run the same way the
+        # retry action's timeout_minutes did.
+        run: |
+          set -o pipefail
+          mkdir -p sytest-logs
+          # Split the suite by file groups so the two halves run on parallel
+          # runners. run-tests.pl takes a file whitelist (only those files'
+          # tests are collected), but every file is still loaded, so fixture
+          # definitions (TEST_SERVER_INFO, INBOUND_SERVER, local_user_fixture,
+          # ...) are always available. The federation group keeps the whole
+          # tests/50federation directory together because its files share the
+          # INBOUND_SERVER/OUTBOUND_CLIENT fixtures from 00prepare.pl; the core
+          # group gets everything else. Paths are rewritten to the in-container
+          # /sytest mount.
+          if [ "${{ matrix.group }}" = "federation" ]; then
+            files=$(find sytest-src/tests/50federation -name '*.pl' | sort)
+          else
+            files=$(find sytest-src/tests -name '*.pl' -not -path '*/50federation/*' | sort)
+          fi
+          # run-tests.pl matches its file whitelist against walkdir's paths,
+          # which are relative to the CWD (the container's /sytest). Strip the
+          # host checkout prefix to yield "tests/...".
+          files=$(printf '%s\n' "$files" | sed 's|^sytest-src/||')
+          # shellcheck disable=SC2086  # files is word-split on purpose
+          timeout 3600 docker run --rm \
+            -v "$PWD/sytest-src:/sytest" \
+            -v "$PWD:/src" \
+            -v "$PWD/sytest-logs:/logs" \
+            -e POSTGRES=1 \
+            -e SYTEST_DEFAULT_BRANCH=develop \
+            sytest-katrix $files 2>&1 | tee /tmp/sytest.log
       - name: summary
         if: always()
         run: |
           tap="$PWD/sytest-logs/results.tap"
-          go run ./cmd/testreport sytest "$tap" >> "$GITHUB_STEP_SUMMARY"
+          # --baseline diffs this run's failures against the committed
+          # known-failures.txt list: new failures (regressions/flakes) and
+          # fixed tests stand out from the still-failing baseline. Since the
+          # sytest job no longer retries, this diff is the flake detector.
+          go run ./cmd/testreport sytest --baseline sytest/known-failures.txt "$tap" >> "$GITHUB_STEP_SUMMARY"
           # Append the "Are We Synapse Yet?" feature-area parity summary that
           # katrix_sytest.sh prints at the end of the container run. Rows come
           # out of the script as "Name: NN% (x/y tests)", so split on the first

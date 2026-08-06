@@ -9,6 +9,13 @@
 //	testreport sytest <results.tap>   # SyTest TAP output
 //	testreport crypto <logfile>       # go test -json output
 //
+// For the sytest mode an optional --baseline <file> flag compares the failing
+// set against a stored baseline list (one test name per line, '#' comments
+// ignored) and renders new/fixed/stable failing tests, so a run that removed
+// the retry still surfaces flaky regressions: a test that was passing before
+// and fails now is a "new failure" regardless of whether it failed again in
+// the same run.
+//
 // Every report carries aggregate pass/fail/skip counts plus a per-test
 // breakdown of failures with the first "expected vs actual" assertion
 // difference, collapsed into a <details> block to keep the summary compact.
@@ -44,11 +51,25 @@ type suite struct {
 }
 
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: testreport complement|sytest|crypto <logfile>")
+	args := os.Args[1:]
+	// Parse an optional --baseline <file> flag (used by the sytest report to
+	// diff the failing set against a stored baseline list). It may appear
+	// anywhere before the mode/path, e.g. `testreport sytest --baseline f tap`.
+	baseline := ""
+	rest := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--baseline" && i+1 < len(args) {
+			baseline = args[i+1]
+			i++
+			continue
+		}
+		rest = append(rest, args[i])
+	}
+	if len(rest) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: testreport [--baseline <file>] complement|sytest|crypto <logfile>")
 		os.Exit(2)
 	}
-	mode, path := os.Args[1], os.Args[2]
+	mode, path := rest[0], rest[1]
 	data, err := os.ReadFile(path)
 	if err != nil {
 		fmt.Printf("## %s report\n\nlog not found: %s\n", modeTitle(mode), path)
@@ -60,7 +81,7 @@ func main() {
 	case "crypto":
 		reportGoSuite("Complement Crypto", data, mode)
 	case "sytest":
-		reportTAP(data)
+		reportTAP(data, baseline)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown mode:", mode)
 		os.Exit(2)
@@ -346,10 +367,11 @@ type tapFail struct {
 	Detail string
 }
 
-func reportTAP(data []byte) {
+func reportTAP(data []byte, baseline string) {
 	sc := newScanner(data)
 	var ok, notOk, skip int
 	var fails []*tapFail
+	ran := make(map[string]bool) // every test that actually ran (pass or fail, not skipped)
 	var inFail *tapFail
 	for sc.Scan() {
 		line := sc.Text()
@@ -374,6 +396,13 @@ func reportTAP(data []byte) {
 				}
 				inFail = &tapFail{Name: name}
 				fails = append(fails, inFail)
+			}
+			name := strings.TrimSpace(strings.Replace(rest, "(expected fail) ", "", 1))
+			if mm := tapNoteRe.FindStringSubmatch(name); mm != nil {
+				name = strings.TrimSpace(mm[1])
+			}
+			if !strings.Contains(rest, "# skip ") {
+				ran[name] = true
 			}
 			continue
 		}
@@ -407,7 +436,84 @@ func reportTAP(data []byte) {
 	fmt.Println("|---|---|---|---|")
 	fmt.Printf("| %d | %d | %d | %.1f%% |\n", ok, notOk, skip, rate)
 	fmt.Println()
+	printBaselineDiff(fails, ran, baseline)
 	printFailTable("Failed tests", failsToDetails(fails))
+}
+
+// printBaselineDiff renders how this run's failing set compares against a
+// stored baseline list (see --baseline). With the sytest retry removed this is
+// the flake detector: a test that passed before and fails now shows up as a
+// "new failure" even if it failed only once, and a baseline test that ran and
+// passed now shows up as fixed. Baseline entries that did not run this time
+// (e.g. they belong to the other group's file set) are excluded from the
+// counts. The baseline is a plain newline-separated list of test names; '#'
+// comments are ignored. A missing baseline is not an error — the section is
+// simply omitted.
+func printBaselineDiff(fails []*tapFail, ran map[string]bool, baseline string) {
+	if baseline == "" {
+		return
+	}
+	want := make(map[string]bool)
+	data, err := os.ReadFile(baseline)
+	if err != nil {
+		fmt.Printf("_baseline %s unreadable (%v); skipping diff._\n\n", baseline, err)
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		line = strings.TrimSpace(line)
+		if line != "" {
+			want[line] = true
+		}
+	}
+	failing := make(map[string]bool, len(fails))
+	for _, f := range fails {
+		failing[f.Name] = true
+	}
+	var added, fixed, stable []string
+	for name := range failing {
+		if want[name] {
+			stable = append(stable, name)
+		} else {
+			added = append(added, name)
+		}
+	}
+	for name := range want {
+		if ran[name] && !failing[name] {
+			fixed = append(fixed, name)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(fixed)
+	sort.Strings(stable)
+	fmt.Println("### vs previous baseline")
+	fmt.Println()
+	fmt.Printf("| new failures | fixed | still failing |\n|---|---|---|\n")
+	fmt.Printf("| %d | %d | %d |\n\n", len(added), len(fixed), len(stable))
+	if len(added) > 0 {
+		fmt.Println("**New failures** (passed before, failing now — likely a regression or flake):")
+		fmt.Println()
+		fmt.Println("<details><summary>show</summary>")
+		fmt.Println()
+		for _, n := range added {
+			fmt.Printf("- %s\n", n)
+		}
+		fmt.Println("</details>")
+		fmt.Println()
+	}
+	if len(fixed) > 0 {
+		fmt.Println("**Fixed** (were failing, now pass):")
+		fmt.Println()
+		fmt.Println("<details><summary>show</summary>")
+		fmt.Println()
+		for _, n := range fixed {
+			fmt.Printf("- %s\n", n)
+		}
+		fmt.Println("</details>")
+		fmt.Println()
+	}
 }
 
 var (

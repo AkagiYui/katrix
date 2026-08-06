@@ -88,6 +88,36 @@ func TestReportTAPDoesNotCountSkipAsFail(t *testing.T) {
 	}
 }
 
+func TestReportTAPBaselineDiff(t *testing.T) {
+	tap := `1..4
+ok 1 Passing test
+not ok 2 Newly broken
+not ok 3 (expected fail) Still broken # TODO expected fail
+ok 4 Fixed before # TODO passed but expected fail
+`
+	base, err := os.CreateTemp(t.TempDir(), "baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.WriteString("# known failures\nStill broken\nFixed before\nNever ran\n")
+	base.Close()
+
+	out := runTAP(t, tap, base.Name())
+	for _, want := range []string{
+		"| new failures | fixed | still failing |",
+		"| 1 | 1 | 1 |", // Newly broken ; Fixed before (failed baseline, passes now) ; Still broken
+		"- Newly broken",
+		"- Fixed before",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Never ran") {
+		t.Fatalf("baseline entries absent from this run must not appear:\n%s", out)
+	}
+}
+
 func TestTopLevel(t *testing.T) {
 	cases := map[string]string{
 		"TestACLs":               "TestACLs",
@@ -131,8 +161,9 @@ func TestShortPkg(t *testing.T) {
 }
 
 // runTAP runs reportTAP against the given TAP input and returns the printed
-// output, restoring stdout afterwards.
-func runTAP(t *testing.T, tap string) string {
+// output, restoring stdout afterwards. An optional baseline file is passed
+// through to reportTAP.
+func runTAP(t *testing.T, tap string, baseline ...string) string {
 	t.Helper()
 	old := os.Stdout
 	r, w, err := os.Pipe()
@@ -140,7 +171,11 @@ func runTAP(t *testing.T, tap string) string {
 		t.Fatal(err)
 	}
 	os.Stdout = w
-	reportTAP([]byte(tap))
+	var base string
+	if len(baseline) > 0 {
+		base = baseline[0]
+	}
+	reportTAP([]byte(tap), base)
 	w.Close()
 	os.Stdout = old
 	var buf bytes.Buffer

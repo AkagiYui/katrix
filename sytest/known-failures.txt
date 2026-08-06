@@ -1,0 +1,182 @@
+# SyTest known failures — baseline for the per-run diff report
+# (testreport sytest --baseline). One test name per line; '#' starts a comment.
+#
+# Regenerated from the 2026-08-06 run (workflow 31105483049) — the first run
+# after the whitelist unmask, so this is the honest failing set with no
+# expected-fail masking. The sytest jobs no longer retry (the failing set is
+# ~100% stable between runs; retrying just re-ran the same failures), so the
+# "vs previous baseline" section in each summary is the flake/regression
+# detector: a name here that fails again is "still failing", a baseline test
+# that now passes is "fixed", and a failing test not listed here is a "new
+# failure" (regression or flake) — which is the signal to act on.
+#
+# Regenerate after any run with:
+#   grep -hE '^not ok ' <both results.tap files> | sed -E 's/^not ok [0-9]+ (\(expected fail\) )?//' | sed -E 's/( \([0-9]+ subtests\))? # TODO expected fail$//' | sort -u
+#
+/context/ returns correct number of events
+/joined_members return joined members
+/state returns M_NOT_FOUND for an outlier
+/state_ids returns M_NOT_FOUND for an outlier
+/upgrade creates a new room
+/whois
+3PIDs are unbound after account deactivation
+A change to displayname should not result in a full state sync
+A filtered timeline reaches its limit
+A full_state incremental update returns all state
+AS and main public room lists are separate
+AS can create a user with an underscore
+AS can publish rooms in their own list
+AS-ghosted users can use rooms themselves
+AS-ghosted users can use rooms via AS
+Accesing an AS-hosted room alias asks the AS server
+Asking for a remote rooms list, but supplying the local server's name, returns the local rooms list
+Banned servers cannot send events
+Banned user is kicked and may not rejoin until unbanned
+Can accept third party invite with /join
+Can accept unbound 3pid invite after inviter leaves
+Can bind 3PID via home server
+Can bind and unbind 3PID via /unbind by specifying the identity server
+Can bind and unbind 3PID via /unbind without specifying the identity server
+Can bind and unbind 3PID via homeserver
+Can get 'm.room.name' state for a departed room (SPEC-216)
+Can get remote public room list
+Can get rooms/{roomId}/messages for a departed room (SPEC-216)
+Can get rooms/{roomId}/state for a departed room (SPEC-216)
+Can invite unbound 3pid
+Can invite unbound 3pid over federation
+Can invite unbound 3pid over federation with no ops into a private room
+Can invite unbound 3pid over federation with users from both servers
+Can invite unbound 3pid with no ops into a private room
+Can login with 3pid and password using m.login.password
+Can login with new user via CAS
+Can paginate public room list
+Can pass a JSON filter as a query parameter
+Can query device keys using POST
+Can receive redactions from regular users over federation in room version 1
+Can receive redactions from regular users over federation in room version 2
+Can recv a device message using /sync
+Can register using an email address
+Can reject invites over federation for rooms with version 1
+Can reject invites over federation for rooms with version 2
+Can request federation format via the filter
+Can sync a joined room
+Can upload self-signing keys
+Can't deactivate account with wrong password
+Changes to state are included in an gapped incremental sync
+Deleted tags appear in an incremental v2 /sync
+Device deletion propagates over federation
+Device list doesn't change if remote server is down
+Don't get pushed for rooms you've muted
+Ephemeral messages received from clients are correctly expired
+Ephemeral messages received from servers are correctly expired
+Events in rooms with AS-hosted room aliases are sent to AS server
+Federation handles empty auth_events in state_ids sanely
+Federation key API can act as a notary server via a GET request
+Federation key API can act as a notary server via a POST request
+Forward extremities remain so even after the next events are populated as outliers
+GET /rooms/:room_id/messages lazy loads members correctly
+GET /rooms/:room_id/messages returns a message
+Gapped incremental syncs include all state changes
+Get presence for newly joined members in incremental sync
+HS can provide query metadata on a single protocol
+HS provides query metadata
+If a device list update goes missing, the server resyncs on the next one
+Ignore user in existing room
+Inbound /v1/send_join rejects incorrectly-signed joins
+Inbound federation accepts a second soft-failed event
+Inbound federation can query room alias directory
+Inbound federation can receive invite and reject when remote is unreachable
+Inbound federation can receive invite and reject when remote replies with a 403
+Inbound federation can receive invite and reject when remote replies with a 500
+Inbound federation can receive invite rejections
+Inbound federation can receive v1 /send_join
+Inbound federation can receive v2 /send_join
+Inbound federation can return events
+Inbound federation redacts events from erased users
+Inbound federation rejects incorrectly-signed invite rejections
+Inbound federation rejects invite rejections which include invalid JSON for room version 6
+Inbound federation rejects invites which include invalid JSON for room version 6
+Inbound: send_join rejects invalid JSON for room version 6
+Invites are pushed
+Invites over federation are correctly pushed
+Invites over federation are correctly pushed with name
+Inviting an AS-hosted user asks the AS server
+Key notary server must not overwrite a valid key with a spurious result from the origin server
+Key notary server should return an expired key if it can't find any others
+Latest account data appears in v2 /sync
+Lazy loading parameters in the filter are strictly boolean
+Local delete device changes appear in v2 /sync
+Members from the gap are included in gappy incr LL sync
+Message history can be paginated over federation
+Named room comes with just joined member count summary
+New federated private chats get full presence information (SYN-115)
+Newly joined room includes presence in incremental sync
+Newly joined room is included in an incremental sync
+Notifications can be viewed with GET /notifications
+Old leaves are present in gapped incremental syncs
+Old members are included in gappy incr LL sync if they start speaking
+Only original members of the room can see messages from erased users
+Outbound federation can backfill events
+Outbound federation can request missing events
+Outbound federation can send invites via v1 API
+Outbound federation correctly handles unsupported room versions
+Outbound federation passes make_join failures through to the client
+Outbound federation rejects backfill containing invalid JSON for events in room version 6
+Outbound federation rejects invite response which include invalid JSON for room version 6
+Outbound federation rejects m.room.create events with an unknown room version
+Outbound federation requests missing prev_events and then asks for /state_ids and resolves the state
+Outbound federation will ignore a missing event with bad JSON for room version 6
+Receipts must be m.read
+Register with a recaptcha
+Regular users cannot create room aliases within the AS namespace
+Rejected events are not pushed
+Remote servers cannot set power levels in rooms without existing powerlevels
+Remote servers should reject attempts by non-creators to set the power levels
+Remote user can backfill in a room with version 1
+Remote user can backfill in a room with version 2
+Remote users can join room by alias
+Remote users may not join unfederated rooms
+Responds correctly when backup is empty
+Room creation reports m.room.create to myself
+Room state after a rejected message event is the same as before
+Room state after a rejected state event is the same as before
+Room summary counts change when membership changes
+Room summary only has 5 heroes
+Rooms with canonical alias are correctly named in pushed
+Rooms with many users are correctly pushed
+Rooms with names are correctly named in pushes
+Server correctly handles transactions that break edu limits
+Server correctly resyncs when server leaves and rejoins a room
+Should not be able to take over the room by pretending there is no PL event
+State from remote users is included in the state in the initial sync
+Sync is woken up for leaves
+Test URL preview
+Test that a message is pushed
+Test that rejected pushers are removed.
+The only membership state included in a gapped incremental sync is for senders in the timeline
+The only membership state included in an incremental sync is for senders in the timeline
+The operation must be consistent through an interactive authentication session
+Unnamed room comes with a name summary
+User can create and send/receive messages in a room with version 1
+User can create and send/receive messages in a room with version 2
+User can invite remote user to room with version 1
+User can invite remote user to room with version 2
+User in remote room doesn't appear in user directory after server left room
+User sees updates to presence from other users in the incremental sync.
+We do send redundant membership state across incremental syncs if asked
+We don't send redundant membership state across incremental syncs by default
+When user joins a room the state is included in a gapped sync
+When user joins a room the state is included in the next sync
+When user joins and leaves a room in the same batch, the full state is still included in the next sync
+Will not back up to an old backup version
+local user has push rules copied to upgraded room
+login types include SSO
+outliers whose auth_events are in a different room are correctly rejected
+registration is idempotent, with username specified
+registration is idempotent, without username specified
+registration remembers parameters
+registration with inhibit_login inhibits login
+remote user can join room with version 1
+remote user can join room with version 2
+remote user has push rules copied to upgraded room
+uploading signed devices gets propagated over federation
