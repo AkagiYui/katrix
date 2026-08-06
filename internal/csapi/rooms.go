@@ -1305,7 +1305,7 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 		if !flt.keep(&e) {
 			continue
 		}
-		if vis != nil && !vis.CanSee(e.StreamOrdering, e.Type) {
+		if vis != nil && !vis.CanSeeRow(&e) {
 			continue
 		}
 		chunk = append(chunk, clientEvent(&e))

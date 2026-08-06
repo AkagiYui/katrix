@@ -2,6 +2,7 @@ package eventstate
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/AkagiYui/katrix/internal/storage"
 )
@@ -33,6 +34,9 @@ var visPriority = map[string]int{
 // changes on boundaries" rule), so a change to joined does not hide the change
 // event itself from a user who could see the previous value.
 type VisibilityEvaluator struct {
+	// userID is the user whose visibility is being evaluated (used for the
+	// own-member-event rule).
+	userID string
 	// hvChanges are the room's m.room.history_visibility changes, oldest first.
 	hvChanges []storage.HistoryVisibilityRow
 	// memberHist is the user's m.room.member history in the room, oldest first.
@@ -51,7 +55,7 @@ func NewVisibilityEvaluator(ctx context.Context, store *storage.Store, roomID, u
 	if err != nil {
 		return nil, err
 	}
-	return &VisibilityEvaluator{hvChanges: hv, memberHist: mh}, nil
+	return &VisibilityEvaluator{userID: userID, hvChanges: hv, memberHist: mh}, nil
 }
 
 // effectiveVisibility returns the room's history_visibility in effect at the
@@ -114,4 +118,74 @@ func (v *VisibilityEvaluator) CanSee(stream int64, eventType string) bool {
 		return vis == "invited"
 	}
 	return false
+}
+
+// membershipBefore returns the user's most recent membership strictly before
+// the given stream position ("leave" when none). Used for the own-member-event
+// rule, where the event's own membership must not be counted as "previous".
+func (v *VisibilityEvaluator) membershipBefore(stream int64) string {
+	membership := "leave"
+	for _, m := range v.memberHist {
+		if m.StreamOrdering < stream {
+			membership = m.Membership
+		} else {
+			break
+		}
+	}
+	return membership
+}
+
+// membershipPriority orders membership values from most to least permissive
+// (mirror of Synapse's MEMBERSHIP_PRIORITY): join > invite > knock > leave >
+// ban. The lower index is the more permissive.
+var membershipPriority = map[string]int{
+	"join":   0,
+	"invite": 1,
+	"knock":  2,
+	"leave":  3,
+	"ban":    4,
+}
+
+// CanSeeRow reports whether the user may see a stored event, applying the
+// own-member-event rule: the user's own m.room.member events are always
+// visible when they are a join/invite, or a leave following a join/invite
+// (the user must see the room disappear — Synapse's _check_membership "Always
+// allow the user to see their own leave events"). For their own member events
+// the effective membership is the more permissive of the event's own and the
+// previous membership, so a re-join visible under joined visibility is not
+// hidden by a subsequent leave.
+func (v *VisibilityEvaluator) CanSeeRow(ev *storage.EventRow) bool {
+	if ev.Type == "m.room.member" && ev.StateKey == v.userID {
+		membership := membershipOf(ev.Content)
+		prev := v.membershipBefore(ev.StreamOrdering)
+		if membership == "leave" && (prev == "join" || prev == "invite") {
+			return true
+		}
+		// Most permissive of the event's own membership and the previous one.
+		eff := membership
+		if membershipPriority[prev] < membershipPriority[eff] {
+			eff = prev
+		}
+		vis := v.effectiveVisibility(ev.StreamOrdering, ev.Type)
+		switch eff {
+		case "join":
+			return true
+		case "invite":
+			return vis == "invited"
+		}
+		return false
+	}
+	return v.CanSee(ev.StreamOrdering, ev.Type)
+}
+
+// membershipOf extracts the membership value from an m.room.member event's
+// content ("" when absent).
+func membershipOf(content []byte) string {
+	var c struct {
+		Membership string `json:"membership"`
+	}
+	if err := json.Unmarshal(content, &c); err != nil {
+		return ""
+	}
+	return c.Membership
 }

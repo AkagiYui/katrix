@@ -1082,7 +1082,7 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		if !filter.keepTimeline(&ev) {
 			continue
 		}
-		if vis != nil && !vis.CanSee(ev.StreamOrdering, ev.Type) {
+		if vis != nil && !vis.CanSeeRow(&ev) {
 			continue
 		}
 		raw := filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(clientEvent(&ev), &ev), &ev), ev.EventID))
