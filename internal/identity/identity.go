@@ -85,6 +85,50 @@ func (c *Client) Lookup(ctx context.Context, medium, address string) (string, er
 	return out.Mxid, nil
 }
 
+// GetValidated3PID resolves a 3PID validation session (sid + client_secret)
+// into the validated (medium, address) via the identity server's
+// getValidated3pid endpoint (spec §3PID validation). This is how a homeserver
+// learns the medium/address a bind request refers to when the client omits
+// them (the client only passes the session credentials it obtained from the
+// identity server).
+type Validated3PID struct {
+	Medium      string `json:"medium"`
+	Address     string `json:"address"`
+	ValidatedAt int64  `json:"validated_at"`
+}
+
+// GetValidated3PID performs GET /_matrix/identity/v2/3pid/getValidated3pid.
+func (c *Client) GetValidated3PID(ctx context.Context, sid, clientSecret, idAccessToken string) (*Validated3PID, error) {
+	u := c.baseURL() + "/_matrix/identity/v2/3pid/getValidated3pid?sid=" + url.QueryEscape(sid) +
+		"&client_secret=" + url.QueryEscape(clientSecret) + "&id_access_token=" + url.QueryEscape(idAccessToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Host = c.serverName
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("identity: getValidated3pid: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("identity: getValidated3pid: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	var out Validated3PID
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("identity: getValidated3pid: decode: %w", err)
+	}
+	if out.Medium == "" || out.Address == "" {
+		return nil, fmt.Errorf("identity: getValidated3pid: session not validated")
+	}
+	return &out, nil
+}
+
 // Bind performs the identity server's 3PID bind (spec §3PID binding): it
 // submits the validation session (sid + client_secret) along with the binding
 // user ID, and returns the signed binding response. The identity server

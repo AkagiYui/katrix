@@ -19,8 +19,10 @@ func (a *API) register3PID(mux *http.ServeMux) {
 // Bind3PID handles POST /_matrix/client/unstable/account/3pid/bind.
 // The body names the identity server plus the validation session (sid and
 // client_secret) obtained from the identity server's 3PID validation flow. The
-// homeserver forwards the bind to the identity server, which records the
-// (medium, address) -> user mapping (spec §3PID binding).
+// homeserver resolves the validated (medium, address) from the session via the
+// identity server (the client does not send them), then forwards the bind to
+// the identity server, which records the (medium, address) -> user mapping
+// (spec §3PID binding).
 func (a *API) Bind3PID(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	var req struct {
@@ -35,12 +37,24 @@ func (a *API) Bind3PID(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	if req.IDServer == "" || req.SID == "" || req.ClientSecret == "" || req.Medium == "" || req.Address == "" {
-		httpx.WriteError(w, httpx.ErrMissingParam("id_server, sid, client_secret, medium and address are required"))
+	if req.IDServer == "" || req.SID == "" || req.ClientSecret == "" {
+		httpx.WriteError(w, httpx.ErrMissingParam("id_server, sid and client_secret are required"))
 		return
 	}
 	client := identity.New(req.IDServer, a.Config.IdentityServerInsecure)
-	if err := client.Bind(r.Context(), req.Medium, req.Address, req.SID, req.ClientSecret, auth.UserID, req.IDAccessToken); err != nil {
+	medium, address := req.Medium, req.Address
+	if medium == "" || address == "" {
+		// The client omits medium/address; resolve them from the validated
+		// session (spec: the homeserver asks the identity server which 3PID
+		// the session validated).
+		validated, err := client.GetValidated3PID(r.Context(), req.SID, req.ClientSecret, req.IDAccessToken)
+		if err != nil {
+			httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_UNKNOWN", err.Error()))
+			return
+		}
+		medium, address = validated.Medium, validated.Address
+	}
+	if err := client.Bind(r.Context(), medium, address, req.SID, req.ClientSecret, auth.UserID, req.IDAccessToken); err != nil {
 		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_UNKNOWN", err.Error()))
 		return
 	}
