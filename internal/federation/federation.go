@@ -30,7 +30,17 @@ type API struct {
 	// The set is per-room so a room being resynced does not disturb another's.
 	partialMu          sync.Mutex
 	partialStateEvents map[string]map[string]struct{} // roomID -> set of event IDs
+
+	// pushNotifier delivers HTTP push notifications for inbound events (see
+	// push.go). nil until SetPushDispatcher wires the CS API's dispatcher.
+	pushNotifier PushNotifier
 }
+
+// SetPushDispatcher wires the CS API's push dispatcher so inbound federation
+// events can deliver HTTP push notifications to local users' pushers. Called
+// once during HTTP server assembly (the CS API is constructed after the
+// federation API).
+func (a *API) SetPushDispatcher(p PushNotifier) { a.pushNotifier = p }
 
 // New constructs the federation API surface with an outbound client for key
 // fetching and a per-event PDU signature verifier backed by that client.

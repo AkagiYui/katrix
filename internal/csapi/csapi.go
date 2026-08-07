@@ -35,18 +35,28 @@ type API struct {
 	// room must be re-delivered with initial=true and the new config so the
 	// client can replace its local copy.
 	ssConns *ssConnStore
+	// push delivers HTTP push notifications to registered pushers (the Push
+	// Module's delivery side). Set on construction; shared with the federation
+	// ingest path via SetFederation wiring.
+	push *pushDispatcher
 }
 
 // New constructs the CS API surface.
 func New(hs *homeserver.HS) *API {
-	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, hs.Typing), ssConns: newSSConnStore()}
+	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, hs.Typing), ssConns: newSSConnStore(), push: newPushDispatcher()}
+	api.push.a = api
 	return api
 }
 
 // SetFederation wires the outbound federation API, used for federated room
 // joins and remote alias resolution. It is called once during HTTP server
 // assembly (the federation API is constructed after the CS API).
-func (a *API) SetFederation(fed *federation.API) { a.fed = fed }
+func (a *API) SetFederation(fed *federation.API) {
+	a.fed = fed
+	// The federation ingest path delivers pushes for remote-originated events;
+	// give it access to the CS push dispatcher.
+	fed.SetPushDispatcher(a.push)
+}
 
 // SetMediaBackend wires the content-repository backend (used by URL preview to
 // store og:image blobs). Called once during HTTP server assembly.

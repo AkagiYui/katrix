@@ -489,8 +489,20 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	// A re-delivered PDU (a server restarting re-sends already-acknowledged
 	// transactions) must not re-trigger side effects; the accepted-event early
 	// return above covers the common case.
-	if _, err := a.Store.InsertEventWithMembership(r.Context(), row, membershipRow); err != nil {
+	inboundStream, err := a.Store.InsertEventWithMembership(r.Context(), row, membershipRow)
+	if err != nil {
 		return evID, false
+	}
+	// Deliver HTTP push notifications to the room's local users' pushers for
+	// the inbound event (spec Push Module: the homeserver notifies the user's
+	// pushers when an event is received). A rejected (soft-failed) event is
+	// never pushed (sytest "Rejected events are not pushed").
+	if a.pushNotifier != nil {
+		sk := ""
+		if ev.StateKey != nil {
+			sk = *ev.StateKey
+		}
+		a.pushNotifier.NotifyInbound(r.Context(), ev.RoomID, evID, ev.Type, ev.Sender, sk, ev.Content, inboundStream, rejected)
 	}
 	// Apply a redaction to its target (spec Handling redactions): the target is
 	// marked redacted when the redaction's sender meets the room's redact power
@@ -2227,7 +2239,7 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 	// The signature was verified above (an invalid signature already returned
 	// 403), so the event is persisted as authenticated.
 	if evID != "" {
-		if _, err := a.Store.InsertEvent(r.Context(), row); err == nil {
+		if inboundStream, err := a.Store.InsertEvent(r.Context(), row); err == nil {
 			a.Store.IndexRelationFromRow(r.Context(), row)
 			// Maintain the per-event state snapshot and recompute room_state
 			// from the forward extremities (handles fork resolution).
@@ -2238,6 +2250,17 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 			}
 			if ev.StateKey != nil && ev.Type == "m.room.member" {
 				a.applyRemoteMembership(r.Context(), ev.RoomID, *ev.StateKey, ev.Content, evID, ev.Depth)
+			}
+			// Deliver HTTP push notifications (a remote user's invite/join/leave
+			// notifies the room's local users, and an invite notifies the
+			// invitee — the remote-origin case of the "Invites over federation
+			// are correctly pushed" tests).
+			if a.pushNotifier != nil {
+				sk := ""
+				if ev.StateKey != nil {
+					sk = *ev.StateKey
+				}
+				a.pushNotifier.NotifyInbound(r.Context(), ev.RoomID, evID, ev.Type, ev.Sender, sk, ev.Content, inboundStream, false)
 			}
 		}
 	}

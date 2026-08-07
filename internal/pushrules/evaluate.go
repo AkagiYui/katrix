@@ -21,6 +21,11 @@ type EventSnapshot struct {
 type EvalResult struct {
 	Notifies   bool
 	Highlights bool
+	// Tweaks carries the set_tweak values of the matched rule's actions (each
+	// set_tweak with its value, defaulting to true). The HTTP push gateway
+	// receives these as the per-device `tweaks` dict (Synapse's
+	// tweaks_for_actions), which gateways use for priority and presentation.
+	Tweaks map[string]any
 }
 
 // Evaluate runs the event through the user's global push ruleset in spec
@@ -189,6 +194,9 @@ func conditionMatches(cm map[string]any, _ string, ev EventSnapshot, _ string) b
 // parameterless actions (notify) are JSON strings, and the only object action
 // is set_tweak; any other object is an unknown action that MUST be ignored.
 func applyActions(rule map[string]any, res *EvalResult) {
+	if res.Tweaks == nil {
+		res.Tweaks = map[string]any{}
+	}
 	actions, _ := rule["actions"].([]any)
 	for _, a := range actions {
 		switch act := a.(type) {
@@ -197,9 +205,19 @@ func applyActions(rule map[string]any, res *EvalResult) {
 				res.Notifies = true
 			}
 		case map[string]any:
-			if tw, ok := act["set_tweak"].(string); ok && tw == "highlight" {
-				if val, ok := act["value"].(bool); ok && val {
-					res.Highlights = true
+			if tw, ok := act["set_tweak"].(string); ok {
+				// The tweak's value defaults to true when omitted (spec:
+				// set_tweak "value: The value of the tweak, if any. Defaults to
+				// `true`" — mirror of Synapse's tweaks_for_actions).
+				if v, ok := act["value"]; ok {
+					res.Tweaks[tw] = v
+				} else {
+					res.Tweaks[tw] = true
+				}
+				if tw == "highlight" {
+					if val, ok := act["value"].(bool); ok && val {
+						res.Highlights = true
+					}
 				}
 			}
 		}

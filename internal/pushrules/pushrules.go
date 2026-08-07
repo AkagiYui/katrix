@@ -6,6 +6,8 @@ package pushrules
 import (
 	"context"
 	"encoding/json"
+
+	"github.com/AkagiYui/katrix/internal/storage"
 )
 
 // PushRulesAccountDataType is the account data type carrying a user's push
@@ -147,6 +149,21 @@ func DefaultRuleset() map[string]any {
 			},
 		},
 	}
+}
+
+// LoadRules returns a user's stored push ruleset as a map, falling back to the
+// spec default ruleset when none is stored or the stored value is malformed.
+// Shared by the CS API handlers (mutate/read) and the push delivery path.
+func LoadRules(ctx context.Context, store *storage.Store, localpart string) map[string]any {
+	raw, _ := store.GetPushRules(ctx, localpart)
+	if len(raw) == 0 {
+		return DefaultRuleset()
+	}
+	var rules map[string]any
+	if err := json.Unmarshal(raw, &rules); err != nil || rules == nil || rules["global"] == nil {
+		return DefaultRuleset()
+	}
+	return rules
 }
 
 // MarshalDefault returns the default ruleset marshalled to JSON bytes.

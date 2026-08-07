@@ -1657,9 +1657,23 @@ func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 	// sender, per the spec's Handling redactions rules.
 	a.notifyRoomMembers(r.Context(), roomID)
 	a.broadcastPDU(r.Context(), roomID, ev)
+	// Deliver HTTP push notifications for the redaction event (a user's custom
+	// rules may match it; the default ruleset does not notify on redactions).
+	a.deliverPushFor(r.Context(), roomID, ev, 0, false)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": ev.EventID()})
 }
 
+// deliverPushFor dispatches HTTP push notifications for a just-persisted event
+// (client or federation path). The stream ordering may be supplied by the
+// caller (when it holds it) so the dispatcher can dedup against the federation
+// ingest path; 0 skips dedup.
+func (a *API) deliverPushFor(ctx context.Context, roomID string, ev *events.Event, stream int64, rejected bool) {
+	if a.push == nil || ev == nil {
+		return
+	}
+	sk, _ := ev.StateKey()
+	a.push.deliverNotifies(ctx, roomID, ev.EventID(), ev.Type(), ev.Sender(), sk, ev.Content(), stream, rejected)
+}
 // roomPowerLevels returns the room's current m.room.power_levels (or the zero
 // value when absent, which means everyone is level 0).
 func (a *API) roomPowerLevels(ctx context.Context, roomID string) *rooms.PowerLevels {
@@ -2594,6 +2608,11 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	a.notifyRoomMembers(r.Context(), roomID)
 	a.Notifier.NotifyUser(target)
 	a.broadcastPDU(r.Context(), roomID, ev)
+	// Deliver HTTP push notifications: an invite notifies the invitee (who may
+	// not be a joined member yet — the evaluator's sender==recipient rule does
+	// not apply to a third party's invite), and a join notifies the room's other
+	// users.
+	a.deliverPushFor(r.Context(), roomID, ev, stream, false)
 	// A remote invite must also be delivered directly to the invitee's server
 	// via PUT /_matrix/federation/v2/invite/{roomID}/{eventID} (spec "inviting
 	// a user to a room"). Generic PDU broadcast cannot reach the invitee's
@@ -2649,6 +2668,7 @@ func (a *API) buildAndPersistMessage(r *http.Request, auth *homeserver.Auth, roo
 	}
 	a.notifyRoomMembers(r.Context(), roomID)
 	a.broadcastPDU(r.Context(), roomID, ev)
+	a.deliverPushFor(r.Context(), roomID, ev, 0, false)
 	return ev, nil
 }
 
@@ -2725,6 +2745,7 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	// room_state is maintained by persistEvent (snapshot + recompute).
 	a.notifyRoomMembers(r.Context(), roomID)
 	a.broadcastPDU(r.Context(), roomID, ev)
+	a.deliverPushFor(r.Context(), roomID, ev, 0, false)
 	return ev, nil
 }
 

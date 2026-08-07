@@ -54,6 +54,8 @@ func (a *API) registerMisc(mux *http.ServeMux) {
 	// Pushers (POST /pushers/set registers or removes an HTTP pusher).
 	mux.HandleFunc("POST /_matrix/client/v3/pushers/set", a.RequireAuth(a.PushSet))
 	mux.HandleFunc("GET /_matrix/client/v3/pushers", a.RequireAuth(a.PushGet))
+	// Notifications (spec §Push Notifications: "Get notifications").
+	mux.HandleFunc("GET /_matrix/client/v3/notifications", a.RequireAuth(a.notificationsHandler))
 	// Public rooms.
 	mux.HandleFunc("GET /_matrix/client/v3/publicRooms", a.PublicRooms)
 	mux.HandleFunc("POST /_matrix/client/v3/publicRooms", a.RequireAuth(a.PublicRooms))
