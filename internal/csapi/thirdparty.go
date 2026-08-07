@@ -23,7 +23,7 @@ func (a *API) ThirdPartyProtocols(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{})
 		return
 	}
-	client := appservice.NewClient()
+	client := appservice.NewClient(a.Config.FederationInsecure)
 	out := map[string]any{}
 	protocols := map[string]map[string]any{}
 	for _, reg := range a.HS.AppServices.All() {
@@ -69,7 +69,7 @@ func (a *API) ThirdPartyProtocol(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	protocol := r.PathValue("protocol")
-	client := appservice.NewClient()
+	client := appservice.NewClient(a.Config.FederationInsecure)
 	var merged map[string]any
 	have := false
 	for _, reg := range a.HS.AppServices.All() {
@@ -139,7 +139,7 @@ func (a *API) thirdPartyLookup(w http.ResponseWriter, r *http.Request, users boo
 		}
 		fields[k] = r.URL.Query().Get(k)
 	}
-	client := appservice.NewClient()
+	client := appservice.NewClient(a.Config.FederationInsecure)
 	out := []json.RawMessage{}
 	for _, reg := range a.HS.AppServices.All() {
 		declared := false

@@ -83,7 +83,7 @@ func (a *API) appServiceRegister(w http.ResponseWriter, r *http.Request, req reg
 	// may provision it) — sytest "Inviting an AS-hosted user asks the AS server"
 	// stubs this request during ghost registration. The query blocks until the
 	// AS answers.
-	client := appservice.NewClient()
+	client := appservice.NewClient(a.Config.FederationInsecure)
 	client.QueryUser(r.Context(), reg, a.UserID(localpart))
 	a.completeRegistration(w, r, localpart, req)
 }

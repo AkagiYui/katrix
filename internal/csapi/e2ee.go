@@ -644,6 +644,25 @@ func (a *API) DeviceSigningUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The first cross-signing upload must include the master key: a self- or
+	// user-signing key cannot be established before its master exists (spec +
+	// sytest "Fails to upload self-signing key without master key" expects a
+	// 400 when only a self_signing_key is uploaded). Once a master exists the
+	// other keys may be uploaded in any order.
+	haveMaster := false
+	for _, k := range keys {
+		if k.KeyType == "master" {
+			haveMaster = true
+		}
+	}
+	if !haveMaster {
+		if _, uploadingMaster := req["master_key"]; !uploadingMaster {
+			httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM",
+				"cross-signing keys require a master key"))
+			return
+		}
+	}
+
 	for _, keyType := range []string{"master", "self_signing", "user_signing"} {
 		if kjson, ok := req[keyType+"_key"]; ok {
 			_, _ = a.Store.UpsertCrossSigningKey(r.Context(), storage.CrossSigningKey{
@@ -651,6 +670,14 @@ func (a *API) DeviceSigningUpload(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
+	// Cross-signing keys are part of a user's device-list visibility: a change
+	// must reach the user's room peers via device_lists.changed (spec + sytest
+	// "Changing master key notifies local users" syncs until user1 appears in
+	// user2's device list) and federating servers via the m.device_list_update
+	// EDU ("uploading self-signing key notifies over federation").
+	_, _ = a.Store.RecordDeviceListChange(r.Context(), auth.UserID, false)
+	a.broadcastDeviceListUpdate(r.Context(), auth.UserID, "", false)
+	a.notifyDeviceListPeers(r.Context(), auth.UserID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 

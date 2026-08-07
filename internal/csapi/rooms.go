@@ -2157,7 +2157,7 @@ func (a *API) resolveRoomIDOrAlias(ctx context.Context, idOrAlias string) string
 		}
 		if a.HS.AppServices != nil {
 			if reg := a.HS.AppServices.AliasMatch(idOrAlias); reg != nil {
-				client := appservice.NewClient()
+				client := appservice.NewClient(a.Config.FederationInsecure)
 				client.QueryAlias(ctx, reg, idOrAlias)
 				// The AS may have created the alias while answering; retry.
 				if roomID2, err2 := a.Store.LookupAlias(ctx, idOrAlias); err2 == nil {
@@ -2578,7 +2578,7 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	if a.HS.AppServices != nil && a.IsLocalUser(target) {
 		if _, err := a.Store.GetUser(r.Context(), a.LocalpartOf(target)); err != nil {
 			if reg := a.HS.AppServices.UserMatch(target); reg != nil {
-				client := appservice.NewClient()
+				client := appservice.NewClient(a.Config.FederationInsecure)
 				client.QueryUser(r.Context(), reg, target)
 			}
 		}

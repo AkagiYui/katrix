@@ -3,6 +3,7 @@ package appservice
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,9 +19,16 @@ type Client struct {
 	http *http.Client
 }
 
-// NewClient constructs an AS client.
-func NewClient() *Client {
-	return &Client{http: &http.Client{Timeout: 15 * time.Second}}
+// NewClient constructs an AS client. When insecure is set, TLS certificate
+// verification is skipped for AS requests — a test-harness-only escape hatch
+// (SyTest's mock appservice presents a self-signed certificate); production
+// deployments must leave it off.
+func NewClient(insecure bool) *Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if insecure {
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- test-only flag
+	}
+	return &Client{http: &http.Client{Timeout: 15 * time.Second, Transport: tr}}
 }
 
 // txnRequest is the body of POST /_matrix/app/v1/transactions/{txnId}: the

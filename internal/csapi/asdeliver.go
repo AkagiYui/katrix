@@ -88,7 +88,7 @@ func (a *API) deliverASEvents(ctx context.Context, roomID string, ev *events.Eve
 		return
 	}
 	clientEv := asClientEvent(ev, roomID)
-	client := appservice.NewClient()
+	client := appservice.NewClient(a.Config.FederationInsecure)
 	for _, reg := range interested {
 		reg := reg
 		go func() {

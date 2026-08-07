@@ -114,9 +114,11 @@ func TestSendAndReceiveToDevice(t *testing.T) {
 func TestDeviceSigningUpload(t *testing.T) {
 	_, srv := testAPI(t)
 	tok := registerUser(t, srv, "carol", "pw")
+	// The spec field names carry the "_key" suffix: master_key,
+	// self_signing_key, user_signing_key.
 	code, _ := doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/keys/device_signing/upload", tok, map[string]any{
-		"master":       map[string]any{"keys": map[string]string{"ed25519:m": "MMM"}},
-		"self_signing": map[string]any{"keys": map[string]string{"ed25519:s": "SSS"}},
+		"master_key":       map[string]any{"keys": map[string]string{"ed25519:m": "MMM"}},
+		"self_signing_key": map[string]any{"keys": map[string]string{"ed25519:s": "SSS"}},
 	})
 	if code != 200 {
 		t.Fatalf("device signing upload: code=%d", code)
