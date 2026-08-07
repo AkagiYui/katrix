@@ -78,13 +78,13 @@ func (a *API) appServiceRegister(w http.ResponseWriter, r *http.Request, req reg
 		httpx.WriteError(w, httpx.ErrForbidden("username not in the appservice's namespace"))
 		return
 	}
-	// Spec "Application services" §Querying: when creating a ghost user the
-	// homeserver asks the application service whether it knows the user (the AS
-	// may provision it) — sytest "Inviting an AS-hosted user asks the AS server"
-	// stubs this request during ghost registration. The query blocks until the
-	// AS answers.
-	client := appservice.NewClient(a.Config.FederationInsecure)
-	client.QueryUser(r.Context(), reg, a.UserID(localpart))
+	// No AS user query here: the AS is creating the user itself via this very
+	// request, so the homeserver has no need to ask whether the AS knows the
+	// user (and a blocking query would deadlock — the sytest mock only answers
+	// paths the test has stubbed, so the register request would hang until the
+	// test times out). The query endpoint (spec §Querying) is used when the
+	// homeserver needs the AS to provision a user it references but has not
+	// seen — e.g. inviting an AS-hosted user (see sendMemberEventWithContent).
 	a.completeRegistration(w, r, localpart, req)
 }
 
