@@ -1866,6 +1866,15 @@ func (a *API) persistStrippedState(ctx context.Context, roomID string, version r
 	srow := &storage.EventRow{
 		EventID: id, RoomID: roomID, Type: se.Type, Sender: se.Sender,
 		Depth: se.Depth, OriginServerTS: se.OSTS, Content: se.Content, RawJSON: sraw,
+		// The delivered stripped state predates the invite: these events are
+		// persisted as outliers (mirror of Synapse's _auth_and_persist_outliers)
+		// so they never surface in the room's timeline — the room's current
+		// state (seeded from them) is what sync's state section delivers, and a
+		// client joining the room must not see pre-join history as new timeline
+		// events (sytest "State from remote users is included in the state in
+		// the initial sync" expects a remote-madeup state event in the state
+		// section, not the timeline).
+		Outlier: true,
 	}
 	if se.StateKey != nil {
 		srow.StateKey = *se.StateKey

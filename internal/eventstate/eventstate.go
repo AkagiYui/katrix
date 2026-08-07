@@ -192,20 +192,6 @@ func isPowerEvent(eventType, stateKey string, content []byte) bool {
 	return false
 }
 
-// IsStateType reports whether an event type is always a state event. This is
-// the set of types whose state_key is meaningful even when empty.
-func IsStateType(eventType string) bool {
-	switch eventType {
-	case "m.room.create", "m.room.power_levels", "m.room.join_rules",
-		"m.room.history_visibility", "m.room.name", "m.room.topic",
-		"m.room.member", "m.room.third_party_invite", "m.room.canonical_alias",
-		"m.room.aliases", "m.room.encryption", "m.room.tombstone",
-		"m.room.server_acl", "m.room.pinned_events":
-		return true
-	}
-	return false
-}
-
 // resolveOverCandidates runs the state-resolution algorithm over a candidate
 // set of state-event IDs and folds the result into a (type\x00state_key)->id
 // map. Used both for merge-event snapshots and for re-resolving room_state over
@@ -238,15 +224,18 @@ func resolveOverCandidates(ctx context.Context, store roomWrite, tx pgx.Tx, cand
 	for _, c := range cands {
 		byID[c.EventID] = c
 	}
+	// Every candidate is a state event (they come from state snapshots, keyed by
+	// type\x00state_key), so every resolved winner maps back into the state map.
+	// No type whitelist here: Matrix allows arbitrary state event types, and a
+	// custom type (e.g. sytest's a.madeup.test.state) must survive a fork
+	// resolution or the room silently loses it from room_state.
 	resolved := make(map[string]string, len(ordered))
 	for _, id := range ordered {
 		c, ok := byID[id]
 		if !ok {
 			continue
 		}
-		if IsStateType(c.Type) {
-			resolved[c.Type+stateKeySep+c.StateKey] = id
-		}
+		resolved[c.Type+stateKeySep+c.StateKey] = id
 	}
 	return resolved, nil
 }

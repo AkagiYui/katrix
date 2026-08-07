@@ -454,7 +454,7 @@ func (s *Store) EventsForRoom(ctx context.Context, roomID string, from, to int64
 	              origin_server_ts, stream_ordering, content, json,
 	              COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
 	       FROM events
-	       WHERE room_id=$1 AND stream_ordering>$2 AND stream_ordering<=$3`
+	       WHERE room_id=$1 AND stream_ordering>$2 AND stream_ordering<=$3 AND outlier=false`
 	// `from` is exclusive (events at or before the token were already seen);
 	// a zero token means "from the start". Backfilled history is stored at
 	// negative stream orderings (below the room's current minimum), so the
@@ -567,13 +567,15 @@ func (s *Store) EventByTimestamp(ctx context.Context, roomID string, ts int64, d
 }
 
 // LatestEvent returns the event with the highest stream_ordering in a room
-// (the forward extremity for the trivial single-extremity case).
+// (the forward extremity for the trivial single-extremity case). Outlier
+// events (remote join state/auth chains) are excluded: they are not part of
+// the room's timeline, so the "latest" event is the latest real one.
 func (s *Store) LatestEvent(ctx context.Context, roomID string) (*EventRow, error) {
 	return scanEvent(s.pool.QueryRow(ctx,
 		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
 		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
-		 FROM events WHERE room_id=$1
+		 FROM events WHERE room_id=$1 AND outlier=false
 		 ORDER BY stream_ordering DESC LIMIT 1`, roomID))
 }
 
@@ -842,6 +844,37 @@ func (s *Store) GetState(ctx context.Context, roomID string) ([]StateRow, error)
 			return nil, err
 		}
 		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// CurrentStateDeltasSince returns the room's current state events whose
+// governing event was persisted after `since` — i.e. the net state changes
+// that landed in the window (since, now]. State events that changed and then
+// reverted within the window drop out (their current tuple's event predates
+// the token). Used by /sync to build the state section of a limited (gappy /
+// count-truncated) incremental sync, mirroring Synapse's state-delta
+// computation (timeline_end − previous_timeline_end).
+func (s *Store) CurrentStateDeltasSince(ctx context.Context, roomID string, since int64) ([]EventRow, error) {
+	q := `SELECT e.event_id, e.room_id, e.type, COALESCE(e.state_key,''), e.sender, e.depth,
+	              e.origin_server_ts, e.stream_ordering, e.content, e.json,
+	              COALESCE(e.redacts,''), e.redacted, COALESCE(e.redacted_by,''), e.outlier
+	       FROM room_state rs
+	       JOIN events e ON e.event_id = rs.event_id
+	       WHERE rs.room_id=$1 AND e.stream_ordering>$2
+	       ORDER BY e.stream_ordering ASC`
+	rows, err := s.pool.Query(ctx, q, roomID, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EventRow
+	for rows.Next() {
+		e, err := scanEventRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
 	}
 	return out, rows.Err()
 }

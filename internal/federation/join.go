@@ -1085,6 +1085,15 @@ func (a *API) persistRemotePDUs(ctx context.Context, roomID string, rules roomve
 		row := &storage.EventRow{
 			EventID: id, RoomID: roomID, Type: ev.Type, Sender: ev.Sender,
 			Depth: ev.Depth, OriginServerTS: ev.OSTS, Content: ev.Content, RawJSON: raw,
+			// The delivered state/auth chain predates the join: these events are
+			// persisted as outliers (mirror of Synapse's _auth_and_persist_outliers)
+			// so they never surface in the room's timeline — a client joining a
+			// room it wasn't in for must not see pre-join history as new timeline
+			// events, and the room's current state (seeded from them) is what the
+			// state section delivers (sytest "State from remote users is included
+			// in the state in the initial sync" expects a remote-madeup state event
+			// in the state section, not the timeline).
+			Outlier: true,
 		}
 		if ev.StateKey != nil {
 			row.StateKey = *ev.StateKey

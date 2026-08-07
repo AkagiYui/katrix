@@ -188,9 +188,39 @@ func (t *TypingTracker) RecentStop(roomID string) bool {
 type Engine struct {
 	store  *storage.Store
 	typing *TypingTracker
+	// llCache remembers, per (user, device), the event ID of the last
+	// membership event delivered to that device under a lazy_load_members
+	// filter. Incremental syncs use it to suppress memberships that were
+	// already sent (mirror of Synapse's lazy_loaded_members_cache; the spec's
+	// lazy-loading expects the server not to resend the same memberships). The
+	// redundant-member opt-in (filter.include_redundant_members) bypasses it.
+	llCache map[string]map[string]string
 }
 
 // NewEngine constructs a sync Engine.
 func NewEngine(store *storage.Store, typing *TypingTracker) *Engine {
-	return &Engine{store: store, typing: typing}
+	return &Engine{store: store, typing: typing, llCache: map[string]map[string]string{}}
+}
+
+// llCacheFor returns (creating if needed) the lazy-loaded-members cache for a
+// (user, device) pair: userID -> last-delivered member event ID.
+func (e *Engine) llCacheFor(userID, deviceID string) map[string]string {
+	key := userID + "\x00" + deviceID
+	m := e.llCache[key]
+	if m == nil {
+		m = map[string]string{}
+		e.llCache[key] = m
+	}
+	return m
+}
+
+// resetLLCache clears the lazy-loaded-members cache for a (user, device) pair
+// and returns it. A fresh sync sequence (initial sync) assumes the client had
+// amnesia and should not have recent memberships de-duplicated (mirror of
+// Synapse's cache.clear() when since_token is None).
+func (e *Engine) resetLLCache(userID, deviceID string) map[string]string {
+	key := userID + "\x00" + deviceID
+	m := map[string]string{}
+	e.llCache[key] = m
+	return m
 }
