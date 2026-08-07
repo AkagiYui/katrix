@@ -36,6 +36,11 @@ type Registration struct {
 		Aliases []Namespace `yaml:"aliases"`
 		Rooms   []Namespace `yaml:"rooms"`
 	} `yaml:"namespaces"`
+
+	// Protocols (spec "Application services" §Third-party networks): the
+	// third-party protocols this AS provides. The homeserver exposes the AS's
+	// protocol metadata to clients via the thirdparty endpoints.
+	Protocols []string `yaml:"protocols"`
 }
 
 // Namespace is one regex (plus its exclusivity flag) in an appservice
@@ -104,17 +109,99 @@ func (r *Registry) ExclusiveAliasMatch(aliasLocalpart string) *Registration {
 	return nil
 }
 
-// regexMatches reports whether re matches s (the localpart, without sigil).
-// The registration's namespace regexes may be written with or without the
-// leading sigil ("@astest-.*" vs "astest-.*"): try both the raw localpart and
-// the "@"-prefixed form so either convention works (sytest writes the sigil,
+// UserMatch returns the first appservice whose user namespace matches the
+// given user ID (matched against the bare localpart, the localpart and the
+// full user ID), or nil. Used to decide whether a user belongs to an AS (ghost
+// users) and therefore whether the AS is interested in their events.
+func (r *Registry) UserMatch(userID string) *Registration {
+	localpart := userID
+	if i := indexByte(userID, ':'); i >= 0 {
+		if userID[0] == '@' {
+			localpart = userID[1:i]
+		}
+	}
+	for _, reg := range r.bySender {
+		for _, ns := range reg.Namespaces.Users {
+			if regexMatches(ns.Regex, localpart) {
+				return reg
+			}
+		}
+	}
+	return nil
+}
+
+// AliasMatch returns the first appservice whose alias namespace matches the
+// given alias (its bare localpart), or nil. Used to decide whether an alias is
+// hosted by an AS (and therefore whether the AS is interested in the room's
+// events).
+func (r *Registry) AliasMatch(alias string) *Registration {
+	localpart := alias
+	if i := indexByte(alias, ':'); i >= 0 {
+		if alias[0] == '#' {
+			localpart = alias[1:i]
+		}
+	}
+	for _, reg := range r.bySender {
+		for _, ns := range reg.Namespaces.Aliases {
+			if regexMatches(ns.Regex, localpart) {
+				return reg
+			}
+		}
+	}
+	return nil
+}
+
+// RoomsMatch returns the first appservice whose rooms namespace matches the
+// given room ID, or nil. Used to decide whether the AS is interested in every
+// event of the room (spec: "For the `rooms` and `aliases` namespaces, all
+// events in a matching room will be sent to the application service").
+func (r *Registry) RoomsMatch(roomID string) *Registration {
+	for _, reg := range r.bySender {
+		for _, ns := range reg.Namespaces.Rooms {
+			if regexMatches(ns.Regex, roomID) {
+				return reg
+			}
+		}
+	}
+	return nil
+}
+
+// All returns every loaded registration, in an unspecified order.
+func (r *Registry) All() []*Registration {
+	out := make([]*Registration, 0, len(r.bySender))
+	for _, reg := range r.bySender {
+		out = append(out, reg)
+	}
+	return out
+}
+
+func indexByte(s string, b byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
+}
+
+// regexMatches reports whether re matches s (the namespace value without its
+// leading sigil). The registration's namespace regexes may be written with or
+// without the sigil ("@astest-.*" vs "astest-.*"), and the sigil may be '@'
+// (users), '#' (aliases) or '+' (rooms); try the raw value and each sigil-
+// prefixed form so either convention works (sytest writes the sigil,
 // Complement does not). A malformed regex never matches.
 func regexMatches(re, s string) bool {
 	compiled, err := regexp.Compile("^(?:" + re + ")$")
 	if err != nil {
 		return false
 	}
-	return compiled.MatchString(s) || compiled.MatchString("@"+s)
+	candidates := []string{s, "@" + s, "#" + s, "+" + s}
+	for _, c := range candidates {
+		if compiled.MatchString(c) {
+			return true
+		}
+	}
+	return false
 }
 
 // LoadDir reads every *.yaml/*.yml registration file in dir, seeds the store

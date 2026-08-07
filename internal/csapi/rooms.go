@@ -67,6 +67,12 @@ func (a *API) registerRooms(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /_matrix/client/v3/directory/list/room/{roomID}", a.RequireAuth(a.DirectoryListRoomPut))
 	mux.HandleFunc("GET /_matrix/client/v3/directory/list/room/{roomID}", a.RequireAuth(a.DirectoryListRoomGet))
 	mux.HandleFunc("DELETE /_matrix/client/v3/directory/list/room/{roomID}", a.RequireAuth(a.DirectoryListRoomDelete))
+	// Application-service room publishing (spec "Application services" §Room
+	// directory): the appservice's own room list, keyed by appservice id +
+	// network id. Only an appservice as_token may publish into its own list.
+	mux.HandleFunc("PUT /_matrix/client/v3/directory/list/appservice/{networkID}/{roomID}", a.RequireAuth(a.DirectoryListAppServicePut))
+	mux.HandleFunc("GET /_matrix/client/v3/directory/list/appservice/{networkID}/{roomID}", a.RequireAuth(a.DirectoryListAppServiceGet))
+	mux.HandleFunc("DELETE /_matrix/client/v3/directory/list/appservice/{networkID}/{roomID}", a.RequireAuth(a.DirectoryListAppServiceDelete))
 }
 
 // ---- createRoom ----
@@ -1673,6 +1679,9 @@ func (a *API) deliverPushFor(ctx context.Context, roomID string, ev *events.Even
 	}
 	sk, _ := ev.StateKey()
 	a.push.deliverNotifies(ctx, roomID, ev.EventID(), ev.Type(), ev.Sender(), sk, ev.Content(), stream, rejected)
+	// Application services interested in the event receive it via the
+	// transaction API (spec "Application services" §Pushing events).
+	a.deliverASEvents(ctx, roomID, ev)
 }
 // roomPowerLevels returns the room's current m.room.power_levels (or the zero
 // value when absent, which means everyone is level 0).
@@ -1997,6 +2006,78 @@ func (a *API) DirectoryListRoomDelete(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
+// requireAppService returns the registration of the authenticated application
+// service (the request must carry an appservice as_token). An appservice may
+// only publish rooms into its own room list (spec "Application services": the
+// room-directory endpoints are AS-only). Returns nil when the request is not
+// authenticated as an appservice (the error response is already written).
+func (a *API) requireAppService(w http.ResponseWriter, r *http.Request) *appservice.Registration {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	if !auth.IsAppService {
+		httpx.WriteError(w, httpx.ErrForbidden("this endpoint requires appservice authentication"))
+		return nil
+	}
+	reg := a.HS.AppServices.ForSender(auth.Localpart)
+	if reg == nil {
+		httpx.WriteError(w, httpx.ErrForbidden("this endpoint requires appservice authentication"))
+		return nil
+	}
+	return reg
+}
+
+// DirectoryListAppServicePut handles PUT /_matrix/client/v3/directory/list/appservice/{networkID}/{roomID}.
+// An appservice publishes (visibility=public) or unpublishes (private) a room
+// in its own room list.
+func (a *API) DirectoryListAppServicePut(w http.ResponseWriter, r *http.Request) {
+	reg := a.requireAppService(w, r)
+	if reg == nil {
+		return
+	}
+	networkID := r.PathValue("networkID")
+	roomID := r.PathValue("roomID")
+	var req struct {
+		Visibility string `json:"visibility"`
+	}
+	_ = httpx.DecodeJSON(w, r, &req)
+	if err := a.Store.SetAppServiceRoomVisibility(r.Context(), reg.ID, networkID, roomID, req.Visibility == "public", a.Now()); err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// DirectoryListAppServiceGet handles GET /_matrix/client/v3/directory/list/appservice/{networkID}/{roomID}.
+func (a *API) DirectoryListAppServiceGet(w http.ResponseWriter, r *http.Request) {
+	reg := a.requireAppService(w, r)
+	if reg == nil {
+		return
+	}
+	networkID := r.PathValue("networkID")
+	roomID := r.PathValue("roomID")
+	vis, err := a.Store.GetAppServiceRoomVisibility(r.Context(), reg.ID, networkID, roomID)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	v := "private"
+	if vis {
+		v = "public"
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"visibility": v})
+}
+
+// DirectoryListAppServiceDelete handles DELETE /_matrix/client/v3/directory/list/appservice/{networkID}/{roomID}.
+func (a *API) DirectoryListAppServiceDelete(w http.ResponseWriter, r *http.Request) {
+	reg := a.requireAppService(w, r)
+	if reg == nil {
+		return
+	}
+	networkID := r.PathValue("networkID")
+	roomID := r.PathValue("roomID")
+	_ = a.Store.SetAppServiceRoomVisibility(r.Context(), reg.ID, networkID, roomID, false, a.Now())
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
 // ---- helpers ----
 
 // roomError is the internal error type carrying a Matrix errcode/status.
@@ -2041,16 +2122,31 @@ func writeRoomErr(w http.ResponseWriter, err error) {
 }
 
 // resolveRoomIDOrAlias resolves a room ID or alias to a room ID.
+// resolveRoomIDOrAlias resolves a room ID or alias to a room ID. A local alias
+// that is not in the directory but lies in an application service's alias
+// namespace is resolved by querying the AS (spec "Application services"
+// §Querying: "The application service SHOULD create the queried entity if it
+// desires"; sytest "Accesing an AS-hosted room alias asks the AS server").
 func (a *API) resolveRoomIDOrAlias(ctx context.Context, idOrAlias string) string {
 	if strings.HasPrefix(idOrAlias, "!") {
 		return idOrAlias
 	}
 	if strings.HasPrefix(idOrAlias, "#") {
 		roomID, err := a.Store.LookupAlias(ctx, idOrAlias)
-		if err != nil {
-			return ""
+		if err == nil {
+			return roomID
 		}
-		return roomID
+		if a.HS.AppServices != nil {
+			if reg := a.HS.AppServices.AliasMatch(idOrAlias); reg != nil {
+				client := appservice.NewClient()
+				client.QueryAlias(ctx, reg, idOrAlias)
+				// The AS may have created the alias while answering; retry.
+				if roomID2, err2 := a.Store.LookupAlias(ctx, idOrAlias); err2 == nil {
+					return roomID2
+				}
+			}
+		}
+		return ""
 	}
 	return ""
 }
@@ -2453,6 +2549,19 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	if mc, _ := rooms.ParseMember(contentRaw); mc != nil && mc.Membership == rooms.MembershipInvite && a.IsLocalUser(target) {
 		if verdict, verr := a.Store.EvaluateInviteFilter(r.Context(), a.LocalpartOf(target), auth.UserID, a.ServerName()); verr == nil && verdict == storage.InviteFilterBlock {
 			return "", newRoomError(http.StatusForbidden, "M_INVITE_BLOCKED", "the invite was blocked by the invitee's permission settings")
+		}
+	}
+	// Application-service query (spec "Application services" §Querying): when a
+	// request references a user in an AS's namespace that this server does not
+	// know, the homeserver must ask the application service whether it knows the
+	// user (the AS may provision it). This blocks the request until the AS
+	// answers (sytest "Inviting an AS-hosted user asks the AS server").
+	if a.HS.AppServices != nil && a.IsLocalUser(target) {
+		if _, err := a.Store.GetUser(r.Context(), a.LocalpartOf(target)); err != nil {
+			if reg := a.HS.AppServices.UserMatch(target); reg != nil {
+				client := appservice.NewClient()
+				client.QueryUser(r.Context(), reg, target)
+			}
 		}
 	}
 	st, err := a.buildStateSnapshot(r.Context(), roomID, target, auth.UserID, contentRaw)

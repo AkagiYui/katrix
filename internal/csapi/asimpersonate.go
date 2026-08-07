@@ -31,7 +31,7 @@ func (a *API) actingAuth(r *http.Request) (*homeserver.Auth, error) {
 		return nil, httpx.ErrForbidden("user_id must be a local user")
 	}
 	reg := a.HS.AppServices.ForSender(auth.Localpart)
-	if reg == nil || !appserviceUserInNamespaces(reg, a.LocalpartOf(target)) {
+	if reg == nil || !appserviceUserInNamespaces(reg, a.LocalpartOf(target), a.ServerName()) {
 		return nil, httpx.ErrForbidden("user_id is not in the appservice's namespace")
 	}
 	clone := *auth

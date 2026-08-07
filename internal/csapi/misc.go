@@ -59,6 +59,12 @@ func (a *API) registerMisc(mux *http.ServeMux) {
 	// Public rooms.
 	mux.HandleFunc("GET /_matrix/client/v3/publicRooms", a.PublicRooms)
 	mux.HandleFunc("POST /_matrix/client/v3/publicRooms", a.RequireAuth(a.PublicRooms))
+	// Third-party network metadata (spec §Third-party networks): proxied to the
+	// appservices that declare the protocol.
+	mux.HandleFunc("GET /_matrix/client/v3/thirdparty/protocols", a.RequireAuth(a.ThirdPartyProtocols))
+	mux.HandleFunc("GET /_matrix/client/v3/thirdparty/protocol/{protocol}", a.RequireAuth(a.ThirdPartyProtocol))
+	mux.HandleFunc("GET /_matrix/client/v3/thirdparty/user/{protocol}", a.RequireAuth(a.ThirdPartyUser))
+	mux.HandleFunc("GET /_matrix/client/v3/thirdparty/location/{protocol}", a.RequireAuth(a.ThirdPartyLocation))
 	// URL preview (P8, with SSRF protection).
 	mux.HandleFunc("GET /_matrix/client/v1/media/preview_url", a.RequireAuth(a.PreviewURL))
 	mux.HandleFunc("GET /_matrix/media/v3/preview_url", a.RequireAuth(a.PreviewURL))
@@ -676,71 +682,148 @@ func (a *API) GetFilter(w http.ResponseWriter, r *http.Request) {
 // flagged is_public with the fields the spec requires each entry to carry:
 // room_id, creator, num_joined_members, world_readable, guest_can_join, plus
 // (when present) canonical_alias, name, topic and avatar_url.
+//
+// The POST filter (spec §Public Room Directory: "If third_party_instance_id
+// is set, only rooms published by the given network are returned. If
+// include_all_networks is set, rooms published by all networks are returned")
+// is honoured: third_party_instance_id ("<appservice_id>|<network_id>")
+// narrows to one appservice's room list, include_all_networks merges every
+// appservice list with the main list, and the default is the main list only.
 func (a *API) PublicRooms(w http.ResponseWriter, r *http.Request) {
-	// Scan rooms table for is_public rows. Simpler than a dedicated query.
+	var req struct {
+		ThirdPartyInstanceID string `json:"third_party_instance_id,omitempty"`
+		IncludeAllNetworks   bool   `json:"include_all_networks,omitempty"`
+	}
+	if r.Method == http.MethodPost {
+		_ = httpx.DecodeJSON(w, r, &req)
+	}
+
+	// The requested room set: the main (is_public) list, an appservice's list,
+	// or both. A third_party_instance_id / include_all_networks filter selects
+	// AS-published rooms (which need not be in the main is_public set — sytest
+	// publishes a private room into the AS list).
+	asRoomIDs := map[string]bool{}
+	if req.ThirdPartyInstanceID != "" {
+		appID, netID := splitInstanceID(req.ThirdPartyInstanceID)
+		if ids, err := a.Store.AppServiceRoomIDs(r.Context(), appID, netID); err == nil {
+			for _, id := range ids {
+				asRoomIDs[id] = true
+			}
+		}
+	} else if req.IncludeAllNetworks && a.HS.AppServices != nil {
+		for _, reg := range a.HS.AppServices.All() {
+			if ids, err := a.Store.AppServiceRoomIDs(r.Context(), reg.ID, ""); err == nil {
+				for _, id := range ids {
+					asRoomIDs[id] = true
+				}
+			}
+		}
+	}
+
+	// Candidate rooms: the main is_public set, plus every AS-published room
+	// when an AS filter is in play.
+	candidates := map[string]string{} // roomID -> creator
 	rows, err := a.Store.Pool().Query(r.Context(),
 		`SELECT room_id, creator, created_ts FROM rooms WHERE is_public=TRUE LIMIT 100`)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
-	defer rows.Close()
-	chunk := make([]map[string]any, 0)
 	for rows.Next() {
 		var roomID, creator string
 		var ts int64
 		_ = rows.Scan(&roomID, &creator, &ts)
-		entry := map[string]any{
-			"room_id":            roomID,
-			"creator":            creator,
-			"num_joined_members": a.publicRoomMemberCount(r, roomID),
-		}
-		// world_readable: history_visibility == world_readable.
-		entry["world_readable"] = a.historyVisibility(r.Context(), roomID) == "world_readable"
-		// guest_can_join: m.room.guest_access allows guests to join.
-		entry["guest_can_join"] = a.guestCanJoin(r.Context(), roomID)
-		// join_rule: required by the spec. Defaults to "invite" when no
-		// m.room.join_rules state event exists.
-		entry["join_rule"] = a.joinRule(r.Context(), roomID)
-		// Optional fields from room state.
-		canonicalAlias := ""
-		if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.canonical_alias", ""); err == nil {
-			if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
-				canonicalAlias = stateStringField(ev.Content, "alias")
+		candidates[roomID] = creator
+	}
+	rows.Close()
+	if req.ThirdPartyInstanceID != "" || req.IncludeAllNetworks {
+		for roomID := range asRoomIDs {
+			if _, ok := candidates[roomID]; !ok {
+				room, rerr := a.Store.GetRoom(r.Context(), roomID)
+				if rerr == nil {
+					candidates[roomID] = room.Creator
+				}
 			}
 		}
-		// Fall back to the room's first alias when no canonical_alias state
-		// event exists (createRoom with room_alias_name publishes the alias but
-		// may not write the state event).
-		if canonicalAlias == "" {
-			if aliases, err := a.Store.AliasesForRoom(r.Context(), roomID); err == nil && len(aliases) > 0 {
-				canonicalAlias = aliases[0]
+	}
+
+	chunk := make([]map[string]any, 0, len(candidates))
+	for roomID, creator := range candidates {
+		// When filtered to an appservice list (or include_all_networks), only
+		// rooms published by an appservice appear; a third_party_instance_id
+		// filter excludes the main list entirely.
+		if req.ThirdPartyInstanceID != "" || req.IncludeAllNetworks {
+			if !asRoomIDs[roomID] {
+				continue
 			}
 		}
-		if canonicalAlias != "" {
-			entry["canonical_alias"] = canonicalAlias
-		}
-		if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.name", ""); err == nil {
-			if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
-				entry["name"] = stateStringField(ev.Content, "name")
-			}
-		}
-		if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.topic", ""); err == nil {
-			if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
-				entry["topic"] = stateStringField(ev.Content, "topic")
-			}
-		}
-		if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.avatar", ""); err == nil {
-			if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
-				entry["avatar_url"] = stateStringField(ev.Content, "url")
-			}
-		}
-		chunk = append(chunk, entry)
+		chunk = append(chunk, a.publicRoomEntry(r, roomID, creator))
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"chunk":                     chunk,
 		"total_room_count_estimate": len(chunk),
 	})
+}
+
+// splitInstanceID splits a third_party_instance_id ("<appservice_id>|<network_id>")
+// into its two parts.
+func splitInstanceID(instanceID string) (string, string) {
+	for i := 0; i < len(instanceID); i++ {
+		if instanceID[i] == '|' {
+			return instanceID[:i], instanceID[i+1:]
+		}
+	}
+	return instanceID, ""
+}
+
+// publicRoomEntry builds one publicRooms chunk entry for a room.
+func (a *API) publicRoomEntry(r *http.Request, roomID, creator string) map[string]any {
+	entry := map[string]any{
+		"room_id":            roomID,
+		"creator":            creator,
+		"num_joined_members": a.publicRoomMemberCount(r, roomID),
+	}
+	// world_readable: history_visibility == world_readable.
+	entry["world_readable"] = a.historyVisibility(r.Context(), roomID) == "world_readable"
+	// guest_can_join: m.room.guest_access allows guests to join.
+	entry["guest_can_join"] = a.guestCanJoin(r.Context(), roomID)
+	// join_rule: required by the spec. Defaults to "invite" when no
+	// m.room.join_rules state event exists.
+	entry["join_rule"] = a.joinRule(r.Context(), roomID)
+	// Optional fields from room state.
+	canonicalAlias := ""
+	if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.canonical_alias", ""); err == nil {
+		if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
+			canonicalAlias = stateStringField(ev.Content, "alias")
+		}
+	}
+	// Fall back to the room's first alias when no canonical_alias state
+	// event exists (createRoom with room_alias_name publishes the alias but
+	// may not write the state event).
+	if canonicalAlias == "" {
+		if aliases, err := a.Store.AliasesForRoom(r.Context(), roomID); err == nil && len(aliases) > 0 {
+			canonicalAlias = aliases[0]
+		}
+	}
+	if canonicalAlias != "" {
+		entry["canonical_alias"] = canonicalAlias
+	}
+	if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.name", ""); err == nil {
+		if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
+			entry["name"] = stateStringField(ev.Content, "name")
+		}
+	}
+	if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.topic", ""); err == nil {
+		if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
+			entry["topic"] = stateStringField(ev.Content, "topic")
+		}
+	}
+	if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.avatar", ""); err == nil {
+		if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
+			entry["avatar_url"] = stateStringField(ev.Content, "url")
+		}
+	}
+	return entry
 }
 
 // publicRoomMemberCount returns the number of joined members in a room.

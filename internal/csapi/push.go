@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/pushrules"
@@ -50,11 +51,13 @@ func newPushDispatcher() *pushDispatcher {
 
 // NotifyInbound implements federation.PushNotifier: the federation ingest path
 // calls it after persisting an inbound event so HTTP push notifications reach
-// the room's local users. The stream ordering is the persisted row's; the
-// dispatcher dedups against the CS path (which may deliver the same event when
-// it is a local echo).
-func (d *pushDispatcher) NotifyInbound(ctx context.Context, roomID, eventID, eventType, sender, stateKey string, content []byte, stream int64, rejected bool) {
-	d.deliverNotifies(ctx, roomID, eventID, eventType, sender, stateKey, content, stream, rejected)
+// the room's local users and interested application services receive the event.
+// The stream ordering is the persisted row's; the dispatcher dedups against the
+// CS path (which may deliver the same event when it is a local echo).
+func (d *pushDispatcher) NotifyInbound(ctx context.Context, ev *events.Event, roomID string, stream int64, rejected bool) {
+	sk, _ := ev.StateKey()
+	d.deliverNotifies(ctx, roomID, ev.EventID(), ev.Type(), ev.Sender(), sk, ev.Content(), stream, rejected)
+	d.a.deliverASEvents(ctx, roomID, ev)
 }
 
 // deliverNotifies evaluates the event against each joined local user's push

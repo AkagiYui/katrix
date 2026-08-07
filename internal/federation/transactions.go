@@ -493,16 +493,14 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	if err != nil {
 		return evID, false
 	}
-	// Deliver HTTP push notifications to the room's local users' pushers for
-	// the inbound event (spec Push Module: the homeserver notifies the user's
-	// pushers when an event is received). A rejected (soft-failed) event is
-	// never pushed (sytest "Rejected events are not pushed").
+	// Deliver HTTP push notifications and application-service events for the
+	// inbound event (spec Push Module + Application Services). A rejected
+	// (soft-failed) event is never pushed (sytest "Rejected events are not
+	// pushed").
 	if a.pushNotifier != nil {
-		sk := ""
-		if ev.StateKey != nil {
-			sk = *ev.StateKey
+		if e, perr := events.New(raw, version); perr == nil {
+			a.pushNotifier.NotifyInbound(r.Context(), e, ev.RoomID, inboundStream, rejected)
 		}
-		a.pushNotifier.NotifyInbound(r.Context(), ev.RoomID, evID, ev.Type, ev.Sender, sk, ev.Content, inboundStream, rejected)
 	}
 	// Apply a redaction to its target (spec Handling redactions): the target is
 	// marked redacted when the redaction's sender meets the room's redact power
@@ -2251,16 +2249,14 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 			if ev.StateKey != nil && ev.Type == "m.room.member" {
 				a.applyRemoteMembership(r.Context(), ev.RoomID, *ev.StateKey, ev.Content, evID, ev.Depth)
 			}
-			// Deliver HTTP push notifications (a remote user's invite/join/leave
-			// notifies the room's local users, and an invite notifies the
-			// invitee — the remote-origin case of the "Invites over federation
-			// are correctly pushed" tests).
+			// Deliver HTTP push notifications and application-service events (a
+			// remote user's invite/join/leave notifies the room's local users,
+			// and an invite notifies the invitee — the remote-origin case of the
+			// "Invites over federation are correctly pushed" tests).
 			if a.pushNotifier != nil {
-				sk := ""
-				if ev.StateKey != nil {
-					sk = *ev.StateKey
+				if e, perr := events.New(eventJSON, version); perr == nil {
+					a.pushNotifier.NotifyInbound(r.Context(), e, ev.RoomID, inboundStream, false)
 				}
-				a.pushNotifier.NotifyInbound(r.Context(), ev.RoomID, evID, ev.Type, ev.Sender, sk, ev.Content, inboundStream, false)
 			}
 		}
 	}

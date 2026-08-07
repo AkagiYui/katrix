@@ -74,34 +74,51 @@ func (a *API) appServiceRegister(w http.ResponseWriter, r *http.Request, req reg
 		httpx.WriteError(w, httpx.ErrInvalidUsername("invalid username"))
 		return
 	}
-	if !appserviceUserInNamespaces(reg, localpart) {
+	if !appserviceUserInNamespaces(reg, localpart, a.ServerName()) {
 		httpx.WriteError(w, httpx.ErrForbidden("username not in the appservice's namespace"))
 		return
 	}
+	// Spec "Application services" §Querying: when creating a ghost user the
+	// homeserver asks the application service whether it knows the user (the AS
+	// may provision it) — sytest "Inviting an AS-hosted user asks the AS server"
+	// stubs this request during ghost registration. The query blocks until the
+	// AS answers.
+	client := appservice.NewClient()
+	client.QueryUser(r.Context(), reg, a.UserID(localpart))
 	a.completeRegistration(w, r, localpart, req)
 }
 
 // appserviceUserInNamespaces reports whether localpart matches any user
 // namespace regex of the appservice's registration (spec: the registration's
-// user namespaces define which users the AS may create/control).
-func appserviceUserInNamespaces(reg *appservice.Registration, localpart string) bool {
+// user namespaces define which users the AS may create/control). The regex is
+// matched against the raw localpart, the "@"-prefixed localpart, and the full
+// user ID ("@localpart:server") — registrations commonly anchor on the full ID
+// (e.g. sytest's non-exclusive "@_.*:servername" namespace, which lets the AS
+// act on any user whose ID ends in the server name).
+func appserviceUserInNamespaces(reg *appservice.Registration, localpart, serverName string) bool {
 	for _, ns := range reg.Namespaces.Users {
-		if regexpMatch(ns.Regex, localpart) {
+		if regexpMatch(ns.Regex, localpart, serverName) {
 			return true
 		}
 	}
 	return false
 }
 
-// regexpMatch reports whether re matches s (anchored), trying both the raw
-// localpart and the "@"-prefixed form (the registration's regex may include
-// the sigil).
-func regexpMatch(re, s string) bool {
+// regexpMatch reports whether re matches the user named by localpart (anchored),
+// trying the raw localpart, the "@"-prefixed form, and the full user ID
+// (the registration's regex may include the sigil and/or the server name).
+func regexpMatch(re, localpart, serverName string) bool {
 	compiled, err := regexp.Compile("^(?:" + re + ")$")
 	if err != nil {
 		return false
 	}
-	return compiled.MatchString(s) || compiled.MatchString("@"+s)
+	if compiled.MatchString(localpart) || compiled.MatchString("@"+localpart) {
+		return true
+	}
+	if serverName != "" {
+		return compiled.MatchString("@" + localpart + ":" + serverName)
+	}
+	return false
 }
 
 // wellKnown returns the m.homeserver well_known object injected into
