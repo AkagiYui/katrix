@@ -1376,17 +1376,28 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 			content["join_authorised_via_users_server"] = authoriser
 		}
 	}
+	// `origin` is a top-level field of legacy room versions (1-2) only. For
+	// v3+ the spec moved it out of the event (the joining server's identity
+	// comes from the request), so the template omits it — mirror of Synapse's
+	// get_templated_pdu_json, which serializes the parsed event (v3+ events
+	// carry no origin). Including it would put a foreign field under the
+	// joining server's signature, and sytest's redaction keeps origin when
+	// present, so our (v11) redaction would drop it and the signature would
+	// fail to verify (sytest "Inbound /v1/send_join rejects incorrectly-signed
+	// joins" runs its room at the server's default version 11).
 	template := map[string]any{
 		"type":             "m.room.member",
 		"state_key":        userID,
 		"sender":           userID,
 		"room_id":          roomID,
-		"origin":           a.ServerName(),
 		"origin_server_ts": a.Now(),
 		"depth":            depth,
 		"prev_events":      prevRefs,
 		"auth_events":      authRefs,
 		"content":          content,
+	}
+	if rules.EventFormatV1 {
+		template["origin"] = a.ServerName()
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"origin":       a.ServerName(),
@@ -1518,12 +1529,14 @@ func (a *API) MakeKnock(w http.ResponseWriter, r *http.Request) {
 		"state_key":        userID,
 		"sender":           userID,
 		"room_id":          roomID,
-		"origin":           a.ServerName(),
 		"origin_server_ts": a.Now(),
 		"depth":            depth,
 		"prev_events":      prevRefs,
 		"auth_events":      authRefs,
 		"content":          map[string]string{"membership": "knock"},
+	}
+	if rules.EventFormatV1 {
+		template["origin"] = a.ServerName()
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"origin":       a.ServerName(),
@@ -1597,26 +1610,32 @@ func (a *API) MakeLeave(w http.ResponseWriter, r *http.Request) {
 	// Legacy room versions (1-2) reference prev/auth events as [id, hash]
 	// pairs; v3+ use plain ID strings (see MakeJoin).
 	var prevRefs, authRefs any = prev, authIDs
+	legacy := false
 	if room, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
 		if rules, ok := roomver.Get(roomver.Version(room.Version)); ok && rules.EventFormatV1 {
+			legacy = true
 			prevRefs = legacyTemplateRefs(prev)
 			authRefs = legacyTemplateRefs(authIDs)
 		}
 	}
+	event := map[string]any{
+		"type":             "m.room.member",
+		"state_key":        userID,
+		"sender":           userID,
+		"room_id":          roomID,
+		"origin_server_ts": a.Now(),
+		"depth":            depth,
+		"prev_events":      prevRefs,
+		"auth_events":      authRefs,
+		"content":          map[string]string{"membership": "leave"},
+	}
+	// `origin` is a top-level field of legacy room versions only (see MakeJoin).
+	if legacy {
+		event["origin"] = a.ServerName()
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"origin": a.ServerName(),
-		"event": map[string]any{
-			"type":             "m.room.member",
-			"state_key":        userID,
-			"sender":           userID,
-			"room_id":          roomID,
-			"origin":           a.ServerName(),
-			"origin_server_ts": a.Now(),
-			"depth":            depth,
-			"prev_events":      prevRefs,
-			"auth_events":      authRefs,
-			"content":          map[string]string{"membership": "leave"},
-		},
+		"event":  event,
 	})
 }
 
