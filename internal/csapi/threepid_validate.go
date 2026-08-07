@@ -243,7 +243,37 @@ func (a *API) sendValidationEmail(ctx context.Context, address, token, clientSec
 	if a.Config.SMTP.Port == 0 {
 		addr = a.Config.SMTP.Host
 	}
-	return smtp.SendMail(addr, nil, from, []string{address}, []byte(body))
+	// Deliver the message over SMTP. The conversation is driven manually rather
+	// than via smtp.SendMail so a server that closes the connection right after
+	// accepting the message body (some test mail servers do) does not turn a
+	// successful delivery into an error: once the DATA command completes the
+	// message is delivered, and a failed QUIT must not fail the request.
+	c, err := smtp.Dial(addr)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	if err := c.Mail(from); err != nil {
+		return err
+	}
+	if err := c.Rcpt(address); err != nil {
+		return err
+	}
+	w, err := c.Data()
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte(body)); err != nil {
+		return err
+	}
+	// Close the DATA writer: the server answers 250 once it has the message.
+	if err := w.Close(); err != nil {
+		return err
+	}
+	// QUIT may fail if the server already closed the connection; the message is
+	// delivered, so a QUIT error is not fatal.
+	_ = c.Quit()
+	return nil
 }
 
 // verifyRecaptcha validates an m.login.recaptcha response against the
