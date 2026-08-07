@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/ids"
@@ -347,10 +346,12 @@ func (a *API) copyStateToNewRoom(r *http.Request, auth *homeserver.Auth, oldRoom
 	}
 }
 
-// copyMembersToNewRoom copies member bans from the old room into the new one
-// and auto-joins the old room's local members (per the spec's server
-// behaviour: "the homeserver may choose to automatically join all local users
-// to the new room" — Synapse sends an invite + join for each local member).
+// copyMembersToNewRoom copies member bans from the old room into the new one.
+// Per Synapse's CS upgrade (auto_member defaults False in upgrade_room) local
+// members are NOT auto-joined: they re-join the replacement room themselves,
+// guided by the old room's tombstone. Auto-joining would make a member's
+// subsequent join a no-op that never shows up in their /sync, so the upgrade
+// tests (which re-join the new room and wait for the sync) would time out.
 func (a *API) copyMembersToNewRoom(r *http.Request, auth *homeserver.Auth, oldRoomID, newRoomID string, version roomver.Version) {
 	members, err := a.Store.Members(r.Context(), oldRoomID, "")
 	if err != nil {
@@ -365,54 +366,8 @@ func (a *API) copyMembersToNewRoom(r *http.Request, auth *homeserver.Auth, oldRo
 			a.sendStateEvent(r, auth, newRoomID, version, "m.room.member", m.UserID, map[string]any{
 				"membership": "ban",
 			})
-		case "join":
-			if m.UserID == auth.UserID {
-				continue // already the creator/owner of the new room
-			}
-			if !a.IsLocalUser(m.UserID) {
-				continue // remote members re-join via the tombstone themselves
-			}
-			// Invite (from the upgrader) then join (from the member) so the
-			// join passes the auth rules regardless of join_rules.
-			a.sendStateEvent(r, auth, newRoomID, version, "m.room.member", m.UserID, map[string]any{
-				"membership": "invite",
-			})
-			a.buildAndPersistMemberJoin(r.Context(), newRoomID, version, m.UserID)
 		}
 	}
-}
-
-// buildAndPersistMemberJoin builds, persists and broadcasts an m.room.member
-// join event for a local user in a room (used by the upgrade auto-join path).
-func (a *API) buildAndPersistMemberJoin(ctx context.Context, roomID string, version roomver.Version, userID string) error {
-	prev, depth := a.dagTipFor(ctx, roomID)
-	b := events.Builder{
-		Type:           "m.room.member",
-		Sender:         userID,
-		RoomID:         roomID,
-		Content:        json.RawMessage(`{"membership":"join"}`),
-		Depth:          depth,
-		OriginServerTS: a.Now(),
-		PrevEvents:     prev,
-		AuthEvents:     a.authEventIDs(ctx, roomID, userID, userID),
-	}
-	sk := userID
-	b.StateKey = &sk
-	ev, err := b.BuildForVersion(a.ServerName(), a.Key, version)
-	if err != nil {
-		return err
-	}
-	stream, err := persistEvent(ctx, a.Store, ev, version)
-	if err != nil {
-		return err
-	}
-	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
-		RoomID: roomID, UserID: userID, Membership: "join",
-		EventID: ev.EventID(), StreamOrdering: stream, Depth: ev.Depth(),
-	})
-	a.notifyRoomMembers(ctx, roomID)
-	a.broadcastPDU(ctx, roomID, ev)
-	return nil
 }
 
 // moveAliasesToNewRoom repoints the old room's aliases at the new room,
