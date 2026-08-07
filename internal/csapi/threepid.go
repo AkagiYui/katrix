@@ -8,10 +8,13 @@ import (
 	"github.com/AkagiYui/katrix/internal/identity"
 )
 
-// register3PID wires the 3PID management endpoints (spec §3PID binding): bind a
-// validated 3PID to the user's account via the identity server, and delete or
-// unbind existing bindings.
+// register3PID wires the 3PID management endpoints (spec §3PID binding): add a
+// validated 3PID to the user's account, bind it at an identity server, and
+// delete or unbind existing bindings. Email validation sessions are created via
+// /account/3pid/email/requestToken and confirmed through the email link.
 func (a *API) register3PID(mux *http.ServeMux) {
+	mux.HandleFunc("POST /_matrix/client/v3/account/3pid/email/requestToken", a.account3PIDEmailRequestToken)
+	mux.HandleFunc("POST /_matrix/client/v3/account/3pid", a.RequireUserAuth(a.Add3PID))
 	mux.HandleFunc("POST /_matrix/client/unstable/account/3pid/bind", a.RequireUserAuth(a.Bind3PID))
 	mux.HandleFunc("POST /_matrix/client/v3/account/3pid/bind", a.RequireUserAuth(a.Bind3PID))
 	mux.HandleFunc("POST /_matrix/client/v3/account/3pid/delete", a.RequireUserAuth(a.Delete3PID))
@@ -21,6 +24,40 @@ func (a *API) register3PID(mux *http.ServeMux) {
 	// notifies this homeserver when a stored 3PID invite's address gets bound,
 	// so the pending invite can be exchanged for a real member invite.
 	mux.HandleFunc("POST /_matrix/federation/v1/3pid/onbind", a.OnBind3PID)
+}
+
+// Add3PID handles POST /_matrix/client/v3/account/3pid. It adds a validated
+// 3PID to the user's account (spec §3PID binding): the three_pid_creds name
+// the validation session obtained from the /requestToken endpoint, which this
+// homeserver created (and which the email confirmation link validated).
+func (a *API) Add3PID(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	var req struct {
+		ThreePIDCreds *threepidCreds `json:"three_pid_creds"`
+	}
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	if req.ThreePIDCreds == nil || req.ThreePIDCreds.SID == "" || req.ThreePIDCreds.ClientSecret == "" {
+		httpx.WriteError(w, httpx.ErrMissingParam("three_pid_creds with sid and client_secret are required"))
+		return
+	}
+	creds := req.ThreePIDCreds
+	v := a.emailValidations.get(creds.SID)
+	if v == nil || v.ClientSecret != creds.ClientSecret {
+		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_UNKNOWN", "invalid threepid credentials"))
+		return
+	}
+	if !v.Validated {
+		httpx.WriteError(w, httpx.NewError(http.StatusForbidden, "M_FORBIDDEN", "threepid not yet validated"))
+		return
+	}
+	if err := a.Store.StoreUserThreePID(r.Context(), auth.Localpart, "email", v.Address, a.Now()); err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
 // Bind3PID handles POST /_matrix/client/{unstable,v3}/account/3pid/bind.

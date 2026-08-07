@@ -103,6 +103,49 @@ type Config struct {
 	// localparts (the appservice bridge-user model, spec "Application
 	// services"). Complement mounts its registrations at /complement/appservice/.
 	AppServiceDir string `yaml:"appservice_dir"`
+
+	// Recaptcha configures the m.login.recaptcha registration stage (spec
+	// §Recaptcha). When set, registration offers a flow whose stages include
+	// m.login.recaptcha; the supplied response is validated against
+	// SiteverifyAPI (POST form-encoded {secret, response}) and the stage
+	// completes only on {"success": true}. PublicKey is advertised in the UIA
+	// challenge params. Test harnesses point SiteverifyAPI at a mock endpoint.
+	Recaptcha struct {
+		SiteverifyAPI string `yaml:"siteverify_api"`
+		PublicKey     string `yaml:"public_key"`
+		PrivateKey    string `yaml:"private_key"`
+	} `yaml:"recaptcha"`
+
+	// RecaptchaInsecure skips TLS certificate verification for the recaptcha
+	// siteverify request. The sytest suite's mock siteverify endpoint presents
+	// a self-signed certificate, so this must be enabled there; production
+	// deployments should leave it off.
+	RecaptchaInsecure bool `yaml:"recaptcha_insecure"`
+
+	// CAS configures CAS SSO login (spec §SSO login): ServerURL is the Identity
+	// Provider's CAS server base URL (the ticket callback and
+	// /login/cas/redirect redirect there); EnableRegistration creates the user
+	// on first login (Synapse's cas_enable_registration). The sytest suite's
+	// mock CAS server listens at the test server's /cas.
+	CAS struct {
+		ServerURL          string `yaml:"server_url"`
+		EnableRegistration bool   `yaml:"enable_registration"`
+	} `yaml:"cas"`
+
+	// CASInsecure skips TLS certificate verification for outbound requests to
+	// the CAS server. The sytest suite's mock CAS server presents a
+	// self-signed certificate, so this must be enabled there; production
+	// deployments should leave it off.
+	CASInsecure bool `yaml:"cas_insecure"`
+
+	// SMTP configures the email sender used by the /requestToken endpoints to
+	// deliver 3PID validation emails (spec §3PID validation). When unset, email
+	// requestToken endpoints return an error.
+	SMTP struct {
+		Host      string `yaml:"host"`
+		Port      int    `yaml:"port"`
+		NotifFrom string `yaml:"notif_from"`
+	} `yaml:"smtp"`
 }
 
 // Default returns a config populated with development defaults.
@@ -123,6 +166,9 @@ func Default() *Config {
 	c.Database.MaxConns = 16
 	c.Database.MinConns = 2
 	c.Metrics.Enabled = true
+	// CAS SSO registers the user on first login by default (Synapse's
+	// cas_enable_registration defaults to true).
+	c.CAS.EnableRegistration = true
 	return c
 }
 
@@ -224,6 +270,12 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("KATRIX_SSRF_ALLOW_PRIVATE_IPS"); v != "" {
 		c.SSRFAllowPrivateIPs = parseBool(v, c.SSRFAllowPrivateIPs)
+	}
+	if v := os.Getenv("KATRIX_RECAPTCHA_INSECURE"); v != "" {
+		c.RecaptchaInsecure = parseBool(v, c.RecaptchaInsecure)
+	}
+	if v := os.Getenv("KATRIX_CAS_INSECURE"); v != "" {
+		c.CASInsecure = parseBool(v, c.CASInsecure)
 	}
 	if v := os.Getenv("KATRIX_APPSERVICE_DIR"); v != "" {
 		c.AppServiceDir = v

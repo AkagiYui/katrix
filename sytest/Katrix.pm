@@ -145,6 +145,32 @@ sub _get_config
       },
    };
 
+   # The sytest mock recaptcha siteverify endpoint, CAS server and SMTP server
+   # are handed over by run-tests.pl via ->configure( recaptcha_config /
+   # cas_config / smtp_server_config ). The mock recaptcha and CAS endpoints
+   # present self-signed certificates, so TLS verification is skipped for both.
+   if ( my $rc = $self->{recaptcha_config} ) {
+      $config->{recaptcha} = {
+         siteverify_api   => $rc->{siteverify_api},
+         public_key       => $rc->{public_key},
+         private_key      => $rc->{private_key},
+      };
+      $config->{recaptcha_insecure} = $JSON::true;
+   }
+   if ( my $cas = $self->{cas_config} ) {
+      $config->{cas} = {
+         server_url => $cas->{server_url},
+      };
+      $config->{cas_insecure} = $JSON::true;
+   }
+   if ( my $smtp = $self->{smtp_server_config} ) {
+      $config->{smtp} = {
+         host       => $smtp->{host},
+         port       => $smtp->{port},
+         notif_from => 'katrix@localhost',
+      };
+   }
+
    # Application services: sytest hands over per-instance registration files
    # via ->configure( app_service_config_files => [...] ). katrix loads its
    # registrations from a directory (appservice_dir), so copy the files into a

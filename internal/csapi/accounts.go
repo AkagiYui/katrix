@@ -21,6 +21,8 @@ import (
 func (a *API) registerAccounts(mux *http.ServeMux) {
 	mux.HandleFunc("POST /_matrix/client/v3/register", a.RegisterAccount)
 	mux.HandleFunc("GET /_matrix/client/v3/register/available", a.RegisterAvailable)
+	mux.HandleFunc("POST /_matrix/client/v3/register/email/requestToken", a.registerEmailRequestToken)
+	mux.HandleFunc("GET /_matrix/client/unstable/registration/email/submit_token", a.registerEmailSubmitToken)
 	mux.HandleFunc("GET /_matrix/client/v3/login", a.LoginFlows)
 	mux.HandleFunc("POST /_matrix/client/v3/login", a.Login)
 	mux.HandleFunc("POST /_matrix/client/v3/logout", a.RequireAuth(a.Logout))
@@ -35,6 +37,7 @@ func (a *API) registerAccounts(mux *http.ServeMux) {
 	a.registerProfile(mux)
 	a.registerTags(mux)
 	a.register3PID(mux)
+	a.registerSSO(mux)
 }
 
 type registerRequest struct {
@@ -85,7 +88,7 @@ func (a *API) appServiceRegister(w http.ResponseWriter, r *http.Request, req reg
 	// test times out). The query endpoint (spec §Querying) is used when the
 	// homeserver needs the AS to provision a user it references but has not
 	// seen — e.g. inviting an AS-hosted user (see sendMemberEventWithContent).
-	a.completeRegistration(w, r, localpart, req)
+	a.completeRegistration(w, r, localpart, req, false)
 }
 
 // appserviceUserInNamespaces reports whether localpart matches any user
@@ -212,7 +215,77 @@ func (a *API) RegisterAccount(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		exists, err := a.Store.UserExists(r.Context(), localpart)
+		// A username that already exists fails here, before UIA (spec: the
+		// username check belongs to the registration step). Exception: a session
+		// that already registered this exact username re-completes idempotently.
+		if !uiaSessionRegisteredFor(body, localpart, a) {
+			exists, err := a.Store.UserExists(r.Context(), localpart)
+			if err != nil {
+				httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+				return
+			}
+			if exists {
+				httpx.WriteError(w, httpx.ErrUserInUse())
+				return
+			}
+		}
+	}
+
+	// Run the User-Interactive Authentication flow. The session remembers the
+	// registration parameters so a multi-step flow that omits them later still
+	// completes with the original values, and the registered localpart so
+	// re-completing a finished session is idempotent.
+	params := registerSessionParams{
+		Username:     localpart,
+		Password:     req.Password,
+		DeviceID:     req.DeviceID,
+		DisplayName:  req.InitialDeviceDisplayName,
+		InhibitLogin: req.InhibitLogin,
+		RefreshToken: req.RefreshToken,
+	}
+	sessionID, ok, err := a.processRegisterUIA(w, r, body, a.Config.Registration.RequireToken, params)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	if !ok {
+		return // challenge already written
+	}
+
+	sess := a.uia.get(sessionID)
+	if sess == nil {
+		httpx.WriteError(w, httpx.ErrForbidden("invalid auth session"))
+		return
+	}
+	// Re-completing a finished registration is idempotent: return the same
+	// account (spec "registration is idempotent"). Remembered parameters fill
+	// any the client omitted on this step.
+	if sess.registeredLocalpart != "" {
+		req = mergeRegisterParams(req, sess.params.(registerSessionParams))
+		a.completeRegistration(w, r, sess.registeredLocalpart, req, true)
+		return
+	}
+	// Username checks run after UIA (spec: they belong to the registration
+	// step, not the auth step). When no username was supplied (or it was
+	// omitted from a later step), fall back to the remembered one, then to a
+	// random localpart.
+	lp := sess.params.(registerSessionParams).Username
+	if lp == "" {
+		lp = localpart
+	}
+	if lp != "" && !ids.ValidLocalpart(lp) {
+		httpx.WriteError(w, httpx.ErrInvalidUsername("invalid username"))
+		return
+	}
+	if lp != "" {
+		if a.HS.AppServices != nil {
+			if reg := a.HS.AppServices.ExclusiveUserMatch(lp); reg != nil {
+				httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_EXCLUSIVE",
+					"username is reserved by an application service"))
+				return
+			}
+		}
+		exists, err := a.Store.UserExists(r.Context(), lp)
 		if err != nil {
 			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
@@ -222,20 +295,42 @@ func (a *API) RegisterAccount(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if lp == "" {
+		lp = strings.ToLower(ids.RandomDeviceID())
+	}
+	// Email registration: the validated email is bound to the new account.
+	if sess.email != nil {
+		_ = a.Store.StoreUserThreePID(r.Context(), lp, "email", sess.email.Address, a.Now())
+	}
+	req = mergeRegisterParams(req, sess.params.(registerSessionParams))
+	sess.registeredLocalpart = lp
+	a.completeRegistration(w, r, lp, req, false)
+}
 
-	ok, err := a.checkUIA(w, r, body, a.Config.Registration.RequireToken)
-	if err != nil {
-		httpx.WriteError(w, err)
-		return
+// mergeRegisterParams fills request fields the client omitted on the current
+// step with the values remembered when the UIA session was created (sytest
+// "registration remembers parameters": the username/device_id/display name are
+// only sent on the first 401 step).
+func mergeRegisterParams(req registerRequest, remembered registerSessionParams) registerRequest {
+	if req.Username == "" {
+		req.Username = remembered.Username
 	}
-	if !ok {
-		return // challenge already written
+	if req.Password == "" {
+		req.Password = remembered.Password
 	}
-
-	if localpart == "" {
-		localpart = strings.ToLower(ids.RandomDeviceID())
+	if req.DeviceID == "" {
+		req.DeviceID = remembered.DeviceID
 	}
-	a.completeRegistration(w, r, localpart, req)
+	if req.InitialDeviceDisplayName == "" {
+		req.InitialDeviceDisplayName = remembered.DisplayName
+	}
+	if !req.InhibitLogin {
+		req.InhibitLogin = remembered.InhibitLogin
+	}
+	if !req.RefreshToken {
+		req.RefreshToken = remembered.RefreshToken
+	}
+	return req
 }
 
 // upgradeGuestAccount converts an existing guest session into a full account
@@ -255,7 +350,14 @@ func (a *API) upgradeGuestAccount(w http.ResponseWriter, r *http.Request, body [
 		httpx.WriteError(w, httpx.ErrForbidden("guest_access_token does not match the given user"))
 		return
 	}
-	ok, err := a.checkUIA(w, r, body, false)
+	_, ok, err := a.processRegisterUIA(w, r, body, false, registerSessionParams{
+		Username:     localpart,
+		Password:     req.Password,
+		DeviceID:     req.DeviceID,
+		DisplayName:  req.InitialDeviceDisplayName,
+		InhibitLogin: req.InhibitLogin,
+		RefreshToken: req.RefreshToken,
+	})
 	if err != nil {
 		httpx.WriteError(w, err)
 		return
@@ -289,7 +391,29 @@ func (a *API) upgradeGuestAccount(w http.ResponseWriter, r *http.Request, body [
 	httpx.WriteJSON(w, http.StatusOK, resp)
 }
 
-func (a *API) completeRegistration(w http.ResponseWriter, r *http.Request, localpart string, req registerRequest) {
+// completeRegistration creates the user (unless alreadyRegistered, the
+// idempotent re-completion path) and writes the POST /register success body:
+// the user ID and, unless inhibit_login, a fresh device session.
+// uiaSessionRegisteredFor reports whether the request's auth dict names a UIA
+// session that has already registered localpart (the idempotent re-completion
+// path, which must not fail the username-in-use check).
+func uiaSessionRegisteredFor(body json.RawMessage, localpart string, a *API) bool {
+	var b struct {
+		Auth struct {
+			Session string `json:"session"`
+		} `json:"auth"`
+	}
+	if len(body) == 0 {
+		return false
+	}
+	if err := json.Unmarshal(body, &b); err != nil || b.Auth.Session == "" {
+		return false
+	}
+	sess := a.uia.get(b.Auth.Session)
+	return sess != nil && sess.registeredLocalpart == localpart
+}
+
+func (a *API) completeRegistration(w http.ResponseWriter, r *http.Request, localpart string, req registerRequest, alreadyRegistered bool) {
 	var passwordHash string
 	if req.Password != "" {
 		h, err := homeserver.HashPassword(req.Password)
@@ -300,18 +424,20 @@ func (a *API) completeRegistration(w http.ResponseWriter, r *http.Request, local
 		passwordHash = h
 	}
 
-	user := storage.User{Localpart: localpart, PasswordHash: passwordHash, CreatedTS: a.Now()}
-	if err := a.Store.CreateUser(r.Context(), user); err != nil {
-		if errors.Is(err, storage.ErrUserExists) {
-			httpx.WriteError(w, httpx.ErrUserInUse())
+	if !alreadyRegistered {
+		user := storage.User{Localpart: localpart, PasswordHash: passwordHash, CreatedTS: a.Now()}
+		if err := a.Store.CreateUser(r.Context(), user); err != nil {
+			if errors.Is(err, storage.ErrUserExists) {
+				httpx.WriteError(w, httpx.ErrUserInUse())
+				return
+			}
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
 		}
-		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
-		return
+		// Seed the default push ruleset as m.push_rules account data so an initial
+		// /sync always carries the rules, and so rule mutations have a row to bump.
+		_ = a.savePushRules(localpart, pushrules.DefaultRuleset())
 	}
-	// Seed the default push ruleset as m.push_rules account data so an initial
-	// /sync always carries the rules, and so rule mutations have a row to bump.
-	_ = a.savePushRules(localpart, pushrules.DefaultRuleset())
 
 	resp := map[string]any{
 		"user_id":     a.UserID(localpart),
@@ -389,12 +515,17 @@ func (a *API) RegisterAvailable(w http.ResponseWriter, r *http.Request) {
 
 // LoginFlows handles GET /_matrix/client/v3/login.
 func (a *API) LoginFlows(w http.ResponseWriter, r *http.Request) {
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"flows": []map[string]any{
-			{"type": "m.login.password"},
-			{"type": "m.login.token"},
-		},
-	})
+	flows := []map[string]any{
+		{"type": "m.login.password"},
+		{"type": "m.login.token"},
+	}
+	if a.casEnabled() {
+		// SSO login: m.login.sso is the spec's SSO login type; m.login.cas is
+		// kept for legacy clients that call /login/cas/redirect directly.
+		flows = append(flows, map[string]any{"type": "m.login.sso"})
+		flows = append(flows, map[string]any{"type": "m.login.cas"})
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"flows": flows})
 }
 
 type loginRequest struct {
@@ -402,6 +533,8 @@ type loginRequest struct {
 	Identifier               loginIdentifier `json:"identifier"`
 	User                     string          `json:"user"` // deprecated flat field
 	Password                 string          `json:"password"`
+	Medium                   string          `json:"medium"` // legacy flat 3pid fields
+	Address                  string          `json:"address"`
 	Token                    string          `json:"token"`
 	DeviceID                 string          `json:"device_id"`
 	InitialDeviceDisplayName string          `json:"initial_device_display_name"`
@@ -409,8 +542,10 @@ type loginRequest struct {
 }
 
 type loginIdentifier struct {
-	Type string `json:"type"`
-	User string `json:"user"`
+	Type    string `json:"type"`
+	User    string `json:"user"`
+	Medium  string `json:"medium"` // 3pid identifiers
+	Address string `json:"address"`
 }
 
 // Login handles POST /_matrix/client/v3/login. Supports m.login.password
@@ -431,6 +566,23 @@ func (a *API) Login(w http.ResponseWriter, r *http.Request) {
 			userField = req.User
 		}
 		localpart = a.resolveLocalpart(userField)
+		if localpart == "" && (req.Identifier.Medium != "" || req.Medium != "") {
+			// Login with a 3PID identifier: resolve the owner from the (medium,
+			// address) stored in the user's account (spec §Login with a 3PID).
+			medium := req.Identifier.Medium
+			if medium == "" {
+				medium = req.Medium
+			}
+			address := req.Identifier.Address
+			if address == "" {
+				address = req.Address
+			}
+			if medium != "" && address != "" {
+				if lp, err := a.Store.LocalpartForThreePID(r.Context(), medium, address); err == nil {
+					localpart = lp
+				}
+			}
+		}
 		if localpart == "" {
 			httpx.WriteError(w, httpx.ErrForbidden("Invalid username or password"))
 			return
@@ -688,7 +840,7 @@ func (a *API) Deactivate(w http.ResponseWriter, r *http.Request) {
 	// Deactivation unbinds every 3PID the user bound through this homeserver at
 	// its identity server (spec: "the homeserver will unbind the 3PIDs from the
 	// identity server"); bindings that fail to unbind (identity server down)
-	// are best-effort.
+	// are best-effort. The locally stored 3PIDs are cleared regardless.
 	result := "success"
 	if bs, err := a.Store.ThreePIDBindings(r.Context(), auth.Localpart); err == nil {
 		for _, b := range bs {
@@ -699,5 +851,7 @@ func (a *API) Deactivate(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	_ = a.Store.DeleteAllThreePIDBindings(r.Context(), auth.Localpart)
+	_ = a.Store.DeleteAllUserThreePIDs(r.Context(), auth.Localpart)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"id_server_unbind_result": result})
 }

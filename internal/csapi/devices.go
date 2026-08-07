@@ -86,8 +86,13 @@ func (a *API) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 
 // DeleteDevice handles DELETE /_matrix/client/v3/devices/{deviceID}. Per spec
 // this must pass User-Interactive Authentication; the client supplies an auth
-// dict with their password. The current device may be deleted (it is logged
-// out), which matches spec behaviour (use /logout for the convenience path).
+// dict with their password (or completes an SSO stage). The current device may
+// be deleted (it is logged out), which matches spec behaviour (use /logout for
+// the convenience path).
+//
+// The UIA session is bound to the device being deleted: reusing a session
+// started for a different device is rejected with 403 (spec "The operation
+// must be consistent through an interactive authentication session").
 func (a *API) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	deviceID := r.PathValue("deviceID")
@@ -96,9 +101,6 @@ func (a *API) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	// UIA for device deletion uses m.login.password against the authenticated
-	// user. checkUIA is single-stage (dummy) for registration; device deletion
-	// needs the password stage, so verify it inline.
 	var ad struct {
 		Auth struct {
 			Type     string `json:"type"`
@@ -115,15 +117,42 @@ func (a *API) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	if len(body) > 0 {
 		_ = json.Unmarshal(body, &ad)
 	}
-	if ad.Auth.Type != "m.login.password" || ad.Auth.Password == "" {
-		// Issue a fresh UIA challenge describing the required flow.
-		id, _ := a.uia.create("password", auth.Localpart)
+	if ad.Auth.Type == "" && ad.Auth.Session == "" {
+		// No auth supplied: issue a fresh UIA challenge describing the flows
+		// (password always; SSO when CAS is configured), bound to this device
+		// so the session cannot be replayed against another one.
+		id, _ := a.uia.create("password", auth.Localpart, deviceID)
+		flows := []uiaFlow{{Stages: []string{"m.login.password"}}}
+		if a.casEnabled() {
+			flows = append(flows, uiaFlow{Stages: []string{"m.login.sso"}})
+		}
 		httpx.WriteJSON(w, http.StatusUnauthorized, uiaChallenge{
-			Flows:   []uiaFlow{{Stages: []string{"m.login.password"}}},
+			Flows:   flows,
 			Params:  map[string]any{},
 			Session: id,
 		})
 		return
+	}
+	// Reusing a session for a different device is forbidden outright (403):
+	// the operation the session was started for must stay consistent.
+	sess := a.uia.get(ad.Auth.Session)
+	if sess != nil && sess.op == "password" && sess.localpart == auth.Localpart && sess.target != "" && sess.target != deviceID {
+		httpx.WriteError(w, httpx.ErrForbidden("Requested operation has changed during the UI authentication session"))
+		return
+	}
+	// An SSO-completed session authorises the deletion without a password
+	// (spec: m.login.sso is a valid UIA stage). A session whose SSO stage
+	// authenticated a different user is rejected (spec: the user must be
+	// consistent through the session).
+	if sess != nil && sess.completed["m.login.sso"] {
+		if sess.ssoMismatch {
+			httpx.WriteError(w, httpx.ErrForbidden("SSO user does not match the session owner"))
+			return
+		}
+		if sess.localpart == auth.Localpart {
+			a.deleteDevice(w, r, auth, deviceID)
+			return
+		}
 	}
 	// The UIA user (when specified) must match the device owner; otherwise the
 	// request is forbidden outright (403), per "requires UI auth user to match
@@ -132,12 +161,23 @@ func (a *API) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrForbidden("UI auth user does not match the device owner"))
 		return
 	}
+	if ad.Auth.Type != "m.login.password" || ad.Auth.Password == "" {
+		// Issue a fresh UIA challenge describing the required flow, bound to
+		// this device (so the session cannot be replayed against another one).
+		id, _ := a.uia.create("password", auth.Localpart, deviceID)
+		httpx.WriteJSON(w, http.StatusUnauthorized, uiaChallenge{
+			Flows:   []uiaFlow{{Stages: []string{"m.login.password"}}},
+			Params:  map[string]any{},
+			Session: id,
+		})
+		return
+	}
 	// Verify the supplied password.
 	user, err := a.Store.GetUser(r.Context(), auth.Localpart)
 	if err != nil || user.PasswordHash == "" || !homeserver.CheckPassword(user.PasswordHash, ad.Auth.Password) {
 		// UIA: a failed auth attempt is still a 401, and Complement expects the
 		// challenge shape PLUS errcode/error (flows/params/session + error).
-		id, _ := a.uia.create("password", auth.Localpart)
+		id, _ := a.uia.create("password", auth.Localpart, deviceID)
 		httpx.WriteJSON(w, http.StatusUnauthorized, map[string]any{
 			"errcode": "M_FORBIDDEN",
 			"error":   "Invalid password",
@@ -147,6 +187,11 @@ func (a *API) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	a.deleteDevice(w, r, auth, deviceID)
+}
+
+// deleteDevice performs the device deletion and its side effects.
+func (a *API) deleteDevice(w http.ResponseWriter, r *http.Request, auth *homeserver.Auth, deviceID string) {
 	if err := a.Store.DeleteDevice(r.Context(), auth.Localpart, deviceID, a.ServerName()); err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
