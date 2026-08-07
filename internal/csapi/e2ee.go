@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/AkagiYui/katrix/internal/canonicaljson"
+	"github.com/AkagiYui/katrix/internal/federation"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/storage"
@@ -197,6 +198,18 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 			if sigs := sigsByUser[dk.UserID][dk.DeviceID]; len(sigs) > 0 {
 				mergeSignatures(keyObj, sigs)
 			}
+			// The spec's device key bundle carries an `unsigned` object with
+			// the device's display name (sytest "Can query device keys using
+			// POST" asserts the unsigned key is present, and has no
+			// device_display_name when the device has none).
+			unsigned, _ := keyObj["unsigned"].(map[string]any)
+			if unsigned == nil {
+				unsigned = map[string]any{}
+			}
+			if d, err := a.Store.GetDevice(r.Context(), a.LocalpartOf(dk.UserID), dk.DeviceID); err == nil && d.DisplayName != "" {
+				unsigned["device_display_name"] = d.DisplayName
+			}
+			keyObj["unsigned"] = unsigned
 			devs[dk.DeviceID] = keyObj
 		}
 	}
@@ -233,10 +246,16 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				if cached, err := a.Store.GetCachedRemoteDeviceList(r.Context(), u); err == nil && len(cached) > 0 {
-					var cachedKeys map[string]any
-					if json.Unmarshal(cached, &cachedKeys) == nil {
-						for did, keyObj := range cachedKeys {
+					var cachedWrap federation.DeviceListCache
+					if json.Unmarshal(cached, &cachedWrap) == nil && len(cachedWrap.DeviceKeys) > 0 {
+						for did, keyObj := range cachedWrap.DeviceKeys {
 							out[u][did] = keyObj
+						}
+						if len(cachedWrap.MasterKey) > 0 {
+							masterKeys[u] = cachedWrap.MasterKey
+						}
+						if len(cachedWrap.SelfSigningKey) > 0 {
+							selfSigningKeys[u] = cachedWrap.SelfSigningKey
 						}
 					}
 					// Served from cache: no federation round-trip (a cached list
@@ -296,7 +315,11 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 				if len(devs.SelfSigningKey) > 0 {
 					selfSigningKeys[u] = devs.SelfSigningKey
 				}
-				if raw, err := json.Marshal(keys); err == nil {
+				if raw, err := json.Marshal(federation.DeviceListCache{
+					DeviceKeys:     keys,
+					MasterKey:      devs.MasterKey,
+					SelfSigningKey: devs.SelfSigningKey,
+				}); err == nil {
 					_ = a.Store.CacheRemoteDeviceList(r.Context(), u, raw)
 				}
 			}
@@ -320,9 +343,14 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 					keys[did] = keyObj
 					merged[did] = keyObj
 				}
-				// Cache the fetched device keys for users that are being tracked.
+				// Cache the fetched device keys (and cross-signing keys) for
+				// users that are being tracked.
 				if a.Store.DeviceListTracked(r.Context(), auth.UserID, uid) {
-					if raw, err := json.Marshal(keys); err == nil {
+					if raw, err := json.Marshal(federation.DeviceListCache{
+						DeviceKeys:     keys,
+						MasterKey:      remote.MasterKeys[uid],
+						SelfSigningKey: remote.SelfSigningKeys[uid],
+					}); err == nil {
 						_ = a.Store.CacheRemoteDeviceList(r.Context(), uid, raw)
 					}
 				}

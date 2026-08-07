@@ -120,6 +120,15 @@ func (a *API) PutRoomKeysSession(w http.ResponseWriter, r *http.Request) {
 func (a *API) putRoomKeys(w http.ResponseWriter, r *http.Request, roomID, sessionID string) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	version := parseVersion(r.URL.Query().Get("version"))
+	// Keys may only be backed up to the latest version: a version older than
+	// the current one is rejected with 403 (spec §Server-side key backups;
+	// Synapse's upload_room_keys returns "403 Forbidden if the version in
+	// question is not the most recently created version" — sytest "Will not
+	// back up to an old backup version").
+	if latest, err := a.Store.LatestKeyBackupVersion(r.Context(), auth.UserID); err == nil && version != 0 && version != latest.Version {
+		httpx.WriteError(w, httpx.NewError(http.StatusForbidden, "M_FORBIDDEN", "can only upload to the latest version"))
+		return
+	}
 	body, err := readBody(r)
 	if err != nil {
 		httpx.WriteError(w, err)
@@ -261,6 +270,25 @@ func (a *API) getRoomKeys(w http.ResponseWriter, r *http.Request, roomID, sessio
 		}
 		obj["session_id"] = sessionID
 		httpx.WriteJSON(w, http.StatusOK, obj)
+		return
+	}
+	// Single-room endpoint (GET /room_keys/keys/{roomID}): the response is
+	// {sessions: {sessionID: KeyBackupData}} — the spec's room backup object
+	// (sytest "Responds correctly when backup is empty" asserts an empty room
+	// answers {sessions: {}}). The all-keys endpoint (GET /room_keys/keys)
+	// answers {rooms: {roomID: {sessions: {...}}}}.
+	if roomID != "" && sessionID == "" {
+		out := map[string]any{"sessions": map[string]any{}}
+		sessions := out["sessions"].(map[string]any)
+		for _, k := range keys {
+			var obj map[string]any
+			_ = json.Unmarshal(k.KeyData, &obj)
+			if obj == nil {
+				obj = map[string]any{}
+			}
+			sessions[k.SessionID] = obj
+		}
+		httpx.WriteJSON(w, http.StatusOK, out)
 		return
 	}
 	// Group into rooms -> sessions -> key data. Per the spec the session value

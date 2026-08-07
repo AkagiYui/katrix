@@ -16,6 +16,18 @@ import (
 
 // ---- outbound EDU delivery (spec "Transaction delivery") ----
 
+// DeviceListCache is the persisted remote device-list cache payload: a user's
+// device keys plus their cross-signing keys. The cross-signing keys are cached
+// alongside the device keys so a /keys/query answered from cache still carries
+// them (sytest "uploading signed devices gets propagated over federation"
+// queries a remote user whose device list is already cached and expects their
+// master key).
+type DeviceListCache struct {
+	DeviceKeys     map[string]any  `json:"device_keys"`
+	MasterKey      json.RawMessage `json:"master_key,omitempty"`
+	SelfSigningKey json.RawMessage `json:"self_signing_key,omitempty"`
+}
+
 // EDU types this server knows how to deliver and receive over federation.
 const (
 	eduDeviceListUpdate = "m.device_list_update"
@@ -388,6 +400,26 @@ func (a *API) applyDeviceListEDU(ctx context.Context, origin string, content jso
 	// is recorded: the gap check compares the EDU's prev_id against the
 	// previous update, not the one being processed now.
 	lastSeen, _ := a.Store.LastSeenRemoteDeviceStream(ctx, origin, c.UserID)
+
+	// cacheDeviceListFor persists a remote user's device keys (and cross-signing
+	// keys) in the device-list cache, in the shape the /keys/query handler reads
+	// back (see DeviceListCache). The cross-signing keys are cached alongside
+	// the device keys so a /keys/query answered from cache still carries them
+	// (sytest "uploading signed devices gets propagated over federation" queries
+	// a remote user whose device list is already cached and expects their
+	// master key).
+	cacheDeviceListFor := func(keys map[string]any, master, selfSigning json.RawMessage) {
+		if len(keys) == 0 && len(master) == 0 && len(selfSigning) == 0 {
+			return
+		}
+		if raw, err := json.Marshal(DeviceListCache{
+			DeviceKeys:     keys,
+			MasterKey:      master,
+			SelfSigningKey: selfSigning,
+		}); err == nil {
+			_ = a.Store.CacheRemoteDeviceList(ctx, c.UserID, raw)
+		}
+	}
 	// monotonic per-user counter. A stale re-delivery (an outbound-queue retry
 	// after a restart re-sends an already-acknowledged transaction) must not
 	// re-record the user in the local device-list stream — that would surface
@@ -458,7 +490,9 @@ func (a *API) applyDeviceListEDU(ctx context.Context, origin string, content jso
 		// Apply the EDU content directly to the cache: the device's key bundle
 		// (content.keys, when present) and display name (content.device_display_name)
 		// are the authoritative description of the change (mirror of Synapse's
-		// update_remote_device_list_cache_entry).
+		// update_remote_device_list_cache_entry). The update merges into any
+		// existing cache entry so previously cached devices and cross-signing keys
+		// survive.
 		if c.DeviceID != "" {
 			var keysObj map[string]any
 			if len(c.DeviceKeys) > 0 {
@@ -477,10 +511,22 @@ func (a *API) applyDeviceListEDU(ctx context.Context, origin string, content jso
 				unsigned["device_display_name"] = c.DeviceDisplayName
 				keysObj["unsigned"] = unsigned
 			}
-			entry := map[string]any{c.DeviceID: keysObj}
-			if raw, err := json.Marshal(entry); err == nil {
-				_ = a.Store.CacheRemoteDeviceList(ctx, c.UserID, raw)
+			// Preserve the existing cached devices and cross-signing keys.
+			keys := map[string]any{c.DeviceID: keysObj}
+			var master, selfSigning json.RawMessage
+			if existing, err := a.Store.GetCachedRemoteDeviceList(ctx, c.UserID); err == nil && len(existing) > 0 {
+				var wrap DeviceListCache
+				if json.Unmarshal(existing, &wrap) == nil {
+					for did, obj := range wrap.DeviceKeys {
+						if did != c.DeviceID {
+							keys[did] = obj
+						}
+					}
+					master = wrap.MasterKey
+					selfSigning = wrap.SelfSigningKey
+				}
 			}
+			cacheDeviceListFor(keys, master, selfSigning)
 		}
 	}
 	if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, false); err != nil {
@@ -547,7 +593,14 @@ func (a *API) resyncRemoteDeviceList(ctx context.Context, userID string) {
 		}
 		keyObj[d.DeviceID] = k
 	}
-	if raw, err := json.Marshal(keyObj); err == nil && len(keyObj) > 0 {
+	// The /user/devices response also carries the user's cross-signing keys;
+	// persist them alongside the device keys so a /keys/query answered from
+	// cache still returns them.
+	if raw, err := json.Marshal(DeviceListCache{
+		DeviceKeys:     keyObj,
+		MasterKey:      devs.MasterKey,
+		SelfSigningKey: devs.SelfSigningKey,
+	}); err == nil && (len(keyObj) > 0 || len(devs.MasterKey) > 0 || len(devs.SelfSigningKey) > 0) {
 		_ = a.Store.CacheRemoteDeviceList(ctx, userID, raw)
 	}
 }

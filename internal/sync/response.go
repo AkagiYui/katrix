@@ -826,7 +826,10 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	if err == nil && len(td) > 0 {
 		events := make([]json.RawMessage, 0, len(td))
 		for _, m := range td {
-			ev := mustMarshalEvent(m.Type, m.Sender, "", m.Content, m.CreatedTS, "")
+			// Per the spec, a to-device event is {sender, type, content} and
+			// nothing else — no origin_server_ts (sytest "Can recv a device
+			// message using /sync" deep-compares the exact object).
+			ev := mustMarshalEvent(m.Type, m.Sender, "", m.Content, 0, "")
 			events = append(events, ev)
 			if m.ID > tdCursor {
 				tdCursor = m.ID
