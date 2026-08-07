@@ -39,6 +39,11 @@ func (a *API) registerE2EE(mux *http.ServeMux) {
 	mux.HandleFunc("POST /_matrix/client/v3/sendToDevice/{eventType}/{txnID}", a.RequireAuth(a.SendToDevice))
 	mux.HandleFunc("POST /_matrix/client/v3/keys/device_signing/upload", a.RequireAuth(a.DeviceSigningUpload))
 	mux.HandleFunc("POST /_matrix/client/v3/keys/signatures/upload", a.RequireAuth(a.SignaturesUpload))
+	// Cross-signing shipped before Matrix 1.1, so the endpoints are also served
+	// under the /unstable namespace (sytest uses /unstable/keys/device_signing/
+	// upload and /unstable/keys/signatures/upload).
+	mux.HandleFunc("POST /_matrix/client/unstable/keys/device_signing/upload", a.RequireAuth(a.DeviceSigningUpload))
+	mux.HandleFunc("POST /_matrix/client/unstable/keys/signatures/upload", a.RequireAuth(a.SignaturesUpload))
 
 	// Key backup (/room_keys/*) — E2EE key material relay only.
 	mux.HandleFunc("POST /_matrix/client/v3/room_keys/version", a.RequireAuth(a.CreateKeyBackup))
