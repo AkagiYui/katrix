@@ -155,11 +155,13 @@ func (a *API) CASTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The token is delivered in the response body as `loginToken=...`; sytest
-	// extracts it with the regex loginToken=([^\"&]+), so the token must be
-	// immediately followed by a double quote.
+	// extracts it with the regex loginToken=([^\"&]+), which captures the
+	// characters right after `=` up to a double quote — so the body must read
+	// `loginToken=<token>"` with NO opening quote before the token (a quoted
+	// value would capture an empty string and fail the login).
 	w.Header().Set("Content-Type", "text/html")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(fmt.Sprintf(`<html><body><p>Login successful.</p><script>loginToken="%s"</script></body></html>`, login)))
+	_, _ = w.Write([]byte(fmt.Sprintf(`<html><body><p>Login successful.</p><script>loginToken=%s"</script></body></html>`, login)))
 }
 
 // validateCASTicket calls the CAS server's /proxyValidate endpoint with the
