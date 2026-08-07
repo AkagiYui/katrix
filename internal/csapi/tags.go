@@ -85,8 +85,10 @@ func (a *API) PutRoomTag(w http.ResponseWriter, r *http.Request) {
 }
 
 // DeleteRoomTag handles DELETE /_matrix/client/v3/user/{userID}/rooms/{roomID}/tags/{tag}.
-// Removing the last tag deletes the account_data entry entirely; the tag is
-// otherwise dropped from the m.tag content.
+// Removing the last tag leaves the m.tag account-data entry with an empty
+// tags object (Synapse does not delete the entry; sytest's incremental sync
+// expects an m.tag event with {tags: {}}), so clients that clear all tags
+// still see the update in /sync.
 func (a *API) DeleteRoomTag(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	userID := r.PathValue("userID")
@@ -110,12 +112,8 @@ func (a *API) DeleteRoomTag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	delete(c.Tags, tag)
-	if len(c.Tags) == 0 {
-		_, _ = a.Store.DeleteAccountData(r.Context(), auth.Localpart, roomID, "m.tag")
-	} else {
-		raw, _ := json.Marshal(map[string]any{"tags": c.Tags})
-		_, _ = a.Store.SetAccountData(r.Context(), auth.Localpart, roomID, "m.tag", raw)
-	}
+	raw, _ := json.Marshal(map[string]any{"tags": c.Tags})
+	_, _ = a.Store.SetAccountData(r.Context(), auth.Localpart, roomID, "m.tag", raw)
 	a.Notifier.NotifyUser(auth.UserID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
