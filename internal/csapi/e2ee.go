@@ -214,6 +214,15 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 	// /user/devices (spec §Device lists) and the result cached — mirror of
 	// Synapse's users_to_resync_devices, which uses the same endpoint so a
 	// device list is fetched wholesale rather than device-by-device.
+	// Cross-signing keys (per spec, keys/query also returns each user's
+	// master/self_signing/user_signing keys). Clients use the master key to
+	// verify key backups and cross-signing signatures; without it the SDK
+	// refuses to import a recovery key ("public key of the imported private key
+	// doesn't match"). The maps are filled for local users below and for remote
+	// users from the federation /keys/query response in the loop below.
+	masterKeys := map[string]json.RawMessage{}
+	selfSigningKeys := map[string]json.RawMessage{}
+	userSigningKeys := map[string]json.RawMessage{}
 	if a.fed != nil {
 		for dom, domUsers := range remoteByDomain {
 			query := map[string][]string{} // users to fetch via POST /keys/query
@@ -308,16 +317,23 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
+			// The remote server also answers cross-signing keys (master and
+			// self-signing; the user-signing key is never shared). Pass them
+			// through so a client can verify a remote user's cross-signing
+			// signatures without a second round-trip — keys/query must answer
+			// master_keys/self_signing_keys for remote users too (sytest "can
+			// fetch self-signing keys over federation" queries a remote user
+			// who shares no room and expects their master + self-signing keys).
+			for uid, kjson := range remote.MasterKeys {
+				masterKeys[uid] = kjson
+			}
+			for uid, kjson := range remote.SelfSigningKeys {
+				selfSigningKeys[uid] = kjson
+			}
 		}
 	}
-	// Cross-signing keys (per spec, keys/query also returns each user's
-	// master/self_signing/user_signing keys). Clients use the master key to
-	// verify key backups and cross-signing signatures; without it the SDK
-	// refuses to import a recovery key ("public key of the imported private key
-	// doesn't match").
-	masterKeys := map[string]json.RawMessage{}
-	selfSigningKeys := map[string]json.RawMessage{}
-	userSigningKeys := map[string]json.RawMessage{}
+	// Local users' cross-signing keys (the remote users' were merged from the
+	// federation /keys/query response in the loop above).
 	for _, u := range localUsers {
 		cks, err := a.Store.CrossSigningKeys(r.Context(), u)
 		if err != nil {
@@ -683,14 +699,30 @@ func (a *API) DeviceSigningUpload(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	// Cross-signing keys are part of a user's device-list visibility: a change
-	// must reach the user's room peers via device_lists.changed (spec + sytest
-	// "Changing master key notifies local users" syncs until user1 appears in
-	// user2's device list) and federating servers via the m.device_list_update
-	// EDU ("uploading self-signing key notifies over federation").
-	_, _ = a.Store.RecordDeviceListChange(r.Context(), auth.UserID, false)
-	a.broadcastDeviceListUpdate(r.Context(), auth.UserID, "", false)
-	a.notifyDeviceListPeers(r.Context(), auth.UserID)
+	// The master and self-signing keys are part of a user's device-list
+	// visibility: a change must reach the user's room peers via
+	// device_lists.changed (spec + sytest "Changing master key notifies local
+	// users" syncs until user1 appears in user2's device list) and federating
+	// servers via the m.device_list_update EDU ("uploading self-signing key
+	// notifies over federation"). A user-signing key upload, by contrast,
+	// only notifies the user's own devices: the user-signing key signs *other*
+	// users, so it is not part of how this user's identity appears to their
+	// room peers (mirror of Synapse's upload_signing_keys_for_user, which calls
+	// notify_device_update only for master/self-signing and
+	// notify_user_signature_update(user, [user]) for user-signing; sytest
+	// "Changing user-signing key notifies local users" asserts the uploader is
+	// NOT in the peer's changed list after a user-signing upload).
+	notifyPeers := false
+	for _, keyType := range []string{"master", "self_signing"} {
+		if _, ok := req[keyType+"_key"]; ok {
+			notifyPeers = true
+		}
+	}
+	if notifyPeers {
+		_, _ = a.Store.RecordDeviceListChange(r.Context(), auth.UserID, false)
+		a.broadcastDeviceListUpdate(r.Context(), auth.UserID, "", false)
+		a.notifyDeviceListPeers(r.Context(), auth.UserID)
+	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
