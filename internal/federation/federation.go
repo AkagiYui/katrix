@@ -34,6 +34,9 @@ type API struct {
 	// pushNotifier delivers HTTP push notifications for inbound events (see
 	// push.go). nil until SetPushDispatcher wires the CS API's dispatcher.
 	pushNotifier PushNotifier
+
+	// notaryCache holds the key notary's per-server key cache (see notary.go).
+	notaryCache *notaryCache
 }
 
 // SetPushDispatcher wires the CS API's push dispatcher so inbound federation
@@ -53,6 +56,7 @@ func New(hs *homeserver.HS) *API {
 		eduWake:  make(chan struct{}, 1),
 
 		partialStateEvents: map[string]map[string]struct{}{},
+		notaryCache:        newNotaryCache(),
 	}
 }
 

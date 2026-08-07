@@ -121,6 +121,39 @@ func (c *Client) FetchServerKeys(ctx context.Context, serverName string) (*serve
 	return &kr, nil
 }
 
+// FetchServerKeysFromOrigin fetches a remote server's keys directly from the
+// origin (GET /_matrix/key/v2/server), bypassing the local cache. The key
+// notary uses it to re-fetch a queried server's keys; the response is not
+// stored in the local signing-key cache (the notary keeps its own cache, and
+// must not evict previously-seen keys — Synapse #5305).
+func (c *Client) FetchServerKeysFromOrigin(ctx context.Context, serverName string) (*serverKeyResponse, error) {
+	base := c.serverBaseURL(serverName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/_matrix/key/v2/server", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("federation: fetch keys for %s: %w", serverName, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("federation: keys for %s: HTTP %d", serverName, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	var kr serverKeyResponse
+	if err := json.Unmarshal(body, &kr); err != nil {
+		return nil, fmt.Errorf("federation: decode keys for %s: %w", serverName, err)
+	}
+	if kr.ServerName == "" {
+		kr.ServerName = serverName
+	}
+	return &kr, nil
+}
+
 // VerifyKeyFor resolves the ed25519 public key for a (server, keyID) pair,
 // fetching from cache or network.
 func (c *Client) VerifyKeyFor(ctx context.Context, serverName, keyID string) ([]byte, error) {
