@@ -483,3 +483,28 @@ func (s *Store) SignatureTargetsSince(ctx context.Context, signerUser string, si
 	}
 	return out, rows.Err()
 }
+
+// SignerSignatures returns every signature row made by signerUser (on any
+// target device or cross-signing key). Used to merge the signer's own
+// signatures into the cross-signing keys they signed, which keys/query serves
+// back to the signer only (mirror of Synapse's _get_e2e_cross_signing_signatures_txn,
+// which filters by from_user_id = the requester).
+func (s *Store) SignerSignatures(ctx context.Context, signerUser string) ([]DeviceSignature, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT target_user, target_device, signer_user, signature_key, signature
+		 FROM device_signatures WHERE signer_user=$1`,
+		signerUser)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DeviceSignature
+	for rows.Next() {
+		var sg DeviceSignature
+		if err := rows.Scan(&sg.TargetUser, &sg.TargetDevice, &sg.SignerUser, &sg.SignatureKey, &sg.Signature); err != nil {
+			return nil, err
+		}
+		out = append(out, sg)
+	}
+	return out, rows.Err()
+}

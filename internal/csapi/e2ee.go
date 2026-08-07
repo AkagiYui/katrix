@@ -343,20 +343,51 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Local users' cross-signing keys (the remote users' were merged from the
-	// federation /keys/query response in the loop above).
+	// federation /keys/query response in the loop above). The requester's own
+	// signatures on these keys are merged in: when a user signs another user's
+	// cross-signing key, the signer alone sees that signature in their own
+	// /keys/query (mirror of Synapse's _get_e2e_cross_signing_signatures_txn,
+	// which filters signatures by from_user_id = the requester; sytest
+	// "Changing user-signing key notifies local users" expects user1's signature
+	// on user2's master key in user1's query but not in user2's).
+	ownSigs := map[string]map[string]map[string]string{} // target_user -> pubkey -> key_id -> sig
+	if sigs, err := a.Store.SignerSignatures(r.Context(), auth.UserID); err == nil {
+		for _, sg := range sigs {
+			byUser := ownSigs[sg.TargetUser]
+			if byUser == nil {
+				byUser = map[string]map[string]string{}
+				ownSigs[sg.TargetUser] = byUser
+			}
+			byKey := byUser[sg.TargetDevice]
+			if byKey == nil {
+				byKey = map[string]string{}
+				byUser[sg.TargetDevice] = byKey
+			}
+			byKey[sg.SignatureKey] = sg.Signature
+		}
+	}
 	for _, u := range localUsers {
 		cks, err := a.Store.CrossSigningKeys(r.Context(), u)
 		if err != nil {
 			continue
 		}
 		for _, k := range cks {
+			keyJSON := k.KeyJSON
+			// The requester's signature on this key is merged under
+			// signatures.<requester>.<key_id>; the target device name is the
+			// key's public part ("ed25519:<pub>").
+			if pub, ok := crossSigningKeyPub(keyJSON); ok {
+				if byKey := ownSigs[u][pub]; len(byKey) > 0 {
+					keyJSON = mergeCrossSigningSignature(keyJSON, auth.UserID, byKey)
+				}
+			}
 			switch k.KeyType {
 			case "master":
-				masterKeys[u] = k.KeyJSON
+				masterKeys[u] = keyJSON
 			case "self_signing":
-				selfSigningKeys[u] = k.KeyJSON
+				selfSigningKeys[u] = keyJSON
 			case "user_signing":
-				userSigningKeys[u] = k.KeyJSON
+				userSigningKeys[u] = keyJSON
 			}
 		}
 	}
@@ -831,6 +862,50 @@ func (a *API) SignaturesUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"failures": failures})
+}
+
+// crossSigningKeyPub extracts the public part of a cross-signing key (the
+// single "ed25519:<pub>" -> "<pub>" entry in its `keys` map), which serves as
+// the key's "device id" in the signatures table. ok is false when the key is
+// malformed.
+func crossSigningKeyPub(keyJSON json.RawMessage) (string, bool) {
+	var c struct {
+		Keys map[string]string `json:"keys"`
+	}
+	if len(keyJSON) == 0 || json.Unmarshal(keyJSON, &c) != nil || len(c.Keys) != 1 {
+		return "", false
+	}
+	for _, pub := range c.Keys {
+		return pub, true
+	}
+	return "", false
+}
+
+// mergeCrossSigningSignature merges the given signatures (key_id -> value) made
+// by signer onto a cross-signing key, under content.signatures.<signer>.<key_id>.
+func mergeCrossSigningSignature(keyJSON json.RawMessage, signer string, byKey map[string]string) json.RawMessage {
+	var obj map[string]any
+	if err := json.Unmarshal(keyJSON, &obj); err != nil {
+		return keyJSON
+	}
+	sigs, _ := obj["signatures"].(map[string]any)
+	if sigs == nil {
+		sigs = map[string]any{}
+		obj["signatures"] = sigs
+	}
+	bySigner, _ := sigs[signer].(map[string]any)
+	if bySigner == nil {
+		bySigner = map[string]any{}
+		sigs[signer] = bySigner
+	}
+	for keyID, val := range byKey {
+		bySigner[keyID] = val
+	}
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		return keyJSON
+	}
+	return raw
 }
 
 // splitKeyID splits an "<algorithm>:<keyId>" string. The algorithm may itself
