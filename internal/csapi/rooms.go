@@ -1288,6 +1288,13 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("from"); v != "" {
 		from, _ = parseIntToken(v)
 	}
+	// The client's `from` token is echoed as `start` on an empty page (mirror of
+	// Synapse's get_messages: "if no events are returned from pagination ...
+	// In that case we do not return end ... return {"chunk": [], "start":
+	// <from_token>}"). Without it a client that has paged to the start of
+	// history cannot tell the terminal page apart from a server hiccup, and
+	// sytest asserts the `start` key on empty pages.
+	startTok := from
 	if v := q.Get("to"); v != "" {
 		to, _ = parseIntToken(v)
 	}
@@ -1331,7 +1338,7 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 			to = from
 			from = 0
 		} else {
-			httpx.WriteJSON(w, http.StatusOK, map[string]any{"chunk": []json.RawMessage{}})
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"chunk": []json.RawMessage{}, "start": formatIntToken(startTok)})
 			return
 		}
 	}
@@ -1402,17 +1409,22 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	// position (forward `from` is exclusive, so no overlap). Emitting them the
 	// wrong way round makes clients loop or skip events. When no events are
 	// returned (start of timeline / no permission), `end` is OMITTED so clients
-	// know to stop paginating — an empty chunk with an `end` token loops forever.
+	// know to stop paginating — an empty chunk with an `end` token loops forever
+	// — but `start` is still present, echoing the client's `from` token (the
+	// page is empty *at* that position; Synapse returns "start" on empty pages).
 	resp := map[string]any{"chunk": chunk}
 	if len(chunk) > 0 {
-		var startTok, endTok int64
 		if dir == "b" {
-			startTok, endTok = maxTok, minTok-1
+			startTok, endTok := maxTok, minTok-1
+			resp["start"] = formatIntToken(startTok)
+			resp["end"] = formatIntToken(endTok)
 		} else {
-			startTok, endTok = minTok, maxTok
+			startTok, endTok := minTok, maxTok
+			resp["start"] = formatIntToken(startTok)
+			resp["end"] = formatIntToken(endTok)
 		}
+	} else {
 		resp["start"] = formatIntToken(startTok)
-		resp["end"] = formatIntToken(endTok)
 	}
 	// Lazy-loading members: with a lazy_load_members filter, the response
 	// carries a `state` list holding the membership events of the timeline
@@ -2573,7 +2585,14 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 			}
 		}
 	}
+	// The target's own sync view changes with their membership transition: a
+	// leave/ban moves the room into their leave section, an invite surfaces it
+	// in rooms.invite. notifyRoomMembers only wakes the room's currently-joined
+	// users — the target is not joined after the event, so they must be woken
+	// explicitly or their long-polled /sync never learns of the change and only
+	// returns at the timeout (sytest "Sync is woken up for leaves").
 	a.notifyRoomMembers(r.Context(), roomID)
+	a.Notifier.NotifyUser(target)
 	a.broadcastPDU(r.Context(), roomID, ev)
 	// A remote invite must also be delivered directly to the invitee's server
 	// via PUT /_matrix/federation/v2/invite/{roomID}/{eventID} (spec "inviting

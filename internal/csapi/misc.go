@@ -1062,9 +1062,17 @@ func validateFilter(raw []byte) error {
 		}
 	}
 	if v, ok := f["event_format"]; ok {
-		var n json.Number
-		if json.Unmarshal(v, &n) != nil {
-			return fmt.Errorf("event_format: must be an integer")
+		// Spec filter schema: event_format is an enum of "client" or
+		// "federation" ("The default is `client`"). Anything else is a 400
+		// (sytest "Can request federation format via the filter" POSTs
+		// event_format: 'federation'; the earlier integer check wrongly
+		// rejected every string value).
+		var s string
+		if json.Unmarshal(v, &s) != nil {
+			return fmt.Errorf("event_format: must be a string")
+		}
+		if s != "client" && s != "federation" {
+			return fmt.Errorf("event_format: must be one of 'client' or 'federation'")
 		}
 	}
 	if v, ok := f["event_fields"]; ok {
@@ -1120,6 +1128,18 @@ func validateFilterSection(raw json.RawMessage) error {
 		if v, ok := sec[key]; ok {
 			if err := requireUserIDList(v); err != nil {
 				return fmt.Errorf("%s: %w", key, err)
+			}
+		}
+	}
+	// lazy_load_members and include_redundant_members are strictly boolean
+	// (spec RoomEventFilter schema: "type: boolean"). A string "true" or a
+	// numeric 1 is a 400 — sytest "Lazy loading parameters in the filter are
+	// strictly boolean" asserts each non-boolean form is rejected.
+	for _, key := range []string{"lazy_load_members", "include_redundant_members"} {
+		if v, ok := sec[key]; ok {
+			var b bool
+			if json.Unmarshal(v, &b) != nil {
+				return fmt.Errorf("%s: must be a boolean", key)
 			}
 		}
 	}

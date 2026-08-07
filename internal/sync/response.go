@@ -207,11 +207,17 @@ type SyncFilter struct {
 	// TimelineLimitSet distinguishes an explicit `limit: 0` (empty timeline)
 	// from an unset limit (default).
 	TimelineLimitSet bool
-	// Room state filters (spec room.state): applied to the state section.
-	StateTypes      []string
-	StateNotTypes   []string
-	StateSenders    []string
-	StateNotSenders []string
+	// Room state filters (spec room.state): applied to the state section. Each
+	// XxxSet flag distinguishes a present-but-empty list (`types: []` means no
+	// types match → nothing passes) from an absent list (no restriction).
+	StateTypesSet      bool
+	StateNotTypesSet   bool
+	StateSendersSet    bool
+	StateNotSendersSet bool
+	StateTypes         []string
+	StateNotTypes      []string
+	StateSenders       []string
+	StateNotSenders    []string
 	// Lazy-load members: only include membership state events, and only for
 	// senders present in the timeline.
 	LazyLoadMembers bool
@@ -262,9 +268,13 @@ func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
 		TimelineSenders:           obj.Room.Timeline.Senders,
 		TimelineNotSenders:        obj.Room.Timeline.NotSenders,
 		StateTypes:                obj.Room.State.Types,
+		StateTypesSet:             obj.Room.State.Types != nil,
 		StateNotTypes:             obj.Room.State.NotTypes,
+		StateNotTypesSet:          obj.Room.State.NotTypes != nil,
 		StateSenders:              obj.Room.State.Senders,
+		StateSendersSet:           obj.Room.State.Senders != nil,
 		StateNotSenders:           obj.Room.State.NotSenders,
+		StateNotSendersSet:        obj.Room.State.NotSenders != nil,
 		LazyLoadMembers:           obj.Room.State.LazyLoadMembers,
 		UnreadThreadNotifications: obj.Room.Timeline.UnreadThreadNotifications,
 		IncludeLeave:              obj.Room.IncludeLeave,
@@ -285,28 +295,34 @@ func (f *SyncFilter) anySet() bool {
 	return f.TimelineLimitSet || f.TimelineLimit > 0 || f.LazyLoadMembers || f.UnreadThreadNotifications || f.IncludeLeave ||
 		len(f.TimelineTypes) > 0 || len(f.TimelineNotTypes) > 0 ||
 		len(f.TimelineSenders) > 0 || len(f.TimelineNotSenders) > 0 ||
-		len(f.StateTypes) > 0 || len(f.StateNotTypes) > 0 ||
-		len(f.StateSenders) > 0 || len(f.StateNotSenders) > 0 ||
+		f.StateTypesSet || f.StateNotTypesSet || f.StateSendersSet || f.StateNotSendersSet ||
 		len(f.EventFields) > 0
 }
 
 // keepState reports whether a room state event passes the filter's state
 // section rules (spec room.state.types/not_types/senders/not_senders). A
-// filter with no state restrictions keeps everything.
+// filter with no state restrictions keeps everything. A present-but-empty list
+// (`types: []`) is a restriction: no type matches it, so nothing passes
+// (sytest "Can pass a JSON filter as a query parameter" filters
+// state.types=["m.room.member"] and asserts exactly one event; Synapse treats
+// an empty list the same way).
 func (f *SyncFilter) keepState(ev *storage.EventRow) bool {
 	if f == nil {
 		return true
 	}
-	if strIn(f.StateNotTypes, ev.Type) {
+	// A not_types / not_senders list excludes events whose value is in it. The
+	// list is a restriction whenever present (even empty: nothing is excluded,
+	// but the field's presence is still valid).
+	if f.StateNotTypesSet && strIn(f.StateNotTypes, ev.Type) {
 		return false
 	}
-	if len(f.StateTypes) > 0 && !strIn(f.StateTypes, ev.Type) {
+	if f.StateNotSendersSet && strIn(f.StateNotSenders, ev.Sender) {
 		return false
 	}
-	if strIn(f.StateNotSenders, ev.Sender) {
+	if f.StateTypesSet && !strIn(f.StateTypes, ev.Type) {
 		return false
 	}
-	if len(f.StateSenders) > 0 && !strIn(f.StateSenders, ev.Sender) {
+	if f.StateSendersSet && !strIn(f.StateSenders, ev.Sender) {
 		return false
 	}
 	return true
@@ -844,6 +860,20 @@ func (e *Engine) appendPresence(ctx context.Context, resp *Response, opts SyncOp
 	for _, u := range userIDs {
 		if p, err := e.store.GetPresence(ctx, u); err == nil && p != nil {
 			events = append(events, presenceEvent(p))
+		} else {
+			// A peer with no stored presence row (they have never synced with
+			// set_presence online, e.g. sytest's matrix_do_and_wait_for_sync
+			// always syncs offline) still has presence: the default state is
+			// "offline" with no status message (Synapse's UserPresenceState
+			// default). Emitting it here matters because a newly-visible peer's
+			// presence must appear exactly once in the sync that makes them
+			// visible — a missing row must not silently drop the event (sytest
+			// "Newly joined room includes presence in incremental sync" expects
+			// one presence event for the room's existing member).
+			events = append(events, presenceEvent(&storage.PresenceRow{
+				UserID:   u,
+				Presence: "offline",
+			}))
 		}
 	}
 	if len(events) > 0 {
@@ -907,10 +937,49 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	// default /current window). The window is the room's recent history — the
 	// *last* `limit` events — not the first `limit` events after the token
 	// (mirror of Synapse's _load_filtered_recents, which paginates backwards
-	// from the newest event).
+	// from the newest event). An explicit `limit: 0` means an empty timeline
+	// (spec: "limit: The maximum number of events to return. Defaults to 0,
+	// which means all events are returned" — per-room this yields no events;
+	// sytest "Can pass a JSON filter as a query parameter" asserts an empty
+	// timeline for limit: 0).
 	limit := 50
-	if filter != nil && filter.TimelineLimit > 0 {
+	if filter != nil && filter.TimelineLimitSet {
 		limit = filter.TimelineLimit
+	}
+	if limit <= 0 {
+		// An explicit timeline limit of 0 yields an empty timeline but the
+		// state section still follows the filter's room.state rules (sytest
+		// "Can pass a JSON filter as a query parameter" filters
+		// state.types=["m.room.member"] with timeline.limit=0 and asserts the
+		// single member event arrives in state.events).
+		jr.Timeline = Timeline{Events: []json.RawMessage{}, Limited: false, PrevBatch: Token{Stream: maxStream}.Encode()}
+		if opts.Since.Stream == 0 || opts.FullState {
+			stateRows, err := e.store.GetState(ctx, roomID)
+			if err != nil {
+				return jr, err
+			}
+			ids := make([]string, 0, len(stateRows))
+			for _, s := range stateRows {
+				ids = append(ids, s.EventID)
+			}
+			stateEvs, _ := e.store.EventsByIDs(ctx, ids)
+			prevContent := e.prevContentAnnotator(ctx, roomID, maxStream)
+			jr.State.Events = make([]json.RawMessage, 0, len(stateEvs))
+			for _, se := range stateEvs {
+				if !filter.keepState(&se) {
+					continue
+				}
+				if filter.lazyLoadMembers() && !lazyLoadMemberEvent(&se, map[string]bool{}) {
+					continue
+				}
+				jr.State.Events = append(jr.State.Events, filter.applyEventFields(prevContent(clientEvent(&se), &se)))
+			}
+		} else {
+			jr.State.Events = []json.RawMessage{}
+		}
+		jr.Summary = e.roomSummary(ctx, roomID, opts.UserID)
+		jr.UnreadNotifications, jr.UnreadThreads = e.unreadCounts(ctx, roomID, opts)
+		return jr, nil
 	}
 
 	// A room the user *transitioned into* after the sync token is a "newly

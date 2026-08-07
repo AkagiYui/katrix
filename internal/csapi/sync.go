@@ -62,7 +62,11 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrBadJSON("invalid since token"))
 		return
 	}
-	timeout := 30 * time.Second
+	// The spec default is 0: without an explicit timeout the server returns
+	// immediately even when the response is empty ("By default, this is `0`, so
+	// the server will return immediately even if the response is empty"). A
+	// client that wants long-polling opts in via the timeout parameter.
+	timeout := 0 * time.Second
 	if v := q.Get("timeout"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 60000 {
 			timeout = time.Duration(n) * time.Millisecond
