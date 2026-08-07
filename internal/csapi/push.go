@@ -199,9 +199,18 @@ func (d *pushDispatcher) dispatchForUser(ctx context.Context, a *API, roomID, ev
 			"pushkey_ts": p.CreatedTS / 1000,
 			"data":       deviceData,
 		}
-		if len(res.Tweaks) > 0 {
-			device["tweaks"] = res.Tweaks
+		// The device's `tweaks` object is always present: the matched rule's
+		// set_tweak values, with a default "highlight": false when the rule
+		// carries no tweaks (mirror of Synapse's tweaks_for_actions, which
+		// always includes highlight — sytest asserts the devices[0].tweaks key).
+		tweaks := res.Tweaks
+		if tweaks == nil {
+			tweaks = map[string]any{}
 		}
+		if _, ok := tweaks["highlight"]; !ok {
+			tweaks["highlight"] = false
+		}
+		device["tweaks"] = tweaks
 		nn := make(map[string]any, len(notif)+2)
 		for k, v := range notif {
 			nn[k] = v
