@@ -120,9 +120,9 @@ func (a *API) notary(ctx context.Context, serverName string, minValidUntilTS int
 		}
 	}
 	obj := map[string]any{
-		"server_name":    serverName,
-		"valid_until_ts": minValid,
-		"verify_keys":    verifyKeys,
+		"server_name":     serverName,
+		"valid_until_ts":  minValid,
+		"verify_keys":     verifyKeys,
 		"old_verify_keys": map[string]verifyKey{},
 	}
 	raw, _ := json.Marshal(obj)

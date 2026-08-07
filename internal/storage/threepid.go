@@ -7,10 +7,10 @@ import (
 // ThreePIDBinding is one (medium, address) 3PID bound to a user via this
 // homeserver, along with the identity server the bind was performed at.
 type ThreePIDBinding struct {
-	Medium    string
-	Address   string
-	IDServer  string
-	BoundTS   int64
+	Medium   string
+	Address  string
+	IDServer string
+	BoundTS  int64
 }
 
 // StoreThreePIDBinding records a 3PID bind so later unbinds/deactivation can

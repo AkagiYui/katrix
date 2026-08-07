@@ -276,8 +276,8 @@ func guestAccessCanJoin(content json.RawMessage) bool {
 // event's third_party_invite content: the identity server's signed statement
 // that the joining/invited user was validated (spec §3PID invites).
 type thirdPartySigned struct {
-	Token      string                      `json:"token"`
-	Mxid       string                      `json:"mxid"`
+	Token      string                       `json:"token"`
+	Mxid       string                       `json:"mxid"`
 	Signatures map[string]map[string]string `json:"signatures"`
 }
 

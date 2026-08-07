@@ -1702,6 +1702,7 @@ func (a *API) deliverPushFor(ctx context.Context, roomID string, ev *events.Even
 	// transaction API (spec "Application services" §Pushing events).
 	a.deliverASEvents(ctx, roomID, ev)
 }
+
 // roomPowerLevels returns the room's current m.room.power_levels (or the zero
 // value when absent, which means everyone is level 0).
 func (a *API) roomPowerLevels(ctx context.Context, roomID string) *rooms.PowerLevels {

@@ -33,7 +33,7 @@ import (
 // API so both the CS path (which owns the API) and the federation ingest path
 // can trigger delivery. `a` is the owning API, set in New after construction.
 type pushDispatcher struct {
-	a *API
+	a  *API
 	mu sync.Mutex
 	// lastNotified tracks the highest event stream_ordering already dispatched
 	// per room, so a path that sees an event already dispatched by another path

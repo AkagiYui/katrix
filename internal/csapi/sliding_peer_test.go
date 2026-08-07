@@ -30,8 +30,8 @@ func TestSlidingSyncRoomAppearsMidstreamReachesJoins(t *testing.T) {
 			},
 		},
 		"extensions": map[string]any{
-			"e2ee":        map[string]any{"enabled": true},
-			"to_device":   map[string]any{"enabled": true},
+			"e2ee":         map[string]any{"enabled": true},
+			"to_device":    map[string]any{"enabled": true},
 			"account_data": map[string]any{"enabled": true},
 		},
 	})
@@ -71,8 +71,8 @@ func TestSlidingSyncRoomAppearsMidstreamReachesJoins(t *testing.T) {
 			},
 		},
 		"extensions": map[string]any{
-			"e2ee":        map[string]any{"enabled": true},
-			"to_device":   map[string]any{"enabled": true},
+			"e2ee":         map[string]any{"enabled": true},
+			"to_device":    map[string]any{"enabled": true},
 			"account_data": map[string]any{"enabled": true},
 		},
 	})
@@ -110,8 +110,8 @@ func TestSlidingSyncRoomAppearsMidstreamReachesJoins(t *testing.T) {
 			},
 		},
 		"extensions": map[string]any{
-			"e2ee":        map[string]any{"enabled": true},
-			"to_device":   map[string]any{"enabled": true},
+			"e2ee":         map[string]any{"enabled": true},
+			"to_device":    map[string]any{"enabled": true},
 			"account_data": map[string]any{"enabled": true},
 		},
 	})
