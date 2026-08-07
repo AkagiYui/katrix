@@ -211,6 +211,30 @@ func TestSignaturesUploadPersistsAndNotifies(t *testing.T) {
 		t.Fatal("bob never saw alice in device_lists.changed after signatures upload")
 	}
 
+	// The signed user (Bob) must ALSO appear in the signer's (Alice's) own
+	// device_lists.changed: uploading signatures of another user means the
+	// signer must re-fetch that user's keys (mirror of sytest "Changing
+	// user-signing key notifies local users").
+	deadline = time.Now().Add(5 * time.Second)
+	seenSigned := false
+	for time.Now().Before(deadline) {
+		_, resp := syncNow(t, srv, aliceTok, since, 0)
+		if dl, _ := resp["device_lists"].(map[string]any); dl != nil {
+			for _, u := range dl["changed"].([]any) {
+				if u == bobID {
+					seenSigned = true
+				}
+			}
+		}
+		since, _ = resp["next_batch"].(string)
+		if seenSigned {
+			break
+		}
+	}
+	if !seenSigned {
+		t.Fatal("signer never saw the signed user in device_lists.changed")
+	}
+
 	// The uploaded signature must be merged into the target's device key bundle
 	// on a later keys/query (signatures made by another user survive the query).
 	// Bob uploads device keys for his real device first, then Alice's signature

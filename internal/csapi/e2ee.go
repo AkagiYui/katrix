@@ -255,6 +255,10 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 			// Resync each tracked-but-uncached user's full device list. Each
 			// fetched device's keys and display name (which /user/devices
 			// carries separately) are folded into the response and the cache.
+			// The endpoint also answers the user's cross-signing keys
+			// (master_key / self_signing_key), which are passed through so a
+			// client can verify a remote user's cross-signing signatures
+			// (sytest "uploading self-signing key notifies over federation").
 			for _, u := range resyncUsers {
 				// Bound the federation round-trip so an unreachable remote
 				// server does not stall the client's request.
@@ -285,6 +289,12 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 					}
 					keys[d.DeviceID] = keyObj
 					merged[d.DeviceID] = keyObj
+				}
+				if len(devs.MasterKey) > 0 {
+					masterKeys[u] = devs.MasterKey
+				}
+				if len(devs.SelfSigningKey) > 0 {
+					selfSigningKeys[u] = devs.SelfSigningKey
 				}
 				if raw, err := json.Marshal(keys); err == nil {
 					_ = a.Store.CacheRemoteDeviceList(r.Context(), u, raw)
@@ -804,6 +814,22 @@ func (a *API) SignaturesUpload(w http.ResponseWriter, r *http.Request) {
 	_, _ = a.Store.RecordDeviceListChange(r.Context(), auth.UserID, false)
 	a.broadcastDeviceListUpdate(r.Context(), auth.UserID, "", false)
 	a.notifyDeviceListPeers(r.Context(), auth.UserID)
+	// The users whose keys were signed are surfaced in the SIGNER's own /sync
+	// device_lists.changed: uploading signatures of another user means the
+	// signer must re-fetch that user's keys (mirror of Synapse's
+	// notify_user_signature_update + get_users_whose_signatures_changed in
+	// generate_sync_entry_for_device_list; sytest "Changing user-signing key
+	// notifies local users" syncs until the signed user appears in the signer's
+	// changed list after upload_signatures).
+	targets := map[string]bool{}
+	for _, sg := range sigs {
+		targets[sg.TargetUser] = true
+	}
+	for target := range targets {
+		if target != auth.UserID {
+			_, _ = a.Store.RecordSignatureChange(r.Context(), auth.UserID, target)
+		}
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"failures": failures})
 }
 

@@ -444,3 +444,42 @@ func (s *Store) DeviceSignatures(ctx context.Context, userID string) (map[string
 	}
 	return out, rows.Err()
 }
+
+// ---- User-signature changes (who a user has signed, per /sync) ----
+
+// RecordSignatureChange records that signerUser uploaded signatures on
+// targetUser's keys. The signed target is surfaced in the signer's own /sync
+// device_lists.changed (mirror of Synapse's user_signature_stream + the
+// get_users_whose_signatures_changed lookup in generate_sync_entry_for_device_list).
+func (s *Store) RecordSignatureChange(ctx context.Context, signerUser, targetUser string) (int64, error) {
+	streamID, err := s.NextSyncStream(ctx)
+	if err != nil {
+		return 0, err
+	}
+	_, err = s.pool.Exec(ctx,
+		`INSERT INTO signature_changes(signer_user, target_user, stream_id) VALUES ($1,$2,$3)
+		 ON CONFLICT (signer_user, target_user) DO UPDATE SET stream_id=EXCLUDED.stream_id`,
+		signerUser, targetUser, streamID)
+	return streamID, err
+}
+
+// SignatureTargetsSince returns the user IDs that signerUser has signed with
+// signatures uploaded after the given stream position (in stream order).
+func (s *Store) SignatureTargetsSince(ctx context.Context, signerUser string, since int64) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT target_user FROM signature_changes WHERE signer_user=$1 AND stream_id>$2 ORDER BY stream_id ASC`,
+		signerUser, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}

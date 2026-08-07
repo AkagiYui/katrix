@@ -606,6 +606,23 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 			ch = append(ch, u)
 		}
 	}
+	// Users whose keys the syncer signed (POST /keys/signatures/upload) appear
+	// in the syncer's OWN `changed` list: uploading signatures of another user
+	// means the signer must re-fetch that user's keys (mirror of Synapse's
+	// get_users_whose_signatures_changed in generate_sync_entry_for_device_list;
+	// sytest "Changing user-signing key notifies local users"). The signed
+	// targets share a room by construction (they were reached via the signer's
+	// peer set), so the peer filter passes them.
+	if opts.Since.Stream > 0 {
+		if signed, err := e.store.SignatureTargetsSince(ctx, opts.UserID, opts.Since.Stream); err == nil {
+			for _, u := range signed {
+				if peers[u] && !seen[u] {
+					seen[u] = true
+					ch = append(ch, u)
+				}
+			}
+		}
+	}
 	// Newly-shared room members, added to `changed`. The membership-based
 	// "newly shared an encrypted room" fallback fires when either (a) the
 	// syncer themselves newly joined a room after the token — every joined
