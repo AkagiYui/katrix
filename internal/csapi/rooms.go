@@ -449,6 +449,25 @@ func (a *API) RoomLeave(w http.ResponseWriter, r *http.Request) {
 	default:
 		// e.g. banned: cannot leave without unban; let the auth rules reject.
 	}
+	// A leave in a room this server does not locally authorise — the room was
+	// learned only via an inbound invite that carried no stripped state (v1
+	// invites deliver the bare event, so the local room view has no
+	// m.room.create) — is performed by federating with the room's origin
+	// server (make_leave/send_leave), and the local leave is recorded by
+	// LeaveRemoteRoom (persisting the leave event + membership). Best-effort:
+	// an invite rejection must succeed locally even when the remote refuses or
+	// is unreachable (sytest "Inbound federation can receive invite and reject
+	// when remote replies with a 403/500/unreachable"), so the local leave is
+	// recorded regardless of the federation outcome.
+	if a.fed != nil {
+		if _, serr := a.Store.GetStateEvent(r.Context(), roomID, "m.room.create", ""); serr != nil {
+			if dom := ids.DomainOf(roomID); dom != "" && dom != a.ServerName() {
+				_ = a.fed.LeaveRemoteRoom(r.Context(), dom, auth.UserID, roomID)
+			}
+			httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+			return
+		}
+	}
 	if err := a.sendMemberEvent(r, auth, roomID, "", auth.UserID, rooms.MembershipLeave, ""); err != nil {
 		writeRoomErr(w, err)
 		return

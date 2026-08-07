@@ -1106,3 +1106,176 @@ func (a *API) persistRemotePDUs(ctx context.Context, roomID string, rules roomve
 	}
 	return rows
 }
+
+// ---- outbound federated leave (make_leave / send_leave) ----
+
+// makeLeave fetches an unsigned leave-event template from dest via
+// GET /_matrix/federation/v1/make_leave/{roomID}/{userID} (spec §make_leave).
+func (c *Client) makeLeave(ctx context.Context, dest, roomID, userID string) (*makeJoinResponse, error) {
+	url := c.serverBaseURL(dest) + "/_matrix/federation/v1/make_leave/" + roomID + "/" + userID + supportedVersionsQuery()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Host = dest
+	if err := signRequestWith(req, c.originName(), c.key); err != nil {
+		return nil, err
+	}
+	metrics.Counters.FedOutboundRequests.Add(1)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("federation: make_leave %s: %w", dest, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: make_leave %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, err
+	}
+	var out makeJoinResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("federation: decode make_leave from %s: %w", dest, err)
+	}
+	if len(out.Event) == 0 {
+		return nil, fmt.Errorf("federation: make_leave from %s returned no event", dest)
+	}
+	return &out, nil
+}
+
+// sendLeave performs PUT /_matrix/federation/v2/send_leave/{roomID}/{userID}
+// (falling back to the legacy v1 path on a 404) with the signed leave event.
+func (c *Client) sendLeave(ctx context.Context, dest, roomID, userID string, ev *events.Event, version roomver.Version) error {
+	// v2 first; a peer that does not know the v2 endpoint falls back to
+	// PUT /v1/send_leave/{roomId}/{eventId} (mirror of the send_join fallback).
+	err := c.sendLeaveRequest(ctx, dest, "v2", roomID, userID, ev)
+	if err != nil {
+		if fe, ok := err.(*FedHTTPError); ok && fe.code == http.StatusNotFound && fe.errcode == "" {
+			return c.sendLeaveRequest(ctx, dest, "v1", roomID, ev.EventID(), ev)
+		}
+		return err
+	}
+	return nil
+}
+
+// sendLeaveRequest performs one send_leave attempt against the given version
+// path. The v1 response is the legacy 2-element [code, body] array (MSC1802)
+// and is unwrapped.
+func (c *Client) sendLeaveRequest(ctx context.Context, dest, version, roomID, idPart string, ev *events.Event) error {
+	var url string
+	if version == "v1" {
+		url = c.serverBaseURL(dest) + "/_matrix/federation/v1/send_leave/" + urlPathEscape(roomID) + "/" + urlPathEscape(idPart)
+	} else {
+		url = c.serverBaseURL(dest) + "/_matrix/federation/v2/send_leave/" + urlPathEscape(roomID) + "/" + urlPathEscape(idPart)
+	}
+	body := ev.Raw()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = dest
+	if err := signRequestWith(req, c.originName(), c.key); err != nil {
+		return err
+	}
+	metrics.Counters.FedOutboundRequests.Add(1)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("federation: send_leave %s: %w", dest, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: send_leave %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
+	}
+	return nil
+}
+
+// buildLeaveEvent fills in and signs a make_leave template, producing an
+// m.room.member(leave) event for userID (mirror of buildJoinEvent).
+func buildLeaveEvent(tpl *makeJoinResponse, userID, roomID string, now int64, version roomver.Version, rules roomver.Rules, key *crypto.SigningKey, serverName string) (*events.Event, error) {
+	prev, auth := tplEventRefs(tpl.Event)
+	content := tplEventContent(tpl.Event)
+	if len(content) == 0 {
+		content = json.RawMessage(`{"membership":"leave"}`)
+	}
+	b := events.Builder{
+		Type:           "m.room.member",
+		Sender:         userID,
+		RoomID:         roomID,
+		Content:        content,
+		Depth:          tplEventDepth(tpl.Event),
+		OriginServerTS: tplEventTS(tpl.Event, now),
+		PrevEvents:     prev,
+		AuthEvents:     auth,
+		Origin:         serverName,
+	}
+	sk := userID
+	b.StateKey = &sk
+	if rules.EventFormatV1 {
+		return b.BuildLegacy(serverName, key, version, ids.RandomTxnSuffix())
+	}
+	return b.BuildForVersion(serverName, key, version)
+}
+
+// LeaveRemoteRoom rejects an invite (or leaves a joined room) by federating
+// with dest: GET make_leave for an unsigned template, sign it, PUT send_leave,
+// and persist the local leave event. Best-effort by design — an invite
+// rejection must succeed locally even when the remote server refuses the
+// make_leave/send_leave (403/500) or is unreachable (sytest "Inbound
+// federation can receive invite and reject when remote replies with a
+// 403/500/unreachable"): the local user's leave is recorded regardless, and a
+// remote refusal is not propagated to the client. The local leave event is
+// persisted so the room moves into the user's leave section.
+func (a *API) LeaveRemoteRoom(ctx context.Context, dest, userID, roomID string) error {
+	tpl, err := a.client.makeLeave(ctx, dest, roomID, userID)
+	if err != nil {
+		// Remote refused the make_leave (403/500) or is unreachable: the local
+		// leave still happens (recorded by the caller).
+		return err
+	}
+	version := roomver.Version(tpl.RoomVersion)
+	if version == "" {
+		version = inferTemplateRoomVersion(tpl.Event)
+	}
+	if version == "" {
+		version = roomver.Default
+	}
+	rules, ok := roomver.Get(version)
+	if !ok {
+		return fmt.Errorf("federation: unsupported room version %q from %s", version, dest)
+	}
+	ev, err := buildLeaveEvent(tpl, userID, roomID, a.Now(), version, rules, a.Key, a.ServerName())
+	if err != nil {
+		return err
+	}
+	// Deliver the leave to the remote.
+	if err := a.client.sendLeave(ctx, dest, roomID, userID, ev, version); err != nil {
+		// A refused send_leave still leaves the local record; best-effort.
+		_ = err
+	}
+	// Persist the leave event locally and update the membership row so /sync
+	// reports the room under leave (the rejected invite).
+	if stream, err := a.Store.InsertEvent(ctx, &storage.EventRow{
+		EventID: ev.EventID(), RoomID: roomID, Type: ev.Type(),
+		StateKey: userID, Sender: userID, Depth: ev.Depth(),
+		OriginServerTS: ev.OriginServerTS(), Content: ev.Content(), RawJSON: ev.Raw(),
+	}); err == nil {
+		a.Store.IndexRelationFromRow(ctx, &storage.EventRow{EventID: ev.EventID(), RoomID: roomID})
+		if rules, ok := roomver.Get(version); ok {
+			_ = eventstate.Maintain(ctx, a.Store, &storage.EventRow{
+				EventID: ev.EventID(), RoomID: roomID, Type: ev.Type(), StateKey: userID,
+				Sender: userID, Depth: ev.Depth(), OriginServerTS: ev.OriginServerTS(),
+				Content: ev.Content(), RawJSON: ev.Raw(),
+			}, rules)
+		}
+		_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
+			RoomID: roomID, UserID: userID, Membership: "leave",
+			EventID: ev.EventID(), StreamOrdering: stream, Depth: ev.Depth(),
+		})
+	}
+	a.Notifier.NotifyUsers(userID)
+	return nil
+}

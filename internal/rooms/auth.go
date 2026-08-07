@@ -74,7 +74,22 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 	}
 
 	// 2. The create event must exist in the state (room already created).
+	//
+	// Exception (mirror of Synapse's _is_membership_change_allowed): a user who
+	// is currently *invited* (or knocked) may always reject the invite by
+	// changing their own membership to leave — even when the local server has no
+	// create event for the room. This is the case for a room learned only via an
+	// inbound invite that carried no stripped state (v1 invites deliver the bare
+	// event): the invited server's room view holds the invite but no create, and
+	// the invitee's rejection must still be accepted (sytest "Inbound federation
+	// can receive invite and reject when remote replies with a 403/500/unreachable"
+	// drives exactly this — the leave 403s with "no m.room.create in state").
 	if len(st.Create) == 0 {
+		if eventType == "m.room.member" && stateKey == sender {
+			if currentMembership(st) == MembershipInvite || currentMembership(st) == MembershipKnock {
+				return nil
+			}
+		}
 		return fmt.Errorf("rooms: no m.room.create in state")
 	}
 	create, err := ParseCreate(st.Create)
@@ -221,6 +236,24 @@ func checkOwnedState(rules roomver.Rules, stateKey, sender string, userLevel fun
 		return nil
 	}
 	return fmt.Errorf("rooms: you are not allowed to set others' state")
+}
+
+// currentMembership returns the target user's current membership from a state
+// snapshot. For a self-membership event (sender == state_key) the sender's
+// member event IS the target's; otherwise the target's own member event is
+// used. "" when neither exists.
+func currentMembership(st StateSnapshot) string {
+	if len(st.SenderMember) > 0 {
+		if m, err := ParseMember(st.SenderMember); err == nil {
+			return m.Membership
+		}
+	}
+	if len(st.TargetMember) > 0 {
+		if m, err := ParseMember(st.TargetMember); err == nil {
+			return m.Membership
+		}
+	}
+	return ""
 }
 
 // guestAccessCanJoin reports whether an m.room.guest_access content value
