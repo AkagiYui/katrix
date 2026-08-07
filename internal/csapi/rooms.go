@@ -2788,7 +2788,19 @@ func isBlockedInviteError(err error) bool {
 
 // sendStateEvent is a helper used by createRoom for name/topic events.
 func (a *API) sendStateEvent(r *http.Request, auth *homeserver.Auth, roomID string, version roomver.Version, eventType, stateKey string, content any) {
-	contentRaw, _ := json.Marshal(content)
+	// content may already be raw event JSON (json.RawMessage from a state copy,
+	// or a []byte from a marshalled map): json.Marshal would base64-encode a
+	// []byte and double-encode a RawMessage's bytes, so pass it through
+	// verbatim and only marshal structured values.
+	var contentRaw []byte
+	switch c := content.(type) {
+	case json.RawMessage:
+		contentRaw = c
+	case []byte:
+		contentRaw = c
+	default:
+		contentRaw, _ = json.Marshal(content)
+	}
 	ev, err := a.buildEvent(r, auth, roomID, version, eventType, stateKey, ids.RandomTxnSuffix(), true, contentRaw)
 	if err != nil {
 		return
