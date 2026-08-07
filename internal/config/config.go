@@ -90,6 +90,13 @@ type Config struct {
 	// disable_tls_validation.
 	FederationInsecure bool `yaml:"federation_insecure"`
 
+	// PushInsecure skips TLS certificate verification for outbound HTTP push
+	// notifications to push gateways. Per the push gateway spec, the homeserver
+	// delivers notifications over HTTPS; sytest's mock push gateway presents a
+	// self-signed certificate (keys/tls-selfsigned.crt), so this must be
+	// enabled there; production deployments should leave it off.
+	PushInsecure bool `yaml:"push_insecure"`
+
 	// AppServiceDir is a directory of application-service registration files
 	// (YAML). When set, the registrations are loaded at startup and their
 	// as_tokens are accepted as access tokens for the registered sender
@@ -211,6 +218,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("KATRIX_FEDERATION_INSECURE"); v != "" {
 		c.FederationInsecure = parseBool(v, c.FederationInsecure)
+	}
+	if v := os.Getenv("KATRIX_PUSH_INSECURE"); v != "" {
+		c.PushInsecure = parseBool(v, c.PushInsecure)
 	}
 	if v := os.Getenv("KATRIX_SSRF_ALLOW_PRIVATE_IPS"); v != "" {
 		c.SSRFAllowPrivateIPs = parseBool(v, c.SSRFAllowPrivateIPs)

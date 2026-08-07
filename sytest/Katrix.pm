@@ -135,6 +135,10 @@ sub _get_config
       # aborts with a "bad certificate" alert.
       federation_insecure => $JSON::true,
 
+      # The sytest mock push gateway presents a self-signed certificate, so
+      # skip TLS verification for outbound HTTP push notifications.
+      push_insecure => $JSON::true,
+
       federation_tls => {
          cert_path => $self->{paths}{tls_cert},
          key_path  => $self->{paths}{tls_key},

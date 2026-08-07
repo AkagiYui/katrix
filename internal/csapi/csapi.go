@@ -43,7 +43,7 @@ type API struct {
 
 // New constructs the CS API surface.
 func New(hs *homeserver.HS) *API {
-	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, hs.Typing), ssConns: newSSConnStore(), push: newPushDispatcher()}
+	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, hs.Typing), ssConns: newSSConnStore(), push: newPushDispatcher(hs.Config.PushInsecure)}
 	api.push.a = api
 	return api
 }

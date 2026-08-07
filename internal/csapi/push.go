@@ -3,6 +3,7 @@ package csapi
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"net/http"
 	"sort"
@@ -42,10 +43,14 @@ type pushDispatcher struct {
 	http         *http.Client
 }
 
-func newPushDispatcher() *pushDispatcher {
+func newPushDispatcher(insecure bool) *pushDispatcher {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if insecure {
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- test-only flag
+	}
 	return &pushDispatcher{
 		lastNotified: map[string]int64{},
-		http:         &http.Client{Timeout: 15 * time.Second},
+		http:         &http.Client{Timeout: 15 * time.Second, Transport: tr},
 	}
 }
 
@@ -236,6 +241,80 @@ func (d *pushDispatcher) postNotify(ctx context.Context, url string, body []byte
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	return len(out.Rejected) > 0
+}
+
+// refreshBadge re-dispatches a badge-count-only push to the user's HTTP
+// pushers after their read receipt advances. The push gateway's badge (the
+// notification `counts.unread`) must track reads even when no new event
+// arrives, so the receipt is re-pushed with the updated count (sytest "Test
+// that a message is pushed" asserts a second push with unread 0 after the
+// user reads the message). The payload mirrors a normal notification, reusing
+// the receipted event's identity, with the freshly computed unread count.
+func (d *pushDispatcher) refreshBadge(ctx context.Context, a *API, roomID, userID, localpart, eventID string) {
+	pushers, err := a.Store.ListPushers(ctx, localpart)
+	if err != nil || len(pushers) == 0 {
+		return
+	}
+	unread := a.totalUnreadCount(ctx, userID, localpart)
+
+	ev, err := a.Store.GetEvent(ctx, eventID)
+	if err != nil {
+		return
+	}
+	notif := map[string]any{
+		"event_id": eventID,
+		"room_id":  roomID,
+		"type":     ev.Type,
+		"sender":   ev.Sender,
+		"prio":     "high",
+		"counts":   map[string]any{"unread": unread},
+	}
+	var content map[string]any
+	_ = json.Unmarshal(ev.Content, &content)
+	if len(content) > 0 {
+		notif["content"] = content
+	}
+	if name := a.pushRoomName(ctx, roomID); name != "" {
+		notif["room_name"] = name
+	}
+	if dn := a.pushSenderDisplayName(ctx, roomID, ev.Sender); dn != "" {
+		notif["sender_display_name"] = dn
+	}
+
+	for _, p := range pushers {
+		if p.Kind != "http" {
+			continue
+		}
+		var data map[string]any
+		_ = json.Unmarshal(p.Data, &data)
+		url, _ := data["url"].(string)
+		if url == "" {
+			continue
+		}
+		deviceData := map[string]any{}
+		for k, v := range data {
+			if k == "url" {
+				continue
+			}
+			deviceData[k] = v
+		}
+		device := map[string]any{
+			"app_id":     p.AppID,
+			"pushkey":    p.PushKey,
+			"pushkey_ts": p.CreatedTS / 1000,
+			"data":       deviceData,
+		}
+		nn := make(map[string]any, len(notif)+2)
+		for k, v := range notif {
+			nn[k] = v
+		}
+		nn["id"] = eventID
+		nn["devices"] = []any{device}
+		body, _ := json.Marshal(map[string]any{"notification": nn})
+		if d.postNotify(ctx, url, body) {
+			_ = a.Store.DeletePusher(context.Background(), localpart, p.AppID, p.PushKey)
+		}
+	}
 }
 
 // mustJSON re-encodes a map to JSON bytes, returning "{}" on failure.

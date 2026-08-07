@@ -353,6 +353,13 @@ func (a *API) Receipt(w http.ResponseWriter, r *http.Request) {
 		ThreadID: threadID, EventID: eventID, TS: a.Now(),
 	})
 	a.notifyRoomMembers(r.Context(), roomID)
+	// Push: advancing a read receipt lowers the user's unread badge, which the
+	// push gateway must be told about even though no new event arrived
+	// (sytest "Test that a message is pushed" asserts the follow-up push with
+	// unread 0). Fires on the main-timeline m.read receipt only.
+	if receiptType == "m.read" && threadID == "" {
+		a.push.refreshBadge(r.Context(), a, roomID, auth.UserID, auth.Localpart, eventID)
+	}
 	// Federation: receipts are delivered to the room's remote servers as an
 	// m.receipt EDU (spec receipt federation). The EDU content is the same shape
 	// /sync emits per room: {event_id: {receipt_type: {user_id: {ts, thread_id?}}}}.
