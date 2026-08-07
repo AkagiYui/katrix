@@ -124,32 +124,53 @@ func (v *Verifier) Verify(ctx context.Context, raw []byte, version roomver.Versi
 		return res
 	}
 
-	if res.Origin == "" {
+	// The event must be signed by the SENDER's server (spec; Synapse's
+	// _check_sigs_on_pdu verifies the signature for the sender's domain). The
+	// `origin` field of a make_join/send_join template names the serving
+	// server, not the signing one, so it cannot be trusted as the verification
+	// target: a join template served by this server and signed by the joining
+	// server must verify against the joining (sender's) server. Fall back to
+	// the origin field only when the sender's domain is unavailable (e.g. a
+	// 3pid invite whose sender is on a third server).
+	senderDomain := ""
+	if c := strings.IndexByte(ev.Sender, ':'); c >= 0 {
+		senderDomain = ev.Sender[c+1:]
+	}
+	res.Origin = senderDomain
+	// Try each candidate entity (sender's domain, then the origin field) until
+	// one yields a valid signature. A single valid signature is sufficient
+	// (spec: any of the origin's current keys).
+	var lastErr error
+	for _, entity := range []string{senderDomain, ev.Origin} {
+		if entity == "" {
+			continue
+		}
+		originSigs := ev.Signatures[entity]
+		if len(originSigs) == 0 {
+			continue
+		}
+		res.Signed = true
+		for keyID, sig := range originSigs {
+			pub, err := v.keys.VerifyKeyFor(ctx, entity, keyID)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if err := crypto.VerifyJSONWith(sig, entity, crypto.KeyID(keyID), pub, redactedBytes); err != nil {
+				lastErr = err
+				continue
+			}
+			res.Valid = true
+			return res
+		}
+	}
+	if res.Origin == "" && ev.Origin == "" {
 		res.Err = fmt.Errorf("fedverify: event has no origin and no sender domain")
 		return res
 	}
-	originSigs := ev.Signatures[res.Origin]
-	if len(originSigs) == 0 {
+	if len(ev.Signatures[senderDomain]) == 0 && len(ev.Signatures[ev.Origin]) == 0 {
 		// Unsigned event: not valid. Caller decides whether to drop.
 		res.Signed = false
-		return res
-	}
-	res.Signed = true
-
-	// Try each origin signature until one verifies. A single valid signature
-	// is sufficient (spec: any of the origin's current keys).
-	var lastErr error
-	for keyID, sig := range originSigs {
-		pub, err := v.keys.VerifyKeyFor(ctx, res.Origin, keyID)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if err := crypto.VerifyJSONWith(sig, res.Origin, crypto.KeyID(keyID), pub, redactedBytes); err != nil {
-			lastErr = err
-			continue
-		}
-		res.Valid = true
 		return res
 	}
 	if lastErr != nil {
