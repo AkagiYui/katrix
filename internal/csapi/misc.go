@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -683,19 +684,59 @@ func (a *API) GetFilter(w http.ResponseWriter, r *http.Request) {
 // room_id, creator, num_joined_members, world_readable, guest_can_join, plus
 // (when present) canonical_alias, name, topic and avatar_url.
 //
-// The POST filter (spec §Public Room Directory: "If third_party_instance_id
-// is set, only rooms published by the given network are returned. If
-// include_all_networks is set, rooms published by all networks are returned")
-// is honoured: third_party_instance_id ("<appservice_id>|<network_id>")
-// narrows to one appservice's room list, include_all_networks merges every
-// appservice list with the main list, and the default is the main list only.
+// A `server` query parameter names another homeserver whose public room list
+// is queried over federation (spec §Public Room Directory: "the homeserver
+// should query the remote server's public room directory"), except when the
+// name is this server's own, in which case the local list is returned (sytest
+// "Asking for a remote rooms list, but supplying the local server's name,
+// returns the local rooms list").
+//
+// The POST filter (spec: "If third_party_instance_id is set, only rooms
+// published by the given network are returned. If include_all_networks is set,
+// rooms published by all networks are returned") is honoured:
+// third_party_instance_id ("<appservice_id>|<network_id>") narrows to one
+// appservice's room list, include_all_networks merges every appservice list
+// with the main list, and the default is the main list only.
 func (a *API) PublicRooms(w http.ResponseWriter, r *http.Request) {
+	server := r.URL.Query().Get("server")
 	var req struct {
+		Limit  int    `json:"limit"`
+		Since  string `json:"since"`
+		Filter struct {
+			GenericSearchTerm string `json:"generic_search_term"`
+		} `json:"filter"`
 		ThirdPartyInstanceID string `json:"third_party_instance_id,omitempty"`
 		IncludeAllNetworks   bool   `json:"include_all_networks,omitempty"`
 	}
 	if r.Method == http.MethodPost {
 		_ = httpx.DecodeJSON(w, r, &req)
+	}
+	limit := req.Limit
+	if limit == 0 {
+		// GET and the POST default both imply no limit for GET; the spec's
+		// POST default is 100. Zero means unlimited in either case.
+		limit = 0
+	}
+
+	// A remote server's list is proxied over federation (the client only
+	// passes the server name, never a full set of rooms).
+	if server != "" && server != a.ServerName() {
+		if a.fed == nil {
+			httpx.WriteError(w, httpx.ErrForbidden("federation is disabled"))
+			return
+		}
+		remote, err := a.fed.Client().FetchPublicRooms(r.Context(), server)
+		if err != nil {
+			httpx.WriteError(w, httpx.NewError(http.StatusBadGateway, "M_UNKNOWN", err.Error()))
+			return
+		}
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{
+			"chunk":                     remote.Chunk,
+			"total_room_count_estimate": remote.TotalRoomCountEstimate,
+			"next_batch":                remote.NextBatch,
+			"prev_batch":                remote.PrevBatch,
+		})
+		return
 	}
 
 	// The requested room set: the main (is_public) list, an appservice's list,
@@ -724,7 +765,7 @@ func (a *API) PublicRooms(w http.ResponseWriter, r *http.Request) {
 	// when an AS filter is in play.
 	candidates := map[string]string{} // roomID -> creator
 	rows, err := a.Store.Pool().Query(r.Context(),
-		`SELECT room_id, creator, created_ts FROM rooms WHERE is_public=TRUE LIMIT 100`)
+		`SELECT room_id, creator, created_ts FROM rooms WHERE is_public=TRUE LIMIT 1000`)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
@@ -747,22 +788,120 @@ func (a *API) PublicRooms(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	chunk := make([]map[string]any, 0, len(candidates))
+	// Build the entries. include_all_networks merges the AS and main lists;
+	// a third_party_instance_id filter narrows to that network only.
+	all := make([]map[string]any, 0, len(candidates))
 	for roomID, creator := range candidates {
-		// When filtered to an appservice list (or include_all_networks), only
-		// rooms published by an appservice appear; a third_party_instance_id
-		// filter excludes the main list entirely.
-		if req.ThirdPartyInstanceID != "" || req.IncludeAllNetworks {
+		if req.ThirdPartyInstanceID != "" {
 			if !asRoomIDs[roomID] {
 				continue
 			}
 		}
-		chunk = append(chunk, a.publicRoomEntry(r, roomID, creator))
+		entry := a.publicRoomEntry(r, roomID, creator)
+		// generic_search_term matches the room name/canonical alias/topic
+		// case-insensitively (spec §Public Room Directory; sytest searches
+		// "wibbles" against a room whose topic is "Test Topic Wibbles").
+		if term := req.Filter.GenericSearchTerm; term != "" {
+			needle := strings.ToLower(term)
+			hay := strings.ToLower(roomSearchText(entry))
+			if !strings.Contains(hay, needle) {
+				continue
+			}
+		}
+		all = append(all, entry)
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"chunk":                     chunk,
-		"total_room_count_estimate": len(chunk),
+
+	// Stable ordering by room ID so pagination tokens are deterministic, then
+	// slice the requested page around `since`. Tokens carry their direction:
+	// "f:<room_id>" is a forward cursor (continue after that room), "b:<room_id>"
+	// is a backward cursor (the page before that room). A bare room ID is
+	// treated as a forward cursor for compatibility.
+	sort.Slice(all, func(i, j int) bool {
+		return all[i]["room_id"].(string) < all[j]["room_id"].(string)
 	})
+	direction := "f"
+	from := -1
+	chunk := all
+	if req.Since != "" {
+		tok := req.Since
+		if strings.HasPrefix(tok, "b:") {
+			direction = "b"
+			tok = tok[2:]
+		} else if strings.HasPrefix(tok, "f:") {
+			tok = tok[2:]
+		}
+		for i, e := range all {
+			if e["room_id"].(string) == tok {
+				from = i
+				break
+			}
+		}
+		if from < 0 {
+			// Unknown cursor: an empty page (the list has moved on).
+			chunk = nil
+		}
+	}
+	idx := func(roomID string) int {
+		for i, e := range all {
+			if e["room_id"].(string) == roomID {
+				return i
+			}
+		}
+		return -1
+	}
+	hasMore := false
+	if limit > 0 && req.Since == "" {
+		start := 0
+		hi := start + limit
+		if hi > len(all) {
+			hi = len(all)
+		}
+		chunk = all[start:hi]
+		hasMore = hi < len(all)
+	} else if limit > 0 && from >= 0 {
+		switch direction {
+		case "b":
+			// The page of up to limit rooms ending just before the cursor room.
+			hi := from
+			if hi > len(all) {
+				hi = len(all)
+			}
+			lo := hi - limit
+			if lo < 0 {
+				lo = 0
+			}
+			chunk = all[lo:hi]
+			hasMore = lo > 0
+		default:
+			start := from + 1
+			hi := start + limit
+			if hi > len(all) {
+				hi = len(all)
+			}
+			chunk = all[start:hi]
+			hasMore = hi < len(all)
+		}
+	}
+	resp := map[string]any{
+		"chunk":                     chunk,
+		"total_room_count_estimate": len(all),
+	}
+	if len(chunk) > 0 {
+		if direction == "b" {
+			// Going backwards: prev_batch continues backwards from the page's
+			// first room; next_batch resumes forward from the page's last room.
+			resp["prev_batch"] = "b:" + chunk[0]["room_id"].(string)
+			if i := idx(chunk[len(chunk)-1]["room_id"].(string)); i >= 0 && i+1 < len(all) {
+				resp["next_batch"] = "f:" + chunk[len(chunk)-1]["room_id"].(string)
+			}
+		} else {
+			resp["prev_batch"] = "b:" + chunk[0]["room_id"].(string)
+			if hasMore {
+				resp["next_batch"] = "f:" + chunk[len(chunk)-1]["room_id"].(string)
+			}
+		}
+	}
+	httpx.WriteJSON(w, http.StatusOK, resp)
 }
 
 // splitInstanceID splits a third_party_instance_id ("<appservice_id>|<network_id>")
@@ -774,6 +913,18 @@ func splitInstanceID(instanceID string) (string, string) {
 		}
 	}
 	return instanceID, ""
+}
+
+// roomSearchText concatenates a room directory entry's searchable fields
+// (name, canonical_alias, topic) for the generic_search_term filter.
+func roomSearchText(entry map[string]any) string {
+	var parts []string
+	for _, k := range []string{"name", "canonical_alias", "topic"} {
+		if v, ok := entry[k].(string); ok && v != "" {
+			parts = append(parts, v)
+		}
+	}
+	return strings.Join(parts, "\x00")
 }
 
 // publicRoomEntry builds one publicRooms chunk entry for a room.

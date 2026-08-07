@@ -221,6 +221,50 @@ func (c *Client) Backfill(ctx context.Context, dest, roomID string, v []string, 
 	return out.Pdus, nil
 }
 
+// RemotePublicRooms is the response to an outbound federation /publicRooms
+// query: the remote server's public room directory.
+type RemotePublicRooms struct {
+	Chunk                  []json.RawMessage `json:"chunk"`
+	TotalRoomCountEstimate int               `json:"total_room_count_estimate"`
+	NextBatch              string            `json:"next_batch"`
+	PrevBatch              string            `json:"prev_batch"`
+}
+
+// FetchPublicRooms performs GET /_matrix/federation/v1/publicRooms against
+// serverName, returning the remote server's public room directory. Used by the
+// client-server /publicRooms handler when the client asks for another server's
+// room list via the `server` query parameter (spec §Public Room Directory:
+// "the homeserver should query the remote server's public room directory over
+// federation").
+func (c *Client) FetchPublicRooms(ctx context.Context, serverName string) (*RemotePublicRooms, error) {
+	url := c.serverBaseURL(serverName) + "/_matrix/federation/v1/publicRooms"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Host = serverName
+	if err := signRequestWith(req, c.originName(), c.key); err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("federation: publicRooms for %s: %w", serverName, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("federation: publicRooms for %s: HTTP %d", serverName, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	var out RemotePublicRooms
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("federation: decode publicRooms for %s: %w", serverName, err)
+	}
+	return &out, nil
+}
+
 // QueryProfile fetches a remote user's profile over federation
 // (GET /_matrix/federation/v1/query/profile?user_id=...). Used by the
 // client-server profile handlers when the target user is on another server.
