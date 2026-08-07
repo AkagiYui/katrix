@@ -478,6 +478,9 @@ func (a *API) memberStateSnapshotFromStore(ctx context.Context, roomID, sender, 
 		if id, err := a.Store.GetStateEvent(ctx, roomID, tc.typ, tc.sk); err == nil {
 			if ev, err := a.Store.GetEvent(ctx, id); err == nil {
 				*tc.dst = ev.Content
+				if tc.typ == "m.room.create" {
+					st.CreateSender = ev.Sender
+				}
 			}
 		}
 	}

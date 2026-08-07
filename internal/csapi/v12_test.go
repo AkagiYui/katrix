@@ -236,15 +236,20 @@ func TestV12Upgrade(t *testing.T) {
 	if newRoomID == "" {
 		t.Fatal("no replacement_room")
 	}
-	// The new create event names bob as creator and charlie as additional
-	// creator; its predecessor points at the old room without an event_id.
+	// The new create event names bob as creator via its sender (v11+ omits the
+	// `creator` content property — room version 12 builds on v11) and charlie
+	// as additional creator; its predecessor points at the old room without an
+	// event_id.
 	code, createBody := getJSON(t, srv, "/_matrix/client/v3/rooms/"+newRoomID+"/state/m.room.create?format=event", bob)
 	if code != 200 {
 		t.Fatalf("new create: code=%d", code)
 	}
+	if createBody["sender"] != bobID {
+		t.Fatalf("new room creator (sender) = %v, want %s", createBody["sender"], bobID)
+	}
 	createContent, _ := createBody["content"].(map[string]any)
-	if createContent["creator"] != bobID {
-		t.Fatalf("new room creator = %v, want %s", createContent["creator"], bobID)
+	if _, hasCreator := createContent["creator"]; hasCreator {
+		t.Fatalf("v11+ create content must omit creator: %v", createContent)
 	}
 	ac, _ := createContent["additional_creators"].([]any)
 	if len(ac) != 1 || ac[0] != charlieID {

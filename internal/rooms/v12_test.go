@@ -1,6 +1,7 @@
 package rooms
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -71,5 +72,49 @@ func TestBuildInitialEventsV11KeepsRoomID(t *testing.T) {
 	}
 	if rid := res.Create.RoomID(); rid != "!random:test" {
 		t.Fatalf("v11 create must carry room_id, got %q", rid)
+	}
+}
+
+// TestCreateContentOmitsCreatorByVersion verifies the spec's "Remove the
+// creator property of m.room.create events" rule: room version 11+ create
+// content omits `creator` (the creator is the create event's sender), while
+// v10 and earlier still carry it.
+func TestCreateContentOmitsCreatorByVersion(t *testing.T) {
+	key, err := crypto.GenerateSigningKey("v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		version     roomver.Version
+		omitCreator bool
+	}{
+		{"1", false},
+		{"10", false},
+		{"11", true},
+		{"12", true},
+	} {
+		res, err := BuildInitialEvents(
+			"!room:test", tc.version, "@alice:test", PresetPublicChat, nil, nil, false, nil,
+			"test", key, 1000,
+		)
+		if err != nil {
+			t.Fatalf("v%s BuildInitialEvents: %v", tc.version, err)
+		}
+		var content struct {
+			Creator string `json:"creator"`
+		}
+		if err := json.Unmarshal(res.Create.Content(), &content); err != nil {
+			t.Fatalf("v%s parse create content: %v", tc.version, err)
+		}
+		if tc.omitCreator && content.Creator != "" {
+			t.Fatalf("v%s create content must omit creator, got %q", tc.version, content.Creator)
+		}
+		if !tc.omitCreator && content.Creator != "@alice:test" {
+			t.Fatalf("v%s create content creator = %q, want @alice:test", tc.version, content.Creator)
+		}
+		// The creator derives from the create event's sender either way.
+		if got := res.Create.Sender(); got != "@alice:test" {
+			t.Fatalf("v%s create sender = %q", tc.version, got)
+		}
 	}
 }

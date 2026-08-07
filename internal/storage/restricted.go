@@ -142,8 +142,9 @@ func (s *Store) RestrictedJoinAuthoriser(ctx context.Context, roomID, serverName
 	return ""
 }
 
-// roomCreator returns the room's creator user ID (from m.room.create), or ""
-// when the event is absent or malformed.
+// roomCreator returns the room's creator user ID, or "" when the event is
+// absent or malformed. Room versions 11+ omit the `creator` content property;
+// the creator is the m.room.create event's sender.
 func (s *Store) roomCreator(ctx context.Context, roomID string) string {
 	id, err := s.GetStateEvent(ctx, roomID, "m.room.create", "")
 	if err != nil {
@@ -159,7 +160,10 @@ func (s *Store) roomCreator(ctx context.Context, roomID string) string {
 	if json.Unmarshal(ev.Content, &c) != nil {
 		return ""
 	}
-	return c.Creator
+	if c.Creator != "" {
+		return c.Creator
+	}
+	return ev.Sender
 }
 
 // authoriserCanInvite reports whether authorisingUser has at least the room's

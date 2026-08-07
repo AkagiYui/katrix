@@ -171,14 +171,28 @@ func ParseCreate(raw json.RawMessage) (*CreateContent, error) {
 	return &c, nil
 }
 
+// CreatorOf returns the room creator's user ID: the content's `creator`
+// property for room versions that carry it, or the m.room.create event's
+// `sender` when the version omits the property (room version 11+ removed
+// `creator` from create content; the creator is always the create event's
+// sender — spec "Remove the creator property of m.room.create events").
+// createSender must be the sender of the m.room.create event.
+func (c *CreateContent) CreatorOf(createSender string) string {
+	if c.Creator != "" {
+		return c.Creator
+	}
+	return createSender
+}
+
 // IsPrivileged reports whether userID is the room creator or one of the
 // additional creators (MSC4289). Such users hold effectively infinite power in
-// room version 12.
-func (c *CreateContent) IsPrivileged(userID string) bool {
+// room version 12. createSender is the m.room.create event's sender, which
+// is the creator for room versions that omit the content `creator` property.
+func (c *CreateContent) IsPrivileged(userID, createSender string) bool {
 	if userID == "" {
 		return false
 	}
-	if userID == c.Creator {
+	if userID == c.CreatorOf(createSender) {
 		return true
 	}
 	for _, ac := range c.AdditionalCreators {

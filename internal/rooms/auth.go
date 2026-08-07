@@ -20,6 +20,10 @@ type StateSnapshot struct {
 	Create     json.RawMessage // m.room.create content (state_key "")
 	JoinRules  json.RawMessage // m.room.join_rules content (state_key "")
 	PowerLevel json.RawMessage // m.room.power_levels content (state_key "")
+	// CreateSender is the sender of the m.room.create event. Room versions 11+
+	// omit the `creator` content property (the creator is the create event's
+	// sender), so auth must be able to derive it.
+	CreateSender string
 	// GuestAccess carries the m.room.guest_access content (state_key ""); a
 	// guest may join a room whose guest_access is "can_join" even when the
 	// join_rule is invite (spec guest_access semantics).
@@ -115,7 +119,7 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 		}
 	} else {
 		pl = &PowerLevels{
-			Users:        map[string]int64{create.Creator: 100},
+			Users:        map[string]int64{create.CreatorOf(st.CreateSender): 100},
 			UsersDefault: 0,
 			StateDefault: 50,
 			Ban:          50,
@@ -128,7 +132,7 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 	// creator (and any additional creators, MSC4289) is exempt from power-level
 	// checks (effectively infinite power).
 	userLevel := func(userID string) int64 {
-		if rules.CreatorPrivileged && create.IsPrivileged(userID) {
+		if rules.CreatorPrivileged && create.IsPrivileged(userID, st.CreateSender) {
 			return 1 << 62
 		}
 		return pl.UserLevel(userID)
@@ -377,7 +381,7 @@ func authorizeMember(rules roomver.Rules, sender, stateKey string, content json.
 	// users may not join unfederated rooms" expects exactly this 403.
 	if (mc.Membership == MembershipJoin || mc.Membership == MembershipInvite) &&
 		create.MSCFederate != nil && !*create.MSCFederate {
-		if tdom, cdom := ids.DomainOf(stateKey), ids.DomainOf(create.Creator); tdom != "" && cdom != "" && tdom != cdom {
+		if tdom, cdom := ids.DomainOf(stateKey), ids.DomainOf(create.CreatorOf(st.CreateSender)); tdom != "" && cdom != "" && tdom != cdom {
 			return fmt.Errorf("rooms: this room has been marked as unfederatable")
 		}
 	}

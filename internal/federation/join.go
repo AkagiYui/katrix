@@ -1016,12 +1016,14 @@ func (a *API) stateContainsVerifiableCreate(ctx context.Context, state []json.Ra
 }
 
 // creatorFromState extracts the creator from the delivered m.room.create event
-// content (best effort; empty when absent).
+// (best effort; empty when absent). Room versions 11+ omit the `creator`
+// content property, so the create event's sender is the creator.
 func creatorFromState(state []json.RawMessage) string {
 	for _, raw := range state {
 		var ev struct {
 			Type     string          `json:"type"`
 			StateKey *string         `json:"state_key"`
+			Sender   string          `json:"sender"`
 			Content  json.RawMessage `json:"content"`
 		}
 		if err := json.Unmarshal(raw, &ev); err != nil {
@@ -1034,7 +1036,10 @@ func creatorFromState(state []json.RawMessage) string {
 			Creator string `json:"creator"`
 		}
 		_ = json.Unmarshal(ev.Content, &c)
-		return c.Creator
+		if c.Creator != "" {
+			return c.Creator
+		}
+		return ev.Sender
 	}
 	return ""
 }

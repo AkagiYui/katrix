@@ -1728,7 +1728,7 @@ func (a *API) roomUserLevel(ctx context.Context, roomID, userID string) int64 {
 	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.create", ""); err == nil {
 		if ev, err := a.Store.GetEvent(ctx, id); err == nil {
 			if c, err := rooms.ParseCreate(ev.Content); err == nil {
-				if rules, ok := roomver.Get(roomver.Version(c.RoomVersion)); ok && rules.CreatorPrivileged && c.IsPrivileged(userID) {
+				if rules, ok := roomver.Get(roomver.Version(c.RoomVersion)); ok && rules.CreatorPrivileged && c.IsPrivileged(userID, ev.Sender) {
 					return 1 << 62
 				}
 			}
@@ -3209,6 +3209,7 @@ func (a *API) buildStateSnapshot(ctx context.Context, roomID, target, sender str
 	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.create", ""); err == nil {
 		if ev, err := a.Store.GetEvent(ctx, id); err == nil {
 			st.Create = ev.Content
+			st.CreateSender = ev.Sender
 		}
 	}
 	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.join_rules", ""); err == nil {

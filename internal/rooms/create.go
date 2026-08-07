@@ -186,11 +186,17 @@ func BuildInitialEvents(
 		roomID = "" // create event omits room_id; the derived id is filled below.
 	}
 
-	// create content
+	// create content. The `creator` property is present for room versions up to
+	// 10; room version 11+ removed it ("the content of a m.room.create event no
+	// longer has a creator property, which previously was always equivalent to
+	// the sender of the event"), so it is omitted and the creator is implicit in
+	// the create event's sender.
 	createContent := map[string]any{
-		"creator":      creator,
 		"room_version": string(version),
 		"m.federate":   true,
+	}
+	if !rules.CreateOmitsCreator {
+		createContent["creator"] = creator
 	}
 	if isDirect {
 		createContent["m.federate"] = false // DMs typically non-federated

@@ -2319,6 +2319,9 @@ func (a *API) memberStateSnapshot(r *http.Request, roomID, sender, target string
 		if id, err := a.Store.GetStateEvent(r.Context(), roomID, tc.typ, tc.sk); err == nil {
 			if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
 				*tc.dst = ev.Content
+				if tc.typ == "m.room.create" {
+					st.CreateSender = ev.Sender
+				}
 			}
 		}
 	}

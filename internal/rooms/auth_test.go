@@ -127,6 +127,31 @@ func TestAuthorizeBanRequiresPower(t *testing.T) {
 	}
 }
 
+// TestAuthorizeV11CreatorFromSender verifies that a room version 11+ create
+// event whose content omits `creator` still authorises the creator (derived
+// from the create event's sender) for default power when no m.room.power_levels
+// event exists (spec: creator holds power 100).
+func TestAuthorizeV11CreatorFromSender(t *testing.T) {
+	creator := "@alice:test"
+	rules, _ := roomver.Get("11")
+	// v11 create content without the creator property.
+	create := mustJSON(t, map[string]string{"room_version": "11"})
+	senderJoined := mustJSON(t, map[string]string{"membership": MembershipJoin})
+	content := mustJSON(t, map[string]string{"membership": MembershipBan})
+	bob := "@bob:test"
+
+	// Creator (derived from CreateSender) can ban bob at the default power 100.
+	st := StateSnapshot{Create: create, CreateSender: creator, SenderMember: senderJoined}
+	if err := Authorize(rules, "m.room.member", bob, creator, content, st, true); err != nil {
+		t.Fatalf("creator ban bob: %v", err)
+	}
+	// A non-creator at users_default 0 cannot ban.
+	st2 := StateSnapshot{Create: create, CreateSender: creator, SenderMember: senderJoined}
+	if err := Authorize(rules, "m.room.member", bob, "@carol:test", content, st2, true); err == nil {
+		t.Fatal("non-creator should not ban bob")
+	}
+}
+
 func TestPowerLevelsUserLevel(t *testing.T) {
 	pl := &PowerLevels{
 		Users:        map[string]int64{"@a:test": 100, "@b:test": 0},

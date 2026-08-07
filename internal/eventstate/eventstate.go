@@ -105,6 +105,7 @@ func (c *powerLevelCache) get(ctx context.Context, id string) *rooms.PowerLevels
 // effectively infinite power (MaxCreatorPowerLevel).
 func senderPowerLevel(ctx context.Context, store roomWrite, tx pgx.Tx, meta *stateres.EventMeta, rules roomver.Rules, ev *events.Event, cache *powerLevelCache) int64 {
 	createContent := ""
+	createSender := ""
 	var pl *rooms.PowerLevels
 	for _, aid := range ev.AuthEvents() {
 		row, err := store.TxGetEvent(ctx, tx, aid)
@@ -116,6 +117,7 @@ func senderPowerLevel(ctx context.Context, store roomWrite, tx pgx.Tx, meta *sta
 		}
 		if row.Type == "m.room.create" && row.StateKey == "" {
 			createContent = string(row.Content)
+			createSender = row.Sender
 		}
 	}
 
@@ -127,15 +129,17 @@ func senderPowerLevel(ctx context.Context, store roomWrite, tx pgx.Tx, meta *sta
 		if id, err := store.TxGetStateEvent(ctx, tx, ev.RoomID(), "m.room.create", ""); err == nil {
 			if createEv, err := store.TxGetEvent(ctx, tx, id); err == nil {
 				createContent = string(createEv.Content)
+				createSender = createEv.Sender
 			}
 		}
 	}
 
 	// v12 (MSC4289): creator and additional creators have effectively infinite
 	// power, outranking any finite power level (including PL at the canonical
-	// JSON max).
+	// JSON max). The creator is the create event's sender for room versions
+	// that omit the content `creator` property.
 	if rules.CreatorPrivileged && createContent != "" {
-		if create, err := rooms.ParseCreate([]byte(createContent)); err == nil && create.IsPrivileged(meta.Sender) {
+		if create, err := rooms.ParseCreate([]byte(createContent)); err == nil && create.IsPrivileged(meta.Sender, createSender) {
 			return stateres.MaxCreatorPowerLevel
 		}
 	}
@@ -143,7 +147,7 @@ func senderPowerLevel(ctx context.Context, store roomWrite, tx pgx.Tx, meta *sta
 	if pl == nil {
 		// No power_levels in auth_events: fall back to creator (level 100).
 		if createContent != "" {
-			if create, err := rooms.ParseCreate([]byte(createContent)); err == nil && create.Creator == meta.Sender {
+			if create, err := rooms.ParseCreate([]byte(createContent)); err == nil && create.CreatorOf(createSender) == meta.Sender {
 				return 100
 			}
 		}

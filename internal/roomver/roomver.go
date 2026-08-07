@@ -57,6 +57,11 @@ type Rules struct {
 	// is exempt from power-level auth (room version 12, MSC4289).
 	CreatorPrivileged bool
 
+	// CreateOmitsCreator: the m.room.create event content omits the `creator`
+	// property; the room creator is the create event's `sender` (room version
+	// 11+, "Remove the creator property of m.room.create events").
+	CreateOmitsCreator bool
+
 	// StrictPowerLevels: power-level values must be integers, not strings that
 	// happen to parse as integers (room version 10+, MSC3667).
 	StrictPowerLevels bool
@@ -161,6 +166,7 @@ func init() {
 	v11 := v10
 	v11.Version = "11"
 	v11.UpdatedRedaction = true
+	v11.CreateOmitsCreator = true
 	register(v11)
 
 	v12 := v11
