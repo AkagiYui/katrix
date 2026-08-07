@@ -594,6 +594,18 @@ func (a *API) KeysChanges(w http.ResponseWriter, r *http.Request) {
 func (a *API) SendToDevice(w http.ResponseWriter, r *http.Request) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	eventType := r.PathValue("eventType")
+	txnID := r.PathValue("txnID")
+	// A retried txn_id must not produce duplicate to-device messages (spec §"Send
+	// to-device messages to a device"; sytest "Device messages with the same
+	// txn_id are deduplicated" re-sends the same txn and expects the first
+	// message to be delivered only once). The claim is made before parsing the
+	// body so a retried request is a no-op regardless of its content.
+	if txnID != "" {
+		if fresh, err := a.Store.ClaimToDeviceTxn(r.Context(), auth.Localpart, eventType, txnID, a.Now()); err == nil && !fresh {
+			httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+			return
+		}
+	}
 	var req struct {
 		Messages map[string]map[string]json.RawMessage `json:"messages"`
 	}
@@ -651,7 +663,7 @@ func (a *API) SendToDevice(w http.ResponseWriter, r *http.Request) {
 			content := map[string]any{
 				"sender":     auth.UserID,
 				"type":       eventType,
-				"message_id": r.PathValue("txnID"),
+				"message_id": txnID,
 				"messages":   byUser,
 			}
 			a.fed.BroadcastDirectToDeviceToServer(r.Context(), dom, content)

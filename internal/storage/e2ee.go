@@ -289,6 +289,22 @@ func (s *Store) EnqueueToDevice(ctx context.Context, msgs []ToDeviceMessage) err
 	return nil
 }
 
+// ClaimToDeviceTxn records a (user, event_type, txn_id) to-device transaction
+// atomically, returning false when the same txn was already recorded (the
+// retry must be ignored). Used by PUT /sendToDevice for idempotency (spec: a
+// retried txn_id must not produce duplicate to-device messages).
+func (s *Store) ClaimToDeviceTxn(ctx context.Context, userLocalpart, eventType, txnID string, now int64) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`INSERT INTO to_device_txns(user_localpart, event_type, txn_id, created_ts)
+		 VALUES ($1,$2,$3,$4)
+		 ON CONFLICT DO NOTHING`,
+		userLocalpart, eventType, txnID, now)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // DequeueToDevice returns to-device messages for a device with id > since
 // (the device's to-device cursor, which travels in the sync token). Messages
 // are NOT deleted here: they are retained until the device's next sync
