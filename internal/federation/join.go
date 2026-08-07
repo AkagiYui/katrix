@@ -468,13 +468,20 @@ func isUnknownInviteEndpoint(err error) bool {
 // transport-level failure (the peer never processed the request: timeout,
 // connection refused/reset, TLS) rather than an application-level rejection.
 // Only the former is retryable — a 403 M_INVITE_BLOCKED must propagate to the
-// inviter, and a malformed body would only recur.
+// inviter, and a malformed body would only recur. A peer response that fails
+// the room version's Canonical JSON check is also non-retryable: the peer saw
+// the request and answered, and retrying would just recur (sytest "Outbound
+// federation rejects invite response which include invalid JSON for room
+// version 6" expects the client invite to fail).
 func isInviteTransportError(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
 	if strings.Contains(msg, "M_INVITE_BLOCKED") {
+		return false
+	}
+	if strings.Contains(msg, "not Canonical JSON") {
 		return false
 	}
 	if strings.Contains(msg, "HTTP ") {

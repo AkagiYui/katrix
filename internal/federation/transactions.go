@@ -1593,12 +1593,14 @@ func (a *API) MakeLeave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prev, depth := a.dagTipFor(r.Context(), roomID)
+	authIDs := a.memberAuthIDs(r, roomID, userID)
 	// Legacy room versions (1-2) reference prev/auth events as [id, hash]
 	// pairs; v3+ use plain ID strings (see MakeJoin).
-	var prevRefs any = prev
+	var prevRefs, authRefs any = prev, authIDs
 	if room, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
 		if rules, ok := roomver.Get(roomver.Version(room.Version)); ok && rules.EventFormatV1 {
 			prevRefs = legacyTemplateRefs(prev)
+			authRefs = legacyTemplateRefs(authIDs)
 		}
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
@@ -1612,6 +1614,7 @@ func (a *API) MakeLeave(w http.ResponseWriter, r *http.Request) {
 			"origin_server_ts": a.Now(),
 			"depth":            depth,
 			"prev_events":      prevRefs,
+			"auth_events":      authRefs,
 			"content":          map[string]string{"membership": "leave"},
 		},
 	})

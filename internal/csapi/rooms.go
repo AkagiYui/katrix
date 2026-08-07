@@ -2767,6 +2767,13 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 			if isBlockedInviteError(err) {
 				return "", newRoomError(http.StatusForbidden, "M_INVITE_BLOCKED", "the invite was blocked by the invitee's permission settings")
 			}
+			// A peer response that fails Canonical JSON (or a peer that
+			// rejected the invite event outright) surfaces as a client error
+			// (spec; sytest "Outbound federation rejects invite response which
+			// include invalid JSON for room version 6" expects M_BAD_JSON).
+			if strings.Contains(err.Error(), "not Canonical JSON") {
+				return "", newRoomError(http.StatusBadRequest, "M_BAD_JSON", "the invitee's server returned an invalid invite event")
+			}
 			_ = err
 		}
 	}
