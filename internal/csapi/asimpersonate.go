@@ -17,6 +17,13 @@ import (
 // The impersonated user is returned as a cloned Auth whose UserID is the
 // target (the device stays the AS's own device, so the event is signed by the
 // bridge user's device — the standard AS-ghosted-user model).
+//
+// The impersonated user must already be registered on this homeserver: mirror
+// of Synapse's validate_appservice_can_control_user_id, which rejects with
+// "Application service has not registered this user" (403) before any request
+// is processed. This is what makes sytest "Ghost user must register before
+// joining room" fail the pre-registration join fast — without it, the join
+// would proceed to query the AS for the unknown user and hang.
 func (a *API) actingAuth(r *http.Request) (*homeserver.Auth, error) {
 	auth, _ := homeserver.AuthFrom(r.Context())
 	if !auth.IsAppService {
@@ -33,6 +40,12 @@ func (a *API) actingAuth(r *http.Request) (*homeserver.Auth, error) {
 	reg := a.HS.AppServices.ForSender(auth.Localpart)
 	if reg == nil || !appserviceUserInNamespaces(reg, a.LocalpartOf(target), a.ServerName()) {
 		return nil, httpx.ErrForbidden("user_id is not in the appservice's namespace")
+	}
+	// The user must have been registered (by the AS, via the register endpoint)
+	// before the AS may act on their behalf (spec: the AS must register its
+	// ghost users first; sytest "Ghost user must register before joining room").
+	if _, err := a.Store.GetUser(r.Context(), a.LocalpartOf(target)); err != nil {
+		return nil, httpx.ErrForbidden("application service has not registered this user")
 	}
 	clone := *auth
 	clone.UserID = target
