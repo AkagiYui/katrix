@@ -180,6 +180,8 @@ func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
 	a.restrictOldRoomPowerLevels(r, auth, roomID)
 	// Copy per-room push rules for every local user in the old room.
 	a.copyPushRulesForAllLocalUsers(r.Context(), roomID, newRoomID)
+	// Copy each local user's room tags to the new room.
+	a.copyTagsForAllLocalUsers(r.Context(), roomID, newRoomID)
 	// Update the upgrading user's m.direct account data.
 	a.updateDirectRoom(ctx(r), auth.Localpart, roomID, newRoomID)
 
@@ -443,6 +445,32 @@ func (a *API) copyPushRulesForAllLocalUsers(ctx context.Context, oldRoomID, newR
 	pushrules.CopyRulesForRoom(ctx, a.Store, localparts, oldRoomID, newRoomID)
 }
 
+// copyTagsForAllLocalUsers clones each local user's room tags (the m.tag
+// account data) from the old room to the new room. Synapse's
+// transfer_room_state_on_room_upgrade does the same for every local user that
+// was in the old room (sytest "local/remote user has tags copied to the new
+// room").
+func (a *API) copyTagsForAllLocalUsers(ctx context.Context, oldRoomID, newRoomID string) {
+	members, err := a.Store.Members(ctx, oldRoomID, "join")
+	if err != nil {
+		return
+	}
+	for _, m := range members {
+		if !a.IsLocalUser(m.UserID) {
+			continue
+		}
+		lp := a.LocalpartOf(m.UserID)
+		raw, err := a.Store.GetAccountData(ctx, lp, oldRoomID, "m.tag")
+		if err != nil || len(raw) == 0 {
+			continue
+		}
+		// Copy the tags verbatim (an empty tags object copies as-is).
+		if _, err := a.Store.SetAccountData(ctx, lp, newRoomID, "m.tag", raw); err == nil {
+			a.Notifier.NotifyUser(m.UserID)
+		}
+	}
+}
+
 // copyPushRulesOnTombstone copies the local users' per-room push rules to the
 // replacement room when an m.room.tombstone is observed (a manual upgrade or a
 // remote upgrade whose tombstone arrives over federation). The replacement room
@@ -455,6 +483,7 @@ func (a *API) copyPushRulesOnTombstone(ctx context.Context, oldRoomID string, co
 		return
 	}
 	a.copyPushRulesForAllLocalUsers(ctx, oldRoomID, tc.ReplacementRoom)
+	a.copyTagsForAllLocalUsers(ctx, oldRoomID, tc.ReplacementRoom)
 }
 
 // copyPushRulesForRoom clones a user's room-specific push rules from oldRoomID
