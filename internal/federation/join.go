@@ -1285,7 +1285,11 @@ func (a *API) LeaveRemoteRoom(ctx context.Context, dest, userID, roomID string) 
 		return fmt.Errorf("federation: could not build local leave for %s", roomID)
 	}
 	// Persist the leave event locally and update the membership row so /sync
-	// reports the room under leave (the rejected invite).
+	// reports the room under leave (the rejected invite). ForceUpsertMembership
+	// is required: the invite's membership row carries the remote template's
+	// (higher) depth, so the depth-monotonic UpsertMembership would silently
+	// keep the invite — the local rejection must win regardless (it is the
+	// authoritative local record of the rejection).
 	if stream, err := a.Store.InsertEvent(ctx, &storage.EventRow{
 		EventID: ev.EventID(), RoomID: roomID, Type: ev.Type(),
 		StateKey: userID, Sender: userID, Depth: ev.Depth(),
@@ -1299,7 +1303,7 @@ func (a *API) LeaveRemoteRoom(ctx context.Context, dest, userID, roomID string) 
 				Content: ev.Content(), RawJSON: ev.Raw(),
 			}, rules)
 		}
-		_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
+		_ = a.Store.ForceUpsertMembership(ctx, storage.MembershipRow{
 			RoomID: roomID, UserID: userID, Membership: "leave",
 			EventID: ev.EventID(), StreamOrdering: stream, Depth: ev.Depth(),
 		})
