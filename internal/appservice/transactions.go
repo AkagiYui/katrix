@@ -56,6 +56,10 @@ func (c *Client) PushTransaction(ctx context.Context, reg *Registration, txnID s
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// The hs_token authenticates the homeserver to the appservice; sent as a
+	// Bearer header per the current spec (the access_token query parameter is
+	// retained for legacy appservices).
+	req.Header.Set("Authorization", "Bearer "+reg.HSToken)
 	q := req.URL.Query()
 	q.Set("access_token", reg.HSToken)
 	req.URL.RawQuery = q.Encode()
@@ -122,12 +126,14 @@ func (c *Client) queryJSON(ctx context.Context, reg *Registration, path string, 
 		return nil, false
 	}
 	// Spec: "the homeserver should use the hs_token as an access token when
-	// talking to the appservice" — sent as a Bearer Authorization header
-	// (legacy clients also use an access_token query parameter; sytest asserts
-	// the Authorization header).
+	// talking to the appservice" — sent as a Bearer Authorization header. The
+	// access_token query parameter is a legacy form the spec now discourages
+	// ("Servers should only send this query parameter if supporting legacy
+	// versions"), and sytest's 3PU/3PL assertions compare the query string
+	// against exactly the client's search fields — an extra access_token there
+	// fails the comparison.
 	req.Header.Set("Authorization", "Bearer "+reg.HSToken)
 	q := req.URL.Query()
-	q.Set("access_token", reg.HSToken)
 	for _, f := range fields {
 		for k, v := range f {
 			q.Set(k, v)

@@ -1230,31 +1230,59 @@ func buildLeaveEvent(tpl *makeJoinResponse, userID, roomID string, now int64, ve
 // remote refusal is not propagated to the client. The local leave event is
 // persisted so the room moves into the user's leave section.
 func (a *API) LeaveRemoteRoom(ctx context.Context, dest, userID, roomID string) error {
+	var ev *events.Event
+	version := roomver.Default
+
 	tpl, err := a.client.makeLeave(ctx, dest, roomID, userID)
-	if err != nil {
-		// Remote refused the make_leave (403/500) or is unreachable: the local
-		// leave still happens (recorded by the caller).
-		return err
+	if err == nil {
+		version = roomver.Version(tpl.RoomVersion)
+		if version == "" {
+			version = inferTemplateRoomVersion(tpl.Event)
+		}
+		if version == "" {
+			version = roomver.Default
+		}
+		if rules, ok := roomver.Get(version); ok {
+			if e, berr := buildLeaveEvent(tpl, userID, roomID, a.Now(), version, rules, a.Key, a.ServerName()); berr == nil {
+				ev = e
+			}
+		}
+		// Deliver the leave to the remote.
+		if ev != nil {
+			if serr := a.client.sendLeave(ctx, dest, roomID, userID, ev, version); serr != nil {
+				// A refused send_leave still leaves the local record; best-effort.
+				_ = serr
+			}
+		}
 	}
-	version := roomver.Version(tpl.RoomVersion)
-	if version == "" {
-		version = inferTemplateRoomVersion(tpl.Event)
+	// make_leave failed (403/500/unreachable) or the template could not be
+	// built: the local leave still happens. Build a self-signed leave event for
+	// the room (its state is incomplete — the room was learned only via an
+	// invite — so the event carries no prev/auth refs) and persist it.
+	if ev == nil {
+		if rules, ok := roomver.Get(version); ok {
+			b := events.Builder{
+				Type:           "m.room.member",
+				Sender:         userID,
+				RoomID:         roomID,
+				Content:        json.RawMessage(`{"membership":"leave"}`),
+				Depth:          1,
+				OriginServerTS: a.Now(),
+				Origin:         a.ServerName(),
+			}
+			sk := userID
+			b.StateKey = &sk
+			if rules.EventFormatV1 {
+				if e, berr := b.BuildLegacy(a.ServerName(), a.Key, version, ids.RandomTxnSuffix()); berr == nil {
+					ev = e
+				}
+			} else if e, berr := b.BuildForVersion(a.ServerName(), a.Key, version); berr == nil {
+				ev = e
+			}
+		}
 	}
-	if version == "" {
-		version = roomver.Default
-	}
-	rules, ok := roomver.Get(version)
-	if !ok {
-		return fmt.Errorf("federation: unsupported room version %q from %s", version, dest)
-	}
-	ev, err := buildLeaveEvent(tpl, userID, roomID, a.Now(), version, rules, a.Key, a.ServerName())
-	if err != nil {
-		return err
-	}
-	// Deliver the leave to the remote.
-	if err := a.client.sendLeave(ctx, dest, roomID, userID, ev, version); err != nil {
-		// A refused send_leave still leaves the local record; best-effort.
-		_ = err
+	if ev == nil {
+		return fmt.Errorf("federation: could not build local leave for %s", roomID)
 	}
 	// Persist the leave event locally and update the membership row so /sync
 	// reports the room under leave (the rejected invite).
