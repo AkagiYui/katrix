@@ -277,6 +277,10 @@ func (a *API) persistNewRoom(r *http.Request, auth *homeserver.Auth, oldRoomID, 
 		}
 	}
 	a.broadcastPDU(r.Context(), newRoomID, initRes.Create)
+	// Wake the creator's /sync so the new room appears promptly (mirror of the
+	// room-create path). The creator is the new room's first member; without
+	// the notify their sync would not deliver the room until the next poll.
+	a.Notifier.NotifyUser(auth.UserID)
 	_ = oldRoomID
 	return nil
 }
