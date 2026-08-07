@@ -593,7 +593,7 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	// would surface the peer twice, because the membership row and the EDU
 	// record advance the shared stream at different times.
 	changed, left, _ := e.store.DeviceListChangesSince(ctx, opts.Since.Stream)
-	peers := e.roomPeers(ctx, opts)
+	peers := e.deviceListPeers(ctx, opts)
 	peers[opts.UserID] = true // always see your own device-list changes
 	seen := map[string]bool{}
 	var ch []string
@@ -941,6 +941,31 @@ func (e *Engine) roomPeers(ctx context.Context, opts SyncOptions) map[string]boo
 	out := map[string]bool{}
 	for _, roomID := range roomIDs {
 		users, err := e.store.JoinedUserIDs(ctx, roomID)
+		if err != nil {
+			continue
+		}
+		for _, u := range users {
+			out[u] = true
+		}
+	}
+	return out
+}
+
+// deviceListPeers returns the set of user IDs whose device-list changes the
+// syncer cares about: the joined members of the syncer's rooms plus users
+// currently invited to them (an invite makes the invitee's devices newly
+// relevant — sytest "uploading self-signing key notifies over federation"
+// expects an invited remote user in device_lists.changed). This deliberately
+// excludes membership beyond joined/invited, unlike roomPeers which drives
+// presence (presence is only delivered for shared *joined* rooms).
+func (e *Engine) deviceListPeers(ctx context.Context, opts SyncOptions) map[string]bool {
+	roomIDs, err := e.store.RoomsForUser(ctx, opts.UserID)
+	if err != nil {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, roomID := range roomIDs {
+		users, err := e.store.JoinedOrInvitedUserIDs(ctx, roomID)
 		if err != nil {
 			continue
 		}

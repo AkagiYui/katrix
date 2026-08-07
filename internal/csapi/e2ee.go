@@ -176,6 +176,16 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
 		}
+		// Cross-signing signatures on the local users' devices (POST
+		// /keys/signatures/upload) are merged back into each device's key
+		// bundle: the spec's signatures/upload flow stores signatures against
+		// the target device, and keys/query returns the signed bundle.
+		sigsByUser := map[string]map[string]map[string]map[string]string{}
+		for _, u := range localUsers {
+			if s, err := a.Store.DeviceSignatures(r.Context(), u); err == nil {
+				sigsByUser[u] = s
+			}
+		}
 		for _, dk := range devKeys {
 			devs := out[dk.UserID]
 			filter := req.DeviceKeys[dk.UserID]
@@ -184,6 +194,9 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 			}
 			var keyObj map[string]any
 			_ = json.Unmarshal(dk.KeyJSON, &keyObj)
+			if sigs := sigsByUser[dk.UserID][dk.DeviceID]; len(sigs) > 0 {
+				mergeSignatures(keyObj, sigs)
+			}
 			devs[dk.DeviceID] = keyObj
 		}
 	}
@@ -682,9 +695,84 @@ func (a *API) DeviceSigningUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 // SignaturesUpload handles POST /_matrix/client/v3/keys/signatures/upload.
+// The body maps target user IDs to device IDs to signed key objects; the
+// uploaded signatures are stored against the target device's key bundle and
+// surfaced again via /keys/query and the federation /user/devices +
+// /user/keys/query endpoints (mirror of Synapse's
+// upload_signatures_for_device_keys + e2e_cross_signing_signatures table).
+//
+// Uploading a signature is a device-identity change for the signer: per the
+// spec, when a user uploads a new signature their user ID appears in the
+// `changed` property of device_lists in the /sync of every user who shares an
+// encrypted room with them (sytest "Changing master key notifies local users"
+// syncs until the signer appears in the peer's device_lists.changed after
+// upload_signatures). Remote servers sharing a room are told via the
+// m.device_list_update EDU so they re-fetch the signer's keys.
 func (a *API) SignaturesUpload(w http.ResponseWriter, r *http.Request) {
-	// Acknowledge; per-user signature storage is a relay concern.
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"failures": map[string]any{}})
+	auth, _ := homeserver.AuthFrom(r.Context())
+	body, err := readBody(r)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	var req map[string]map[string]struct {
+		UserID     string                    `json:"user_id"`
+		DeviceID   string                    `json:"device_id"`
+		Signatures map[string]map[string]any `json:"signatures"`
+	}
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			httpx.WriteError(w, httpx.ErrBadJSON("could not decode JSON: "+err.Error()))
+			return
+		}
+	}
+	failures := map[string]map[string]any{}
+	var sigs []storage.DeviceSignature
+	for targetUser, devices := range req {
+		// A user may sign any target (their own devices or other users'
+		// devices/cross-signing keys); malformed targets fail per-entry.
+		for targetDevice, signed := range devices {
+			if len(signed.Signatures) == 0 {
+				continue
+			}
+			valid := signed.UserID == targetUser && signed.DeviceID == targetDevice
+			for signer, keys := range signed.Signatures {
+				for key, val := range keys {
+					vs, _ := val.(string)
+					if vs == "" {
+						valid = false
+						continue
+					}
+					sigs = append(sigs, storage.DeviceSignature{
+						TargetUser: targetUser, TargetDevice: targetDevice,
+						SignerUser: signer, SignatureKey: key, Signature: vs,
+					})
+				}
+			}
+			if !valid {
+				devFailures := failures[targetUser]
+				if devFailures == nil {
+					devFailures = map[string]any{}
+					failures[targetUser] = devFailures
+				}
+				devFailures[targetDevice] = map[string]any{
+					"errcode": "M_INVALID_PARAM", "error": "signature block did not match the target",
+				}
+			}
+		}
+	}
+	if err := a.Store.StoreDeviceSignatures(r.Context(), sigs); err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	// Uploading signatures is a device-identity change for the signer: their
+	// room peers must re-fetch /keys/query (device_lists.changed) and remote
+	// servers must be told via m.device_list_update (mirror of Synapse's
+	// notify_device_update / notify_user_signature_update).
+	_, _ = a.Store.RecordDeviceListChange(r.Context(), auth.UserID, false)
+	a.broadcastDeviceListUpdate(r.Context(), auth.UserID, "", false)
+	a.notifyDeviceListPeers(r.Context(), auth.UserID)
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"failures": failures})
 }
 
 // splitKeyID splits an "<algorithm>:<keyId>" string. The algorithm may itself
@@ -696,6 +784,30 @@ func splitKeyID(s string) (string, string) {
 		}
 	}
 	return s, ""
+}
+
+// mergeSignatures merges cross-signing signatures (signer -> "ed25519:<key_id>"
+// -> value) into a device's key bundle: each signature is added under
+// content.signatures.<signer>.<key_id> without clobbering the signatures that
+// shipped with the key bundle (the signer's own device signature).
+func mergeSignatures(keyObj map[string]any, sigs map[string]map[string]string) {
+	existing, _ := keyObj["signatures"].(map[string]any)
+	if existing == nil {
+		existing = map[string]any{}
+		keyObj["signatures"] = existing
+	}
+	for signer, keys := range sigs {
+		byKey, _ := existing[signer].(map[string]any)
+		if byKey == nil {
+			byKey = map[string]any{}
+			existing[signer] = byKey
+		}
+		for key, val := range keys {
+			if _, ok := byKey[key]; !ok {
+				byKey[key] = val
+			}
+		}
+	}
 }
 
 func contains(haystack []string, needle string) bool {

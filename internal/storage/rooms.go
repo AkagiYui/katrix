@@ -1264,6 +1264,30 @@ func (s *Store) JoinedUserIDs(ctx context.Context, roomID string) ([]string, err
 	return out, rows.Err()
 }
 
+// JoinedOrInvitedUserIDs returns the user IDs of all currently-joined members
+// of a room plus users currently invited to it. Device-list visibility (the
+// `changed` list of /sync) includes invited users: an invite makes the
+// invitee's devices newly-relevant to the room, so their device-list changes
+// must be reported even before they join (mirror of Synapse's
+// newly_joined_or_invited_or_knocked_users in generate_sync_entry_for_device_list).
+func (s *Store) JoinedOrInvitedUserIDs(ctx context.Context, roomID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT user_id FROM room_memberships WHERE room_id=$1 AND membership IN ('join','invite')`, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // SetForgotten marks a room as forgotten for a user.
 func (s *Store) SetForgotten(ctx context.Context, roomID, userID string, forgotten bool) error {
 	_, err := s.pool.Exec(ctx,

@@ -2727,6 +2727,18 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 				}
 			}
 		}
+		// An invite makes the invitee's devices newly-relevant to the room: the
+		// other members' /sync must report the invitee in device_lists.changed so
+		// they (re-)query the invitee's keys even before the invitee joins
+		// (mirror of Synapse's newly_joined_or_invited_or_knocked_users; sytest
+		// "uploading self-signing key notifies over federation" syncs until an
+		// invited remote user appears in changed). The invitee is not joined, so
+		// the generic per-user EDU fan-out (RoomsForUser) would miss it; the
+		// invite PDU itself is delivered to the invitee's server, which is what
+		// puts the invitee's device list on the inviting server's radar.
+		if mc.Membership == rooms.MembershipInvite && prevMembership != rooms.MembershipInvite {
+			_, _ = a.Store.RecordDeviceListChange(r.Context(), target, false)
+		}
 	}
 	// The target's own sync view changes with their membership transition: a
 	// leave/ban moves the room into their leave section, an invite surfaces it

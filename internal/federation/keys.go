@@ -42,12 +42,15 @@ func (a *API) FedKeysQuery(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
+		// Cross-signing signatures on the user's devices are merged back into
+		// each device's key bundle (mirror of the CS /keys/query handler).
+		sigsByDev, _ := a.Store.DeviceSignatures(r.Context(), userID)
 		devs := map[string]json.RawMessage{}
 		for _, k := range keys {
 			if len(deviceIDs) > 0 && !containsKey(deviceIDs, k.DeviceID) {
 				continue
 			}
-			devs[k.DeviceID] = a.deviceKeyWithDisplayName(r.Context(), userID, localpart, k.DeviceID, k.KeyJSON)
+			devs[k.DeviceID] = a.deviceKeyWithDisplayName(r.Context(), userID, localpart, k.DeviceID, mergeDeviceSignatures(k.KeyJSON, sigsByDev[k.DeviceID]))
 		}
 		if len(devs) > 0 {
 			deviceKeys[userID] = devs
@@ -143,12 +146,13 @@ func (a *API) FedUserDevices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := make([]map[string]any, 0, len(devices))
+	sigsByDev, _ := a.Store.DeviceSignatures(r.Context(), userID)
 	for _, d := range devices {
 		var keyObj json.RawMessage
 		if keys, err := a.Store.DeviceKeysForUsers(r.Context(), []string{userID}); err == nil {
 			for _, k := range keys {
 				if k.DeviceID == d.DeviceID {
-					keyObj = k.KeyJSON
+					keyObj = mergeDeviceSignatures(k.KeyJSON, sigsByDev[d.DeviceID])
 					break
 				}
 			}
@@ -216,6 +220,43 @@ func containsKey(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// mergeDeviceSignatures merges cross-signing signatures (signer ->
+// "ed25519:<key_id>" -> value) into a device's key bundle, adding each
+// signature under content.signatures.<signer>.<key_id> without clobbering the
+// signatures that shipped with the key bundle. The bundle is returned as raw
+// JSON (unchanged when there is nothing to merge or the bundle is empty).
+func mergeDeviceSignatures(keyJSON json.RawMessage, sigs map[string]map[string]string) json.RawMessage {
+	if len(sigs) == 0 || len(keyJSON) == 0 {
+		return keyJSON
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(keyJSON, &obj); err != nil {
+		return keyJSON
+	}
+	existing, _ := obj["signatures"].(map[string]any)
+	if existing == nil {
+		existing = map[string]any{}
+		obj["signatures"] = existing
+	}
+	for signer, keys := range sigs {
+		byKey, _ := existing[signer].(map[string]any)
+		if byKey == nil {
+			byKey = map[string]any{}
+			existing[signer] = byKey
+		}
+		for key, val := range keys {
+			if _, ok := byKey[key]; !ok {
+				byKey[key] = val
+			}
+		}
+	}
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		return keyJSON
+	}
+	return raw
 }
 
 // splitKeyIDFederation splits an "<algorithm>:<keyId>" string on the last

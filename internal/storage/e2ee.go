@@ -377,3 +377,70 @@ func (s *Store) UnusedFallbackKeyAlgorithms(ctx context.Context, userID, deviceI
 	}
 	return out, rows.Err()
 }
+
+// ---- Cross-signing signatures (POST /keys/signatures/upload) ----
+
+// DeviceSignature is one "ed25519:<key_id>" signature value from signerUser on
+// a target device (or cross-signing key) of targetUser.
+type DeviceSignature struct {
+	TargetUser   string
+	TargetDevice string
+	SignerUser   string
+	SignatureKey string
+	Signature    string
+}
+
+// StoreDeviceSignatures upserts a set of cross-signing signatures. The
+// signature table is keyed by (target, signer, key) so re-uploading the same
+// signature is idempotent and a signature made by one user survives another
+// user re-uploading the target's device keys.
+func (s *Store) StoreDeviceSignatures(ctx context.Context, sigs []DeviceSignature) error {
+	if len(sigs) == 0 {
+		return nil
+	}
+	for _, sg := range sigs {
+		if _, err := s.pool.Exec(ctx,
+			`INSERT INTO device_signatures(target_user, target_device, signer_user, signature_key, signature)
+			 VALUES ($1,$2,$3,$4,$5)
+			 ON CONFLICT (target_user, target_device, signer_user, signature_key)
+			 DO UPDATE SET signature=EXCLUDED.signature`,
+			sg.TargetUser, sg.TargetDevice, sg.SignerUser, sg.SignatureKey, sg.Signature,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DeviceSignatures returns the signatures on the given user's devices: a map
+// of device_id -> signer -> "ed25519:<key_id>" -> signature value. Only
+// devices that have signatures are present.
+func (s *Store) DeviceSignatures(ctx context.Context, userID string) (map[string]map[string]map[string]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT target_device, signer_user, signature_key, signature
+		 FROM device_signatures WHERE target_user=$1`,
+		userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]map[string]map[string]string{}
+	for rows.Next() {
+		var dev, signer, key, val string
+		if err := rows.Scan(&dev, &signer, &key, &val); err != nil {
+			return nil, err
+		}
+		sigs := out[dev]
+		if sigs == nil {
+			sigs = map[string]map[string]string{}
+			out[dev] = sigs
+		}
+		bySigner := sigs[signer]
+		if bySigner == nil {
+			bySigner = map[string]string{}
+			sigs[signer] = bySigner
+		}
+		bySigner[key] = val
+	}
+	return out, rows.Err()
+}
