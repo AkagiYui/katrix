@@ -154,7 +154,7 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	// room ID is unique. Pre-v12 room IDs are random and never collide.
 	var roomID string
 	for attempt := 0; ; attempt++ {
-		initRes, err := rooms.BuildInitialEvents(seedRoomID, version, auth.UserID, preset, req.PowerLevelOverride, req.CreationContent, isDirect, req.Invite, a.ServerName(), a.Key, now)
+		initRes, err := rooms.BuildInitialEvents(seedRoomID, version, auth.UserID, preset, req.PowerLevelOverride, req.CreationContent, isDirect, req.Invite, a.ServerName(), a.Key, now, nil)
 		if err != nil {
 			// additional_creators validation failures are client errors (400).
 			if strings.Contains(err.Error(), "additional_creators") {

@@ -250,7 +250,26 @@ func (a *API) GetRoomKeysSession(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) getRoomKeys(w http.ResponseWriter, r *http.Request, roomID, sessionID string) {
 	auth, _ := homeserver.AuthFrom(r.Context())
-	version := parseVersion(r.URL.Query().Get("version"))
+	versionParam := r.URL.Query().Get("version")
+	// Resolve the backup version: absent means the latest; an explicit version
+	// that is non-numeric or does not exist is a 404 (spec §Server-side key
+	// backups; sytest "Responds correctly when backup is empty" asks for
+	// 'bogusversion' and expects M_NOT_FOUND).
+	var version int64
+	if versionParam == "" {
+		latest, err := a.Store.LatestKeyBackupVersion(r.Context(), auth.UserID)
+		if err != nil {
+			httpx.WriteError(w, httpx.ErrNotFound("No backup version with that id exists"))
+			return
+		}
+		version = latest.Version
+	} else {
+		version = parseVersion(versionParam)
+		if _, err := a.Store.GetKeyBackupVersion(r.Context(), auth.UserID, version); err != nil {
+			httpx.WriteError(w, httpx.ErrNotFound("No backup version with that id exists"))
+			return
+		}
+	}
 	keys, err := a.Store.GetRoomKeys(r.Context(), auth.UserID, version, roomID, sessionID)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))

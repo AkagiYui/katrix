@@ -21,7 +21,7 @@ func TestBuildInitialEventsV12DerivesRoomID(t *testing.T) {
 	res, err := BuildInitialEvents(
 		"!placeholder:ignored", roomver.Version("12"),
 		"@alice:test", PresetPublicChat, nil, nil, false, nil,
-		"test", key, 1000,
+		"test", key, 1000, nil,
 	)
 	if err != nil {
 		t.Fatalf("BuildInitialEvents: %v", err)
@@ -62,7 +62,7 @@ func TestBuildInitialEventsV11KeepsRoomID(t *testing.T) {
 	res, err := BuildInitialEvents(
 		"!random:test", roomver.Version("11"),
 		"@alice:test", PresetPublicChat, nil, nil, false, nil,
-		"test", key, 1000,
+		"test", key, 1000, nil,
 	)
 	if err != nil {
 		t.Fatalf("BuildInitialEvents: %v", err)
@@ -95,7 +95,7 @@ func TestCreateContentOmitsCreatorByVersion(t *testing.T) {
 	} {
 		res, err := BuildInitialEvents(
 			"!room:test", tc.version, "@alice:test", PresetPublicChat, nil, nil, false, nil,
-			"test", key, 1000,
+			"test", key, 1000, nil,
 		)
 		if err != nil {
 			t.Fatalf("v%s BuildInitialEvents: %v", tc.version, err)

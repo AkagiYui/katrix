@@ -394,3 +394,54 @@ func TestUserDirectorySearchByMxid(t *testing.T) {
 	// Bob is not in a public room and shares no room with Alice, so his
 	// matching localpart must not be returned.
 }
+
+func TestRoomUpgradeSyncShowsNewRoom(t *testing.T) {
+	_, srv := testAPI(t)
+	tok := registerUser(t, srv, "upg-sync", "pw")
+	roomID := createRoom(t, srv, tok, map[string]any{"preset": "public_chat"})
+
+	// Initial sync (as sytest's upgrade_room_synced does).
+	code, body := syncNow(t, srv, tok, "", 0)
+	if code != 200 {
+		t.Fatalf("initial sync: %d", code)
+	}
+	since, _ := body["next_batch"].(string)
+
+	// Upgrade.
+	code, body = doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/rooms/"+roomID+"/upgrade", tok,
+		map[string]any{"new_version": "10"})
+	if code != 200 {
+		t.Fatalf("upgrade: %d %v", code, body)
+	}
+	newRoomID, _ := body["replacement_room"].(string)
+
+	// Sync after upgrade: the new room must appear in rooms.join with the
+	// initial events (create, member, power_levels, join_rules,
+	// history_visibility, guest_access).
+	code, body = syncNow(t, srv, tok, since, 0)
+	if code != 200 {
+		t.Fatalf("post-upgrade sync: %d", code)
+	}
+	join, _ := body["rooms"].(map[string]any)
+	joins, _ := join["join"].(map[string]any)
+	newRoom, _ := joins[newRoomID].(map[string]any)
+	if newRoom == nil {
+		t.Fatalf("new room %s not in sync rooms.join: %v", newRoomID, joins)
+	}
+	tl, _ := newRoom["timeline"].(map[string]any)
+	tlEvents, _ := tl["events"].([]any)
+	st, _ := newRoom["state"].(map[string]any)
+	stEvents, _ := st["events"].([]any)
+	counts := map[string]int{}
+	for _, e := range append(tlEvents, stEvents...) {
+		em, _ := e.(map[string]any)
+		counts[em["type"].(string)]++
+	}
+	want := map[string]int{"m.room.create": 1, "m.room.member": 1, "m.room.power_levels": 1,
+		"m.room.join_rules": 1, "m.room.history_visibility": 1, "m.room.guest_access": 1}
+	for typ, n := range want {
+		if counts[typ] != n {
+			t.Fatalf("new room event count %s = %d, want %d (counts=%v)", typ, counts[typ], n, counts)
+		}
+	}
+}

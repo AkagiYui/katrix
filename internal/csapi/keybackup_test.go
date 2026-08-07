@@ -89,3 +89,39 @@ func itoa(n int64) string {
 	}
 	return string(buf[i:])
 }
+
+func TestKeyBackupEmptyShapes(t *testing.T) {
+	_, srv := testAPI(t)
+	tok := registerUser(t, srv, "bob", "pw")
+
+	code, body := doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/room_keys/version", tok,
+		map[string]any{"algorithm": "m.megolm_backup.v1", "auth_data": "x"})
+	if code != 200 {
+		t.Fatalf("create backup: %d %v", code, body)
+	}
+	version, _ := strconv.ParseInt(body["version"].(string), 10, 64)
+
+	// Single-session GET for a room/session with no keys: 404.
+	code, _ = getJSON(t, srv, "/_matrix/client/v3/room_keys/keys/!notaroom/notassession?version="+itoa(version), tok)
+	if code != 404 {
+		t.Fatalf("single-session missing should 404: code=%d", code)
+	}
+	// Room-level GET for a room with no keys: {sessions: {}}.
+	code, body = getJSON(t, srv, "/_matrix/client/v3/room_keys/keys/!notaroom?version="+itoa(version), tok)
+	if code != 200 {
+		t.Fatalf("room-level empty: code=%d", code)
+	}
+	sessions, _ := body["sessions"].(map[string]any)
+	if sessions == nil || len(sessions) != 0 {
+		t.Fatalf("expected empty sessions object: %v", body)
+	}
+	// All-keys GET with no keys: {rooms: {}}.
+	code, body = getJSON(t, srv, "/_matrix/client/v3/room_keys/keys?version="+itoa(version), tok)
+	if code != 200 {
+		t.Fatalf("all empty: code=%d", code)
+	}
+	rooms, _ := body["rooms"].(map[string]any)
+	if rooms == nil || len(rooms) != 0 {
+		t.Fatalf("expected empty rooms object: %v", body)
+	}
+}

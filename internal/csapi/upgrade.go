@@ -107,6 +107,19 @@ func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	powerOverride := a.upgradePowerLevels(r, auth, roomID, version, rules, additional)
 
+	// Seed the new room's initial join_rules/history_visibility with the old
+	// room's values (when present), so a client reading the first event of each
+	// type sees the copied value rather than a preset default followed by a
+	// duplicate override (sytest "/upgrade creates a new room" reads the first
+	// timeline event of each type).
+	stateOverrides := map[string]json.RawMessage{}
+	if jr := a.stateContent(r.Context(), roomID, "m.room.join_rules", ""); jr != nil {
+		stateOverrides["m.room.join_rules"] = jr
+	}
+	if hv := a.stateContent(r.Context(), roomID, "m.room.history_visibility", ""); hv != nil {
+		stateOverrides["m.room.history_visibility"] = hv
+	}
+
 	if rules.RoomIDIsCreateHash {
 		// v12+ (MSC4291): the room ID is derived from the create event's
 		// reference hash. Build the create first (predecessor carries only the
@@ -114,7 +127,7 @@ func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
 		// the room, then send the tombstone referencing it.
 		creationContent["predecessor"] = map[string]any{"room_id": roomID}
 		ccRaw, _ := json.Marshal(creationContent)
-		initRes, err = rooms.BuildInitialEvents(ids.NewRoomID(a.ServerName()), version, auth.UserID, "", powerOverride, ccRaw, false, nil, a.ServerName(), a.Key, a.Now())
+		initRes, err = rooms.BuildInitialEvents(ids.NewRoomID(a.ServerName()), version, auth.UserID, "", powerOverride, ccRaw, false, nil, a.ServerName(), a.Key, a.Now(), stateOverrides)
 		if err != nil {
 			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
@@ -144,7 +157,7 @@ func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
 			"event_id": tombstoneEventID,
 		}
 		ccRaw, _ := json.Marshal(creationContent)
-		initRes, err = rooms.BuildInitialEvents(newRoomID, version, auth.UserID, "", powerOverride, ccRaw, false, nil, a.ServerName(), a.Key, a.Now())
+		initRes, err = rooms.BuildInitialEvents(newRoomID, version, auth.UserID, "", powerOverride, ccRaw, false, nil, a.ServerName(), a.Key, a.Now(), stateOverrides)
 		if err != nil {
 			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
@@ -304,29 +317,33 @@ func (a *API) sendTombstone(r *http.Request, auth *homeserver.Auth, oldRoomID, n
 // avatar, encryption, server_acl, and power_levels (which may already have been
 // carried in as the initial PL — the copy is then an idempotent no-op).
 func (a *API) copyStateToNewRoom(r *http.Request, auth *homeserver.Auth, oldRoomID, newRoomID string, version roomver.Version) {
+	// join_rules, history_visibility and power_levels were already seeded into
+	// the new room's initial events (their values are carried over by
+	// stateOverrides/upgradePowerLevels), so they are not re-sent here —
+	// emitting a duplicate would leave two events of the same type in the
+	// timeline (sytest reads the first of each type).
 	types := []string{
-		"m.room.join_rules", "m.room.name", "m.room.topic", "m.room.guest_access",
-		"m.room.history_visibility", "m.room.avatar", "m.room.encryption",
-		"m.room.server_acl", "m.room.power_levels",
+		"m.room.name", "m.room.topic", "m.room.guest_access",
+		"m.room.avatar", "m.room.encryption",
+		"m.room.server_acl",
 	}
 	// For v12 (privileged-creator) upgrades the power levels must NOT be copied
-	// verbatim: the new room's initial PL was already built from
+	// verbatim either: the new room's initial PL was already built from
 	// upgradePowerLevels (which strips the new creator and any additional
-	// creators from the users map), and re-sending the old PL would reintroduce
-	// them (and be rejected by the creator-omission rule).
-	if rules, ok := roomver.Get(version); ok && rules.CreatorPrivileged {
-		types = []string{
-			"m.room.join_rules", "m.room.name", "m.room.topic", "m.room.guest_access",
-			"m.room.history_visibility", "m.room.avatar", "m.room.encryption",
-			"m.room.server_acl",
-		}
-	}
+	// creators from the users map).
 	for _, t := range types {
 		content := a.stateContent(r.Context(), oldRoomID, t, "")
 		if content == nil {
 			continue
 		}
 		a.sendStateEvent(r, auth, newRoomID, version, t, "", content)
+	}
+	// guest_access: the new room always carries one, even when the old room
+	// never set it (sytest "/upgrade creates a new room" expects a guest_access
+	// event in the new room). The spec default is "forbidden" (guests may not
+	// join unless the room opts in).
+	if a.stateContent(r.Context(), oldRoomID, "m.room.guest_access", "") == nil {
+		a.sendStateEvent(r, auth, newRoomID, version, "m.room.guest_access", "", json.RawMessage(`{"guest_access":"forbidden"}`))
 	}
 }
 
