@@ -120,7 +120,9 @@ func (a *API) broadcastDeviceListForUser(ctx context.Context, userID string) {
 }
 
 // broadcastDeviceListDelete queues an m.device_list_update EDU marked deleted
-// (device_lists.left) to every remote server sharing roomID. It is used when a
+// (device_lists.changed semantics: the user's device list shrank, never `left`,
+// which is reserved for users who stopped sharing every encrypted room) to
+// every remote server sharing roomID. It is used when a
 // local user leaves/ban/unbans a room: the user's own room list no longer
 // contains the room (the membership row was already updated), so the generic
 // broadcastDeviceListUpdate would miss the room's servers. The room's other
@@ -192,22 +194,18 @@ func (a *API) notifyDeviceListPeers(ctx context.Context, userID string) {
 
 // recordDeviceRemoval records a device-list change after a device is deleted
 // (logout, delete-device). Per the spec, `device_lists.left` in /sync reports
-// users who "no longer share rooms or have stopped uploading device keys" —
-// i.e. users whose whole device list is gone. Deleting one device while the
-// user retains other devices must be reported as `changed`, or clients would
-// (incorrectly) drop the user entirely and stop sharing room keys with the
-// remaining devices. Only when the deletion leaves the user with no devices at
-// all is it reported as `left`.
+// users with whom we no longer share any encrypted rooms — a purely
+// membership-driven condition. Deleting a device (even the user's last one) is
+// a device-identity update, so the user is reported in `device_lists.changed`
+// and their room peers re-fetch the (shorter or empty) device list; reporting
+// `left` would wrongly tell clients the user stopped sharing rooms and drop
+// their remaining devices' keys (sytest "Local delete device changes appear in
+// v2 /sync" expects a last-device deletion to surface in `changed`). The
+// outbound EDU still carries `deleted: true` — the flag is authoritative for
+// the device itself and lets receivers evict its cached keys.
 func (a *API) recordDeviceRemoval(ctx context.Context, userID, localpart, deviceID string) {
-	devices, err := a.Store.ListDevices(ctx, localpart)
-	if err != nil {
-		return
-	}
-	// DeleteDevice was already called: if the user has no remaining devices,
-	// their whole device list is gone.
-	isDelete := len(devices) == 0
-	_, _ = a.Store.RecordDeviceListChange(ctx, userID, isDelete)
-	a.broadcastDeviceListUpdate(ctx, userID, deviceID, isDelete)
+	_, _ = a.Store.RecordDeviceListChange(ctx, userID, false)
+	a.broadcastDeviceListUpdate(ctx, userID, deviceID, true)
 	a.notifyDeviceListPeers(ctx, userID)
 }
 

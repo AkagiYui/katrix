@@ -408,6 +408,83 @@ func TestSyncDeviceListsChanged(t *testing.T) {
 	t.Fatalf("device 2 never saw device_lists.changed")
 }
 
+// TestSyncDeviceDeletionChanged: deleting a device (even the user's last one)
+// must surface the user in device_lists.changed, not .left. The spec reserves
+// device_lists.left for users with whom we no longer share any encrypted rooms
+// (a purely membership-driven condition); a device deletion is a device-identity
+// update, so room peers must re-fetch the (shorter or empty) device list
+// (sytest "Local delete device changes appear in v2 /sync").
+func TestSyncDeviceDeletionChanged(t *testing.T) {
+	_, srv := testAPI(t)
+	tok := registerUser(t, srv, "alice-deldl", "pw")
+	// Login again as a second device of the same user.
+	code, body := doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/login", "",
+		map[string]any{"type": "m.login.password", "identifier": map[string]any{"type": "m.id.user", "user": "alice-deldl"}, "password": "pw"})
+	if code != 200 {
+		t.Fatalf("second login: %d %v", code, body)
+	}
+	dev2Token, _ := body["access_token"].(string)
+	if dev2Token == "" {
+		t.Fatal("no token for second device")
+	}
+	dev2ID, _ := body["device_id"].(string)
+
+	// Device 1 initial sync to get a since token.
+	_, resp := syncNow(t, srv, tok, "", 0)
+	since, _ := resp["next_batch"].(string)
+	if since == "" {
+		t.Fatal("no next_batch")
+	}
+
+	// Resolve device 1's ID (registerUser does not return it) and delete it —
+	// the user's last remaining device (device 2's ID is the other one).
+	code, body = getJSON(t, srv, "/_matrix/client/v3/devices", tok)
+	if code != 200 {
+		t.Fatalf("list devices: code=%d body=%v", code, body)
+	}
+	devs, _ := body["devices"].([]any)
+	if len(devs) != 2 {
+		t.Fatalf("expected 2 devices, got %d", len(devs))
+	}
+	var devID string
+	for _, d := range devs {
+		if id, _ := d.(map[string]any)["device_id"].(string); id != dev2ID {
+			devID = id
+		}
+	}
+	if devID == "" {
+		t.Fatal("device 1 ID not found")
+	}
+	code, body = doJSON(t, srv, http.MethodDelete, "/_matrix/client/v3/devices/"+devID, tok,
+		map[string]any{
+			"auth": map[string]any{
+				"type":       "m.login.password",
+				"identifier": map[string]any{"type": "m.id.user", "user": "@alice-deldl:test.katrix"},
+				"password":   "pw",
+			},
+		})
+	if code != 200 {
+		t.Fatalf("delete device: %d %v", code, body)
+	}
+
+	// Device 2 must see the user in device_lists.changed (never .left).
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_, resp := syncNow(t, srv, dev2Token, since, 0)
+		if dl, ok := resp["device_lists"].(map[string]any); ok {
+			if changed, _ := dl["changed"].([]any); len(changed) > 0 {
+				return // pass
+			}
+			if left, _ := dl["left"].([]any); len(left) > 0 {
+				t.Fatalf("device deletion wrongly reported in device_lists.left: %v", left)
+			}
+		}
+		since, _ = resp["next_batch"].(string)
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("device 2 never saw device_lists.changed for deleted user")
+}
+
 func TestSyncPresenceBroadcast(t *testing.T) {
 	_, srv := testAPI(t)
 	alice := registerUser(t, srv, "alice-pres", "pw")

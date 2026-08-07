@@ -399,12 +399,18 @@ func (a *API) applyDeviceListEDU(ctx context.Context, origin string, content jso
 			return nil
 		}
 	}
-	// The `deleted` flag is authoritative and does not need a resync: the user
-	// is gone from every shared room, so their cached device list is dropped
-	// and their local devices learn device_lists.left.
+	// The `deleted` flag is authoritative and does not need a resync: the
+	// device is gone, so its cached keys are dropped. The user still shares the
+	// room (a device deletion is not a leave), so their room peers must
+	// re-fetch the (shorter or empty) device list via device_lists.changed —
+	// device_lists.left is reserved for users with whom we no longer share any
+	// encrypted rooms, a purely membership-driven condition (mirror of Synapse,
+	// whose delete_devices only ever records device-list changes; sytest
+	// "Device deletion propagates over federation" expects the remote user in
+	// `changed`).
 	if c.Deleted != nil && *c.Deleted {
 		_ = a.Store.EvictRemoteDeviceList(ctx, c.UserID)
-		if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, true); err != nil {
+		if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, false); err != nil {
 			return err
 		}
 		a.wakeSharedRoomLocals(ctx, c.UserID)
