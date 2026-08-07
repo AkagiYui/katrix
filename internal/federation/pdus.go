@@ -219,10 +219,21 @@ func (a *API) deliverInvite(ctx context.Context, inv storage.OutboundInvite) {
 	}
 	tctx, cancel := context.WithTimeout(ctx, fedDeliveryTimeout)
 	defer cancel()
-	err := a.sendRemoteInviteOnce(tctx, inv.Destination, inv.RoomID, inv.EventID, inv.Raw, version)
+	err := a.sendRemoteInviteOnce(tctx, inv.Destination, inv.RoomID, inv.EventID, inv.Raw, version, "v2")
 	if err == nil {
 		_ = a.Store.DeleteOutboundInvite(ctx, inv.ID)
 		return
+	}
+	// Retried invites from a v1/v2 room may also need the v1 fallback when the
+	// peer does not recognise /v2/invite. The v1 endpoint takes the bare event,
+	// so unwrap the stored v2 envelope first.
+	if isUnknownInviteEndpoint(err) && roomverRulesV1V2(version) {
+		if eventJSON := inviteEventFromEnvelope(inv.Raw); eventJSON != nil {
+			if err1 := a.sendRemoteInviteOnce(tctx, inv.Destination, inv.RoomID, inv.EventID, eventJSON, version, "v1"); err1 == nil {
+				_ = a.Store.DeleteOutboundInvite(ctx, inv.ID)
+				return
+			}
+		}
 	}
 	if !isInviteTransportError(err) {
 		// Rejected (non-200): the peer saw the request; stop retrying.

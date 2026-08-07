@@ -1714,10 +1714,24 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) {
 			version = roomver.Default
 		}
 	}
+
 	rules, ok := roomver.Get(version)
 	if !ok {
 		httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_UNSUPPORTED_ROOM_VERSION", "unsupported room version"))
 		return
+	}
+
+	// Room version 6+ requires events to be Canonical JSON (spec §room version
+	// 6: "homeservers should strictly enforce canonical JSON on PDUs"). An
+	// invite with a non-canonical body (e.g. a fractional number) is rejected
+	// with 400 M_BAD_JSON (sytest "Inbound federation rejects invites which
+	// include invalid JSON for room version 6").
+	if roomver.AtLeast(version, 6) {
+		if _, cerr := canonicaljson.Canonical(req.Event); cerr != nil {
+			httpx.WriteError(w, httpx.NewError(http.StatusBadRequest, "M_BAD_JSON",
+				"invite event is not Canonical JSON"))
+			return
+		}
 	}
 
 	// Verify the invite event's signature against its origin server's keys.
@@ -2415,9 +2429,13 @@ func (a *API) authChain(r *http.Request, roomID string) []json.RawMessage {
 }
 
 // authChainIDs computes the transitive closure of auth_events starting from the
-// room's current state events. It walks each state event's auth_events
-// recursively, returning the full set (excluding the state events themselves
-// unless they are reached as an ancestor).
+// room's current state events. Per the spec, the auth chain of a room's state
+// is the set of events reachable via auth_events from the state — the state
+// events themselves are not part of it (unless they are reached as an ancestor
+// of another event's auth_events). Seeding the walk with the state events
+// themselves would leak them into the chain, which breaks peers' auth checks
+// (sytest walks the send_join auth_chain and rejects a non-creator join event
+// in it).
 func (a *API) authChainIDs(r *http.Request, roomID string) []string {
 	stateRows, err := a.Store.GetState(r.Context(), roomID)
 	if err != nil {
@@ -2430,10 +2448,23 @@ func (a *API) authChainIDs(r *http.Request, roomID string) []string {
 		}
 		return ids
 	}
-	// Seed the walk with the auth_events of every current state event.
+	// Seed the walk with the auth_events of every current state event, so the
+	// state events themselves are excluded from the result.
 	seed := make([]string, 0, len(stateRows))
 	for _, s := range stateRows {
-		seed = append(seed, s.EventID)
+		row, err := a.Store.GetEvent(r.Context(), s.EventID)
+		if err != nil || row == nil {
+			continue
+		}
+		rules := a.roomRules(row.RoomID)
+		if rules == nil {
+			continue
+		}
+		ev, err := events.New(row.RawJSON, rules.Version)
+		if err != nil {
+			continue
+		}
+		seed = append(seed, ev.AuthEvents()...)
 	}
 	chain := a.walkAuthChain(r.Context(), seed)
 	out := make([]string, 0, len(chain))

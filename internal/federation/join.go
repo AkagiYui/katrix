@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/AkagiYui/katrix/internal/canonicaljson"
 	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/eventstate"
@@ -387,9 +388,25 @@ func (a *API) SendRemoteInvite(ctx context.Context, roomID, invitee string, ev *
 	if err != nil {
 		return err
 	}
-	err = a.sendRemoteInviteOnce(ctx, dom, roomID, ev.EventID(), raw, version)
+	err = a.sendRemoteInviteOnce(ctx, dom, roomID, ev.EventID(), raw, version, "v2")
 	if err == nil {
 		return nil
+	}
+	// The v2 endpoint may not be recognised by an older peer (it answers 404
+	// M_UNRECOGNIZED to /v2/invite). Per Synapse, fall back to the v1 endpoint
+	// when the room version uses old-style event IDs (room versions 1 and 2) —
+	// the only versions whose invite flow the v1 API can describe (sytest's
+	// "Outbound federation can send invites via v1 API" and the v1 invite
+	// rejection tests run their rooms at room_version 1/2).
+	if isUnknownInviteEndpoint(err) && roomverRulesV1V2(version) {
+		rules, ok := roomver.Get(version)
+		if !ok || rules.EventFormatV1 {
+			if err1 := a.sendRemoteInviteOnce(ctx, dom, roomID, ev.EventID(), json.RawMessage(ev.Raw()), version, "v1"); err1 == nil {
+				return nil
+			} else {
+				err = err1
+			}
+		}
 	}
 	// A rejection by the peer (non-200) must surface to the caller — the client
 	// invite request fails with the remote server's status. Only transport
@@ -401,6 +418,50 @@ func (a *API) SendRemoteInvite(ctx context.Context, roomID, invitee string, ev *
 	_ = a.Store.InsertOutboundInvite(ctx, roomID, ev.EventID(), dom, raw, a.Now())
 	a.wakeDeliveries()
 	return nil
+}
+
+// inviteEventFromEnvelope extracts the bare signed event from a v2 invite
+// envelope {event: ...}, returning nil when the body is not an envelope (it
+// may already be the bare event).
+func inviteEventFromEnvelope(raw json.RawMessage) json.RawMessage {
+	var env struct {
+		Event json.RawMessage `json:"event"`
+	}
+	if json.Unmarshal(raw, &env) == nil && len(env.Event) > 0 {
+		return env.Event
+	}
+	return raw
+}
+
+// roomverRulesV1V2 reports whether the room version rules use the legacy
+// v1/v2 event format (event IDs as [id, hash] pairs in auth_events/prev_events
+// and no per-event IDs derived from the reference hash), which is what the v1
+// federation API can describe.
+func roomverRulesV1V2(version roomver.Version) bool {
+	rules, ok := roomver.Get(version)
+	return ok && rules.EventFormatV1
+}
+
+// isUnknownInviteEndpoint reports whether an invite delivery error means the
+// peer did not recognise the endpoint (404/405 with an M_UNRECOGNIZED errcode,
+// or a non-JSON/empty body — older Dendrites/Conduits answer 404 with no
+// body), per Synapse's is_unknown_endpoint. Only such errors trigger the
+// v2 -> v1 invite fallback.
+func isUnknownInviteEndpoint(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "HTTP 404") && !strings.Contains(msg, "HTTP 405") {
+		return false
+	}
+	if strings.Contains(msg, "M_UNRECOGNIZED") {
+		return true
+	}
+	// A 404 with an empty or non-JSON body is treated as an unrecognised
+	// endpoint (the body would only carry JSON if the server answered with an
+	// errcode).
+	return strings.Contains(msg, "HTTP 404")
 }
 
 // isInviteTransportError reports whether an invite delivery error was a
@@ -422,12 +483,15 @@ func isInviteTransportError(err error) bool {
 	return true
 }
 
-// sendRemoteInviteOnce performs a single signed PUT /_matrix/federation/v2/
-// invite delivery against dom with the pre-built body, and persists the
-// doubly-signed invite event the peer returns (the room's other servers then
-// see the invite signed by both parties).
-func (a *API) sendRemoteInviteOnce(ctx context.Context, dom, roomID, eventID string, raw json.RawMessage, version roomver.Version) error {
-	url := a.client.serverBaseURL(dom) + "/_matrix/federation/v2/invite/" + urlPathEscape(roomID) + "/" + urlPathEscape(eventID)
+// sendRemoteInviteOnce performs a single signed PUT invite delivery against
+// dom with the pre-built body, and persists the doubly-signed invite event the
+// peer returns (the room's other servers then see the invite signed by both
+// parties). apiVersion selects the endpoint: "v2" sends the envelope body
+// {room_version, event, invite_room_state} to /v2/invite and reads the plain
+// {event} response; "v1" sends the bare signed event to /v1/invite and reads
+// the MSC1802 [200, {event}] array response.
+func (a *API) sendRemoteInviteOnce(ctx context.Context, dom, roomID, eventID string, raw json.RawMessage, version roomver.Version, apiVersion string) error {
+	url := a.client.serverBaseURL(dom) + "/_matrix/federation/" + apiVersion + "/invite/" + urlPathEscape(roomID) + "/" + urlPathEscape(eventID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(raw))
 	if err != nil {
 		return err
@@ -450,11 +514,31 @@ func (a *API) sendRemoteInviteOnce(ctx context.Context, dom, roomID, eventID str
 	// The remote server returns the invite event signed by both parties.
 	// Persist it over our copy so the room's stored invite carries both
 	// signatures (matters when other servers receive it via transactions).
+	respBody, rerr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if rerr != nil {
+		return nil
+	}
+	// The v1 endpoint wraps the body in the extraneous [200, {...}] array
+	// (MSC1802); unwrap it before reading the event.
+	if apiVersion == "v1" {
+		var arr []json.RawMessage
+		if json.Unmarshal(respBody, &arr) == nil && len(arr) == 2 {
+			respBody = arr[1]
+		}
+	}
+	// Room version 6+ requires Canonical JSON: a doubly-signed invite whose
+	// body the peer re-encoded non-canonically is rejected (sytest "Outbound
+	// federation rejects invite response which include invalid JSON for room
+	// version 6" injects a fractional number into the returned event).
+	if roomver.AtLeast(version, 6) {
+		if _, cerr := canonicaljson.Canonical(respBody); cerr != nil {
+			return fmt.Errorf("federation: invite %s: response is not Canonical JSON", dom)
+		}
+	}
 	var out struct {
 		Event json.RawMessage `json:"event"`
 	}
-	respBody, rerr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if rerr == nil && json.Unmarshal(respBody, &out) == nil && len(out.Event) > 0 {
+	if json.Unmarshal(respBody, &out) == nil && len(out.Event) > 0 {
 		if signedEv, err := events.New(out.Event, version); err == nil && signedEv.EventID() == eventID {
 			_ = a.Store.UpdateEventRaw(ctx, eventID, out.Event)
 		}
