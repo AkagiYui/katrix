@@ -178,6 +178,16 @@ func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
 	// Restrict the old room's power levels (spec: stop regular users from
 	// speaking after an upgrade).
 	a.restrictOldRoomPowerLevels(r, auth, roomID)
+	// Remove the old room from the public room directory: the replacement room
+	// inherited the old room's visibility (persistNewRoom), so the old room
+	// must not stay listed (mirror of Synapse's
+	// transfer_room_state_on_room_upgrade — set_room_is_public(old, False);
+	// sytest "Local and remote users' homeservers remove a room from their
+	// public directory on upgrade" asserts the old room_id is absent from
+	// /publicRooms and the new one present).
+	if oldRoom.IsPublic {
+		_ = a.Store.SetRoomVisibility(r.Context(), roomID, false)
+	}
 	// Copy per-room push rules for every local user in the old room.
 	a.copyPushRulesForAllLocalUsers(r.Context(), roomID, newRoomID)
 	// Copy each local user's room tags to the new room.
@@ -199,6 +209,22 @@ func (a *API) stateContent(ctx context.Context, roomID, eventType, stateKey stri
 		}
 	}
 	return nil
+}
+
+// stateRowsFor returns the room's current state rows of a given type (any
+// state_key), e.g. the per-domain m.room.aliases events.
+func (a *API) stateRowsFor(ctx context.Context, roomID, eventType string) []storage.StateRow {
+	rows, err := a.Store.GetState(ctx, roomID)
+	if err != nil {
+		return nil
+	}
+	var out []storage.StateRow
+	for _, r := range rows {
+		if r.Type == eventType {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // upgradePowerLevels builds the initial power-levels content for the new room:
@@ -339,6 +365,18 @@ func (a *API) copyStateToNewRoom(r *http.Request, auth *homeserver.Auth, oldRoom
 		}
 		a.sendStateEvent(r, auth, newRoomID, version, t, "", content)
 	}
+	// Copy the per-domain m.room.aliases state events (state_key = server
+	// domain). These are how aliases registered on *other* servers travel: each
+	// homeserver publishes the aliases it owns into the room as an m.room.aliases
+	// event keyed by its domain, and a remote server watching the replacement
+	// room repoints its directory entries from that state (sytest "/upgrade
+	// moves remote aliases to the new room" — a remote user's alias must resolve
+	// to the replacement room after the upgrade).
+	for _, row := range a.stateRowsFor(r.Context(), oldRoomID, "m.room.aliases") {
+		if ev, err := a.Store.GetEvent(r.Context(), row.EventID); err == nil {
+			a.sendStateEvent(r, auth, newRoomID, version, "m.room.aliases", row.StateKey, ev.Content)
+		}
+	}
 	// guest_access: the new room always carries one, even when the old room
 	// never set it (sytest "/upgrade creates a new room" expects a guest_access
 	// event in the new room). The spec default is "forbidden" (guests may not
@@ -445,20 +483,19 @@ func (a *API) copyPushRulesForAllLocalUsers(ctx context.Context, oldRoomID, newR
 	pushrules.CopyRulesForRoom(ctx, a.Store, localparts, oldRoomID, newRoomID)
 }
 
-// copyTagsForAllLocalUsers clones each local user's room tags (the m.tag
+// copyTagsForAllLocalUsers clones each room member's room tags (the m.tag
 // account data) from the old room to the new room. Synapse's
 // transfer_room_state_on_room_upgrade does the same for every local user that
 // was in the old room (sytest "local/remote user has tags copied to the new
-// room").
+// room"). A "remote" user in sytest is still served by this homeserver (their
+// client requests hit us), so their account data lives here too and must be
+// copied — filtering by IsLocalUser drops their tags.
 func (a *API) copyTagsForAllLocalUsers(ctx context.Context, oldRoomID, newRoomID string) {
 	members, err := a.Store.Members(ctx, oldRoomID, "join")
 	if err != nil {
 		return
 	}
 	for _, m := range members {
-		if !a.IsLocalUser(m.UserID) {
-			continue
-		}
 		lp := a.LocalpartOf(m.UserID)
 		raw, err := a.Store.GetAccountData(ctx, lp, oldRoomID, "m.tag")
 		if err != nil || len(raw) == 0 {

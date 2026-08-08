@@ -730,6 +730,23 @@ func (a *API) copyPushRulesOnRemoteTombstone(ctx context.Context, oldRoomID stri
 		}
 	}
 	pushrules.CopyRulesForRoom(ctx, a.Store, localparts, oldRoomID, tc.ReplacementRoom)
+	// Also copy each local user's room tags to the replacement room (sytest
+	// "remote user has tags copied to the new room": the joiner's homeserver
+	// learns of the upgrade via this inbound tombstone and must carry the tag
+	// over, or the joiner's /tags for the new room come back empty).
+	for _, m := range members {
+		if !a.IsLocalUser(m.UserID) {
+			continue
+		}
+		lp := a.LocalpartOf(m.UserID)
+		raw, err := a.Store.GetAccountData(ctx, lp, oldRoomID, "m.tag")
+		if err != nil || len(raw) == 0 {
+			continue
+		}
+		if _, err := a.Store.SetAccountData(ctx, lp, tc.ReplacementRoom, "m.tag", raw); err == nil {
+			a.Notifier.NotifyUser(m.UserID)
+		}
+	}
 }
 
 // membershipRowFromContent builds the denormalised membership row for a member
