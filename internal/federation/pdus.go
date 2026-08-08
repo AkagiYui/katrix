@@ -396,10 +396,16 @@ func (a *API) MaybeBackfill(ctx context.Context, roomID string, limit int) int {
 			if id == "" {
 				continue
 			}
+			// Backfilled events are part of the room's DAG and timeline (Synapse
+			// persists them via _persist_events(backfilled=True), outlier=False);
+			// only the send_join/invite state-auth chains are outliers. The
+			// negative stream ordering allocated by InsertBackfillEvents is what
+			// keeps them out of forward syncs, so the outlier flag must stay
+			// false or /messages backward pagination (which filters
+			// outlier=false) can never return them.
 			row := &storage.EventRow{
 				EventID: id, RoomID: roomID, Type: ev.Type, Sender: ev.Sender,
 				Depth: ev.Depth, OriginServerTS: ev.OSTS, Content: ev.Content, RawJSON: raw,
-				Outlier: true,
 			}
 			if ev.StateKey != nil {
 				row.StateKey = *ev.StateKey
