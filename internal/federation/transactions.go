@@ -602,6 +602,15 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	if ev.Type == "m.room.tombstone" && ev.StateKey != nil && *ev.StateKey == "" {
 		a.copyPushRulesOnRemoteTombstone(r.Context(), ev.RoomID, ev.Content)
 	}
+	// An inbound m.room.aliases state event keyed by this server's domain is
+	// the authoritative list of the local aliases that belong to the room —
+	// the only place a server learns of aliases other servers create for its
+	// rooms, and how an upgrade moves a remote-owned alias to the replacement
+	// room (the upgraded room's m.room.aliases events announce the new
+	// mapping; sytest "/upgrade moves remote aliases to the new room").
+	if ev.Type == "m.room.aliases" && ev.StateKey != nil && *ev.StateKey != "" {
+		a.learnAliasesFromStateEvent(r.Context(), ev.RoomID, *ev.StateKey, raw)
+	}
 	// Revoking guest_access kicks the room's local joined guests (spec
 	// guest_access semantics).
 	if ev.Type == "m.room.guest_access" && ev.StateKey != nil && *ev.StateKey == "" {
@@ -745,6 +754,26 @@ func (a *API) copyPushRulesOnRemoteTombstone(ctx context.Context, oldRoomID stri
 		}
 		if _, err := a.Store.SetAccountData(ctx, lp, tc.ReplacementRoom, "m.tag", raw); err == nil {
 			a.Notifier.NotifyUser(m.UserID)
+		}
+	}
+	// Carry the public-directory visibility across: if the old room was listed
+	// locally, the replacement room inherits the listing and the old room is
+	// removed (mirror of Synapse's transfer_room_state_on_room_upgrade — sytest
+	// "Local and remote users' homeservers remove a room from their public
+	// directory on upgrade" checks both servers' /publicRooms).
+	if old, err := a.Store.GetRoom(ctx, oldRoomID); err == nil && old.IsPublic {
+		_ = a.Store.SetRoomVisibility(ctx, tc.ReplacementRoom, true)
+		_ = a.Store.SetRoomVisibility(ctx, oldRoomID, false)
+	}
+	// Repoint every alias this server's directory holds for the old room at
+	// the replacement room (spec upgrade semantics; sytest "/upgrade moves
+	// remote aliases to the new room" — a remote user's alias must resolve to
+	// the new room once the upgrade's tombstone is observed, which is the
+	// signal that fires on the joiner's server even when the joiner later
+	// joins the replacement room locally).
+	if aliases, err := a.Store.AliasesForRoom(ctx, oldRoomID); err == nil {
+		for _, alias := range aliases {
+			_ = a.Store.SetAliasForRoom(ctx, alias, tc.ReplacementRoom, "", a.Now())
 		}
 	}
 }

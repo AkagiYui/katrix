@@ -448,6 +448,51 @@ func (a *API) roomServers(ctx context.Context, roomID string) []string {
 	return out
 }
 
+// learnAliasesFromStateEvent applies an inbound m.room.aliases state event to
+// the local directory: an event keyed by this server's own domain announces
+// which local aliases belong to the room, so the room_aliases table is
+// brought in line (an alias newly listed for a replacement room after an
+// upgrade is repointed there; an alias that vanished from the room's list is
+// unmapped). Aliases on other domains are left to those domains' servers to
+// reconcile — per the spec, each server only maintains the aliases on its own
+// domain. Best-effort.
+func (a *API) learnAliasesFromStateEvent(ctx context.Context, roomID, serverName string, raw json.RawMessage) {
+	if serverName != a.ServerName() {
+		return
+	}
+	var ev struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(raw, &ev) != nil {
+		return
+	}
+	var c struct {
+		Aliases []string `json:"aliases"`
+	}
+	if json.Unmarshal(ev.Content, &c) != nil {
+		return
+	}
+	// Unmap any locally-known alias of the room that is no longer listed.
+	existing, err := a.Store.AliasesForRoom(ctx, roomID)
+	if err == nil {
+		kept := map[string]bool{}
+		for _, al := range c.Aliases {
+			kept[al] = true
+		}
+		for _, al := range existing {
+			if !kept[al] {
+				_ = a.Store.DeleteAlias(ctx, al)
+			}
+		}
+	}
+	for _, alias := range c.Aliases {
+		if ids.DomainOf(alias) != a.ServerName() {
+			continue
+		}
+		_ = a.Store.SetAliasForRoom(ctx, alias, roomID, "", a.Now())
+	}
+}
+
 // fetchMissingEventsFor asks origin for the events between the room's current
 // state and the event that just arrived with unknown prev_events, then ingests
 // them. It mirrors what the sender expects per the spec's get_missing_events

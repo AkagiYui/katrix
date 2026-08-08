@@ -20,3 +20,4 @@ internal/webui/dist/assets/
 
 # Compiled helper binaries
 /testreport
+sytest-logs-local/

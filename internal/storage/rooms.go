@@ -1324,6 +1324,18 @@ func (s *Store) CreateAlias(ctx context.Context, alias, roomID, creator string, 
 	return err
 }
 
+// SetAliasForRoom repoints an alias at a room, creating the row or updating an
+// existing mapping (used when an m.room.aliases state event announces that an
+// alias on this server's domain now belongs to a room — e.g. a room upgrade
+// copying the aliases into the replacement room).
+func (s *Store) SetAliasForRoom(ctx context.Context, alias, roomID, creator string, createdTS int64) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO room_aliases(alias, room_id, creator, created_ts) VALUES ($1,$2,$3,$4)
+		 ON CONFLICT (alias) DO UPDATE SET room_id=EXCLUDED.room_id, creator=EXCLUDED.creator, created_ts=EXCLUDED.created_ts`,
+		alias, roomID, creator, createdTS)
+	return err
+}
+
 // LookupAlias resolves an alias to a room ID.
 func (s *Store) LookupAlias(ctx context.Context, alias string) (string, error) {
 	var roomID string

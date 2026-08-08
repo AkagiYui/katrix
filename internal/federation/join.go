@@ -1067,7 +1067,129 @@ func (a *API) ingestRemoteJoin(ctx context.Context, roomID string, version roomv
 	// members) and /keys/query, so an unsolicited EDU would be an unexpected
 	// side effect (Complement's partial-state suite fails the run on one).
 	a.notifyRoomMembers(ctx, roomID)
+	// When the joined room is the replacement of a room this server already
+	// knows (its m.room.create names a predecessor), carry the predecessor's
+	// directory state over: repoint its local aliases at the new room, keep
+	// its public-directory visibility, and copy the local users' room tags
+	// (mirror of Synapse's transfer_room_state_on_room_upgrade, which runs on
+	// joining an upgraded room too; sytest "remote user has tags copied to the
+	// new room" and "/upgrade moves remote aliases to the new room" join the
+	// replacement room over federation).
+	a.migratePredecessorOnJoin(ctx, roomID, sj.State)
 	return nil
+}
+
+// migratePredecessorOnJoin transfers a predecessor room's directory state to a
+// newly-joined replacement room: the aliases this server registered for the
+// old room, the public-room visibility, and each local member's room tags.
+// Best-effort (mirror of Synapse's transfer_room_state_on_room_upgrade, which
+// also runs when a server joins an upgraded room it did not upgrade itself).
+func (a *API) migratePredecessorOnJoin(ctx context.Context, newRoomID string, state []json.RawMessage) {
+	oldRoomID := ""
+	for _, raw := range state {
+		var ev struct {
+			Type     string          `json:"type"`
+			StateKey *string         `json:"state_key"`
+			Content  json.RawMessage `json:"content"`
+		}
+		if json.Unmarshal(raw, &ev) != nil || ev.Type != "m.room.create" || ev.StateKey == nil || *ev.StateKey != "" {
+			continue
+		}
+		var c struct {
+			Predecessor struct {
+				RoomID string `json:"room_id"`
+			} `json:"predecessor"`
+		}
+		if json.Unmarshal(ev.Content, &c) == nil && c.Predecessor.RoomID != "" {
+			oldRoomID = c.Predecessor.RoomID
+		}
+		break
+	}
+	if oldRoomID != "" {
+		a.migratePredecessor(ctx, newRoomID, oldRoomID)
+	}
+}
+
+// MigratePredecessorForLocalJoin runs the upgrade directory migration when a
+// user locally joins a room whose m.room.create names a predecessor (a
+// replacement room the invite or sync already created locally, so no federated
+// send_join ever fires). sytest "/upgrade moves remote aliases to the new
+// room" invites the remote user to the replacement room before they join, so
+// this server learns of the upgrade via the invite rather than a send_join.
+func (a *API) MigratePredecessorForLocalJoin(ctx context.Context, newRoomID string) {
+	id, err := a.Store.GetStateEvent(ctx, newRoomID, "m.room.create", "")
+	if err != nil {
+		return
+	}
+	ev, err := a.Store.GetEvent(ctx, id)
+	if err != nil || ev == nil {
+		return
+	}
+	var c struct {
+		Predecessor struct {
+			RoomID string `json:"room_id"`
+		} `json:"predecessor"`
+	}
+	if json.Unmarshal(ev.Content, &c) != nil || c.Predecessor.RoomID == "" {
+		return
+	}
+	a.migratePredecessor(ctx, newRoomID, c.Predecessor.RoomID)
+}
+
+// migratePredecessor transfers a predecessor room's directory state to a
+// newly-joined replacement room: the aliases this server registered for the
+// old room, the public-room visibility, and each local member's room tags.
+// Best-effort.
+func (a *API) migratePredecessor(ctx context.Context, newRoomID, oldRoomID string) {
+	if oldRoomID == "" || oldRoomID == newRoomID {
+		return
+	}
+	if exists, err := a.Store.RoomExists(ctx, oldRoomID); err != nil || !exists {
+		return
+	}
+	// Repoint every alias this server's directory holds for the old room at
+	// the new one (spec upgrade semantics; the old room's tombstone names the
+	// replacement). The aliases live in this server's room_aliases table —
+	// they were registered here, not announced into the old room's state, so
+	// the room's own m.room.aliases events are not the source.
+	if aliases, err := a.Store.AliasesForRoom(ctx, oldRoomID); err == nil {
+		for _, alias := range aliases {
+			_ = a.Store.SetAliasForRoom(ctx, alias, newRoomID, "", a.Now())
+		}
+	}
+	// Carry the public-room visibility across (the replacement room's initial
+	// is_public is unset on a remote join; the predecessor's flag is the
+	// source of truth — sytest "Local and remote users' homeservers remove a
+	// room from their public directory on upgrade" lists the new room and
+	// removes the old one).
+	if old, err := a.Store.GetRoom(ctx, oldRoomID); err == nil && old.IsPublic {
+		_ = a.Store.SetRoomVisibility(ctx, newRoomID, true)
+		_ = a.Store.SetRoomVisibility(ctx, oldRoomID, false)
+	}
+	// Copy each local user's room tags from the old room.
+	a.copyTagsForMembers(ctx, oldRoomID, newRoomID)
+}
+
+// copyTagsForMembers clones every member's m.tag account data from oldRoomID
+// to newRoomID.
+func (a *API) copyTagsForMembers(ctx context.Context, oldRoomID, newRoomID string) {
+	members, err := a.Store.Members(ctx, oldRoomID, "join")
+	if err != nil {
+		return
+	}
+	for _, m := range members {
+		if !a.IsLocalUser(m.UserID) {
+			continue
+		}
+		lp := a.LocalpartOf(m.UserID)
+		raw, err := a.Store.GetAccountData(ctx, lp, oldRoomID, "m.tag")
+		if err != nil || len(raw) == 0 {
+			continue
+		}
+		if _, err := a.Store.SetAccountData(ctx, lp, newRoomID, "m.tag", raw); err == nil {
+			a.Notifier.NotifyUser(m.UserID)
+		}
+	}
 }
 
 // stateContainsVerifiableCreate reports whether the delivered send_join state

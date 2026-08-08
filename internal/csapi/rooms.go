@@ -1876,7 +1876,39 @@ func (a *API) DirectoryPutAlias(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
+	// Publish the alias into the room's state (spec m.room.aliases): each
+	// homeserver announces the aliases it owns for a room as an m.room.aliases
+	// state event keyed by its server name. Other servers — and room upgrades —
+	// learn of the mapping from that state, and sytest's remote-alias tests
+	// ("Remote users can join room by alias", "/upgrade moves remote aliases
+	// to the new room") depend on it. Best-effort: the alias is already
+	// registered in the local directory; an insufficient-power failure leaves
+	// the directory entry in place.
+	a.announceAliasesForRoom(r, auth, req.RoomID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// announceAliasesForRoom sends the room's m.room.aliases state event keyed by
+// this server's domain, listing the local aliases that point at the room.
+func (a *API) announceAliasesForRoom(r *http.Request, auth *homeserver.Auth, roomID string) {
+	aliases, err := a.Store.AliasesForRoom(r.Context(), roomID)
+	if err != nil {
+		return
+	}
+	var local []string
+	for _, al := range aliases {
+		if ids.DomainOf(al) == a.ServerName() {
+			local = append(local, al)
+		}
+	}
+	if local == nil {
+		local = []string{}
+	}
+	room, err := a.Store.GetRoom(r.Context(), roomID)
+	if err != nil {
+		return
+	}
+	a.sendStateEvent(r, auth, roomID, roomver.Version(room.Version), "m.room.aliases", a.ServerName(), map[string]any{"aliases": local})
 }
 
 // appserviceAliasInNamespaces reports whether aliasLocalpart matches any alias
@@ -2312,6 +2344,13 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 		}
 		if _, err := a.sendMemberEventWithContent(r, auth, roomID, auth.UserID, content); err != nil {
 			return nil, err
+		}
+		// A local join to a replacement room (an upgraded room this server
+		// learned of via invite/sync, so no federated send_join ran) carries the
+		// predecessor's directory state across: aliases, public visibility and
+		// room tags (sytest "/upgrade moves remote aliases to the new room").
+		if a.fed != nil {
+			a.fed.MigratePredecessorForLocalJoin(r.Context(), roomID)
 		}
 		return nil, nil
 	}
