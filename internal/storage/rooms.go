@@ -388,15 +388,33 @@ func upsertMembershipTx(ctx context.Context, ex execer, m *MembershipRow) error 
 }
 
 // ParsePrevEvents extracts prev_events IDs from a raw event JSON for the
-// extremity update. Returns nil for legacy [id, hash] pairs (flattened to IDs).
+// extremity update. Handles both the modern flat ID array (v3+) and the
+// legacy [id, hash] pairs (v1/v2), flattened to IDs.
 func ParsePrevEvents(raw []byte) []string {
 	var ev struct {
-		PrevEvents []string `json:"prev_events"`
+		PrevEvents json.RawMessage `json:"prev_events"`
 	}
-	if err := json.Unmarshal(raw, &ev); err != nil {
+	if err := json.Unmarshal(raw, &ev); err != nil || len(ev.PrevEvents) == 0 {
 		return nil
 	}
-	return ev.PrevEvents
+	var idsArr []string
+	if json.Unmarshal(ev.PrevEvents, &idsArr) == nil {
+		return idsArr
+	}
+	var pairs [][]json.RawMessage
+	if err := json.Unmarshal(ev.PrevEvents, &pairs); err != nil {
+		return nil
+	}
+	var out []string
+	for _, p := range pairs {
+		if len(p) > 0 {
+			var id string
+			if json.Unmarshal(p[0], &id) == nil && id != "" {
+				out = append(out, id)
+			}
+		}
+	}
+	return out
 }
 
 // GetEvent fetches a single event by ID.

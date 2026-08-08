@@ -549,13 +549,7 @@ func (a *API) fetchMissingEventsFor(ctx context.Context, roomID string, eventID 
 // present locally ("" when all are present). It is the point where a pulled
 // event chain stops linking into the local DAG.
 func (a *API) firstUnknownPrev(ctx context.Context, raw json.RawMessage) string {
-	var ev struct {
-		PrevEvents []string `json:"prev_events"`
-	}
-	if err := json.Unmarshal(raw, &ev); err != nil {
-		return ""
-	}
-	for _, id := range ev.PrevEvents {
+	for _, id := range prevEventIDs(raw) {
 		if id == "" {
 			continue
 		}
@@ -592,14 +586,8 @@ func (a *API) authReferencesRejected(ctx context.Context, raw json.RawMessage) b
 // is simply rejected, not reconciled). The walk is depth-bounded because a
 // room's full known history must never be traversed per inbound event.
 func (a *API) unknownDeepFrontier(ctx context.Context, raw json.RawMessage) string {
-	var ev struct {
-		PrevEvents []string `json:"prev_events"`
-	}
-	if err := json.Unmarshal(raw, &ev); err != nil {
-		return ""
-	}
 	// Depth 2: prevs of the (known) direct prevs.
-	for _, id := range ev.PrevEvents {
+	for _, id := range prevEventIDs(raw) {
 		if id == "" {
 			continue
 		}
@@ -989,18 +977,12 @@ func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roo
 // hasUnknownPrevEvents reports whether any of the event's prev_events are not
 // present locally.
 func (a *API) hasUnknownPrevEvents(ctx context.Context, raw json.RawMessage) bool {
-	var ev struct {
-		RoomID     string   `json:"room_id"`
-		PrevEvents []string `json:"prev_events"`
-	}
-	if err := json.Unmarshal(raw, &ev); err != nil {
+	prevs := prevEventIDs(raw)
+	if len(prevs) == 0 {
 		return false
 	}
-	if len(ev.PrevEvents) == 0 {
-		return false
-	}
-	known, err := a.Store.EventsByIDs(ctx, ev.PrevEvents)
-	if err != nil || len(known) != len(ev.PrevEvents) {
+	known, err := a.Store.EventsByIDs(ctx, prevs)
+	if err != nil || len(known) != len(prevs) {
 		return true
 	}
 	return false
