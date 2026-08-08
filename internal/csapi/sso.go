@@ -219,7 +219,7 @@ func mapUsernameToLocalpart(username string) string {
 			return true
 		}
 		switch c {
-		case '-', '.', '/', '=', '+':
+		case '-', '.', '/', '=', '+', '_':
 			return true
 		}
 		return false
@@ -227,12 +227,15 @@ func mapUsernameToLocalpart(username string) string {
 	raw := []byte(strings.ToLower(username))
 	var b strings.Builder
 	for i, c := range raw {
-		if !allowed(c) {
-			fmt.Fprintf(&b, "=%02x", c)
-			continue
-		}
+		// A leading underscore is not valid at the start of an MXID (Synapse
+		// escapes it), but underscores elsewhere are ordinary localpart
+		// characters.
 		if c == '_' && i == 0 {
 			b.WriteString("=5f")
+			continue
+		}
+		if !allowed(c) {
+			fmt.Fprintf(&b, "=%02x", c)
 			continue
 		}
 		b.WriteByte(c)
