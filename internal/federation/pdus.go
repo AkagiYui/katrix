@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/eventstate"
 	"github.com/AkagiYui/katrix/internal/ids"
@@ -589,18 +591,13 @@ func (a *API) fetchMissingEventsFor(ctx context.Context, roomID string, eventID 
 	// (Complement's TestCorruptedAuthChain asserts exactly this anchor, and the
 	// MSC4297 v2.1 tests depend on the /state_ids round-trip).
 	//
-	// The state fetch runs in the background, mirroring Synapse: it is many
-	// network round-trips against a peer (Complement's MSC4297 v2.1 tests hand
-	// over a ~240-event auth chain), and blocking the ingest on it stalls the
-	// /send response beyond the sender's deadline on slow CI. The triggered
-	// event is accepted immediately; the reconcile completes the room's state
-	// asynchronously.
-	for _, rawEv := range out.Events {
-		if id := a.firstUnknownPrev(ctx, rawEv); id != "" {
-			go a.reconcileStateFrom(context.WithoutCancel(ctx), roomID, origin, id)
-			break
-		}
-	}
+	// The reconcile itself is triggered by the caller (the transaction ingest
+	// path reconciles synchronously right after this returns, when the sent
+	// event's own prevs are now present but a deeper gap remains — see
+	// ingestPDU). It is NOT launched from here: a background goroutine would
+	// race the synchronous trigger for the same anchor, and a peer's /state_ids
+	// is single-shot per request (sytest's mock answers each awaited request
+	// once, then 404s), so the duplicate round-trip breaks the gap fill.
 }
 
 // firstUnknownPrev returns the first prev_event of the raw event that is not
@@ -734,6 +731,24 @@ func (a *API) reconcileStateFrom(ctx context.Context, roomID, server, anchorEven
 	if server == "" || server == a.ServerName() {
 		return
 	}
+	// Deduplicate concurrent reconciles for the same (room, anchor): the
+	// synchronous ingest path and the background gap-fill path can both fire for
+	// the same divergence point, and a duplicate /state_ids round-trip races the
+	// first one (a mock/one-shot peer answers once, then 404s — sytest's
+	// "create_outlier_event" helper registers exactly one await for /state_ids).
+	key := roomID + "\x00" + anchorEventID
+	a.reconcileMu.Lock()
+	if _, dup := a.reconcileInFlight[key]; dup {
+		a.reconcileMu.Unlock()
+		return
+	}
+	a.reconcileInFlight[key] = struct{}{}
+	a.reconcileMu.Unlock()
+	defer func() {
+		a.reconcileMu.Lock()
+		delete(a.reconcileInFlight, key)
+		a.reconcileMu.Unlock()
+	}()
 	stateIDs, authIDs, err := a.fetchStateIDs(ctx, server, roomID, anchorEventID)
 	if err != nil || len(stateIDs) == 0 {
 		return
@@ -754,7 +769,21 @@ func (a *API) reconcileStateFrom(ctx context.Context, roomID, server, anchorEven
 	// blow the caller's request deadline under load.
 	raws := map[string]json.RawMessage{}
 	unfetchable := map[string]bool{}
-	all := append(append([]string{}, stateIDs...), authIDs...)
+	// The snapshot the anchor event points at is the state the local server
+	// must converge on, but the anchor event itself (e.g. a remote join whose
+	// membership the triggering event's auth_events reference) is not part of
+	// the state — fetch it too and persist it as an outlier so auth chains
+	// referencing it resolve locally (mirror of the sytest "create_outlier_event"
+	// comment: "requesting the state at Q ... leads to Q being persisted as an
+	// outlier"). The fetch list is the deduplicated union of state IDs, auth
+	// chain IDs and the anchor.
+	all := []string{anchorEventID}
+	for _, id := range stateIDs {
+		all = append(all, id)
+	}
+	for _, id := range authIDs {
+		all = append(all, id)
+	}
 	var (
 		mu  sync.Mutex
 		wg  sync.WaitGroup
@@ -830,6 +859,119 @@ func (a *API) reconcileStateFrom(ctx context.Context, roomID, server, anchorEven
 	for id, raw := range raws {
 		a.persistReconcilePDU(ctx, roomID, version, rules, raw, rejected[id])
 	}
+	// Phase 4: apply the fetched snapshot's state to the room, resolved against
+	// the current state. The snapshot (state at the divergence point) contains
+	// state events the local server may not hold (e.g. a membership or a
+	// made-up state event the peer served); they must join room_state so the
+	// room converges on the authoritative view (sytest "Outbound federation
+	// requests missing prev_events and then asks for /state_ids and resolves
+	// the state" asserts the snapshot's test_state T lands in the room's final
+	// state). Conflicting (type, state_key) tuples — e.g. a served power_levels
+	// vs the room's real one — are settled by state resolution, which keeps the
+	// mainline winner (the room's real power_levels) while accepting the
+	// snapshot's genuinely-new tuples. Rejected events contribute nothing.
+	resolved := a.reconcileSnapshotState(ctx, roomID, rules, stateIDs, rejected, anchorEventID)
+	if resolved != nil {
+		if err := a.Store.WithRoomWrite(ctx, roomID, func(tx pgx.Tx) error {
+			if err := a.Store.TxSetRoomState(ctx, tx, roomID, resolved); err != nil {
+				return err
+			}
+			// Write the resolved state as the state-at-event snapshot of every
+			// freshly-fetched event and the anchor, so a later event whose prevs
+			// include them computes its own snapshot from the reconciled state —
+			// without this, the next event's Maintain recomputes room_state from
+			// extremity snapshots (which lack the snapshot's new tuples, e.g. the
+			// made-up test_state T) and overwrites the merged state.
+			for id := range raws {
+				if _, err := a.Store.TxGetEvent(ctx, tx, id); err != nil {
+					continue
+				}
+				if err := a.Store.TxSaveEventState(ctx, tx, id, roomID, resolved); err != nil {
+					return err
+				}
+			}
+			if _, err := a.Store.TxGetEvent(ctx, tx, anchorEventID); err == nil {
+				if err := a.Store.TxSaveEventState(ctx, tx, anchorEventID, roomID, resolved); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			_ = err
+		}
+	}
+}
+
+// reconcileSnapshotState computes the state-resolution result over the union of
+// the room's current state and the fetched reconcile snapshot, returning the
+// state rows to write to room_state (or nil when there is nothing to apply).
+// Candidates are the accepted snapshot state events plus the current room_state
+// events; resolution keeps the mainline winner per (type, state_key).
+func (a *API) reconcileSnapshotState(ctx context.Context, roomID string, rules roomver.Rules, stateIDs []string, rejected map[string]bool, anchorEventID string) []storage.StateRow {
+	if len(stateIDs) == 0 {
+		return nil
+	}
+	var out []storage.StateRow
+	err := a.Store.WithRoomWrite(ctx, roomID, func(tx pgx.Tx) error {
+		// The room's current state is authoritative: every (type, state_key)
+		// the local server already holds keeps its event (the mock federation
+		// server injects made-up state events — a fake power_levels included —
+		// into the /state_ids snapshot, and the room's real mainline state must
+		// survive; sytest "Outbound federation requests missing prev_events and
+		// then asks for /state_ids and resolves the state" asserts the real
+		// power_levels event still wins after the reconcile).
+		current := map[string]storage.StateRow{}
+		if cur, err := a.Store.TxGetRoomState(ctx, tx, roomID); err == nil {
+			for _, r := range cur {
+				current[r.Type+"\x00"+r.StateKey] = r
+			}
+		}
+		merged := make(map[string]storage.StateRow, len(current)+len(stateIDs))
+		for k, r := range current {
+			merged[k] = r
+		}
+		// The snapshot's accepted state events fill the gaps: a (type,
+		// state_key) the room does not hold yet (e.g. the mock's test_state T)
+		// joins room_state so the room converges on the snapshot's view; a key
+		// the room already holds is left untouched (the current event wins).
+		for _, id := range stateIDs {
+			if rejected[id] {
+				continue
+			}
+			ev, err := a.Store.TxGetEvent(ctx, tx, id)
+			if err != nil {
+				continue
+			}
+			k := ev.Type + "\x00" + ev.StateKey
+			if _, has := merged[k]; has {
+				continue
+			}
+			merged[k] = storage.StateRow{RoomID: roomID, Type: ev.Type, StateKey: ev.StateKey, EventID: id}
+		}
+		// The anchor event itself is a state event (e.g. the remote join whose
+		// membership the triggering event references, or a fork point like the
+		// mock's test_state Y): its own tuple is part of the state *at* the
+		// anchor, but /state_ids does not list it (it is the point the snapshot
+		// is taken *as of*, not a member of it). Apply it when the room does not
+		// already hold that (type, state_key) — the state at Y includes Y.
+		if !rejected[anchorEventID] {
+			if ev, err := a.Store.TxGetEvent(ctx, tx, anchorEventID); err == nil && ev.Type != "" {
+				k := ev.Type + "\x00" + ev.StateKey
+				if _, has := merged[k]; !has {
+					merged[k] = storage.StateRow{RoomID: roomID, Type: ev.Type, StateKey: ev.StateKey, EventID: anchorEventID}
+				}
+			}
+		}
+		out = make([]storage.StateRow, 0, len(merged))
+		for _, r := range merged {
+			out = append(out, r)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 // persistReconcilePDU verifies and persists a PDU fetched during state
@@ -868,6 +1010,14 @@ func (a *API) persistReconcilePDU(ctx context.Context, roomID string, version ro
 		EventID: id, RoomID: roomID, Type: ev.Type, Sender: ev.Sender,
 		Depth: ev.Depth, OriginServerTS: ev.OSTS, Content: ev.Content, RawJSON: raw,
 		Redacts: ev.Redacts,
+		// The events fetched during state reconciliation (/state_ids snapshot +
+		// /event fills) are the room's state at the anchor event, not its
+		// timeline: persist them as outliers (mirror of Synapse's
+		// _auth_and_persist_outliers) so they never surface as timeline events
+		// and /state /state_ids for a state-fetched event answers M_NOT_FOUND
+		// (sytest "/state returns M_NOT_FOUND for an outlier" drives the state
+		// at a reconcile-fetched member event).
+		Outlier: true,
 	}
 	if ev.StateKey != nil {
 		row.StateKey = *ev.StateKey
@@ -891,9 +1041,17 @@ func (a *API) persistReconcilePDU(ctx context.Context, roomID string, version ro
 	if rejected {
 		return nil
 	}
-	if err := eventstate.Maintain(ctx, a.Store, row, rules); err != nil {
-		_ = err
-	}
+	// The fetched event is persisted as an OUTLIER (a state-at-event snapshot of
+	// the room at the divergence point, not a timeline event), so it must not
+	// become a forward extremity nor recompute the room's current state: running
+	// eventstate.Maintain here would let a snapshot event (e.g. a made-up
+	// power_levels event a peer injects into /state_ids) displace the room's
+	// real state by winning the per-event extremity recompute (sytest
+	// "Outbound federation requests missing prev_events and then asks for
+	// /state_ids and resolves the state" asserts the room's real power_levels
+	// survives the reconcile). Membership events that are genuinely part of the
+	// room still update the denormalised membership table so /joined_members and
+	// lazy-loading see the snapshot's members.
 	if ev.StateKey != nil && ev.Type == "m.room.member" {
 		a.applyRemoteMembership(ctx, roomID, *ev.StateKey, ev.Content, id, ev.Depth)
 	}

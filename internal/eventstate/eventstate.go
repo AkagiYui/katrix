@@ -54,6 +54,7 @@ type roomWrite interface {
 	TxSaveEventState(ctx context.Context, tx pgx.Tx, eventID, roomID string, state []storage.StateRow) error
 	TxForwardExtremities(ctx context.Context, tx pgx.Tx, roomID string) ([]storage.ForwardExtremity, error)
 	TxSetRoomState(ctx context.Context, tx pgx.Tx, roomID string, state []storage.StateRow) error
+	TxGetRoomState(ctx context.Context, tx pgx.Tx, roomID string) ([]storage.StateRow, error)
 	TxSetForwardExtremities(ctx context.Context, tx pgx.Tx, roomID string, extremities []storage.ForwardExtremity) error
 }
 
@@ -306,7 +307,20 @@ func snapshotForEventTx(ctx context.Context, store roomWrite, tx pgx.Tx, row *st
 		} else if !errors.Is(err, storage.ErrNotFound) {
 			return nil, fmt.Errorf("eventstate: load prev snapshot %s: %w", prevs[0], err)
 		} else {
-			base = map[string]string{}
+			// The prev event carries no snapshot (it is soft-failed/rejected, so
+			// it was persisted for DAG continuity without state). The event's
+			// state-at-event is the room's current state — a rejected event is
+			// not part of the real DAG, so the accepted leaves' state is what
+			// this event builds on (sytest "Room state after a rejected message
+			// event is the same as before" asserts the room state survives a
+			// rejected event between two accepted ones). Falling back to the
+			// current room_state preserves it; an empty base would cascade into
+			// recomputeCurrentStateTx overwriting room_state with nothing.
+			if cur, err := store.TxGetRoomState(ctx, tx, row.RoomID); err == nil && len(cur) > 0 {
+				base = stateRowsToMap(cur)
+			} else {
+				base = map[string]string{}
+			}
 		}
 	default:
 		// Merge: gather the union of state-event IDs across all prev snapshots.
@@ -359,7 +373,14 @@ func recomputeCurrentStateTx(ctx context.Context, store roomWrite, tx pgx.Tx, ro
 		rows, err := store.TxGetEventState(ctx, tx, exts[0].EventID)
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
-				// No snapshot yet: clear current state to be safe.
+				// The extremity (e.g. a soft-failed leaf) carries no snapshot:
+				// preserve the room's current state rather than clearing it —
+				// wiping room_state would lose the real state to a rejected
+				// event (sytest "Room state after a rejected message event is
+				// the same as before").
+				if cur, cerr := store.TxGetRoomState(ctx, tx, roomID); cerr == nil && len(cur) > 0 {
+					return store.TxSetRoomState(ctx, tx, roomID, cur)
+				}
 				return store.TxSetRoomState(ctx, tx, roomID, nil)
 			}
 			return fmt.Errorf("eventstate: load extremity snapshot: %w", err)

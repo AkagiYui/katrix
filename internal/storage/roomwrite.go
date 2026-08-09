@@ -177,6 +177,28 @@ func (s *Store) TxSetRoomState(ctx context.Context, tx pgx.Tx, roomID string, st
 	return nil
 }
 
+// TxGetRoomState is the in-transaction variant of GetState: the room's current
+// state rows (room_state). Used as the fallback state-at-event base when a
+// prev event carries no snapshot (e.g. a soft-failed predecessor), so the room's
+// real state is preserved rather than collapsed to empty.
+func (s *Store) TxGetRoomState(ctx context.Context, tx pgx.Tx, roomID string) ([]StateRow, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT room_id, type, state_key, event_id FROM room_state WHERE room_id=$1`, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []StateRow
+	for rows.Next() {
+		var r StateRow
+		if err := rows.Scan(&r.RoomID, &r.Type, &r.StateKey, &r.EventID); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // TxForwardExtremities is the in-transaction variant of ForwardExtremities.
 func (s *Store) TxForwardExtremities(ctx context.Context, tx pgx.Tx, roomID string) ([]ForwardExtremity, error) {
 	rows, err := tx.Query(ctx,

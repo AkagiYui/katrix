@@ -31,6 +31,17 @@ type API struct {
 	partialMu          sync.Mutex
 	partialStateEvents map[string]map[string]struct{} // roomID -> set of event IDs
 
+	// reconcileMu guards reconcileInFlight: the (room, anchor) pairs currently
+	// being reconciled from a remote server. Both the synchronous ingest path
+	// (which reconciles before computing the triggering event's state-at-event)
+	// and the background gap-fill path (which reconciles after get_missing_events
+	// leaves a deeper gap) can fire for the same anchor; deduplicating keeps the
+	// remote /state_ids round-trip single-shot per anchor (sytest's mock
+	// federation server answers each awaited /state_ids request once, so a
+	// duplicate reconcile 404s and races the first one).
+	reconcileMu       sync.Mutex
+	reconcileInFlight map[string]struct{}
+
 	// pushNotifier delivers HTTP push notifications for inbound events (see
 	// push.go). nil until SetPushDispatcher wires the CS API's dispatcher.
 	pushNotifier PushNotifier
@@ -56,6 +67,7 @@ func New(hs *homeserver.HS) *API {
 		eduWake:  make(chan struct{}, 1),
 
 		partialStateEvents: map[string]map[string]struct{}{},
+		reconcileInFlight:  map[string]struct{}{},
 		notaryCache:        newNotaryCache(),
 	}
 }
