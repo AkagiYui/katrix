@@ -189,9 +189,19 @@ func (c *Client) Backfill(ctx context.Context, dest, roomID string, v []string, 
 	if limit <= 0 {
 		limit = 50
 	}
-	url := c.serverBaseURL(dest) + "/_matrix/federation/v1/backfill/" + urlPathEscape(roomID) +
-		"?v=" + url.QueryEscape(strings.Join(v, ",")) + "&limit=" + strconv.Itoa(limit)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	endpoint := c.serverBaseURL(dest) + "/_matrix/federation/v1/backfill/" + urlPathEscape(roomID) + "?"
+	// Spec §GET /_matrix/federation/v1/backfill: the seeds are one `v` query
+	// parameter per event ID (repeatable), NOT a comma-joined single value. A
+	// receiver that parses `url.Query()["v"]` splits on the parameter boundary,
+	// so joining with commas would hand it one un-split ID and the backfill
+	// would come back empty.
+	q := make([]string, 0, len(v)+1)
+	for _, id := range v {
+		q = append(q, "v="+url.QueryEscape(id))
+	}
+	q = append(q, "limit="+strconv.Itoa(limit))
+	endpoint += strings.Join(q, "&")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -1036,6 +1036,21 @@ func (a *API) Backfill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	seeds := r.URL.Query()["v"]
+	// Defensive: a peer may join several IDs into one comma-separated `v` value
+	// instead of repeating the parameter (spec allows both the repeatable form
+	// and, in practice, comma-joined values). Split each value so every seed is
+	// tried independently.
+	{
+		var out []string
+		for _, s := range seeds {
+			for _, id := range strings.Split(s, ",") {
+				if id = strings.TrimSpace(id); id != "" {
+					out = append(out, id)
+				}
+			}
+		}
+		seeds = out
+	}
 	limit := 50
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 100 {
