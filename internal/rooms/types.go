@@ -216,6 +216,14 @@ type MemberContent struct {
 	JoinAuthorisedViaUsersServer string `json:"join_authorised_via_users_server,omitempty"`
 }
 
+// Profile is a user's display profile, used to populate the displayname and
+// avatar_url of their m.room.member join events (spec: a join's content carries
+// the user's profile).
+type Profile struct {
+	DisplayName string
+	AvatarURL   string
+}
+
 // ParseMember decodes m.room.member content.
 func ParseMember(raw json.RawMessage) (*MemberContent, error) {
 	var c MemberContent

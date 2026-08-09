@@ -5,8 +5,10 @@ package homeserver
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AkagiYui/katrix/internal/appservice"
@@ -33,7 +35,17 @@ type HS struct {
 	// than inside one API surface) because both the client-server handlers and
 	// the federation EDU ingest path need to read and write it.
 	Typing *syncpkg.TypingTracker
+	// touchMu guards lastTouch, a throttle map keyed by "localpart\x00deviceID"
+	// recording the last time the device's last_seen_ts was written. Authenticated
+	// requests refresh the device's last-seen at most once per interval so /whois
+	// sees live connections without hammering the database.
+	touchMu   sync.Mutex
+	lastTouch map[string]int64
 }
+
+// touchInterval is the minimum gap between two last_seen writes for the same
+// device. Requests within the interval reuse the existing row.
+const touchInterval = 30 * 1000 // 30 seconds
 
 // New constructs an HS and its notifier.
 func New(cfg *config.Config, store *storage.Store, key *crypto.SigningKey) *HS {
@@ -173,7 +185,52 @@ func (h *HS) Authenticate(r *http.Request) (*Auth, error) {
 	if h.AppServices != nil && h.AppServices.ForToken(token) != nil {
 		auth.IsAppService = true
 	}
+	// Refresh the device's last-seen so admin /whois reflects live activity
+	// (spec ConnectionInfo.last_seen). Throttled: at most one write per device
+	// per touchInterval.
+	h.touchDevice(r, tok.UserLocalpart, tok.DeviceID)
 	return auth, nil
+}
+
+// touchDevice updates a device's last_seen_ts/ip/user_agent, at most once per
+// touchInterval per device. The throttle is in-memory and best-effort: a write
+// that fails (e.g. the device row was removed mid-flight) is ignored.
+func (h *HS) touchDevice(r *http.Request, localpart, deviceID string) {
+	if deviceID == "" {
+		return
+	}
+	key := localpart + "\x00" + deviceID
+	now := h.Now()
+	h.touchMu.Lock()
+	if h.lastTouch == nil {
+		h.lastTouch = map[string]int64{}
+	}
+	last := h.lastTouch[key]
+	if now-last < touchInterval {
+		h.touchMu.Unlock()
+		return
+	}
+	h.lastTouch[key] = now
+	h.touchMu.Unlock()
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	ip := r.RemoteAddr
+	if err == nil {
+		ip = host
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i >= 0 {
+			ip = strings.TrimSpace(xff[:i])
+		} else {
+			ip = strings.TrimSpace(xff)
+		}
+	}
+	_ = h.Store.UpsertDevice(r.Context(), storage.Device{
+		UserLocalpart: localpart,
+		DeviceID:      deviceID,
+		LastSeenTS:    now,
+		LastSeenIP:    ip,
+		UserAgent:     r.UserAgent(),
+	})
 }
 
 // RequireAuth is middleware that authenticates and injects Auth into context.

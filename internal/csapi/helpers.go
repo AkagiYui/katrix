@@ -188,6 +188,7 @@ func (a *API) issueLogin(r *http.Request, localpart, deviceID, displayName strin
 		CreatedTS:     now,
 		LastSeenTS:    now,
 		LastSeenIP:    clientIP(r),
+		UserAgent:     r.UserAgent(),
 	}); err != nil {
 		return loginResult{}, httpx.ErrUnknown(err.Error())
 	}

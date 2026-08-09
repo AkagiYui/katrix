@@ -1,6 +1,7 @@
 package csapi
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/AkagiYui/katrix/internal/federation"
@@ -200,4 +201,19 @@ func (a *API) profileLocalpart(userID string) string {
 		return ""
 	}
 	return a.LocalpartOf(userID)
+}
+
+// localProfile returns a local user's display profile for embedding into their
+// m.room.member join events (spec §m.room.member: a join carries the user's
+// displayname and avatar_url). Returns nil when the user is not local or the
+// lookup fails, so callers can omit the profile fields entirely.
+func (a *API) localProfile(ctx context.Context, userID string) *rooms.Profile {
+	if !a.IsLocalUser(userID) {
+		return nil
+	}
+	u, err := a.Store.GetUser(ctx, a.LocalpartOf(userID))
+	if err != nil {
+		return nil
+	}
+	return &rooms.Profile{DisplayName: u.DisplayName, AvatarURL: u.AvatarURL}
 }

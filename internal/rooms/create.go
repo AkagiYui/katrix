@@ -178,6 +178,7 @@ func BuildInitialEvents(
 	key *crypto.SigningKey,
 	now int64,
 	stateOverrides map[string]json.RawMessage,
+	creatorProfile *Profile,
 ) (*InitialEventsResult, error) {
 	rules, ok := roomver.Get(version)
 	if !ok {
@@ -284,9 +285,21 @@ func BuildInitialEvents(
 	// event's auth_events — its presence is implied — so the creator-join
 	// references nothing and the later events reference the prior initial
 	// events only.
-	creatorJoinRaw, _ := json.Marshal(map[string]any{
+	// The creator's join event carries their profile (spec: a join's content
+	// includes the user's displayname and avatar_url), so /joined_members and
+	// lazy-loaded member events can render the profile without a separate lookup.
+	creatorJoinContent := map[string]any{
 		"membership": MembershipJoin,
-	})
+	}
+	if creatorProfile != nil {
+		if creatorProfile.DisplayName != "" {
+			creatorJoinContent["displayname"] = creatorProfile.DisplayName
+		}
+		if creatorProfile.AvatarURL != "" {
+			creatorJoinContent["avatar_url"] = creatorProfile.AvatarURL
+		}
+	}
+	creatorJoinRaw, _ := json.Marshal(creatorJoinContent)
 	creatorJoinAuth := []string{createEv.EventID()}
 	if rules.RoomIDIsCreateHash {
 		creatorJoinAuth = nil

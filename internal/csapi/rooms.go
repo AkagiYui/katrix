@@ -152,9 +152,10 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 	// collide (the same room ID). Retry with an incremented timestamp (which
 	// changes the create event's origin_server_ts and thus its hash) until the
 	// room ID is unique. Pre-v12 room IDs are random and never collide.
+	creatorProfile := a.localProfile(r.Context(), auth.UserID)
 	var roomID string
 	for attempt := 0; ; attempt++ {
-		initRes, err := rooms.BuildInitialEvents(seedRoomID, version, auth.UserID, preset, req.PowerLevelOverride, req.CreationContent, isDirect, req.Invite, a.ServerName(), a.Key, now, nil)
+		initRes, err := rooms.BuildInitialEvents(seedRoomID, version, auth.UserID, preset, req.PowerLevelOverride, req.CreationContent, isDirect, req.Invite, a.ServerName(), a.Key, now, nil, creatorProfile)
 		if err != nil {
 			// additional_creators validation failures are client errors (400).
 			if strings.Contains(err.Error(), "additional_creators") {
@@ -1494,9 +1495,10 @@ func (a *API) RoomContext(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	// events_before: up to limit events strictly older than the target,
-	// returned in chronological order (newest last). events_after: up to limit
-	// events strictly newer, in chronological order (newest last).
+	// events_before: up to limit events strictly older than the target, in
+	// reverse-chronological order (newest first, per spec §Event Context).
+	// events_after: up to limit events strictly newer, in chronological order
+	// (newest last). The store returns both in the order they are served.
 	beforeDesc, err := a.Store.EventsForRoom(r.Context(), roomID, 0, ev.StreamOrdering-1, limit, "b")
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
@@ -1512,9 +1514,10 @@ func (a *API) RoomContext(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	// Reverse the before-window (store returns newest first) and filter both.
+	// Filter both windows, preserving the served order (events_before stays
+	// newest-first, events_after stays chronological).
 	before := make([]json.RawMessage, 0, len(beforeDesc))
-	for i := len(beforeDesc) - 1; i >= 0; i-- {
+	for i := range beforeDesc {
 		e := &beforeDesc[i]
 		if !flt.keep(e) {
 			continue
@@ -2341,6 +2344,16 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 		content := map[string]any{"membership": rooms.MembershipJoin}
 		for k, v := range extra {
 			content[k] = v
+		}
+		// A join's content carries the joiner's profile (displayname/avatar_url,
+		// spec §m.room.member), so the room's member state renders it.
+		if p := a.localProfile(r.Context(), auth.UserID); p != nil {
+			if p.DisplayName != "" {
+				content["displayname"] = p.DisplayName
+			}
+			if p.AvatarURL != "" {
+				content["avatar_url"] = p.AvatarURL
+			}
 		}
 		if _, err := a.sendMemberEventWithContent(r, auth, roomID, auth.UserID, content); err != nil {
 			return nil, err

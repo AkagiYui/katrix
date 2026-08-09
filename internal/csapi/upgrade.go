@@ -126,7 +126,7 @@ func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
 		// the room, then send the tombstone referencing it.
 		creationContent["predecessor"] = map[string]any{"room_id": roomID}
 		ccRaw, _ := json.Marshal(creationContent)
-		initRes, err = rooms.BuildInitialEvents(ids.NewRoomID(a.ServerName()), version, auth.UserID, "", powerOverride, ccRaw, false, nil, a.ServerName(), a.Key, a.Now(), stateOverrides)
+		initRes, err = rooms.BuildInitialEvents(ids.NewRoomID(a.ServerName()), version, auth.UserID, "", powerOverride, ccRaw, false, nil, a.ServerName(), a.Key, a.Now(), stateOverrides, a.localProfile(r.Context(), auth.UserID))
 		if err != nil {
 			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
@@ -156,7 +156,7 @@ func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
 			"event_id": tombstoneEventID,
 		}
 		ccRaw, _ := json.Marshal(creationContent)
-		initRes, err = rooms.BuildInitialEvents(newRoomID, version, auth.UserID, "", powerOverride, ccRaw, false, nil, a.ServerName(), a.Key, a.Now(), stateOverrides)
+		initRes, err = rooms.BuildInitialEvents(newRoomID, version, auth.UserID, "", powerOverride, ccRaw, false, nil, a.ServerName(), a.Key, a.Now(), stateOverrides, a.localProfile(r.Context(), auth.UserID))
 		if err != nil {
 			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return

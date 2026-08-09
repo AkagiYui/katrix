@@ -154,28 +154,30 @@ type Device struct {
 	DisplayName   string
 	LastSeenTS    int64
 	LastSeenIP    string
+	UserAgent     string
 	CreatedTS     int64
 }
 
 // UpsertDevice creates or updates a device record. On conflict it refreshes
-// last_seen_ts/last_seen_ip but keeps the existing display_name when the caller
-// supplies an empty one (login without a new name).
+// last_seen_ts/last_seen_ip/user_agent but keeps the existing display_name when
+// the caller supplies an empty one (login without a new name).
 func (s *Store) UpsertDevice(ctx context.Context, d Device) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO devices(user_localpart, device_id, display_name, created_ts, last_seen_ts, last_seen_ip)
-		 VALUES ($1,$2,$3,$4,$4,$5)
+		`INSERT INTO devices(user_localpart, device_id, display_name, created_ts, last_seen_ts, last_seen_ip, user_agent)
+		 VALUES ($1,$2,$3,$4,$4,$5,$6)
 		 ON CONFLICT (user_localpart, device_id) DO UPDATE SET
 		     display_name=COALESCE(EXCLUDED.display_name, devices.display_name),
 		     last_seen_ts=EXCLUDED.last_seen_ts,
-		     last_seen_ip=COALESCE(NULLIF(EXCLUDED.last_seen_ip,''), devices.last_seen_ip)`,
-		d.UserLocalpart, d.DeviceID, nullString(d.DisplayName), d.CreatedTS, nullString(d.LastSeenIP))
+		     last_seen_ip=COALESCE(NULLIF(EXCLUDED.last_seen_ip,''), devices.last_seen_ip),
+		     user_agent=COALESCE(NULLIF(EXCLUDED.user_agent,''), devices.user_agent)`,
+		d.UserLocalpart, d.DeviceID, nullString(d.DisplayName), d.CreatedTS, nullString(d.LastSeenIP), nullString(d.UserAgent))
 	return err
 }
 
 // ListDevices returns all devices for a user.
 func (s *Store) ListDevices(ctx context.Context, localpart string) ([]Device, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT user_localpart, device_id, COALESCE(display_name,''), COALESCE(last_seen_ts,0), COALESCE(last_seen_ip,''), created_ts
+		`SELECT user_localpart, device_id, COALESCE(display_name,''), COALESCE(last_seen_ts,0), COALESCE(last_seen_ip,''), COALESCE(user_agent,''), created_ts
 		 FROM devices WHERE user_localpart=$1 ORDER BY created_ts`, localpart)
 	if err != nil {
 		return nil, err
@@ -184,7 +186,7 @@ func (s *Store) ListDevices(ctx context.Context, localpart string) ([]Device, er
 	var out []Device
 	for rows.Next() {
 		var d Device
-		if err := rows.Scan(&d.UserLocalpart, &d.DeviceID, &d.DisplayName, &d.LastSeenTS, &d.LastSeenIP, &d.CreatedTS); err != nil {
+		if err := rows.Scan(&d.UserLocalpart, &d.DeviceID, &d.DisplayName, &d.LastSeenTS, &d.LastSeenIP, &d.UserAgent, &d.CreatedTS); err != nil {
 			return nil, err
 		}
 		out = append(out, d)
@@ -196,9 +198,9 @@ func (s *Store) ListDevices(ctx context.Context, localpart string) ([]Device, er
 func (s *Store) GetDevice(ctx context.Context, localpart, deviceID string) (*Device, error) {
 	var d Device
 	err := s.pool.QueryRow(ctx,
-		`SELECT user_localpart, device_id, COALESCE(display_name,''), COALESCE(last_seen_ts,0), COALESCE(last_seen_ip,''), created_ts
+		`SELECT user_localpart, device_id, COALESCE(display_name,''), COALESCE(last_seen_ts,0), COALESCE(last_seen_ip,''), COALESCE(user_agent,''), created_ts
 		 FROM devices WHERE user_localpart=$1 AND device_id=$2`, localpart, deviceID,
-	).Scan(&d.UserLocalpart, &d.DeviceID, &d.DisplayName, &d.LastSeenTS, &d.LastSeenIP, &d.CreatedTS)
+	).Scan(&d.UserLocalpart, &d.DeviceID, &d.DisplayName, &d.LastSeenTS, &d.LastSeenIP, &d.UserAgent, &d.CreatedTS)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound

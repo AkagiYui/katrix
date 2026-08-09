@@ -1151,10 +1151,49 @@ func extractOpenGraph(html string) map[string]any {
 // ---- Admin API ----
 
 // AdminWhois handles GET /_matrix/client/v3/admin/whois/{userID}.
+// It reports every device of the target user, each with its sessions and the
+// connections (ip, last_seen, user_agent) seen in them (spec §Admin whois).
+// A user may whois themselves; whoising another user requires admin privileges
+// (mirror of Synapse's WhoisRestServlet).
 func (a *API) AdminWhois(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("userID")
+	auth, _ := homeserver.AuthFrom(r.Context())
+	if userID != auth.UserID && !a.isAdmin(auth) {
+		httpx.WriteError(w, httpx.ErrForbidden("admin privileges required"))
+		return
+	}
+	localpart := a.LocalpartOf(userID)
+	devices, err := a.Store.ListDevices(r.Context(), localpart)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	out := make(map[string]any, len(devices))
+	for _, d := range devices {
+		// Each device has a single session with one connection in katrix (there
+		// is no multi-login session bookkeeping); the connection mirrors the
+		// device's last-seen activity (spec ConnectionInfo).
+		conn := map[string]any{}
+		if d.LastSeenIP != "" {
+			conn["ip"] = d.LastSeenIP
+		}
+		if d.LastSeenTS != 0 {
+			conn["last_seen"] = d.LastSeenTS
+		}
+		if d.UserAgent != "" {
+			conn["user_agent"] = d.UserAgent
+		}
+		out[d.DeviceID] = map[string]any{
+			"sessions": []any{
+				map[string]any{
+					"connections": []any{conn},
+				},
+			},
+		}
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"user_id": r.PathValue("userID"),
-		"devices": map[string]any{},
+		"user_id": userID,
+		"devices": out,
 	})
 }
 
