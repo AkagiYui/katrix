@@ -640,7 +640,7 @@ func (s *Store) BackfillPoints(ctx context.Context, roomID string, limit int) ([
 		limit = 5
 	}
 	rows, err := s.pool.Query(ctx,
-		`SELECT event_id, json FROM events WHERE room_id=$1 ORDER BY stream_ordering DESC LIMIT 500`, roomID)
+		`SELECT event_id, json, outlier FROM events WHERE room_id=$1 ORDER BY stream_ordering DESC LIMIT 500`, roomID)
 	if err != nil {
 		return nil, err
 	}
@@ -654,8 +654,19 @@ func (s *Store) BackfillPoints(ctx context.Context, roomID string, limit int) ([
 	for rows.Next() {
 		var id string
 		var raw []byte
-		if err := rows.Scan(&id, &raw); err != nil {
+		var outlier bool
+		if err := rows.Scan(&id, &raw, &outlier); err != nil {
 			return nil, err
+		}
+		// Outliers (the send_join/invite state + auth chain persisted beside a
+		// remote join) are snapshots of the room at the join, not timeline
+		// events: they must never seed a backfill, and an outlier must never
+		// satisfy a prev_event reference (the join's own prev — the room's real
+		// tip — is usually absent locally, and counting a delivered state event
+		// with that ID as "known" would suppress the backfill that fetches the
+		// room's actual history).
+		if outlier {
+			continue
 		}
 		var ev struct {
 			Depth int64 `json:"depth"`
@@ -693,7 +704,7 @@ func (s *Store) BackfillPoints(ctx context.Context, roomID string, limit int) ([
 	known := map[string]bool{}
 	if len(ids) > 0 {
 		krows, err := s.pool.Query(ctx,
-			`SELECT event_id FROM events WHERE room_id=$1 AND event_id = ANY($2)`, roomID, ids)
+			`SELECT event_id FROM events WHERE room_id=$1 AND outlier=false AND event_id = ANY($2)`, roomID, ids)
 		if err != nil {
 			return nil, err
 		}
