@@ -222,13 +222,13 @@ type Device struct {
 func (s *Store) UpsertDevice(ctx context.Context, d Device) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO devices(user_localpart, device_id, display_name, created_ts, last_seen_ts, last_seen_ip, user_agent)
-		 VALUES ($1,$2,$3,$4,$4,$5,$6)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7)
 		 ON CONFLICT (user_localpart, device_id) DO UPDATE SET
 		     display_name=COALESCE(EXCLUDED.display_name, devices.display_name),
-		     last_seen_ts=EXCLUDED.last_seen_ts,
+		     last_seen_ts=COALESCE(NULLIF(EXCLUDED.last_seen_ts,0), devices.last_seen_ts),
 		     last_seen_ip=COALESCE(NULLIF(EXCLUDED.last_seen_ip,''), devices.last_seen_ip),
 		     user_agent=COALESCE(NULLIF(EXCLUDED.user_agent,''), devices.user_agent)`,
-		d.UserLocalpart, d.DeviceID, nullString(d.DisplayName), d.CreatedTS, nullString(d.LastSeenIP), nullString(d.UserAgent))
+		d.UserLocalpart, d.DeviceID, nullString(d.DisplayName), d.CreatedTS, d.LastSeenTS, nullString(d.LastSeenIP), nullString(d.UserAgent))
 	return err
 }
 
