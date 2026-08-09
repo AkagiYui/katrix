@@ -2423,13 +2423,22 @@ func (a *API) canLocalJoin(ctx context.Context, roomID, userID string) bool {
 	if a.roomIsPartial(ctx, roomID) {
 		return false
 	}
+	// The local server must actually be in the room (have a joined member) to
+	// author a local join. A server that only knows the room via an invite's
+	// stripped state has no link to the room's real DAG: a local join would
+	// fork from the invite and the joining user's history — including anything
+	// the room's other servers later backfill — would never reach them. Mirror
+	// Synapse's _should_perform_remote_join: a server that is not in the room
+	// performs a remote join (send_join against the room's servers), even for
+	// an invited user (sytest "Remote user can backfill in a room with version
+	// N" invites the remote user first; the join must still link into the real
+	// DAG or /messages comes back short).
+	if !a.Store.ServerHasJoinedMember(ctx, roomID, a.ServerName()) {
+		return false
+	}
 	// Accepting an invite: the auth rules allow the transition locally.
 	if m, err := a.Store.GetMembership(ctx, roomID, userID); err == nil && m.Membership == rooms.MembershipInvite {
 		return true
-	}
-	// The local server must actually be in the room to author a local join.
-	if !a.Store.ServerHasJoinedMember(ctx, roomID, a.ServerName()) {
-		return false
 	}
 	id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.join_rules", "")
 	if err != nil {
