@@ -116,7 +116,11 @@ func (d *pushDispatcher) deliverNotifies(ctx context.Context, roomID, eventID, e
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d.dispatchForUser(ctx, a, roomID, eventID, eventType, sender, stateKey, content, userID, localpart, res)
+			// The dispatch runs after the persisting request has returned, so the
+			// request's context is already cancelled by the time it fires. Use an
+			// independent context or every push would fail at the first store/HTTP
+			// call (sytest's push tests time out waiting for the gateway).
+			d.dispatchForUser(context.WithoutCancel(ctx), a, roomID, eventID, eventType, sender, stateKey, content, userID, localpart, res)
 		}()
 	}
 
