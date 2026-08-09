@@ -852,24 +852,23 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 // presence, plus room peers' presence. On incremental sync only peers whose
 // presence changed after the sync token are emitted; on initial sync all joined
 // room peers are emitted (the spec's "presence events for all users the client
-// shares a room with" on initial sync).
+// shares a room with" on initial sync). The user's OWN presence is treated the
+// same way: it appears on initial sync, and on incremental sync only when it
+// actually changed after the token (spec: the presence section carries events
+// for users whose presence changed — echoing an unchanged own-presence on every
+// poll would make /sync never quiesce; sytest's presence tests assert an empty
+// presence section on the follow-up sync).
 func (e *Engine) appendPresence(ctx context.Context, resp *Response, opts SyncOptions) {
-	// Own presence (always included).
-	var events []json.RawMessage
-	if p, err := e.store.GetPresence(ctx, opts.UserID); err == nil && p != nil {
-		events = append(events, presenceEvent(p))
-	}
-
-	// Peers: users sharing a joined room with the syncer.
 	peers := e.roomPeers(ctx, opts)
-	if len(peers) == 0 {
-		if len(events) > 0 {
-			resp.Presence = &PresenceResp{Events: events}
+	if len(peers) == 0 && opts.Since.Stream == 0 {
+		// Initial sync with no room peers: still echo own presence.
+		if p, err := e.store.GetPresence(ctx, opts.UserID); err == nil && p != nil {
+			resp.Presence = &PresenceResp{Events: []json.RawMessage{presenceEvent(p)}}
 		}
 		return
 	}
 
-	var userIDs []string
+	var events []json.RawMessage
 	if opts.Since.Stream > 0 {
 		// Incremental: peers whose presence changed since the token, plus peers
 		// who newly share a room (they joined one of the syncer's rooms after
@@ -885,42 +884,66 @@ func (e *Engine) appendPresence(ctx context.Context, resp *Response, opts SyncOp
 			newPeers = nil
 		}
 		seen := map[string]bool{}
+		own := false
 		for _, u := range append(changed, newPeers...) {
-			if u == opts.UserID || seen[u] || !peers[u] {
+			if seen[u] {
 				continue
 			}
 			seen[u] = true
-			userIDs = append(userIDs, u)
+			if u == opts.UserID {
+				own = true
+				continue
+			}
+			if !peers[u] {
+				continue
+			}
+			userIDs := []string{u}
+			events = append(events, presenceEvents(ctx, e.store, userIDs)...)
+		}
+		// Own presence only when it changed after the token (see doc comment).
+		if own {
+			if p, err := e.store.GetPresence(ctx, opts.UserID); err == nil && p != nil {
+				events = append(events, presenceEvent(p))
+			}
 		}
 	} else {
+		// Initial sync: own presence plus every joined room peer.
+		if p, err := e.store.GetPresence(ctx, opts.UserID); err == nil && p != nil {
+			events = append(events, presenceEvent(p))
+		}
+		var userIDs []string
 		for u := range peers {
 			if u != opts.UserID {
 				userIDs = append(userIDs, u)
 			}
 		}
+		events = append(events, presenceEvents(ctx, e.store, userIDs)...)
 	}
+	if len(events) > 0 {
+		resp.Presence = &PresenceResp{Events: events}
+	}
+}
+
+// presenceEvents renders the stored presence rows for the given user IDs. A
+// peer with no stored presence row (they have never synced with set_presence
+// online, e.g. sytest's matrix_do_and_wait_for_sync always syncs offline) still
+// has presence: the default state is "offline" with no status message (Synapse's
+// UserPresenceState default). Emitting it matters because a newly-visible peer's
+// presence must appear exactly once in the sync that makes them visible — a
+// missing row must not silently drop the event.
+func presenceEvents(ctx context.Context, store *storage.Store, userIDs []string) []json.RawMessage {
+	var out []json.RawMessage
 	for _, u := range userIDs {
-		if p, err := e.store.GetPresence(ctx, u); err == nil && p != nil {
-			events = append(events, presenceEvent(p))
+		if p, err := store.GetPresence(ctx, u); err == nil && p != nil {
+			out = append(out, presenceEvent(p))
 		} else {
-			// A peer with no stored presence row (they have never synced with
-			// set_presence online, e.g. sytest's matrix_do_and_wait_for_sync
-			// always syncs offline) still has presence: the default state is
-			// "offline" with no status message (Synapse's UserPresenceState
-			// default). Emitting it here matters because a newly-visible peer's
-			// presence must appear exactly once in the sync that makes them
-			// visible — a missing row must not silently drop the event (sytest
-			// "Newly joined room includes presence in incremental sync" expects
-			// one presence event for the room's existing member).
-			events = append(events, presenceEvent(&storage.PresenceRow{
+			out = append(out, presenceEvent(&storage.PresenceRow{
 				UserID:   u,
 				Presence: "offline",
 			}))
 		}
 	}
-	if len(events) > 0 {
-		resp.Presence = &PresenceResp{Events: events}
-	}
+	return out
 }
 
 // presenceEvent marshals a stored presence row as an m.presence client event.
