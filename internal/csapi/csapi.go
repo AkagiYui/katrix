@@ -39,6 +39,10 @@ type API struct {
 	// Module's delivery side). Set on construction; shared with the federation
 	// ingest path via SetFederation wiring.
 	push *pushDispatcher
+	// tpMeta caches third-party protocol metadata fetched from appservices
+	// (spec §Third-party networks), mirroring Synapse's short-lived AS response
+	// cache.
+	tpMeta *tpMetaCache
 	// emailValidations tracks email validation sessions created by the
 	// /requestToken endpoints (spec §3PID validation) until their confirmation
 	// link is followed or they expire.
@@ -47,7 +51,7 @@ type API struct {
 
 // New constructs the CS API surface.
 func New(hs *homeserver.HS) *API {
-	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, hs.Typing), ssConns: newSSConnStore(), push: newPushDispatcher(hs.Config.PushInsecure), emailValidations: newEmailValidationStore()}
+	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, hs.Typing), ssConns: newSSConnStore(), push: newPushDispatcher(hs.Config.PushInsecure), emailValidations: newEmailValidationStore(), tpMeta: newTPMetaCache()}
 	api.push.a = api
 	return api
 }

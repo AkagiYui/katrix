@@ -2214,29 +2214,33 @@ func writeRoomErr(w http.ResponseWriter, err error) {
 }
 
 // resolveRoomIDOrAlias resolves a room ID or alias to a room ID.
-// resolveRoomIDOrAlias resolves a room ID or alias to a room ID. A local alias
-// that is not in the directory but lies in an application service's alias
-// namespace is resolved by querying the AS (spec "Application services"
-// §Querying: "The application service SHOULD create the queried entity if it
-// desires"; sytest "Accesing an AS-hosted room alias asks the AS server").
+// resolveRoomIDOrAlias resolves a room ID or alias to a room ID. An alias in an
+// application service's namespace is resolved by querying the AS first — even
+// when the alias is already in the local directory — because the AS may
+// redirect the alias elsewhere (spec "Application services" §Querying: "the
+// homeserver must query the application service before resolving an alias in
+// the AS's namespace"; sytest "Accesing an AS-hosted room alias asks the AS
+// server" creates the alias via the AS and still expects the AS to be asked on
+// join).
 func (a *API) resolveRoomIDOrAlias(ctx context.Context, idOrAlias string) string {
 	if strings.HasPrefix(idOrAlias, "!") {
 		return idOrAlias
 	}
 	if strings.HasPrefix(idOrAlias, "#") {
-		roomID, err := a.Store.LookupAlias(ctx, idOrAlias)
-		if err == nil {
-			return roomID
-		}
 		if a.HS.AppServices != nil {
 			if reg := a.HS.AppServices.AliasMatch(idOrAlias); reg != nil {
 				client := appservice.NewClient(a.Config.FederationInsecure)
 				client.QueryAlias(ctx, reg, idOrAlias)
-				// The AS may have created the alias while answering; retry.
+				// The AS may have (re)created the alias while answering; the
+				// directory is re-checked so a mapping it just established wins.
 				if roomID2, err2 := a.Store.LookupAlias(ctx, idOrAlias); err2 == nil {
 					return roomID2
 				}
 			}
+		}
+		roomID, err := a.Store.LookupAlias(ctx, idOrAlias)
+		if err == nil {
+			return roomID
 		}
 		return ""
 	}

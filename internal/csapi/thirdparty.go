@@ -12,7 +12,11 @@ import (
 // homeserver exposes the appservices' third-party protocols to clients via
 // /thirdparty/protocols, /thirdparty/protocol/{protocol}, and the user/location
 // lookup endpoints, proxying each query to every appservice that declares the
-// protocol and merging the responses.
+// protocol and merging the responses. Merged protocol metadata is cached
+// briefly (tpMeta), mirroring Synapse's AS response cache: a client asking for
+// one protocol right after the merged listing (sytest "HS can provide query
+// metadata on a single protocol") must see the previously fetched metadata even
+// if the AS now answers an empty stub.
 
 // ThirdPartyProtocols handles GET /_matrix/client/v3/thirdparty/protocols.
 // It fetches the protocol metadata from every appservice and returns a map of
@@ -28,7 +32,7 @@ func (a *API) ThirdPartyProtocols(w http.ResponseWriter, r *http.Request) {
 	protocols := map[string]map[string]any{}
 	for _, reg := range a.HS.AppServices.All() {
 		for _, proto := range reg.Protocols {
-			meta, ok := client.ProtocolMetadata(r.Context(), reg, proto)
+			meta, ok := a.tpMetaProtocol(r, client, reg, proto)
 			if !ok {
 				continue
 			}
@@ -60,6 +64,21 @@ func (a *API) ThirdPartyProtocols(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, out)
 }
 
+// tpMetaProtocol returns an AS's protocol metadata for `proto`, consulting the
+// metadata cache first and refreshing it from the AS on a miss.
+func (a *API) tpMetaProtocol(r *http.Request, client *appservice.Client, reg *appservice.Registration, proto string) (json.RawMessage, bool) {
+	key := proto + "\x00" + reg.URL
+	if cached := a.tpMeta.get(key); cached != nil {
+		return cached, true
+	}
+	meta, ok := client.ProtocolMetadata(r.Context(), reg, proto)
+	if !ok {
+		return nil, false
+	}
+	a.tpMeta.set(key, meta)
+	return meta, true
+}
+
 // ThirdPartyProtocol handles GET /_matrix/client/v3/thirdparty/protocol/{protocol}.
 // It fetches the protocol metadata from every appservice that declares it and
 // merges the result (sytest "HS can provide query metadata on a single protocol").
@@ -83,7 +102,7 @@ func (a *API) ThirdPartyProtocol(w http.ResponseWriter, r *http.Request) {
 		if !declared {
 			continue
 		}
-		meta, ok := client.ProtocolMetadata(r.Context(), reg, protocol)
+		meta, ok := a.tpMetaProtocol(r, client, reg, protocol)
 		if !ok {
 			continue
 		}
