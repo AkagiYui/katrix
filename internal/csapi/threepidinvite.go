@@ -18,6 +18,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/rooms"
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
@@ -38,6 +39,13 @@ func (a *API) registerThirdPartyInvite(mux *http.ServeMux) {
 // revocation check) and exchanged into a member invite. A failing invite is
 // skipped (the identity server still gets a 200; the invitee simply cannot
 // join until the invite is valid — mirror of Synapse's best-effort loop).
+//
+// When the onbind arrives on a server that does not host the room (the
+// invitee's homeserver, which never joined), the exchange is forwarded to the
+// inviter's server — the m.room.third_party_invite event and the room state
+// live there (mirror of Synapse's exchange_third_party_invite else-branch →
+// forward_third_party_invite). Without the forward the pending invite would
+// never become a member invite and the invitee could not join.
 func (a *API) OnBind3PID(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Invites []struct {
@@ -55,6 +63,22 @@ func (a *API) OnBind3PID(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, inv := range req.Invites {
 		if inv.Mxid == "" || inv.RoomID == "" || len(inv.Signed) == 0 {
+			continue
+		}
+		// A room this server does not host (e.g. the invitee's server receiving
+		// the onbind): forward the exchange to the inviter's server, which holds
+		// the room's m.room.third_party_invite state. The inviter's server then
+		// persists the member invite and broadcasts it back to the room's servers
+		// (including this one), so the invitee's sync still sees it.
+		if _, err := a.Store.GetRoom(r.Context(), inv.RoomID); err != nil {
+			if a.fed != nil {
+				if d := ids.DomainOf(inv.Sender); d != "" {
+					if ferr := a.fed.Client().ExchangeThirdPartyInvite(r.Context(), d, inv.Sender, inv.Mxid, inv.RoomID, inv.Signed); ferr == nil {
+						continue
+					}
+				}
+			}
+			_ = err
 			continue
 		}
 		if err := a.exchangeThirdPartyInvite(r.Context(), inv.Sender, inv.Mxid, inv.RoomID, inv.Signed); err != nil {
@@ -139,24 +163,52 @@ func (a *API) verifyThirdPartySigned(ctx context.Context, roomID string, signedR
 	}
 
 	// Verify the signed block against every key the invite published, and check
-	// the winning key is not revoked (key_validity_url, when present).
-	raw, _ := json.Marshal(signed)
+	// the winning key is not revoked (key_validity_url, when present). The raw
+	// bytes are hashed/signed as delivered — re-marshalling the parsed struct
+	// would drop fields the identity server signed over (e.g. `sender`), making
+	// the canonical form differ from what was signed.
+	//
+	// The legacy `public_key` shortcut must not bypass the revocation check: the
+	// key it names is usually also listed in public_keys (with a
+	// key_validity_url), and a rotated-away key must reject even when the
+	// signature still verifies cryptographically (sytest "valid signature but
+	// revoked keys are rejected").
+	validityFor := func(b64 string) string {
+		for _, pk := range tpiContent.PublicKeys {
+			if pk.PublicKey == b64 {
+				return pk.KeyValidityURL
+			}
+		}
+		return ""
+	}
+	raw := signedRaw
 	checkKey := func(b64 string) bool {
 		pub, err := base64.RawStdEncoding.DecodeString(b64)
 		if err != nil || len(pub) != ed25519.PublicKeySize {
 			return false
 		}
+		ok := false
 		for _, sigBlock := range signed.Signatures {
 			for keyID, sigB64 := range sigBlock {
 				if !strings.HasPrefix(keyID, "ed25519:") {
 					continue
 				}
 				if crypto.VerifyJSONWith(sigB64, "", crypto.KeyID(keyID), ed25519.PublicKey(pub), raw) == nil {
-					return true
+					ok = true
+					break
 				}
 			}
+			if ok {
+				break
+			}
 		}
-		return false
+		if !ok {
+			return false
+		}
+		if u := validityFor(b64); u != "" {
+			return a.thirdPartyKeyValid(ctx, u, b64)
+		}
+		return true
 	}
 	verified := false
 	if tpiContent.PublicKey != "" && checkKey(tpiContent.PublicKey) {
@@ -166,7 +218,7 @@ func (a *API) verifyThirdPartySigned(ctx context.Context, roomID string, signedR
 		if verified {
 			break
 		}
-		if checkKey(pk.PublicKey) && (pk.KeyValidityURL == "" || a.thirdPartyKeyValid(ctx, pk.KeyValidityURL, pk.PublicKey)) {
+		if checkKey(pk.PublicKey) {
 			verified = true
 		}
 	}
@@ -318,6 +370,13 @@ func (a *API) persistThirdPartyMemberInvite(ctx context.Context, sender, target,
 	// deliver the invite PDU to the room's servers (including the invitee's).
 	a.notifyRoomMembers(ctx, roomID)
 	a.broadcastPDU(ctx, roomID, ev)
+	// A remote invitee's server cannot receive the invite via broadcast — it
+	// does not know the room yet. Deliver it via PUT
+	// /_matrix/federation/v2/invite/{roomID}/{eventID}, which creates the room
+	// view there (the same path the client invite flow uses).
+	if a.fed != nil && !a.IsLocalUser(target) {
+		_ = a.fed.SendRemoteInvite(ctx, roomID, target, ev, version)
+	}
 	return nil
 }
 

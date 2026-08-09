@@ -276,15 +276,6 @@ func guestAccessCanJoin(content json.RawMessage) bool {
 	return ga.GuestAccess == "can_join"
 }
 
-// thirdPartySigned is the parsed "signed" object inside an m.room.member
-// event's third_party_invite content: the identity server's signed statement
-// that the joining/invited user was validated (spec §3PID invites).
-type thirdPartySigned struct {
-	Token      string                       `json:"token"`
-	Mxid       string                       `json:"mxid"`
-	Signatures map[string]map[string]string `json:"signatures"`
-}
-
 // thirdPartyInviteContent is the content of an m.room.third_party_invite state
 // event: the public key material the identity server will use to sign eventual
 // third-party memberships.
@@ -308,13 +299,18 @@ func verifyThirdPartyInvite(memberThirdParty json.RawMessage, inviteContent json
 		return false
 	}
 	var m struct {
-		Signed thirdPartySigned `json:"signed"`
+		Signed json.RawMessage `json:"signed"`
 	}
 	if err := json.Unmarshal(memberThirdParty, &m); err != nil {
 		return false
 	}
-	signed := m.Signed
-	if signed.Token == "" || len(signed.Signatures) == 0 {
+	raw := m.Signed
+	var signed struct {
+		Token      string                       `json:"token"`
+		Mxid       string                       `json:"mxid"`
+		Signatures map[string]map[string]string `json:"signatures"`
+	}
+	if err := json.Unmarshal(raw, &signed); err != nil || signed.Token == "" || len(signed.Signatures) == 0 {
 		return false
 	}
 	var inv thirdPartyInviteContent
@@ -333,7 +329,9 @@ func verifyThirdPartyInvite(memberThirdParty json.RawMessage, inviteContent json
 	if len(keys) == 0 {
 		return false
 	}
-	raw, _ := json.Marshal(signed)
+	// Verify over the signed block as delivered — re-marshalling the parsed
+	// struct would drop fields the identity server signed over (e.g. `sender`),
+	// making the canonical form differ from what was signed.
 	for _, b64 := range keys {
 		pub, err := base64.RawStdEncoding.DecodeString(b64)
 		if err != nil {

@@ -580,3 +580,44 @@ func filenameFromContentDisposition(cd string) string {
 	}
 	return ""
 }
+
+// ExchangeThirdPartyInvite forwards a bound 3PID invite exchange to a remote
+// homeserver (POST /_matrix/federation/v1/3pid/onbind, spec §3PID invites). The
+// receiving homeserver turns the pending m.room.third_party_invite into a real
+// member invite for mxid. Used when the local server receives an onbind for a
+// room it does not host: the invite must be forwarded to a server that is in
+// the room (mirror of Synapse's forward_third_party_invite).
+func (c *Client) ExchangeThirdPartyInvite(ctx context.Context, dest, sender, mxid, roomID string, signed json.RawMessage) error {
+	body, _ := json.Marshal(map[string]any{
+		"invites": []any{
+			map[string]any{
+				"medium":  "email",
+				"address": "",
+				"sender":  sender,
+				"mxid":    mxid,
+				"room_id": roomID,
+				"signed":  json.RawMessage(signed),
+			},
+		},
+	})
+	url := c.serverBaseURL(dest) + "/_matrix/federation/v1/3pid/onbind"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = dest
+	if err := signRequestWith(req, c.originName(), c.key); err != nil {
+		return err
+	}
+	metrics.Counters.FedOutboundRequests.Add(1)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("federation: 3pid/onbind %s: %w", dest, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("federation: 3pid/onbind %s: HTTP %d", dest, resp.StatusCode)
+	}
+	return nil
+}
