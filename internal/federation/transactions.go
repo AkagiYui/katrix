@@ -2427,6 +2427,12 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 // remote membership transition: the create/join_rules/power_levels state plus
 // the sender's and target's current member events.
 func (a *API) memberStateSnapshot(r *http.Request, roomID, sender, target string) rooms.StateSnapshot {
+	return a.memberStateSnapshotCtx(r.Context(), roomID, sender, target)
+}
+
+// memberStateSnapshotCtx is the context-based form of memberStateSnapshot (the
+// gap-fill / state-reconcile paths have no *http.Request).
+func (a *API) memberStateSnapshotCtx(ctx context.Context, roomID, sender, target string) rooms.StateSnapshot {
 	var st rooms.StateSnapshot
 	for _, tc := range []struct {
 		typ, sk string
@@ -2438,8 +2444,8 @@ func (a *API) memberStateSnapshot(r *http.Request, roomID, sender, target string
 		{"m.room.guest_access", "", &st.GuestAccess},
 		{"m.room.member", sender, &st.SenderMember},
 	} {
-		if id, err := a.Store.GetStateEvent(r.Context(), roomID, tc.typ, tc.sk); err == nil {
-			if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
+		if id, err := a.Store.GetStateEvent(ctx, roomID, tc.typ, tc.sk); err == nil {
+			if ev, err := a.Store.GetEvent(ctx, id); err == nil {
 				*tc.dst = ev.Content
 				if tc.typ == "m.room.create" {
 					st.CreateSender = ev.Sender
@@ -2448,8 +2454,8 @@ func (a *API) memberStateSnapshot(r *http.Request, roomID, sender, target string
 		}
 	}
 	if target != sender && target != "" {
-		if id, err := a.Store.GetStateEvent(r.Context(), roomID, "m.room.member", target); err == nil {
-			if ev, err := a.Store.GetEvent(r.Context(), id); err == nil {
+		if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.member", target); err == nil {
+			if ev, err := a.Store.GetEvent(ctx, id); err == nil {
 				st.TargetMember = ev.Content
 			}
 		}

@@ -203,7 +203,7 @@ func (a *API) FetchEventRelationships(ctx context.Context, roomID string, req Ev
 			rules, ok := roomver.Get(version)
 			if ok {
 				for _, rawEv := range append(out.AuthChain, out.Events...) {
-					_ = a.persistVerifiedPDU(ctx, roomID, version, rules, rawEv)
+					_ = a.persistVerifiedPDU(ctx, roomID, version, rules, rawEv, false)
 				}
 			}
 		}

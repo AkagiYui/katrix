@@ -13,11 +13,13 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/AkagiYui/katrix/internal/canonicaljson"
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/eventstate"
 	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/metrics"
 	"github.com/AkagiYui/katrix/internal/roomver"
+	"github.com/AkagiYui/katrix/internal/rooms"
 	"github.com/AkagiYui/katrix/internal/storage"
 )
 
@@ -575,8 +577,65 @@ func (a *API) fetchMissingEventsFor(ctx context.Context, roomID string, eventID 
 	if !ok {
 		return
 	}
+	// Two passes over the response. First, decide which events are themselves
+	// poison: an event that is not canonical (room v6+; sytest "Outbound
+	// federation will ignore a missing event with bad JSON for room version 6"
+	// stuffs a fractional number into a message so it can never be fetched) or
+	// whose signature does not verify cannot be persisted, and any event that
+	// references one of them as a prev_event must be dropped too — it sits on a
+	// parent the server can never obtain, so accepting it would surface an
+	// event whose DAG link is permanently broken. An event whose unknown prev
+	// was NOT part of the response (a deeper gap, e.g. the outlier tests where
+	// the mock returns only R and Q is absent) is kept: that gap is filled by
+	// the caller's state reconcile / backfill, and dropping the event would
+	// break the trigger (S's prev R would stay unknown and S would be
+	// rejected).
+	poison := map[string]bool{}
+	valid := map[string]json.RawMessage{}
+	eventIDOf := func(raw json.RawMessage) string {
+		var ev struct {
+			EventID string `json:"event_id"`
+		}
+		_ = json.Unmarshal(raw, &ev)
+		if ev.EventID != "" {
+			return ev.EventID
+		}
+		if res := a.verifier.Verify(ctx, raw, version); res.EventID != "" {
+			return res.EventID
+		}
+		return ""
+	}
 	for _, rawEv := range out.Events {
-		_ = a.persistVerifiedPDU(ctx, roomID, version, rules, rawEv)
+		id := eventIDOf(rawEv)
+		if id == "" {
+			continue
+		}
+		if roomver.AtLeast(version, 6) {
+			if _, cerr := canonicaljson.Canonical(rawEv); cerr != nil {
+				poison[id] = true
+				continue
+			}
+		}
+		res := a.verifier.Verify(ctx, rawEv, version)
+		if res.Err != nil || (res.Signed && !res.Valid) {
+			poison[id] = true
+			continue
+		}
+		valid[id] = rawEv
+	}
+	for id, rawEv := range valid {
+		drop := false
+		for _, prev := range prevEventIDs(rawEv) {
+			if poison[prev] {
+				drop = true
+				break
+			}
+		}
+		if drop {
+			continue
+		}
+		_ = a.persistVerifiedPDU(ctx, roomID, version, rules, rawEv, true)
+		_ = id
 	}
 	// The gap is only closed when every pulled event links into the local DAG.
 	// If one of them still references prev_events we do not hold, the sending
@@ -831,6 +890,44 @@ func (a *API) reconcileStateFrom(ctx context.Context, roomID, server, anchorEven
 					changed = true
 					break
 				}
+				if authRaw, isFetched := raws[aid]; isFetched {
+					// Auth events must belong to the same room as the event they
+					// authorise (spec §Auth events). A fetched auth event that
+					// lives in a different room is a forged cross-room reference
+					// (sytest "outliers whose auth_events are in a different room
+					// are correctly rejected" builds a join whose auth_events
+					// point at a membership in another room); the event it
+					// authorises is rejected.
+					var aev struct {
+						RoomID string `json:"room_id"`
+					}
+					if json.Unmarshal(authRaw, &aev) == nil && aev.RoomID != "" && aev.RoomID != roomID {
+						rejected[id] = true
+						changed = true
+						break
+					}
+				} else {
+					// The auth event was neither fetched in this snapshot. If it
+					// is known locally but belongs to a DIFFERENT room, it is a
+					// forged cross-room reference (sytest "outliers whose
+					// auth_events are in a different room are correctly rejected"
+					// builds a join whose auth_events point at a membership in
+					// another room that IS held locally). If it is not known at
+					// all, the event cannot be authorised and is rejected
+					// (mirror of Synapse's soft-fail for an incomplete auth
+					// chain).
+					if aev, err := a.Store.GetEvent(ctx, aid); err == nil && aev != nil {
+						if aev.RoomID != "" && aev.RoomID != roomID {
+							rejected[id] = true
+							changed = true
+							break
+						}
+					} else {
+						rejected[id] = true
+						changed = true
+						break
+					}
+				}
 				if r, _ := a.Store.IsEventRejected(ctx, aid); r {
 					rejected[id] = true
 					changed = true
@@ -1041,6 +1138,27 @@ func (a *API) persistReconcilePDU(ctx context.Context, roomID string, version ro
 	if rejected {
 		return nil
 	}
+	// Auth events must belong to the same room (spec §Auth events: "The auth
+	// events must be in the same room as the event"). A reconcile-fetched event
+	// whose auth_events reference an event the store holds in a DIFFERENT room
+	// is rejected (sytest "outliers whose auth_events are in a different room
+	// are correctly rejected" drives a member event whose auth references a
+	// membership in another room — accepting it would make the sender appear a
+	// member of a room they are not in, and their subsequent messages would
+	// surface). Only events the store already holds can be cross-checked; an
+	// unknown auth event is the caller's concern (the transitive-rejection
+	// pass in reconcileStateFrom).
+	crossRoom := false
+	for _, aid := range authEventIDsFromRaw(raw) {
+		if aev, err := a.Store.GetEvent(ctx, aid); err == nil && aev != nil && aev.RoomID != "" && aev.RoomID != roomID {
+			crossRoom = true
+			break
+		}
+	}
+	if crossRoom {
+		a.Store.MarkEventRejected(ctx, id)
+		return nil
+	}
 	// The fetched event is persisted as an OUTLIER (a state-at-event snapshot of
 	// the room at the divergence point, not a timeline event), so it must not
 	// become a forward extremity nor recompute the room's current state: running
@@ -1105,7 +1223,7 @@ func (a *API) fetchAuthChainFor(ctx context.Context, roomID, eventID, origin str
 		return
 	}
 	for _, rawEv := range out.AuthChain {
-		if err := a.persistVerifiedPDU(ctx, roomID, version, rules, rawEv); err != nil {
+		if err := a.persistVerifiedPDU(ctx, roomID, version, rules, rawEv, false); err != nil {
 			log.Printf("katrix: auth chain event for %s from %s failed to persist: %v", eventID, origin, err)
 		}
 	}
@@ -1114,7 +1232,7 @@ func (a *API) fetchAuthChainFor(ctx context.Context, roomID, eventID, origin str
 // persistVerifiedPDU verifies an inbound PDU's signature and persists it,
 // maintaining state snapshots and membership. Returns an error when the event
 // is unverifiable or the insert fails.
-func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roomver.Version, rules roomver.Rules, raw json.RawMessage) error {
+func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roomver.Version, rules roomver.Rules, raw json.RawMessage, authorize bool) error {
 	var ev struct {
 		EventID  string          `json:"event_id"`
 		RoomID   string          `json:"room_id"`
@@ -1135,6 +1253,20 @@ func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roo
 	vres := a.verifier.Verify(ctx, raw, version)
 	if vres.Err != nil || (vres.Signed && !vres.Valid) {
 		return errors.New("verification failed")
+	}
+	// Room version 6+ requires events to be Canonical JSON (spec §room version
+	// 6: "homeservers should strictly enforce canonical JSON on PDUs"). A
+	// gap-filled event that is not canonical (e.g. carries a fractional number
+	// a peer smuggled into its history) is rejected, so it is never accepted
+	// into the DAG and a later event referencing it triggers a fresh
+	// get_missing_events round (sytest "Outbound federation will ignore a
+	// missing event with bad JSON for room version 6" asserts exactly this
+	// behaviour). Auth-chain events are historical state and are already
+	// signature-checked; skipping the strict check keeps them flowing.
+	if authorize && roomver.AtLeast(version, 6) {
+		if _, cerr := canonicaljson.Canonical(raw); cerr != nil {
+			return errors.New("event is not canonical JSON")
+		}
 	}
 	id := ev.EventID
 	if id == "" {
@@ -1175,6 +1307,41 @@ func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roo
 	// applied to state or membership — mirror of Synapse's transitive
 	// soft-fail for events pulled in via /event_auth or get_missing_events.
 	rejected := a.authReferencesRejected(ctx, raw)
+	// Auth events must belong to the same room (spec §Auth events): an event
+	// whose auth_events reference an event the store holds in a DIFFERENT room
+	// is rejected, so its sender never appears as a member via a forged
+	// cross-room membership and their messages never surface in /sync (sytest
+	// "outliers whose auth_events are in a different room are correctly
+	// rejected"). Unknown auth events are not cross-checkable; they are the
+	// gap-fill/auth-fetch path's concern.
+	if !rejected {
+		for _, aid := range authEventIDsFromRaw(raw) {
+			if aev, err := a.Store.GetEvent(ctx, aid); err == nil && aev != nil && aev.RoomID != "" && aev.RoomID != roomID {
+				rejected = true
+				break
+			}
+		}
+	}
+	// Authorize a gap-filled event against the room's current state: an event
+	// sent by a user who is not (and never was) a member is rejected, so it is
+	// never applied to membership or delivered to clients (sytest "outliers
+	// whose auth_events are in a different room are correctly rejected" sends a
+	// message from a user whose membership is forged in a different room —
+	// authorizing it against the real room state rejects it). Auth-chain events
+	// are NOT authorized here: they were already authenticated at the origin and
+	// may legitimately describe historical state (e.g. a member who has since
+	// left), so re-checking them against the current state would wrongly reject
+	// them.
+	if authorize && !rejected {
+		stateKey := ""
+		if ev.StateKey != nil {
+			stateKey = *ev.StateKey
+		}
+		st := a.memberStateSnapshotCtx(ctx, roomID, ev.Sender, stateKey)
+		if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, ev.StateKey != nil); err != nil {
+			rejected = true
+		}
+	}
 	if rejected {
 		a.Store.MarkEventRejected(ctx, id)
 	}
