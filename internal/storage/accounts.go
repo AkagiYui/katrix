@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -18,6 +19,7 @@ type User struct {
 	PasswordHash string
 	Admin        bool
 	Deactivated  bool
+	Erased       bool
 	IsGuest      bool
 	DisplayName  string
 	AvatarURL    string
@@ -46,9 +48,9 @@ func (s *Store) GetUser(ctx context.Context, localpart string) (*User, error) {
 	var u User
 	var pw, dn, av *string
 	err := s.pool.QueryRow(ctx,
-		`SELECT localpart, password_hash, admin, deactivated, is_guest, display_name, avatar_url, created_ts
+		`SELECT localpart, password_hash, admin, deactivated, is_guest, display_name, avatar_url, created_ts, COALESCE(erased,FALSE)
 		 FROM users WHERE localpart=$1`, localpart,
-	).Scan(&u.Localpart, &pw, &u.Admin, &u.Deactivated, &u.IsGuest, &dn, &av, &u.CreatedTS)
+	).Scan(&u.Localpart, &pw, &u.Admin, &u.Deactivated, &u.IsGuest, &dn, &av, &u.CreatedTS, &u.Erased)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -93,14 +95,70 @@ func (s *Store) SetPassword(ctx context.Context, localpart, hash string) error {
 }
 
 // Deactivate marks an account deactivated and clears its password.
-func (s *Store) Deactivate(ctx context.Context, localpart string) error {
+// Deactivate deactivates an account, optionally GDPR-erasing the user's data
+// (spec §Deactivating your account: `erase`). An erased user's events are
+// served redacted to users who were not joined at the time, and federation
+// requests for their events return redacted forms.
+func (s *Store) Deactivate(ctx context.Context, localpart string, erase bool) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `UPDATE users SET deactivated=TRUE, password_hash=NULL WHERE localpart=$1`, localpart); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE users SET deactivated=TRUE, password_hash=NULL, erased=$2 WHERE localpart=$1`, localpart, erase); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `DELETE FROM access_tokens WHERE user_localpart=$1`, localpart)
 		return err
 	})
+}
+
+// ErasedUsers returns the subset of the given (full) user IDs whose accounts
+// have requested erasure. Callers use it to serve redacted events for erased
+// senders (spec §Erasure). Local erasure flags apply: a sender's localpart is
+// matched against this server's erased-user table.
+func (s *Store) ErasedUsers(ctx context.Context, userIDs []string) (map[string]bool, error) {
+	if len(userIDs) == 0 {
+		return map[string]bool{}, nil
+	}
+	localparts := make([]string, 0, len(userIDs))
+	byLocalpart := map[string][]string{}
+	for _, id := range userIDs {
+		lp := localpartOf(id)
+		if lp == "" {
+			continue
+		}
+		localparts = append(localparts, lp)
+		byLocalpart[lp] = append(byLocalpart[lp], id)
+	}
+	if len(localparts) == 0 {
+		return map[string]bool{}, nil
+	}
+	rows, err := s.pool.Query(ctx, `SELECT localpart FROM users WHERE erased=TRUE AND localpart = ANY($1)`, localparts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var lp string
+		if err := rows.Scan(&lp); err != nil {
+			return nil, err
+		}
+		for _, id := range byLocalpart[lp] {
+			out[id] = true
+		}
+	}
+	return out, rows.Err()
+}
+
+// localpartOf extracts the localpart from a full Matrix user ID ("@local:host"
+// -> "local", "" when malformed).
+func localpartOf(userID string) string {
+	if len(userID) < 2 || userID[0] != '@' {
+		return ""
+	}
+	colon := strings.IndexByte(userID, ':')
+	if colon <= 1 {
+		return ""
+	}
+	return userID[1:colon]
 }
 
 // ---- Registration tokens ----

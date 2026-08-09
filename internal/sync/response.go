@@ -1274,6 +1274,21 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		}
 	}
 	vis, _ := eventstate.NewVisibilityEvaluator(ctx, e.store, roomID, opts.UserID, maxStream)
+	// GDPR erasure (spec §Erasure): an erased sender's events are served redacted
+	// to users who were not joined at the event's time (mirror of Synapse's
+	// _check_client_allowed_to_see_event: `sender_erased and not joined → prune`).
+	// The window's senders are checked once; the viewer's membership per event is
+	// taken from the visibility evaluator.
+	erased := map[string]bool{}
+	if len(evs) > 0 {
+		senders := make([]string, 0, len(evs))
+		for _, ev := range evs {
+			senders = append(senders, ev.Sender)
+		}
+		if es, err := e.store.ErasedUsers(ctx, senders); err == nil {
+			erased = es
+		}
+	}
 	type renderedEvent struct {
 		raw    json.RawMessage
 		send   string
@@ -1287,7 +1302,12 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		if vis != nil && !currentState[ev.EventID] && !vis.CanSeeRow(&ev) {
 			continue
 		}
-		raw := filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(clientEvent(&ev), &ev), &ev), ev.EventID))
+		var raw json.RawMessage
+		if erased[ev.Sender] && (vis == nil || vis.MembershipAt(ev.StreamOrdering) != "join") {
+			raw = filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(erasedClientEvent(&ev), &ev), &ev), ev.EventID))
+		} else {
+			raw = filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(clientEvent(&ev), &ev), &ev), ev.EventID))
+		}
 		rendered = append(rendered, renderedEvent{raw: raw, send: ev.Sender, stream: ev.StreamOrdering})
 	}
 	if countLimited && len(rendered) > limit {
@@ -2167,6 +2187,19 @@ func mustMarshalEvent(eventType, sender, stateKey string, content []byte, ts int
 // redaction's event ID is exposed as unsigned.redacted_by (spec: a redacted
 // event tells clients which redaction redacted it).
 func clientEvent(row *storage.EventRow) json.RawMessage {
+	return clientEventCore(row, row.Redacted)
+}
+
+// erasedClientEvent renders a client event whose sender has been erased: the
+// content is always pruned, regardless of row.Redacted (spec §Erasure — a user
+// who was not joined when the erased user's event was sent sees only its
+// redacted form). No unsigned.redacted_by is attached: there is no redaction
+// event behind the pruning.
+func erasedClientEvent(row *storage.EventRow) json.RawMessage {
+	return clientEventCore(row, true)
+}
+
+func clientEventCore(row *storage.EventRow, redact bool) json.RawMessage {
 	m := map[string]any{
 		"type":             row.Type,
 		"content":          json.RawMessage(row.Content),
@@ -2177,7 +2210,7 @@ func clientEvent(row *storage.EventRow) json.RawMessage {
 	if row.StateKey != "" || isStateTypeSync(row.Type) {
 		m["state_key"] = row.StateKey
 	}
-	if row.Redacted {
+	if redact {
 		if rules, ok := roomver.Get(roomver.Default); ok {
 			if red, err := events.Redact(row.RawJSON, rules); err == nil {
 				if c, exists := red["content"]; exists {
@@ -2185,7 +2218,7 @@ func clientEvent(row *storage.EventRow) json.RawMessage {
 				}
 			}
 		}
-		if row.RedactedBy != "" {
+		if row.Redacted && row.RedactedBy != "" {
 			unsigned, _ := json.Marshal(map[string]any{"redacted_by": row.RedactedBy})
 			// json.RawMessage (not []byte) so the marshalled unsigned object is
 			// embedded as JSON rather than base64-encoded by the outer Marshal.

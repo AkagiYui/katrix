@@ -1206,7 +1206,14 @@ func (a *API) AdminDeactivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	localpart := a.LocalpartOf(userID)
-	if err := a.Store.Deactivate(r.Context(), localpart); err != nil {
+	// An admin may erase a user's data too: the request body carries the same
+	// `erase` flag as the client deactivation endpoint (spec §Deactivating your
+	// account), serving the user's events redacted thereafter.
+	var req struct {
+		Erase bool `json:"erase"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := a.Store.Deactivate(r.Context(), localpart, req.Erase); err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}

@@ -18,6 +18,19 @@ import (
 // its algorithmically-pruned redacted form (per the room version's redaction
 // rules), so clients see the stripped content rather than the original.
 func clientEvent(row *storage.EventRow) json.RawMessage {
+	return clientEventCore(row, row.Redacted)
+}
+
+// erasedClientEvent renders a client event whose sender has been erased: the
+// content is always pruned, regardless of row.Redacted (spec §Erasure — a user
+// who was not joined when the erased user's event was sent sees only its
+// redacted form). No unsigned.redacted_by is attached: there is no redaction
+// event behind the pruning.
+func erasedClientEvent(row *storage.EventRow) json.RawMessage {
+	return clientEventCore(row, true)
+}
+
+func clientEventCore(row *storage.EventRow, redact bool) json.RawMessage {
 	m := map[string]any{
 		"type":             row.Type,
 		"content":          json.RawMessage(row.Content),
@@ -29,7 +42,7 @@ func clientEvent(row *storage.EventRow) json.RawMessage {
 	if row.StateKey != "" || isStateTypeCSAPI(row.Type) {
 		m["state_key"] = row.StateKey
 	}
-	if row.Redacted {
+	if redact {
 		// Apply the redaction algorithm to obtain the pruned content the client
 		// should see. We use the room-version redaction rules; for events whose
 		// original room version is unknown we fall back to the default rules,
@@ -43,8 +56,9 @@ func clientEvent(row *storage.EventRow) json.RawMessage {
 			}
 		}
 		// Per the spec, a redacted event carries the redaction's event ID in
-		// unsigned.redacted_by so clients can show who/what redacted it.
-		if row.RedactedBy != "" {
+		// unsigned.redacted_by so clients can show who/what redacted it. An
+		// erasure pruning has no redaction event behind it, so it carries none.
+		if row.Redacted && row.RedactedBy != "" {
 			unsigned, _ := json.Marshal(map[string]any{"redacted_by": row.RedactedBy})
 			// json.RawMessage (not []byte) so the marshalled unsigned object is
 			// embedded as JSON rather than base64-encoded by the outer Marshal.

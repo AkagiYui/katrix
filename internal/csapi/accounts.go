@@ -818,7 +818,7 @@ func (a *API) Deactivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if auth.IsAppService {
-		if err := a.Store.Deactivate(r.Context(), auth.Localpart); err != nil {
+		if err := a.Store.Deactivate(r.Context(), auth.Localpart, false); err != nil {
 			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
 		}
@@ -833,7 +833,14 @@ func (a *API) Deactivate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := a.Store.Deactivate(r.Context(), auth.Localpart); err != nil {
+	// erase=true GDPR-erases the user's data: their events are served redacted
+	// to users who were not joined at the time, and federation requests for them
+	// return redacted forms (spec §Deactivating your account).
+	var req struct {
+		Erase bool `json:"erase"`
+	}
+	_ = json.Unmarshal(body, &req)
+	if err := a.Store.Deactivate(r.Context(), auth.Localpart, req.Erase); err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}

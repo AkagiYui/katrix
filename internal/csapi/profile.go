@@ -217,3 +217,19 @@ func (a *API) localProfile(ctx context.Context, userID string) *rooms.Profile {
 	}
 	return &rooms.Profile{DisplayName: u.DisplayName, AvatarURL: u.AvatarURL}
 }
+
+// memberAt reports whether the user was joined to the room at the given stream
+// position. Used for erasure rendering: an erased sender's event is served
+// redacted to users who were not joined when it was sent.
+func (a *API) memberAt(ctx context.Context, roomID, userID string, stream int64) bool {
+	hist, err := a.Store.MemberEventsForUser(ctx, roomID, userID, stream)
+	if err != nil {
+		return false
+	}
+	for i := len(hist) - 1; i >= 0; i-- {
+		if hist[i].StreamOrdering <= stream {
+			return hist[i].Membership == "join"
+		}
+	}
+	return false
+}

@@ -1410,6 +1410,18 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 			_ = room
 		}
 	}
+	// GDPR erasure: an erased sender's events are served redacted to users who
+	// were not joined at the event's time (spec §Erasure).
+	erased := map[string]bool{}
+	if len(evs) > 0 {
+		senders := make([]string, 0, len(evs))
+		for i := range evs {
+			senders = append(senders, evs[i].Sender)
+		}
+		if es, err := a.Store.ErasedUsers(r.Context(), senders); err == nil {
+			erased = es
+		}
+	}
 	for i := range evs {
 		e := evs[i]
 		if !flt.keep(&e) {
@@ -1418,7 +1430,11 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 		if vis != nil && !vis.CanSeeRow(&e) {
 			continue
 		}
-		chunk = append(chunk, clientEvent(&e))
+		if erased[e.Sender] && (vis == nil || vis.MembershipAt(e.StreamOrdering) != "join") {
+			chunk = append(chunk, erasedClientEvent(&e))
+		} else {
+			chunk = append(chunk, clientEvent(&e))
+		}
 		senders[e.Sender] = true
 		if minTok == 0 || e.StreamOrdering < minTok {
 			minTok = e.StreamOrdering
@@ -1514,6 +1530,19 @@ func (a *API) RoomContext(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
+	// GDPR erasure: an erased sender's events are served redacted to users who
+	// were not joined at the event's time (spec §Erasure).
+	var erased map[string]bool
+	erasureSenders := make([]string, 0, len(beforeDesc)+len(afterAsc))
+	for i := range beforeDesc {
+		erasureSenders = append(erasureSenders, beforeDesc[i].Sender)
+	}
+	for i := range afterAsc {
+		erasureSenders = append(erasureSenders, afterAsc[i].Sender)
+	}
+	if es, err := a.Store.ErasedUsers(r.Context(), erasureSenders); err == nil {
+		erased = es
+	}
 	// Filter both windows, preserving the served order (events_before stays
 	// newest-first, events_after stays chronological).
 	before := make([]json.RawMessage, 0, len(beforeDesc))
@@ -1522,7 +1551,11 @@ func (a *API) RoomContext(w http.ResponseWriter, r *http.Request) {
 		if !flt.keep(e) {
 			continue
 		}
-		before = append(before, clientEvent(e))
+		if erased[e.Sender] && !a.memberAt(r.Context(), roomID, auth.UserID, e.StreamOrdering) {
+			before = append(before, erasedClientEvent(e))
+		} else {
+			before = append(before, clientEvent(e))
+		}
 	}
 	after := make([]json.RawMessage, 0, len(afterAsc))
 	for i := range afterAsc {
@@ -1530,7 +1563,11 @@ func (a *API) RoomContext(w http.ResponseWriter, r *http.Request) {
 		if !flt.keep(e) {
 			continue
 		}
-		after = append(after, clientEvent(e))
+		if erased[e.Sender] && !a.memberAt(r.Context(), roomID, auth.UserID, e.StreamOrdering) {
+			after = append(after, erasedClientEvent(e))
+		} else {
+			after = append(after, clientEvent(e))
+		}
 	}
 	// State as of the event: the state-at-event snapshot captured when the
 	// event was persisted. Lazy-load members narrows it to the membership

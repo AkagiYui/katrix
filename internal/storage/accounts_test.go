@@ -73,7 +73,7 @@ func TestDeactivateClearsPasswordAndTokens(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Deactivate(ctx, "eve"); err != nil {
+	if err := s.Deactivate(ctx, "eve", false); err != nil {
 		t.Fatal(err)
 	}
 	u, err := s.GetUser(ctx, "eve")

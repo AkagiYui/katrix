@@ -848,10 +848,25 @@ func (a *API) GetEvent(w http.ResponseWriter, r *http.Request) {
 	if a.checkServerACL(w, r, ev.RoomID) {
 		return
 	}
+	raw := ev.RawJSON
+	// GDPR erasure: an erased user's events are served redacted over federation
+	// too (spec §Erasure, mirror of Synapse's filter_events_for_server with
+	// filter_out_erased_senders: events from erased senders are pruned).
+	if es, err := a.Store.ErasedUsers(r.Context(), []string{ev.Sender}); err == nil && es[ev.Sender] {
+		if room, rerr := a.Store.GetRoom(r.Context(), ev.RoomID); rerr == nil {
+			if rules, ok := roomver.Get(roomver.Version(room.Version)); ok {
+				if red, rerr := events.Redact(raw, rules); rerr == nil {
+					if b, merr := json.Marshal(red); merr == nil {
+						raw = b
+					}
+				}
+			}
+		}
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"origin":           a.ServerName(),
 		"origin_server_ts": ev.OriginServerTS,
-		"pdus":             []json.RawMessage{ev.RawJSON},
+		"pdus":             []json.RawMessage{raw},
 	})
 }
 

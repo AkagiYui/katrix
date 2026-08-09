@@ -102,6 +102,13 @@ func (v *VisibilityEvaluator) membershipAt(stream int64) string {
 	return membership
 }
 
+// MembershipAt returns the user's most recent membership at-or-before the
+// given stream position ("leave" when none). Exported for the erasure check:
+// an erased sender's events are served redacted to users who were not joined
+// when the event was sent (spec §Erasure, mirror of Synapse's
+// _check_client_allowed_to_see_event).
+func (v *VisibilityEvaluator) MembershipAt(stream int64) string { return v.membershipAt(stream) }
+
 // CanSee reports whether the user may see an event at the given stream position
 // (with the event's type, used for the history-visibility boundary rule).
 func (v *VisibilityEvaluator) CanSee(stream int64, eventType string) bool {
