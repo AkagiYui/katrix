@@ -68,8 +68,12 @@ func (d *pushDispatcher) NotifyInbound(ctx context.Context, ev *events.Event, ro
 // deliverNotifies evaluates the event against each joined local user's push
 // rules and dispatches to their HTTP pushers. It is called after the event has
 // been persisted (and, for membership events, after the membership row
-// reflects it). The dispatch runs on a goroutine so a slow push gateway never
-// blocks the request that stored the event.
+// reflects it). The dispatch is fire-and-forget: each notification runs on its
+// own goroutine and the function returns immediately, so a slow or wedged push
+// gateway never blocks the request that stored the event (a blocked handler
+// would stall every later request on the same HTTP/1.1 keep-alive connection,
+// and sytest's push tests time out waiting for their gateway). The dispatcher
+// dedups against the federation ingest path via lastNotified before spawning.
 //
 // Rejected (soft-failed) events are never delivered (sytest "Rejected events
 // are not pushed"), and an event never notifies its own sender (the evaluator
@@ -97,7 +101,6 @@ func (d *pushDispatcher) deliverNotifies(ctx context.Context, roomID, eventID, e
 	var content map[string]any
 	_ = json.Unmarshal(contentJSON, &content)
 
-	var wg sync.WaitGroup
 	evaluate := func(userID, localpart string) {
 		if !a.IsLocalUser(userID) || userID == sender {
 			return
@@ -113,15 +116,11 @@ func (d *pushDispatcher) deliverNotifies(ctx context.Context, roomID, eventID, e
 		if !res.Notifies {
 			return
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// The dispatch runs after the persisting request has returned, so the
-			// request's context is already cancelled by the time it fires. Use an
-			// independent context or every push would fail at the first store/HTTP
-			// call (sytest's push tests time out waiting for the gateway).
-			d.dispatchForUser(context.WithoutCancel(ctx), a, roomID, eventID, eventType, sender, stateKey, content, userID, localpart, res)
-		}()
+		// The dispatch runs after the persisting request has returned, so the
+		// request's context is already cancelled by the time it fires. Use an
+		// independent context or every push would fail at the first store/HTTP
+		// call (sytest's push tests time out waiting for the gateway).
+		go d.dispatchForUser(context.WithoutCancel(ctx), a, roomID, eventID, eventType, sender, stateKey, content, userID, localpart, res)
 	}
 
 	seen := map[string]bool{}
@@ -137,7 +136,6 @@ func (d *pushDispatcher) deliverNotifies(ctx context.Context, roomID, eventID, e
 	if eventType == "m.room.member" && stateKey != "" && stateKey != sender && !seen[stateKey] && a.IsLocalUser(stateKey) {
 		evaluate(stateKey, a.LocalpartOf(stateKey))
 	}
-	wg.Wait()
 }
 
 // dispatchForUser POSTs the notify payload to every HTTP pusher of the user.

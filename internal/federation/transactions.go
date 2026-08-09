@@ -1904,6 +1904,16 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) {
 	})
 	a.Notifier.NotifyUsers(*ev.StateKey)
 
+	// Deliver HTTP push notifications for the invite: the invitee (a local
+	// user, but not yet a joined member) must be pushed for the invite exactly
+	// like a local invite is (sytest "Invites over federation are correctly
+	// pushed" drives the pusher of a user invited from a remote server).
+	if a.pushNotifier != nil {
+		if e, perr := events.New(req.Event, version); perr == nil {
+			a.pushNotifier.NotifyInbound(r.Context(), e, ev.RoomID, row.StreamOrdering, false)
+		}
+	}
+
 	// Seed room_state with the invite event + stripped state (if the room was
 	// created by this invite; a known room's state is maintained normally).
 	if !exists {
