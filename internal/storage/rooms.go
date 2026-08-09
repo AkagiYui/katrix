@@ -1084,6 +1084,7 @@ type MemberHistoryRow struct {
 	UserID         string
 	Membership     string
 	StreamOrdering int64
+	Depth          int64
 }
 
 // HistoryVisibilityRow is one m.room.history_visibility change event in a room
@@ -1091,19 +1092,26 @@ type MemberHistoryRow struct {
 type HistoryVisibilityRow struct {
 	Visibility     string
 	StreamOrdering int64
+	Depth          int64
 }
 
 // HistoryVisibilityChanges returns the m.room.history_visibility change events
-// for a room (state_key ""), ordered by stream, with the value each set. Used
+// for a room (state_key ""), ordered by depth, with the value each set. Used
 // to evaluate per-event history visibility: the effective visibility of an
-// event is the value of the most recent change at-or-before its stream position
-// ("shared" when none precedes it).
+// event is the value of the most recent change at-or-before its DAG position
+// ("shared" when none precedes it). The rows are ordered by depth (not stream)
+// because backfilled events are stored at negative stream orderings (below the
+// room's minimum) while their history-visibility changes live at positive
+// ones: stream order would place a backfilled event *before* every change and
+// default it to the pre-change visibility, leaking pre-join history — the
+// order must be topological (depth), mirroring Synapse's
+// _get_visible_events_graph.
 func (s *Store) HistoryVisibilityChanges(ctx context.Context, roomID string) ([]HistoryVisibilityRow, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT content->>'history_visibility', stream_ordering
+		`SELECT content->>'history_visibility', stream_ordering, depth
 		 FROM events
 		 WHERE room_id=$1 AND type='m.room.history_visibility' AND (state_key='' OR state_key IS NULL)
-		 ORDER BY stream_ordering ASC`, roomID)
+		 ORDER BY depth ASC`, roomID)
 	if err != nil {
 		return nil, err
 	}
@@ -1111,7 +1119,7 @@ func (s *Store) HistoryVisibilityChanges(ctx context.Context, roomID string) ([]
 	var out []HistoryVisibilityRow
 	for rows.Next() {
 		var h HistoryVisibilityRow
-		if err := rows.Scan(&h.Visibility, &h.StreamOrdering); err != nil {
+		if err := rows.Scan(&h.Visibility, &h.StreamOrdering, &h.Depth); err != nil {
 			return nil, err
 		}
 		if h.Visibility == "" {
@@ -1127,11 +1135,11 @@ func (s *Store) HistoryVisibilityChanges(ctx context.Context, roomID string) ([]
 // per-user slice of MemberHistory used by the history-visibility filter.
 func (s *Store) MemberEventsForUser(ctx context.Context, roomID, userID string, upto int64) ([]MemberHistoryRow, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT state_key, content->>'membership', stream_ordering
+		`SELECT state_key, content->>'membership', stream_ordering, depth
 		 FROM events
 		 WHERE room_id=$1 AND type='m.room.member' AND state_key=$2
 		   AND stream_ordering<=$3
-		 ORDER BY stream_ordering ASC`, roomID, userID, upto)
+		 ORDER BY depth ASC`, roomID, userID, upto)
 	if err != nil {
 		return nil, err
 	}
@@ -1139,7 +1147,7 @@ func (s *Store) MemberEventsForUser(ctx context.Context, roomID, userID string, 
 	var out []MemberHistoryRow
 	for rows.Next() {
 		var h MemberHistoryRow
-		if err := rows.Scan(&h.UserID, &h.Membership, &h.StreamOrdering); err != nil {
+		if err := rows.Scan(&h.UserID, &h.Membership, &h.StreamOrdering, &h.Depth); err != nil {
 			return nil, err
 		}
 		if h.Membership == "" {
@@ -1193,11 +1201,11 @@ func (s *Store) MemberEvents(ctx context.Context, roomID string, upto int64) ([]
 // unsigned.membership).
 func (s *Store) MemberHistory(ctx context.Context, roomID string, upto int64) ([]MemberHistoryRow, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT state_key, content->>'membership', stream_ordering
+		`SELECT state_key, content->>'membership', stream_ordering, depth
 		 FROM events
 		 WHERE room_id=$1 AND type='m.room.member' AND state_key IS NOT NULL
 		   AND stream_ordering<=$2
-		 ORDER BY stream_ordering ASC`, roomID, upto)
+		 ORDER BY depth ASC`, roomID, upto)
 	if err != nil {
 		return nil, err
 	}
@@ -1205,7 +1213,7 @@ func (s *Store) MemberHistory(ctx context.Context, roomID string, upto int64) ([
 	var out []MemberHistoryRow
 	for rows.Next() {
 		var h MemberHistoryRow
-		if err := rows.Scan(&h.UserID, &h.Membership, &h.StreamOrdering); err != nil {
+		if err := rows.Scan(&h.UserID, &h.Membership, &h.StreamOrdering, &h.Depth); err != nil {
 			return nil, err
 		}
 		if h.Membership == "" {

@@ -1430,7 +1430,7 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 		if vis != nil && !vis.CanSeeRow(&e) {
 			continue
 		}
-		if erased[e.Sender] && (vis == nil || vis.MembershipAt(e.StreamOrdering) != "join") {
+		if erased[e.Sender] && (vis == nil || vis.MembershipAt(e.Depth) != "join") {
 			chunk = append(chunk, erasedClientEvent(&e))
 		} else {
 			chunk = append(chunk, clientEvent(&e))

@@ -358,8 +358,21 @@ func (a *API) MaybeBackfill(ctx context.Context, roomID string, limit int) int {
 	}
 	version := roomver.Version(room.Version)
 	servers := a.roomServers(ctx, roomID)
+	// The /backfill response counts the requesting server's own seeds (v)
+	// against the limit (spec §Backfilling: "the PDUs given in v and the PDUs
+	// that preceded them are retrieved, up to the total number given by the
+	// limit"), so requesting exactly the client's page limit yields a page that
+	// is short by the seed count every time — and the *next* page finds nothing
+	// (the previous fetch already consumed the visible range). Ask for the page
+	// limit plus the seed count with room to spare, mirroring Synapse's
+	// backfill which requests a fixed 100 events per call and relies on the
+	// already-known events being dropped at persist time.
+	requestLimit := limit + len(v) + 25
+	if requestLimit > 100 {
+		requestLimit = 100
+	}
 	for _, dest := range servers {
-		pdus, berr := a.client.Backfill(ctx, dest, roomID, v, limit)
+		pdus, berr := a.client.Backfill(ctx, dest, roomID, v, requestLimit)
 		if berr != nil {
 			continue
 		}

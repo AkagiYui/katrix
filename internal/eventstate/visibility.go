@@ -59,15 +59,19 @@ func NewVisibilityEvaluator(ctx context.Context, store *storage.Store, roomID, u
 }
 
 // effectiveVisibility returns the room's history_visibility in effect at the
-// given stream position (the most recent change at-or-before it, "shared" when
-// none precedes it). For an m.room.history_visibility event at that position it
-// returns the least restrictive of the old and new values (the boundary rule).
-func (v *VisibilityEvaluator) effectiveVisibility(stream int64, eventType string) string {
+// given event (the most recent change at-or-before it, "shared" when none
+// precedes it). For an m.room.history_visibility event it returns the least
+// restrictive of the old and new values (the boundary rule). Position is the
+// event's DAG depth (its stream position is meaningless for backfilled events,
+// which are stored at negative stream orderings below the room's minimum while
+// the room's visibility changes live at positive ones — a stream comparison
+// would default every backfilled event to the pre-change visibility).
+func (v *VisibilityEvaluator) effectiveVisibility(depth int64, eventType string) string {
 	vis := "shared"
-	// idx of the change at-or-before stream, if the event itself is a change.
+	// idx of the change at-or-before depth, if the event itself is a change.
 	lastIdx := -1
 	for i, c := range v.hvChanges {
-		if c.StreamOrdering <= stream {
+		if c.Depth <= depth {
 			vis = c.Visibility
 			lastIdx = i
 		} else {
@@ -89,11 +93,11 @@ func (v *VisibilityEvaluator) effectiveVisibility(stream int64, eventType string
 }
 
 // membershipAt returns the user's most recent membership at-or-before the
-// given stream position ("leave" when none).
-func (v *VisibilityEvaluator) membershipAt(stream int64) string {
+// given DAG depth ("leave" when none).
+func (v *VisibilityEvaluator) membershipAt(depth int64) string {
 	membership := "leave"
 	for _, m := range v.memberHist {
-		if m.StreamOrdering <= stream {
+		if m.Depth <= depth {
 			membership = m.Membership
 		} else {
 			break
@@ -103,22 +107,22 @@ func (v *VisibilityEvaluator) membershipAt(stream int64) string {
 }
 
 // MembershipAt returns the user's most recent membership at-or-before the
-// given stream position ("leave" when none). Exported for the erasure check:
-// an erased sender's events are served redacted to users who were not joined
-// when the event was sent (spec §Erasure, mirror of Synapse's
+// event's DAG depth ("leave" when none). Exported for the erasure check: an
+// erased sender's events are served redacted to users who were not joined when
+// the event was sent (spec §Erasure, mirror of Synapse's
 // _check_client_allowed_to_see_event).
-func (v *VisibilityEvaluator) MembershipAt(stream int64) string { return v.membershipAt(stream) }
+func (v *VisibilityEvaluator) MembershipAt(depth int64) string { return v.membershipAt(depth) }
 
-// CanSee reports whether the user may see an event at the given stream position
+// CanSee reports whether the user may see an event at the given DAG depth
 // (with the event's type, used for the history-visibility boundary rule).
-func (v *VisibilityEvaluator) CanSee(stream int64, eventType string) bool {
-	vis := v.effectiveVisibility(stream, eventType)
+func (v *VisibilityEvaluator) CanSee(depth int64, eventType string) bool {
+	vis := v.effectiveVisibility(depth, eventType)
 	if vis == "world_readable" || vis == "shared" {
 		return true
 	}
 	// invited / joined: the user must have been joined (or, for invited,
 	// invited) at the event's time.
-	switch v.membershipAt(stream) {
+	switch v.membershipAt(depth) {
 	case "join":
 		return true
 	case "invite":
@@ -128,12 +132,12 @@ func (v *VisibilityEvaluator) CanSee(stream int64, eventType string) bool {
 }
 
 // membershipBefore returns the user's most recent membership strictly before
-// the given stream position ("leave" when none). Used for the own-member-event
-// rule, where the event's own membership must not be counted as "previous".
-func (v *VisibilityEvaluator) membershipBefore(stream int64) string {
+// the given DAG depth ("leave" when none). Used for the own-member-event rule,
+// where the event's own membership must not be counted as "previous".
+func (v *VisibilityEvaluator) membershipBefore(depth int64) string {
 	membership := "leave"
 	for _, m := range v.memberHist {
-		if m.StreamOrdering < stream {
+		if m.Depth < depth {
 			membership = m.Membership
 		} else {
 			break
@@ -164,7 +168,7 @@ var membershipPriority = map[string]int{
 func (v *VisibilityEvaluator) CanSeeRow(ev *storage.EventRow) bool {
 	if ev.Type == "m.room.member" && ev.StateKey == v.userID {
 		membership := membershipOf(ev.Content)
-		prev := v.membershipBefore(ev.StreamOrdering)
+		prev := v.membershipBefore(ev.Depth)
 		if membership == "leave" && (prev == "join" || prev == "invite") {
 			return true
 		}
@@ -173,7 +177,7 @@ func (v *VisibilityEvaluator) CanSeeRow(ev *storage.EventRow) bool {
 		if membershipPriority[prev] < membershipPriority[eff] {
 			eff = prev
 		}
-		vis := v.effectiveVisibility(ev.StreamOrdering, ev.Type)
+		vis := v.effectiveVisibility(ev.Depth, ev.Type)
 		switch eff {
 		case "join":
 			return true
@@ -182,7 +186,7 @@ func (v *VisibilityEvaluator) CanSeeRow(ev *storage.EventRow) bool {
 		}
 		return false
 	}
-	return v.CanSee(ev.StreamOrdering, ev.Type)
+	return v.CanSee(ev.Depth, ev.Type)
 }
 
 // membershipOf extracts the membership value from an m.room.member event's

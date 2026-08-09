@@ -1326,7 +1326,7 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 			continue
 		}
 		var raw json.RawMessage
-		if erased[ev.Sender] && (vis == nil || vis.MembershipAt(ev.StreamOrdering) != "join") {
+		if erased[ev.Sender] && (vis == nil || vis.MembershipAt(ev.Depth) != "join") {
 			raw = filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(erasedClientEvent(&ev), &ev), &ev), ev.EventID))
 		} else {
 			raw = filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(clientEvent(&ev), &ev), &ev), ev.EventID))
