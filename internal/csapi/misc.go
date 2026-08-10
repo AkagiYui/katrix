@@ -443,13 +443,17 @@ func validatePushRuleBody(kind string, rule map[string]any) error {
 	for _, act := range actions {
 		switch a := act.(type) {
 		case string:
-			// The spec's push rule actions are a list of "string | object"
-			// items with no enumerated string values: 'notify' and
-			// 'dont_notify' are the standard ones, but any other string is a
-			// valid custom action (e.g. org.matrix.msc2625.mark_unread,
-			// MSC2625) that the server stores and passes through. Rejecting
-			// them broke the MSC2625 unread-count test, whose fixture adds a
-			// content rule with the mark_unread action.
+			// The spec's push rule actions: 'notify', 'dont_notify' and the
+			// legacy 'coalesce' are the recognised strings; anything else is
+			// rejected (mirror of Synapse's check_actions, which raises
+			// "Unrecognised action"; sytest "Trying to add push rule with
+			// invalid action fails with 400" PUTs actions ["not_an_action"]).
+			// The org.matrix.msc2625.mark_unread action (MSC2625) is the one
+			// extension katrix implements (it drives the room's
+			// org.matrix.msc2625.unread_count in /sync), so it is accepted.
+			if a != "notify" && a != "dont_notify" && a != "coalesce" && a != "org.matrix.msc2625.mark_unread" {
+				return fmt.Errorf("unrecognised action %q", a)
+			}
 		case map[string]any:
 			if _, ok := a["set_tweak"]; !ok {
 				return fmt.Errorf("action object must contain set_tweak")
