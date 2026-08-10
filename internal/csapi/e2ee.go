@@ -298,12 +298,16 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 					} else {
 						keyObj = map[string]any{}
 					}
-					if d.DisplayName != "" {
+					dn := d.DisplayName
+					if dn == "" {
+						dn = d.DeviceDisplayName
+					}
+					if dn != "" {
 						unsigned, _ := keyObj["unsigned"].(map[string]any)
 						if unsigned == nil {
 							unsigned = map[string]any{}
 						}
-						unsigned["device_display_name"] = d.DisplayName
+						unsigned["device_display_name"] = dn
 						keyObj["unsigned"] = unsigned
 					}
 					keys[d.DeviceID] = keyObj

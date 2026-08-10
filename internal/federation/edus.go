@@ -583,12 +583,16 @@ func (a *API) resyncRemoteDeviceList(ctx context.Context, userID string) {
 		if err := json.Unmarshal(d.Keys, &k); err != nil {
 			continue
 		}
-		if d.DisplayName != "" {
+		dn := d.DisplayName
+		if dn == "" {
+			dn = d.DeviceDisplayName
+		}
+		if dn != "" {
 			unsigned, _ := k["unsigned"].(map[string]any)
 			if unsigned == nil {
 				unsigned = map[string]any{}
 			}
-			unsigned["device_display_name"] = d.DisplayName
+			unsigned["device_display_name"] = dn
 			k["unsigned"] = unsigned
 		}
 		keyObj[d.DeviceID] = k

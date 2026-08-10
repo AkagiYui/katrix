@@ -367,11 +367,14 @@ type RemoteUserDevices struct {
 // RemoteUserDevice is one device in a /user/devices response. keys is the
 // device's key bundle (the object /keys/query returns per device, including
 // its own user_id/device_id/algorithms/keys/signatures); display_name is the
-// device display name carried separately by the endpoint.
+// device display name carried separately by the endpoint. Some peers (and
+// sytest's mock federation server) name the field device_display_name; both
+// forms are accepted.
 type RemoteUserDevice struct {
-	DeviceID    string          `json:"device_id"`
-	DisplayName string          `json:"display_name"`
-	Keys        json.RawMessage `json:"keys"`
+	DeviceID          string          `json:"device_id"`
+	DisplayName       string          `json:"display_name"`
+	DeviceDisplayName string          `json:"device_display_name"`
+	Keys              json.RawMessage `json:"keys"`
 }
 
 // QueryRemoteUserDevices performs GET /_matrix/federation/v1/user/devices/
