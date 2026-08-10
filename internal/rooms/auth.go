@@ -158,6 +158,16 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 		if userLevel(sender) < pl.EventLevel("m.room.power_levels", true) {
 			return fmt.Errorf("rooms: insufficient power to set power_levels")
 		}
+		// Spec: no permission in the new content may be set above the sender's
+		// own current power level ("If the new value is higher than the sender's
+		// current power level, reject"), and a permission the sender does not
+		// hold cannot be changed or removed ("If the current value is higher
+		// than the sender's current power level, reject"). The `users` map uses
+		// "greater than or equal to" for the current-value check and exempts
+		// the sender's own entry.
+		if err := checkPowerLevelsProposal(rules, sender, content, userLevel(sender), pl); err != nil {
+			return err
+		}
 		return nil
 	case "m.room.join_rules", "m.room.history_visibility", "m.room.name", "m.room.topic",
 		"m.room.avatar", "m.room.canonical_alias", "m.room.aliases", "m.room.encryption",
@@ -189,6 +199,143 @@ func Authorize(rules roomver.Rules, eventType, stateKey, sender string, content 
 		}
 		return nil
 	}
+}
+
+// checkPowerLevelsProposal enforces the spec's power-level auth rules against a
+// proposed m.room.power_levels content (spec "Authorization rules for events",
+// m.room.power_levels):
+//
+//   - For the top-level permissions (users_default, events_default, state_default,
+//     ban, redact, kick, invite): "If the current value is higher than the
+//     sender's current power level, reject. If the new value is higher than the
+//     sender's current power level, reject." A field omitted from the new
+//     content keeps its current value (not a removal), so the current-value
+//     check only applies when the field is actually changed.
+//   - For the events and notifications maps: an entry changed or removed whose
+//     current value is greater than the sender's power is rejected; an entry
+//     added or changed whose new value is greater is rejected.
+//   - For the users map (excluding the sender's own entry): an entry changed or
+//     removed whose current value is greater than *or equal to* the sender's
+//     power is rejected; an entry added or changed whose new value is greater
+//     is rejected.
+//
+// senderLevel is the sender's effective power under the pre-event power levels
+// (already creator-privileged for v12); current is the pre-event power levels.
+func checkPowerLevelsProposal(rules roomver.Rules, sender string, content json.RawMessage, senderLevel int64, current *PowerLevels) error {
+	var c struct {
+		Users         map[string]int64 `json:"users"`
+		UsersDefault  *int64           `json:"users_default"`
+		Events        map[string]int64 `json:"events"`
+		EventsDefault *int64           `json:"events_default"`
+		StateDefault  *int64           `json:"state_default"`
+		Ban           *int64           `json:"ban"`
+		Kick          *int64           `json:"kick"`
+		Redact        *int64           `json:"redact"`
+		Invite        *int64           `json:"invite"`
+		Notifications map[string]int64 `json:"notifications"`
+	}
+	if err := json.Unmarshal(content, &c); err != nil {
+		return fmt.Errorf("rooms: parse power levels: %w", err)
+	}
+
+	// Top-level scalar permissions. A value above the sender's level is
+	// rejected outright; changing a field whose current value is already above
+	// the sender's level is also rejected (the sender does not hold that
+	// permission to give away). An unchanged value (same as current) is a no-op
+	// and passes.
+	currentScalar := map[string]int64{
+		"users_default":  current.UsersDefault,
+		"events_default": current.EventsDefault,
+		"state_default":  current.StateDefault,
+		"ban":            current.Ban,
+		"kick":           current.Kick,
+		"redact":         current.Redact,
+		"invite":         current.Invite,
+	}
+	for name, v := range map[string]*int64{
+		"users_default":  c.UsersDefault,
+		"events_default": c.EventsDefault,
+		"state_default":  c.StateDefault,
+		"ban":            c.Ban,
+		"kick":           c.Kick,
+		"redact":         c.Redact,
+		"invite":         c.Invite,
+	} {
+		if v == nil {
+			continue
+		}
+		if *v == currentScalar[name] {
+			continue
+		}
+		if *v > senderLevel {
+			return fmt.Errorf("rooms: cannot set %s powerlevel higher than your own", name)
+		}
+		if currentScalar[name] > senderLevel {
+			return fmt.Errorf("rooms: cannot change %s powerlevel you do not hold", name)
+		}
+	}
+
+	// events / notifications map entries: current-value check for changes and
+	// removals, new-value check for additions and changes. Unchanged entries
+	// (same value round-tripped) are no-ops and pass.
+	checkMap := func(name string, proposed, currentMap map[string]int64) error {
+		for k, nv := range proposed {
+			cv, ok := currentMap[k]
+			if ok && cv == nv {
+				continue
+			}
+			if nv > senderLevel {
+				return fmt.Errorf("rooms: cannot set %s powerlevel for %q higher than your own", name, k)
+			}
+			if ok && cv > senderLevel {
+				return fmt.Errorf("rooms: cannot change %s powerlevel for %q you do not hold", name, k)
+			}
+		}
+		for k, cv := range currentMap {
+			if _, ok := proposed[k]; !ok && cv > senderLevel {
+				return fmt.Errorf("rooms: cannot remove %s powerlevel for %q you do not hold", name, k)
+			}
+		}
+		return nil
+	}
+	if err := checkMap("events", c.Events, current.Events); err != nil {
+		return err
+	}
+	// The notifications map is honoured from room version 6 onwards; earlier
+	// versions' auth rules do not mention it, so it is not policed there.
+	if rules.NotificationsPowerLevel {
+		if err := checkMap("notifications", c.Notifications, current.Notifications); err != nil {
+			return err
+		}
+	}
+
+	// users map: the sender's own entry is exempt; changes/removals use the
+	// "greater than or equal to" current-value rule, additions/changes the
+	// new-value rule. Unchanged entries pass.
+	for u, nv := range c.Users {
+		if u == sender {
+			continue
+		}
+		cv, ok := current.Users[u]
+		if ok && cv == nv {
+			continue
+		}
+		if nv > senderLevel {
+			return fmt.Errorf("rooms: cannot set %s's powerlevel higher than your own", u)
+		}
+		if ok && cv >= senderLevel {
+			return fmt.Errorf("rooms: cannot change %s's powerlevel (they outrank you)", u)
+		}
+	}
+	for u, cv := range current.Users {
+		if u == sender {
+			continue
+		}
+		if _, ok := c.Users[u]; !ok && cv >= senderLevel {
+			return fmt.Errorf("rooms: cannot remove %s's powerlevel (they outrank you)", u)
+		}
+	}
+	return nil
 }
 
 // ErrBadStateKey is returned by Authorize when a state event's state_key is a

@@ -242,3 +242,92 @@ func TestAuthorizeOwnedState(t *testing.T) {
 		t.Fatal("malformed user ID as state_key must be rejected")
 	}
 }
+
+// TestAuthorizePowerLevelsProposal verifies the spec's power-level auth rules
+// ("no permission may be set above the sender's own power"): a user may set
+// ban/kick/redact/notifications to a value they hold, but a value above their
+// own level is rejected with 403, and so is changing a field they do not hold.
+// Like sytest's matrix_change_room_power_levels, the proposed content is the
+// full round-tripped levels (existing users preserved), not a bare partial map.
+func TestAuthorizePowerLevelsProposal(t *testing.T) {
+	creator := "@alice:test"
+	member := "@bob:test"
+	rules, _ := roomver.Get("11")
+	create := mustJSON(t, map[string]string{"creator": creator, "room_version": "11"})
+	// Creator at 100, member at 50; defaults ban/kick/redact/state_default 50.
+	pl := mustJSON(t, map[string]any{
+		"users": map[string]int{creator: 100, member: 50},
+	})
+	joined := mustJSON(t, map[string]string{"membership": MembershipJoin})
+	st := StateSnapshot{Create: create, PowerLevel: pl, SenderMember: joined}
+	fullLevels := func(extra map[string]any) json.RawMessage {
+		m := map[string]any{
+			"users":          map[string]int{creator: 100, member: 50},
+			"users_default":  0,
+			"state_default":  50,
+			"ban":            50,
+			"kick":           50,
+			"redact":         50,
+			"invite":         0,
+			"events_default": 0,
+		}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return mustJSON(t, m)
+	}
+
+	// The member (power 50) may set ban to 25...
+	if err := Authorize(rules, "m.room.power_levels", "", member,
+		fullLevels(map[string]any{"ban": 25}), st, true); err != nil {
+		t.Fatalf("member set ban 25: %v", err)
+	}
+	// ...but not above their own level.
+	if err := Authorize(rules, "m.room.power_levels", "", member,
+		fullLevels(map[string]any{"ban": 10000000}), st, true); err == nil {
+		t.Fatal("member setting ban above own power must be rejected")
+	}
+	// Same for kick and redact.
+	for _, field := range []string{"kick", "redact"} {
+		if err := Authorize(rules, "m.room.power_levels", "", member,
+			fullLevels(map[string]any{field: 10000000}), st, true); err == nil {
+			t.Fatalf("member setting %s above own power must be rejected", field)
+		}
+	}
+	// notifications (room version 6+ honours the map).
+	if err := Authorize(rules, "m.room.power_levels", "", member,
+		fullLevels(map[string]any{"notifications": map[string]int{"room": 10000000}}), st, true); err == nil {
+		t.Fatal("member setting notifications above own power must be rejected")
+	}
+	// A user in the map who outranks the member cannot be changed or removed.
+	if err := Authorize(rules, "m.room.power_levels", "", member,
+		fullLevels(map[string]any{"users": map[string]int{creator: 90, member: 50}}), st, true); err == nil {
+		t.Fatal("member changing creator's level must be rejected")
+	}
+	// The creator (100) can set ban up to their own level, and no higher.
+	if err := Authorize(rules, "m.room.power_levels", "", creator,
+		fullLevels(map[string]any{"ban": 100}), st, true); err != nil {
+		t.Fatalf("creator set ban 100: %v", err)
+	}
+	if err := Authorize(rules, "m.room.power_levels", "", creator,
+		fullLevels(map[string]any{"ban": 10000000}), st, true); err == nil {
+		t.Fatal("creator setting ban above own power must be rejected")
+	}
+}
+
+// TestAuthorizePowerLevelsNotificationsPreV6 checks that the notifications map
+// is not policed in room versions before 6 (the spec added it there).
+func TestAuthorizePowerLevelsNotificationsPreV6(t *testing.T) {
+	creator := "@alice:test"
+	rules, _ := roomver.Get("5")
+	create := mustJSON(t, map[string]string{"creator": creator, "room_version": "5"})
+	joined := mustJSON(t, map[string]string{"membership": MembershipJoin})
+	st := StateSnapshot{Create: create, SenderMember: joined}
+	// No power_levels event yet: creator holds 100, everyone else 0. The
+	// member has no explicit level, so setting notifications is not policed in
+	// v5 (the rule did not exist).
+	if err := Authorize(rules, "m.room.power_levels", "", creator,
+		mustJSON(t, map[string]any{"notifications": map[string]int{"room": 10000000}}), st, true); err != nil {
+		t.Fatalf("v5 notifications not policed: %v", err)
+	}
+}
