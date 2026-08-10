@@ -207,13 +207,14 @@ func BuildInitialEvents(
 	if !rules.CreateOmitsCreator {
 		createContent["creator"] = creator
 	}
-	if isDirect {
-		createContent["m.federate"] = false // DMs typically non-federated
-	}
 	// Merge caller-supplied creation_content, which may carry custom keys and
 	// override m.federate. Per the spec, room_version in creation_content is
 	// ignored (the top-level room_version field controls the version); creator
-	// is set by the server.
+	// is set by the server. A room becomes non-federated only when the client
+	// asks for it via creation_content m.federate: false — the `is_direct`
+	// flag marks the invite member events, not the create event (mirror of
+	// Synapse's createRoom, which only carries m.federate through
+	// creation_content).
 	if len(creationContent) > 0 {
 		var extra map[string]json.RawMessage
 		if json.Unmarshal(creationContent, &extra) == nil {
