@@ -1,0 +1,77 @@
+Un-skip the three SyTest test groups that previously always reported "# skip"
+instead of running, so katrix's actual gaps show up as real failures:
+
+* can_change_power_levels / can_upload_media are required by several tests but
+  no test anywhere in the suite ever *proves* them (run-tests.pl only runs a
+  test whose every `requires` capability was PROVEN or PRESUMED by an earlier
+  test, else it reports "skip lack of <cap>"). Result: the power-level tests in
+  30rooms/{06invite,08levels,60version_upgrade}.pl and 90jira/SYN-343.pl always
+  skip, and so does 51media/48admin-quarantine.pl ("lack of can_upload_media").
+  Fix: declare can_change_power_levels as a prove of the (always-run,
+  PL-writing) aliases test in 30rooms/05aliases.pl, and drop the dead
+  can_upload_media/can_download_media gate from the quarantine test.
+
+* the MSC2625 mark_unread push test passed its action name as the fixture's
+  $skip_on_fail flag, so a server that rejects the org.matrix.msc2625.mark_unread
+  push-rule action silently SKIPped instead of failing (61push/03_unread_count.pl).
+  Fix: call the fixture without skip_on_fail so a missing MSC2625
+  implementation is a visible failure.
+
+These are upstream sytest issues (no implementation proves those capabilities),
+so they ship as a katrix-side patch, like the other sytest patches here. If this
+stops applying against a newer sytest develop, rebase it (the hunks are in
+stable, old test code).
+
+--- a/tests/30rooms/05aliases.pl
++++ b/tests/30rooms/05aliases.pl
+@@ -209,7 +209,13 @@ test "Regular users can add and delete aliases when m.room.aliases is restricted
+       qw( can_delete_room_alias ),
+    ],
+ 
+-   proves => [qw( can_delete_room_alias )],
++   # This test writes m.room.power_levels (events.m.room.aliases = 50) and
++   # checks it took effect, so it also proves the server can handle power-level
++   # changes. Declared here so the can_change_power_levels-gated tests in
++   # 06invite/08levels/60version_upgrade are un-skipped (no other test in the
++   # suite proves this capability; without it they all report
++   # "skip lack of can_change_power_levels").
++   proves => [qw( can_delete_room_alias can_change_power_levels )],
+ 
+    do => sub {
+       my ( $creator, $other_user, $room_id, $alias ) = @_;
+--- a/tests/51media/48admin-quarantine.pl
++++ b/tests/51media/48admin-quarantine.pl
+@@ -4,8 +4,12 @@ use File::Slurper qw( read_binary );
+ my $dir = dirname __FILE__;
+ 
+ multi_test "Can quarantine media in rooms",
+-   requires => [ local_admin_fixture(), local_user_and_room_fixtures(), remote_user_fixture(),
+-                 qw( can_upload_media can_download_media )],
++   # No capability gate: can_upload_media/can_download_media are never proved
++   # anywhere in the suite, so the old `qw( can_upload_media can_download_media )`
++   # requirement always skipped this test ("lack of can_upload_media") on every
++   # implementation. Run it unconditionally so a broken media upload/quarantine
++   # surfaces as a real failure.
++   requires => [ local_admin_fixture(), local_user_and_room_fixtures(), remote_user_fixture() ],
+ 
+    do => sub {
+       my ( $admin, $user, $room_id, $remote_user ) = @_;
+--- a/tests/61push/03_unread_count.pl
++++ b/tests/61push/03_unread_count.pl
+@@ -41,10 +41,12 @@ foreach my $action_and_counter (
+    my ( $action, $counter ) = @$action_and_counter;
+    test "Messages that $action from another user increment $counter",
+       requires => [
+-         user_with_push_rule_fixture(
+-            $action,
+-            $action eq "org.matrix.msc2625.mark_unread",
+-         ),
++         # No skip_on_fail: the mark_unread test used to pass
++         # `$action eq "org.matrix.msc2625.mark_unread"` as skip_on_fail, so a
++         # server that rejects the org.matrix.msc2625.mark_unread push-rule
++         # action silently SKIPped instead of failing. Run it unconditionally
++         # so a missing MSC2625 implementation is a visible failure.
++         user_with_push_rule_fixture( $action ),
+          local_user_fixture(),
+          qw( can_sync )
+       ],

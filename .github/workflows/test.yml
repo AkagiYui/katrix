@@ -154,6 +154,11 @@ jobs:
           # "Unknown room" warning derefs the room_id as a symbol name (strict
           # refs crash) — see sytest/patches/federation-server-unknown-room.patch.
           patch -p1 -d sytest-src < sytest/patches/federation-server-unknown-room.patch
+          # Un-skip tests that always reported "# skip": power-level and media
+          # tests gated on capabilities nothing ever proves, and the MSC2625
+          # mark_unread test that skipped itself on unsupported push actions —
+          # see sytest/patches/unmask-sytest-skips.patch.
+          patch -p1 -d sytest-src < sytest/patches/unmask-sytest-skips.patch
       # The summary step below renders the TAP report with the Go tool.
       - uses: actions/setup-go@v7
         with:
