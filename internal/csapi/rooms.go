@@ -2825,6 +2825,17 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 							continue
 						}
 						_, _ = a.Store.RecordDeviceListChange(r.Context(), m.UserID, true)
+						// The local user leaving stops tracking every remote
+						// member's device list (the shared-room relationship
+						// ends), so their cached keys are evicted: the next
+						// /keys/query must re-fetch from federation. If the
+						// local user later REJOINS, the remote user's keys are
+						// re-fetched — picking up devices added while the
+						// servers did not share a room (sytest "Server correctly
+						// resyncs when server leaves and rejoins a room").
+						if !a.IsLocalUser(m.UserID) {
+							_ = a.Store.EvictRemoteDeviceList(r.Context(), m.UserID)
+						}
 					}
 				}
 			}
