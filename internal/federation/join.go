@@ -17,6 +17,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/eventstate"
 	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/metrics"
+	"github.com/AkagiYui/katrix/internal/rooms"
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
 )
@@ -104,7 +105,7 @@ func newFedHTTPError(code int, msg string, body []byte) error {
 // one refuses the join (e.g. a server that has left the room or a stale
 // directory entry): per the spec a client/server should try each supplied
 // server until one succeeds.
-func (a *API) JoinRemoteRoom(ctx context.Context, userID, roomID string, via []string) (bool, error) {
+func (a *API) JoinRemoteRoom(ctx context.Context, userID, roomID string, via []string, profile *rooms.Profile) (bool, error) {
 	dest := pickJoinDestination(roomID, via)
 	if dest == "" {
 		return false, fmt.Errorf("federation: cannot determine a server to join %s from", roomID)
@@ -125,7 +126,7 @@ func (a *API) JoinRemoteRoom(ctx context.Context, userID, roomID string, via []s
 		if cand == "" {
 			continue
 		}
-		ok, err := a.joinRemoteRoomFrom(ctx, userID, roomID, cand)
+		ok, err := a.joinRemoteRoomFrom(ctx, userID, roomID, cand, profile)
 		if err == nil {
 			return ok, nil
 		}
@@ -167,7 +168,7 @@ func inferTemplateRoomVersion(raw json.RawMessage) roomver.Version {
 
 // joinRemoteRoomFrom performs a single make_join + send_join cycle against one
 // server and ingests the result.
-func (a *API) joinRemoteRoomFrom(ctx context.Context, userID, roomID, dest string) (bool, error) {
+func (a *API) joinRemoteRoomFrom(ctx context.Context, userID, roomID, dest string, profile *rooms.Profile) (bool, error) {
 	tpl, err := a.client.makeJoin(ctx, dest, roomID, userID)
 	if err != nil {
 		return false, err
@@ -185,7 +186,7 @@ func (a *API) joinRemoteRoomFrom(ctx context.Context, userID, roomID, dest strin
 	if !ok {
 		return false, fmt.Errorf("federation: unsupported room version %q from %s", version, dest)
 	}
-	ev, err := buildJoinEvent(tpl, userID, roomID, a.Now(), version, rules, a.Key, a.ServerName())
+	ev, err := buildJoinEvent(tpl, userID, roomID, a.Now(), version, rules, a.Key, a.ServerName(), profile)
 	if err != nil {
 		return false, err
 	}
@@ -594,13 +595,32 @@ func pickJoinDestination(roomID string, via []string) string {
 // supplies prev_events/auth_events/depth; we take those verbatim (a fresh join
 // must reference exactly what the remote told us to reference) and sign the
 // event with our own key so its origin is verifiable as this server.
-func buildJoinEvent(tpl *makeJoinResponse, userID, roomID string, now int64, version roomver.Version, rules roomver.Rules, key *crypto.SigningKey, serverName string) (*events.Event, error) {
+func buildJoinEvent(tpl *makeJoinResponse, userID, roomID string, now int64, version roomver.Version, rules roomver.Rules, key *crypto.SigningKey, serverName string, profile *rooms.Profile) (*events.Event, error) {
 	// Legacy (v1/v2) room versions reference prev/auth events as [id, hash]
 	// pairs; flatten them to IDs before building (BuildLegacy re-wraps them).
 	prev, auth := tplEventRefs(tpl.Event)
 	content := tplEventContent(tpl.Event)
 	if len(content) == 0 {
 		content = json.RawMessage(`{"membership":"join"}`)
+	}
+	// A join's content carries the joiner's profile (displayname/avatar_url,
+	// spec §m.room.member), so the remote room's member state renders it — the
+	// same profile the local join path embeds (sytest "Remote users can join
+	// room by alias" expects the joined user's own member event to carry
+	// displayname and avatar_url).
+	if profile != nil {
+		var c map[string]any
+		if json.Unmarshal(content, &c) == nil {
+			if profile.DisplayName != "" {
+				c["displayname"] = profile.DisplayName
+			}
+			if profile.AvatarURL != "" {
+				c["avatar_url"] = profile.AvatarURL
+			}
+			if merged, err := json.Marshal(c); err == nil {
+				content = merged
+			}
+		}
 	}
 	b := events.Builder{
 		Type:           "m.room.member",

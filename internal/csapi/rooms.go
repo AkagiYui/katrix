@@ -2439,7 +2439,7 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 					}
 				}
 			}
-			if partial, err := a.fed.JoinRemoteRoom(r.Context(), auth.UserID, roomID, candidates); err == nil {
+			if partial, err := a.fed.JoinRemoteRoom(r.Context(), auth.UserID, roomID, candidates, a.localProfile(r.Context(), auth.UserID)); err == nil {
 				if !partial {
 					a.broadcastDeviceListForUser(r.Context(), auth.UserID)
 				}
@@ -2475,7 +2475,7 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 	// Not a local room: federated join (make_join/send_join against a remote
 	// server, then persist the delivered room state).
 	if a.fed != nil {
-		partial, err := a.fed.JoinRemoteRoom(r.Context(), auth.UserID, roomID, via)
+		partial, err := a.fed.JoinRemoteRoom(r.Context(), auth.UserID, roomID, via, a.localProfile(r.Context(), auth.UserID))
 		if err != nil {
 			// A remote rejection (e.g. the room's join_rule is knock, or the
 			// user is banned) surfaces as the remote's 403; an unreachable or
