@@ -175,6 +175,24 @@ func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
 	a.copyMembersToNewRoom(r, auth, roomID, newRoomID, version)
 	// Move aliases + canonical alias state to the new room.
 	a.moveAliasesToNewRoom(r, auth, roomID, newRoomID, version)
+	// Restore the old room's power levels: the new room's initial PL was
+	// elevated so the upgrading user could send the copied state events, and
+	// must now come back down to match the old room's exact levels (the
+	// upgrader returns from the temporary Administrator to their original
+	// level — mirror of Synapse's upgrade_room, which sends a second
+	// power_levels event for exactly this; sytest "/upgrade preserves the
+	// power level of the upgrading user in old and new rooms"). When the
+	// elevated PL already equals the old PL (a creator-only upgrade) the
+	// idempotency check in buildAndPersistState makes this a no-op, so no
+	// duplicate event is created (sytest "/upgrade copies the power levels to
+	// the new room" reads the last PL event and expects it to equal the old
+	// room's).
+	if oldPL := a.stateContent(r.Context(), roomID, "m.room.power_levels", ""); oldPL != nil {
+		if _, err := a.buildAndPersistState(r, auth, newRoomID, "m.room.power_levels", "", oldPL); err != nil {
+			writeRoomErr(w, err)
+			return
+		}
+	}
 	// Restrict the old room's power levels (spec: stop regular users from
 	// speaking after an upgrade).
 	a.restrictOldRoomPowerLevels(r, auth, roomID)
@@ -462,8 +480,35 @@ func (a *API) restrictOldRoomPowerLevels(r *http.Request, auth *homeserver.Auth,
 	if err != nil {
 		return
 	}
-	out, _ := json.Marshal(pl)
-	a.sendStateEvent(r, auth, roomID, roomver.Version(room.Version), "m.room.power_levels", "", out)
+	// The restrict is only applied when the upgrading user holds the power to
+	// send an m.room.power_levels event in the old room. A low-power upgrader
+	// (e.g. a moderator at PL 50 upgrading per a tombstone at 50) cannot write
+	// the old room's PL (usually gated at 100), and the old room must be left
+	// untouched — mirror of Synapse's _update_upgraded_room_pls, which wraps
+	// the old-room PL send in try/except AuthError and logs a warning when the
+	// user lacks permission (sytest "/upgrade preserves the power level of the
+	// upgrading user in old and new rooms" asserts the old room's PL is
+	// unchanged after a moderator-driven upgrade).
+	if a.canSendPowerLevels(r.Context(), roomID, auth.UserID) {
+		out, _ := json.Marshal(pl)
+		a.sendStateEvent(r, auth, roomID, roomver.Version(room.Version), "m.room.power_levels", "", out)
+	}
+}
+
+// canSendPowerLevels reports whether userID holds at least the level required
+// to send an m.room.power_levels event in the room. The required level is the
+// PL event's own level, defaulting to 100 when the room has no power_levels
+// event (the spec default).
+func (a *API) canSendPowerLevels(ctx context.Context, roomID, userID string) bool {
+	required := int64(100) // spec default gates m.room.power_levels at 100
+	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.power_levels", ""); err == nil && id != "" {
+		if ev, err := a.Store.GetEvent(ctx, id); err == nil && ev != nil {
+			if pl, err := rooms.ParsePowerLevels(ev.Content); err == nil {
+				required = pl.EventLevel("m.room.power_levels", true)
+			}
+		}
+	}
+	return a.roomUserLevel(ctx, roomID, userID) >= required
 }
 
 // copyPushRulesForAllLocalUsers clones each local user's per-room push rules

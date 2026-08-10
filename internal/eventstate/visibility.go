@@ -113,12 +113,6 @@ func (v *VisibilityEvaluator) membershipAt(depth int64) string {
 // _check_client_allowed_to_see_event).
 func (v *VisibilityEvaluator) MembershipAt(depth int64) string { return v.membershipAt(depth) }
 
-// EffectiveVisibility exposes the effective history_visibility at a depth for
-// diagnostics.
-func (v *VisibilityEvaluator) EffectiveVisibility(depth int64, eventType string) string {
-	return v.effectiveVisibility(depth, eventType)
-}
-
 // CanSee reports whether the user may see an event at the given DAG depth
 // (with the event's type, used for the history-visibility boundary rule).
 func (v *VisibilityEvaluator) CanSee(depth int64, eventType string) bool {
