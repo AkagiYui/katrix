@@ -558,6 +558,17 @@ func authorizeMember(rules roomver.Rules, sender, stateKey string, content json.
 			if sender != stateKey {
 				return fmt.Errorf("rooms: only invitee may join")
 			}
+			// A guest may only join a room whose m.room.guest_access is
+			// "can_join", regardless of how the join came to be authorised (an
+			// invite does not waive guest_access — mirror of Synapse's
+			// _can_guest_join, which is checked on every guest join and denies
+			// guests whenever guest_access is not "can_join"; sytest "Guest
+			// users denied access over federation if guest access prohibited"
+			// invites a guest into a guest_access "forbidden" room and expects
+			// the join to be refused with 403).
+			if st.SenderIsGuest && !guestAccessCanJoin(st.GuestAccess) {
+				return fmt.Errorf("rooms: guest access not allowed")
+			}
 		case MembershipJoin:
 			// Already joined: re-join (e.g. profile update) ok for self only.
 			if sender != stateKey {

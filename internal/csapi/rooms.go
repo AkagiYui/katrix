@@ -2374,6 +2374,19 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 		if m, err := a.Store.GetMembership(r.Context(), roomID, auth.UserID); err == nil && m.Membership == rooms.MembershipBan {
 			return nil, newRoomError(http.StatusForbidden, "M_FORBIDDEN", "banned user cannot join")
 		}
+		// Guests may only join a room whose m.room.guest_access is "can_join"
+		// (mirror of Synapse's handler-level _can_guest_join). This gate runs
+		// before the restricted-rule/remote-join delegation below: a guest's
+		// join of a remote room is delegated to that server, which has no notion
+		// of the guest account, so the local server must enforce guest_access
+		// itself (sytest "Guest users denied access over federation if guest
+		// access prohibited" invites a guest into a guest_access "forbidden"
+		// remote room and expects the join to be refused with 403).
+		if u, err := a.Store.GetUser(r.Context(), a.LocalpartOf(auth.UserID)); err == nil && u.IsGuest {
+			if ga := a.stateContent(r.Context(), roomID, "m.room.guest_access", ""); !guestAccessAllowsJoin(ga) {
+				return nil, newRoomError(http.StatusForbidden, "M_FORBIDDEN", "guests may not join this room (guest_access is not 'can_join')")
+			}
+		}
 		// A restricted-rule join (MSC3083) the local server cannot authorise
 		// must be delegated to a remote server that can (Synapse's
 		// _should_perform_remote_join): when the joining user is not already
