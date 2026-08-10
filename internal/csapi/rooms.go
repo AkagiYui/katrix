@@ -713,7 +713,34 @@ func (a *API) RoomSend(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"delay_id": delayID})
 		return
 	}
+	// A known state event type sent via /send is a state event: it must be
+	// persisted, authorised and validated as state (the tombstone same-room
+	// check, the creator-in-power-levels check, power-level auth, ...), exactly
+	// as if the client had PUT /state. Sending it as a message would bypass
+	// those checks and store a stateless duplicate of a state event.
+	if isStateEventType(eventType) {
+		stateEventViaSend(a, w, r, auth, roomID, eventType, txnID, content)
+		return
+	}
 	ev, err := a.buildAndPersistMessage(r, auth, roomID, eventType, txnID, content)
+	if err != nil {
+		writeRoomErr(w, err)
+		return
+	}
+	_ = a.Store.RecordTxnEventID(r.Context(), auth.Localpart, roomID, txnID, ev.EventID(), a.Now())
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": ev.EventID()})
+}
+
+// stateEventViaSend routes a PUT /send/{eventType} whose type is a known state
+// event (e.g. m.room.tombstone) through the state path: state events carry a
+// state_key (empty-string key for the room-scoped ones) and must be persisted,
+// authorised and paginated as state. RoomSend delegates here so sending
+// "m.room.tombstone" via /send behaves identically to PUT /state (spec §Room
+// events: the /send endpoint "is the same as sending a state event" for state
+// types; sytest "Cannot send tombstone event that points to the same room"
+// uses /send and expects the same 400).
+func stateEventViaSend(a *API, w http.ResponseWriter, r *http.Request, auth *homeserver.Auth, roomID, eventType, txnID string, content json.RawMessage) {
+	ev, err := a.buildAndPersistState(r, auth, roomID, eventType, "", content)
 	if err != nil {
 		writeRoomErr(w, err)
 		return
@@ -2374,6 +2401,30 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 				}
 			} else {
 				candidates = via
+				if len(candidates) == 0 {
+					// The client supplied no via servers and the local server is
+					// not in the room. The servers to delegate to are the room's
+					// known members' domains — for an invite-only room that is
+					// the inviter's server. This matters for hash-derived room
+					// IDs (room version 12, MSC4291) which carry no :domain for
+					// ids.DomainOf to fall back on (sytest "Remote user can
+					// backfill in a room with version 12" invites the remote
+					// user first, then joins with no via).
+					if m, err := a.Store.Members(r.Context(), roomID, ""); err == nil {
+						seen := map[string]bool{}
+						for _, row := range m {
+							if dom := ids.DomainOf(row.UserID); dom != "" && dom != a.ServerName() && !seen[dom] {
+								seen[dom] = true
+								candidates = append(candidates, dom)
+							}
+						}
+					}
+					if len(candidates) == 0 {
+						if dom := ids.DomainOf(roomID); dom != "" {
+							candidates = append(candidates, dom)
+						}
+					}
+				}
 			}
 			if partial, err := a.fed.JoinRemoteRoom(r.Context(), auth.UserID, roomID, candidates); err == nil {
 				if !partial {
@@ -2984,6 +3035,23 @@ func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomI
 	// event, and a second create in an existing room is rejected (spec auth).
 	if eventType == "m.room.create" {
 		return nil, newRoomError(http.StatusBadRequest, "M_FORBIDDEN", "a room can only be created once")
+	}
+	// An m.room.tombstone must name a different room as its replacement: a
+	// tombstone pointing at the room it is sent in is meaningless and would
+	// loop the upgrade process (mirror of Synapse's EventValidator, which
+	// rejects it with "Tombstone cannot reference the room it was sent in";
+	// sytest "Cannot send tombstone event that points to the same room"
+	// expects a 400).
+	if eventType == "m.room.tombstone" && stateKey == "" {
+		var tc struct {
+			ReplacementRoom string `json:"replacement_room"`
+		}
+		if json.Unmarshal(content, &tc) != nil || tc.ReplacementRoom == "" {
+			return nil, newRoomError(http.StatusBadRequest, "M_BAD_JSON", "m.room.tombstone requires a replacement_room")
+		}
+		if tc.ReplacementRoom == roomID {
+			return nil, newRoomError(http.StatusBadRequest, "M_INVALID_PARAM", "tombstone cannot reference the room it was sent in")
+		}
 	}
 	if err := rooms.Authorize(rules, eventType, stateKey, auth.UserID, content, st, true); err != nil {
 		if errors.Is(err, rooms.ErrBadStateKey) {
