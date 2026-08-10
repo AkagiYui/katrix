@@ -188,7 +188,31 @@ func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
 	// the new room" reads the last PL event and expects it to equal the old
 	// room's).
 	if oldPL := a.stateContent(r.Context(), roomID, "m.room.power_levels", ""); oldPL != nil {
-		if _, err := a.buildAndPersistState(r, auth, newRoomID, "m.room.power_levels", "", oldPL); err != nil {
+		restored := oldPL
+		// For v12 (privileged-creator) rooms the creator and additional creators
+		// must not appear in the users map — their power is implicit (MSC4289).
+		// The old room's PL was created under the same rule, but the old room's
+		// *creator* may differ from the upgrader (a non-creator upgrader is
+		// listed in the old users map at their own level and stays listed; the
+		// new room's creator — the upgrader — is the only addition). Strip the
+		// new room's privileged users so the restore cannot be rejected by
+		// rejectCreatorInPowerLevels (Complement TestMSC4289PrivilegedRoomCreators
+		// _Upgrades upgrades with a creator in the old room's users map).
+		if rules.CreatorPrivileged {
+			var pl map[string]any
+			if json.Unmarshal(oldPL, &pl) == nil {
+				if users, ok := pl["users"].(map[string]any); ok {
+					delete(users, auth.UserID)
+					for _, ac := range additional {
+						delete(users, ac)
+					}
+					if updated, err := json.Marshal(pl); err == nil {
+						restored = updated
+					}
+				}
+			}
+		}
+		if _, err := a.buildAndPersistState(r, auth, newRoomID, "m.room.power_levels", "", restored); err != nil {
 			writeRoomErr(w, err)
 			return
 		}
