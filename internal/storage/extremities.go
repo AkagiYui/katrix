@@ -152,5 +152,60 @@ func (s *Store) UndoExtremitiesForRejected(ctx context.Context, roomID, eventID 
 	return nil
 }
 
+// EventIDsReferencingPrev returns the event IDs in a room whose prev_events
+// include prevID. Used after a state reconcile to refresh the state-at-event
+// snapshots of the anchor's children: an event gap-filled before the reconcile
+// holds a snapshot computed against the pre-reconcile state, and a later event
+// building on it would otherwise inherit that stale view (losing the
+// reconciled tuples). Handles both the plain ID array (v3+) and the legacy
+// [id, hash] pair forms.
+func (s *Store) EventIDsReferencingPrev(ctx context.Context, roomID, prevID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT json FROM events WHERE room_id=$1`, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var ev struct {
+			EventID    string          `json:"event_id"`
+			PrevEvents json.RawMessage `json:"prev_events"`
+		}
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			continue
+		}
+		var prevs []string
+		var idsArr []string
+		if json.Unmarshal(ev.PrevEvents, &idsArr) == nil {
+			prevs = idsArr
+		} else {
+			var pairs [][]json.RawMessage
+			if err := json.Unmarshal(ev.PrevEvents, &pairs); err != nil {
+				continue
+			}
+			for _, p := range pairs {
+				if len(p) > 0 {
+					var id string
+					if json.Unmarshal(p[0], &id) == nil && id != "" {
+						prevs = append(prevs, id)
+					}
+				}
+			}
+		}
+		for _, p := range prevs {
+			if p == prevID {
+				out = append(out, ev.EventID)
+				break
+			}
+		}
+	}
+	return out, rows.Err()
+}
+
 // ErrNoExtremities is returned when a room has no recorded extremities.
 var ErrNoExtremities = errors.New("storage: no forward extremities")

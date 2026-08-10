@@ -992,6 +992,26 @@ func (a *API) reconcileStateFrom(ctx context.Context, roomID, server, anchorEven
 					return err
 				}
 			}
+			// Refresh the state-at-event snapshot of any event whose prev_events
+			// include the anchor: such an event (e.g. one gap-filled before this
+			// reconcile) holds a snapshot computed against the pre-reconcile
+			// state, and a later event building on it would inherit that stale
+			// view — losing the reconciled tuples (sytest "Outbound federation
+			// requests missing prev_events and then asks for /state_ids and
+			// resolves the state": the made-up test_state T served in the /state_ids
+			// snapshot must survive into the room's final state even though the
+			// event between the anchor and the final event was gap-filled first).
+			children, cerr := a.Store.EventIDsReferencingPrev(ctx, roomID, anchorEventID)
+			if cerr == nil {
+				for _, cid := range children {
+					if _, err := a.Store.TxGetEvent(ctx, tx, cid); err != nil {
+						continue
+					}
+					if err := a.Store.TxSaveEventState(ctx, tx, cid, roomID, resolved); err != nil {
+						return err
+					}
+				}
+			}
 			return nil
 		}); err != nil {
 			_ = err
@@ -1119,7 +1139,12 @@ func (a *API) persistReconcilePDU(ctx context.Context, roomID string, version ro
 	if ev.StateKey != nil {
 		row.StateKey = *ev.StateKey
 	}
-	if _, err := a.Store.InsertEvent(ctx, row); err != nil {
+	// Outliers are inserted without forward-extremity maintenance: a
+	// state-fetched event is an ancestor snapshot, never a DAG leaf of the live
+	// room, so it must not displace the room's real extremities (sytest
+	// "Forward extremities remain so even after the next events are populated
+	// as outliers").
+	if _, err := a.Store.InsertOutlierEvent(ctx, row); err != nil {
 		return err
 	}
 	if rejected {

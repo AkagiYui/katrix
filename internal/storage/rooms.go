@@ -222,6 +222,44 @@ func (s *Store) InsertEvent(ctx context.Context, e *EventRow) (int64, error) {
 	return stream, nil
 }
 
+// InsertOutlierEvent persists a single event that is NOT part of the room's
+// timeline — a state-at-event snapshot / auth-chain event fetched during
+// federation state reconciliation (mirror of Synapse's
+// _auth_and_persist_outliers). Unlike InsertEvent it skips forward-extremity
+// maintenance entirely: an outlier is an ancestor snapshot, never a DAG leaf of
+// the live room, so it must not displace the room's real extremities nor
+// become one itself (sytest "Forward extremities remain so even after the next
+// events are populated as outliers" asserts the room's true extremity survives
+// an outlier fetch between two rejected events).
+func (s *Store) InsertOutlierEvent(ctx context.Context, e *EventRow) (int64, error) {
+	var stateKey *string
+	if e.StateKey != "" {
+		sk := e.StateKey
+		stateKey = &sk
+	}
+	var redacts *string
+	if e.Redacts != "" {
+		r := e.Redacts
+		redacts = &r
+	}
+	var stream int64
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO events(event_id, room_id, type, state_key, sender, depth,
+		                    origin_server_ts, content, json, redacts, redacted, outlier)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		 ON CONFLICT (event_id) DO UPDATE SET event_id=events.event_id
+		 RETURNING CASE WHEN xmax = 0 THEN stream_ordering
+		                ELSE (SELECT stream_ordering FROM events WHERE event_id = $1) END`,
+		e.EventID, e.RoomID, e.Type, stateKey, e.Sender, e.Depth,
+		e.OriginServerTS, e.Content, e.RawJSON, redacts, e.Redacted, e.Outlier,
+	).Scan(&stream)
+	if err != nil {
+		return 0, err
+	}
+	e.StreamOrdering = stream
+	return stream, nil
+}
+
 // InsertBackfillEvents persists a batch of backfilled PDUs — history older than
 // everything the local server currently holds (e.g. events predating a remote
 // join, fetched via GET /backfill). The rows are handed in newest-first order
