@@ -113,6 +113,12 @@ func (v *VisibilityEvaluator) membershipAt(depth int64) string {
 // _check_client_allowed_to_see_event).
 func (v *VisibilityEvaluator) MembershipAt(depth int64) string { return v.membershipAt(depth) }
 
+// EffectiveVisibility exposes the effective history_visibility at a depth for
+// diagnostics.
+func (v *VisibilityEvaluator) EffectiveVisibility(depth int64, eventType string) string {
+	return v.effectiveVisibility(depth, eventType)
+}
+
 // CanSee reports whether the user may see an event at the given DAG depth
 // (with the event's type, used for the history-visibility boundary rule).
 func (v *VisibilityEvaluator) CanSee(depth int64, eventType string) bool {
@@ -166,6 +172,15 @@ var membershipPriority = map[string]int{
 // previous membership, so a re-join visible under joined visibility is not
 // hidden by a subsequent leave.
 func (v *VisibilityEvaluator) CanSeeRow(ev *storage.EventRow) bool {
+	// world_readable / shared rooms show every event to everyone; the
+	// membership-gated rules below only apply under invited/joined visibility.
+	// Without this a user's own pre-join invite event is wrongly hidden in a
+	// shared room, making a backfilled /messages page come back short (sytest
+	// "Remote user can backfill in a room with version N").
+	vis := v.effectiveVisibility(ev.Depth, ev.Type)
+	if vis == "world_readable" || vis == "shared" {
+		return true
+	}
 	if ev.Type == "m.room.member" && ev.StateKey == v.userID {
 		membership := membershipOf(ev.Content)
 		prev := v.membershipBefore(ev.Depth)
@@ -177,7 +192,6 @@ func (v *VisibilityEvaluator) CanSeeRow(ev *storage.EventRow) bool {
 		if membershipPriority[prev] < membershipPriority[eff] {
 			eff = prev
 		}
-		vis := v.effectiveVisibility(ev.Depth, ev.Type)
 		switch eff {
 		case "join":
 			return true
