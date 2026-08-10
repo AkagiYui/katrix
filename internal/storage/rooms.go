@@ -741,8 +741,16 @@ func (s *Store) BackfillPoints(ctx context.Context, roomID string, limit int) ([
 	}
 	known := map[string]bool{}
 	if len(ids) > 0 {
+		// Outliers count as known here: a prev_event that is stored (even as an
+		// outlier — e.g. the room's create event or a send_join state member on a
+		// newly-joined server) means the event does NOT sit on a gap. Only a
+		// genuinely-absent prev marks a backward extremity. Excluding outliers
+		// would make every state event whose prev is the (outlier) create event
+		// look like a backfill point, seeding the remote request from an old
+		// member instead of the join above the real gap — the remote then fills
+		// the old state branch (which is already known) and the page stays short.
 		krows, err := s.pool.Query(ctx,
-			`SELECT event_id FROM events WHERE room_id=$1 AND outlier=false AND event_id = ANY($2)`, roomID, ids)
+			`SELECT event_id FROM events WHERE room_id=$1 AND event_id = ANY($2)`, roomID, ids)
 		if err != nil {
 			return nil, err
 		}
@@ -754,8 +762,15 @@ func (s *Store) BackfillPoints(ctx context.Context, roomID string, limit int) ([
 		}
 		krows.Close()
 	}
-	// The qualifying candidates, oldest (lowest depth) first: those are the
-	// events at the frontier of local knowledge, whose history is missing.
+	// The qualifying candidates, newest (highest depth) first: pagination hits
+	// the room's newest events first, so the backfill seed must be the most
+	// recent backward extremity — the event just above the gap, whose ancestry
+	// is the history the client is about to page into. Seeding from an old
+	// candidate instead (e.g. a stale member event whose prevs are missing)
+	// would ask the remote for that old branch's history — the room's early
+	// state, which is already known locally — and the page would stay short
+	// (mirror of Synapse's get_backfill_points, which returns the deepest
+	// backward extremities first).
 	var out []candidate
 	for _, c := range cands {
 		missing := false
@@ -769,7 +784,7 @@ func (s *Store) BackfillPoints(ctx context.Context, roomID string, limit int) ([
 			out = append(out, c)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].depth < out[j].depth })
+	sort.Slice(out, func(i, j int) bool { return out[i].depth > out[j].depth })
 	result := make([]string, 0, len(out))
 	for _, c := range out {
 		result = append(result, c.id)
