@@ -121,6 +121,10 @@ type JoinedRoom struct {
 type UnreadNotifications struct {
 	NotificationCount *int `json:"notification_count,omitempty"`
 	HighlightCount    *int `json:"highlight_count,omitempty"`
+	// UnreadCount (MSC2625): the number of events matched by a push rule whose
+	// actions include org.matrix.msc2625.mark_unread, since the user's read
+	// position. Rendered as org.matrix.msc2625.unread_count.
+	UnreadCount *int `json:"org.matrix.msc2625.unread_count,omitempty"`
 }
 
 // EphemeralSection holds the ephemeral events for a joined room. The spec
@@ -1707,7 +1711,7 @@ func (e *Engine) unreadCounts(ctx context.Context, roomID string, opts SyncOptio
 	}
 
 	// Main timeline: events after the main timeline's effective read position.
-	mainCount, mainHighlight := e.countFor(ctx, roomID, "", mainPos, opts, rules, joined)
+	mainCount, mainHighlight, mainUnread := e.countFor(ctx, roomID, "", mainPos, opts, rules, joined)
 	// Threads: events after each thread's own (threaded) read position, which
 	// is floored by the unthreaded position (a new unthreaded receipt reads all
 	// threads up to its position, per Synapse).
@@ -1719,20 +1723,20 @@ func (e *Engine) unreadCounts(ctx context.Context, roomID string, opts SyncOptio
 			if pos < unthreadedPos {
 				pos = unthreadedPos
 			}
-			n, h := e.countFor(ctx, roomID, root, pos, opts, rules, joined)
-			if n == 0 && h == 0 {
+			n, h, u := e.countFor(ctx, roomID, root, pos, opts, rules, joined)
+			if n == 0 && h == 0 && u == 0 {
 				continue
 			}
-			threadCounts[root] = UnreadNotifications{NotificationCount: &n, HighlightCount: &h}
+			threadCounts[root] = UnreadNotifications{NotificationCount: &n, HighlightCount: &h, UnreadCount: &u}
 		}
 	}
 
 	if opts.Filter != nil && opts.Filter.UnreadThreadNotifications {
-		main := &UnreadNotifications{NotificationCount: &mainCount, HighlightCount: &mainHighlight}
+		main := &UnreadNotifications{NotificationCount: &mainCount, HighlightCount: &mainHighlight, UnreadCount: &mainUnread}
 		return main, threadCounts
 	}
 	// No thread filter: fold the thread counts into the main count.
-	combinedCount, combinedHighlight := mainCount, mainHighlight
+	combinedCount, combinedHighlight, combinedUnread := mainCount, mainHighlight, mainUnread
 	for _, tc := range threadCounts {
 		if tc.NotificationCount != nil {
 			combinedCount += *tc.NotificationCount
@@ -1740,8 +1744,11 @@ func (e *Engine) unreadCounts(ctx context.Context, roomID string, opts SyncOptio
 		if tc.HighlightCount != nil {
 			combinedHighlight += *tc.HighlightCount
 		}
+		if tc.UnreadCount != nil {
+			combinedUnread += *tc.UnreadCount
+		}
 	}
-	return &UnreadNotifications{NotificationCount: &combinedCount, HighlightCount: &combinedHighlight}, nil
+	return &UnreadNotifications{NotificationCount: &combinedCount, HighlightCount: &combinedHighlight, UnreadCount: &combinedUnread}, nil
 }
 
 // SlidingUnreadCounts computes a user's combined unread notification and
@@ -1780,12 +1787,12 @@ func filteredCount(rows []storage.EventRow, filter *SyncFilter) int {
 
 // countFor evaluates the unread push actions for one timeline (main or a
 // single thread) and returns the notification and highlight counts.
-func (e *Engine) countFor(ctx context.Context, roomID, root string, since int64, opts SyncOptions, rules map[string]any, joined int64) (int, int) {
+func (e *Engine) countFor(ctx context.Context, roomID, root string, since int64, opts SyncOptions, rules map[string]any, joined int64) (int, int, int) {
 	evs, err := e.store.EventsForNotificationCount(ctx, roomID, root, since, 1000)
 	if err != nil {
-		return 0, 0
+		return 0, 0, 0
 	}
-	var notif, highlight int
+	var notif, highlight, unread int
 	for _, ev := range evs {
 		res := pushrules.Evaluate(rules, opts.UserID, opts.Localpart, pushrules.EventSnapshot{
 			Type:        ev.Type,
@@ -1800,8 +1807,11 @@ func (e *Engine) countFor(ctx context.Context, roomID, root string, since int64,
 		if res.Highlights {
 			highlight++
 		}
+		if res.MarkUnread {
+			unread++
+		}
 	}
-	return notif, highlight
+	return notif, highlight, unread
 }
 
 // buildPeekedRoom constructs the peek section entry (MSC2753) for a device that

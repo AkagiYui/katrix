@@ -21,6 +21,11 @@ type EventSnapshot struct {
 type EvalResult struct {
 	Notifies   bool
 	Highlights bool
+	// MarkUnread (MSC2625): the matched rule's actions include the
+	// org.matrix.msc2625.mark_unread action, which marks the event's room as
+	// having unread messages (org.matrix.msc2625.unread_count). The flag is
+	// per-event: a rule may mark unread without notifying.
+	MarkUnread bool
 	// Tweaks carries the set_tweak values of the matched rule's actions (each
 	// set_tweak with its value, defaulting to true). The HTTP push gateway
 	// receives these as the per-device `tweaks` dict (Synapse's
@@ -203,6 +208,9 @@ func applyActions(rule map[string]any, res *EvalResult) {
 		case string:
 			if act == "notify" {
 				res.Notifies = true
+			}
+			if act == "org.matrix.msc2625.mark_unread" {
+				res.MarkUnread = true
 			}
 		case map[string]any:
 			if tw, ok := act["set_tweak"].(string); ok {

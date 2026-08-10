@@ -443,9 +443,13 @@ func validatePushRuleBody(kind string, rule map[string]any) error {
 	for _, act := range actions {
 		switch a := act.(type) {
 		case string:
-			if a != "notify" && a != "dont_notify" {
-				return fmt.Errorf("unknown action %q", a)
-			}
+			// The spec's push rule actions are a list of "string | object"
+			// items with no enumerated string values: 'notify' and
+			// 'dont_notify' are the standard ones, but any other string is a
+			// valid custom action (e.g. org.matrix.msc2625.mark_unread,
+			// MSC2625) that the server stores and passes through. Rejecting
+			// them broke the MSC2625 unread-count test, whose fixture adds a
+			// content rule with the mark_unread action.
 		case map[string]any:
 			if _, ok := a["set_tweak"]; !ok {
 				return fmt.Errorf("action object must contain set_tweak")
