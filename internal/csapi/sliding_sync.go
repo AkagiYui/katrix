@@ -188,15 +188,16 @@ func (a *API) SlidingSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// set_presence mirrors /v3/sync (default online; "offline" marks the client
-	// offline — the row is still written so a later /sync reports offline, but
-	// no EDU is broadcast for it).
+	// set_presence mirrors /v3/sync (default online; "offline" leaves the
+	// stored presence untouched — see the /v3/sync handler for why).
 	sp := q.Get("set_presence")
 	if sp == "" {
 		sp = "online"
 	}
-	if changed, err := a.Store.SetPresence(r.Context(), auth.UserID, sp, "", a.Now()); err == nil && changed && sp != "offline" {
-		a.broadcastLocalPresence(r.Context(), auth.UserID)
+	if sp != "offline" {
+		if changed, err := a.Store.SetPresence(r.Context(), auth.UserID, sp, "", a.Now()); err == nil && changed {
+			a.broadcastLocalPresence(r.Context(), auth.UserID)
+		}
 	}
 
 	compute := func() *slidingSyncResponse {

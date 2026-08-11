@@ -2940,17 +2940,17 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 			if mc.Membership == "join" {
 				a.broadcastDeviceListForUser(r.Context(), target)
 				// A local user's join makes their presence newly visible to the
-				// room's other members. Mark them online (the spec's /sync
-				// default — a client that never PUT /presence is online) so the
-				// change is recorded in the shared stream and their own /sync
-				// carries them, and broadcast the m.presence EDU to the room's
-				// remote servers — their shared-room relationship is new, so the
-				// change broadcast is the only way they learn it (spec "Presence
-				// in the federation API"; sytest "New federated private chats get
-				// full presence information (SYN-115)").
-				if _, err := a.Store.SetPresence(r.Context(), target, "online", "", a.Now()); err == nil {
-					a.broadcastLocalPresence(r.Context(), target)
-				}
+				// room's other members: broadcast the m.presence EDU to the
+				// room's remote servers (their shared-room relationship is new,
+				// so the change broadcast is the only way they learn it). The
+				// join itself does NOT write a presence row — a row must only
+				// appear when the user actually declares presence (PUT /presence
+				// or a /sync set_presence), so a later declaration still counts
+				// as a change in the shared stream (spec "Presence in the
+				// federation API"; sytest "New federated private chats get full
+				// presence information (SYN-115)" and "User sees updates to
+				// presence from other users in the incremental sync.").
+				a.broadcastLocalPresence(r.Context(), target)
 			} else {
 				a.broadcastDeviceListDelete(r.Context(), target, roomID)
 				// The reverse direction: the user leaving/being banned stops

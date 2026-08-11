@@ -113,13 +113,21 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 	if sp == "" {
 		sp = "online"
 	}
-	if changed, err := a.Store.SetPresence(r.Context(), auth.UserID, sp, "", a.Now()); err == nil && changed && sp != "offline" {
-		// The client declared presence for the first time (or changed it):
-		// broadcast the m.presence EDU to every remote server sharing a room
-		// with the user, so federated peers learn the presence without
-		// waiting for a PUT /presence (sytest "New federated private chats
-		// get full presence information (SYN-115)").
-		a.broadcastLocalPresence(r.Context(), auth.UserID)
+	// set_presence=offline does not write a row: the parameter means "don't
+	// mark me online", not "change my presence to offline" — a PUT /presence
+	// value must survive a subsequent /sync (sytest "Presence change reports
+	// an event to myself"), and a fresh user who only ever syncs offline is
+	// rendered offline by the presence fallback ("User is offline if they
+	// set_presence=offline in their sync").
+	if sp != "offline" {
+		if changed, err := a.Store.SetPresence(r.Context(), auth.UserID, sp, "", a.Now()); err == nil && changed {
+			// The client declared presence for the first time (or changed it):
+			// broadcast the m.presence EDU to every remote server sharing a room
+			// with the user, so federated peers learn the presence without
+			// waiting for a PUT /presence (sytest "New federated private chats
+			// get full presence information (SYN-115)").
+			a.broadcastLocalPresence(r.Context(), auth.UserID)
+		}
 	}
 
 	// Long-poll: compute sync; if no new data, wait on the notifier and retry.

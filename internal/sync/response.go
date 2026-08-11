@@ -1203,19 +1203,19 @@ func presenceEvents(ctx context.Context, store *storage.Store, userIDs []string)
 }
 
 // presenceEventFor renders the m.presence event for one user, falling back to
-// "online" when the user has no presence row yet. A user who exists but has
-// never PUT /presence or /sync'd (or joined via a path that writes no row) is
-// online per the spec's /sync default ("If this parameter is omitted then the
-// client is automatically marked as online"), and a peer must still be able to
-// learn it (sytest "New federated private chats get full presence information
-// (SYN-115)").
+// "offline" when the user has no presence row. An absent row means the user
+// never declared presence (no /sync without set_presence=offline, no
+// PUT /presence, no join that seeded a row), and unknown presence is reported
+// as offline per the spec ("If the presence of a user is unknown, it should
+// be reported as offline") — sytest "User is offline if they set_presence=
+// offline in their sync" asserts exactly this.
 func presenceEventFor(ctx context.Context, store *storage.Store, userID string) json.RawMessage {
 	if p, err := store.GetPresence(ctx, userID); err == nil && p != nil {
 		return presenceEvent(p)
 	}
 	return presenceEvent(&storage.PresenceRow{
 		UserID:   userID,
-		Presence: "online",
+		Presence: "offline",
 	})
 }
 

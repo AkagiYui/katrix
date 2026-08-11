@@ -2588,20 +2588,14 @@ func (a *API) applyRemoteMembershipNotify(ctx context.Context, roomID, userID, m
 	// A LOCAL user joining a room (whether via the client path or a federated
 	// send_join whose PDU is ingested back) makes their presence newly visible
 	// to the room's remote servers: they have no baseline for the user, so push
-	// an m.presence EDU to each server sharing the room. A user with no
-	// presence row yet (never /sync'd) is reported as online — the spec's
-	// /sync default (sytest "New federated private chats get full presence
-	// information (SYN-115)" seeds the event-stream token via the legacy
-	// /events endpoint, which never writes a presence row).
+	// an m.presence EDU to each server sharing the room. The stored presence
+	// (or "online" when none) is broadcast; the join itself does NOT write a
+	// presence row — a row must only appear when the user actually declares
+	// presence (PUT /presence or a /sync set_presence), so a later declaration
+	// still counts as a change in the shared stream (sytest "User sees updates
+	// to presence from other users in the incremental sync." syncs the joiner
+	// and expects the other user to observe the online transition).
 	if membership == "join" && a.IsLocalUser(userID) {
-		// Establish the user's presence row: a join means the user is present
-		// (spec /sync default "online"). Without it, an initial /sync from the
-		// joining user omits their own presence event and the client never
-		// learns they are online — the test needs the joiner to see both peers'
-		// presence immediately.
-		if _, err := a.Store.SetPresence(ctx, userID, "online", "", a.Now()); err != nil {
-			return
-		}
 		presence := "online"
 		statusMsg := ""
 		if p, err := a.Store.GetPresence(ctx, userID); err == nil && p != nil {
