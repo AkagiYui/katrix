@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -88,7 +89,12 @@ func (c *Client) QueryUser(ctx context.Context, reg *Registration, userID string
 // alias (spec: the homeserver must ask the AS before resolving an alias in
 // the AS's namespace). It returns whether the AS acknowledged the alias.
 func (c *Client) QueryAlias(ctx context.Context, reg *Registration, alias string) bool {
-	return c.query(ctx, reg, "/_matrix/app/v1/rooms/"+alias)
+	// A Matrix alias leads with '#', which would otherwise terminate the URL
+	// path and be swallowed as a fragment (net/http strips it before the wire),
+	// leaving a path with no alias and an AS that never sees the query. The
+	// spec's room alias is a path segment, so percent-encode it (# -> %23);
+	// sytest's AS mock uri_unescapes the request path before matching.
+	return c.query(ctx, reg, "/_matrix/app/v1/rooms/"+url.PathEscape(alias))
 }
 
 // ProtocolMetadata fetches the AS's third-party-protocol metadata for the
