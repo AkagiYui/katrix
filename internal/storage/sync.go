@@ -440,6 +440,18 @@ func (s *Store) DeviceListChangesSince(ctx context.Context, since int64) (change
 	return changed, left, rows.Err()
 }
 
+// HasDeviceListChange reports whether a device-list change record exists for
+// the user. The EDU receive path uses it to tell a join advertisement (the
+// user's join already recorded a change synchronously on the send_join path)
+// apart from a genuine first change (no record — the change must be recorded
+// at a fresh token).
+func (s *Store) HasDeviceListChange(ctx context.Context, userID string) (bool, error) {
+	var one bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM device_list_updates WHERE user_id=$1)`, userID).Scan(&one)
+	return one, err
+}
+
 // LastSeenRemoteDeviceStream returns the highest m.device_list_update stream_id
 // seen so far from origin for userID (0 when none). Used to detect gaps when a
 // fresh EDU carries a prev_id: if prev_id does not equal the last seen

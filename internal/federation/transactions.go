@@ -2415,6 +2415,18 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 				}
 			}
 		}
+		// A remote user's join makes their device list newly visible to this
+		// server's users: record the change at the join's stream position now,
+		// so the joining server's m.device_list_update advertisement (delivered
+		// asynchronously by the outbound worker) is recognised as a duplicate
+		// rather than re-surfacing the user in a later sync window (mirror of
+		// the joining server's own join.go recording; Complement's
+		// TestDeviceListsUpdateOverFederation). send_leave/send_knock are not
+		// recorded here — the sync engine's membership deltas cover the
+		// leave/knock direction.
+		if wantMembership == "join" && ev.StateKey != nil {
+			_ = a.Store.RecordDeviceListJoinEDU(r.Context(), *ev.StateKey)
+		}
 	}
 	statePDUs, _ := a.roomStatePDUs(r, ev.RoomID)
 	// Re-broadcast the accepted membership event to the room's OTHER servers

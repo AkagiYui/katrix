@@ -529,17 +529,28 @@ func (a *API) applyDeviceListEDU(ctx context.Context, origin string, content jso
 			cacheDeviceListFor(keys, master, selfSigning)
 		}
 	}
-	// A join advertisement (the sender's very first update for the user, which
-	// the spec's prev_id contract leaves prev_id-less) is recorded coalesced
-	// into the user's join stream position rather than at a fresh token: the
-	// sync engine already reports the user in device_lists.changed via its
-	// membership-based "newly shared room" computation, and the EDU arrives
-	// asynchronously (the outbound worker delivers with a base delay), so a
-	// fresh-token record would re-surface the user in a later sync window
-	// (Complement's TestDeviceListsUpdateOverFederation). Genuine changes
-	// always carry a prev_id and are recorded as before.
+	// The sender's very first update for a user (which the spec's prev_id
+	// contract leaves prev_id-less) is either the join advertisement or a
+	// genuine first change, and the two must be told apart:
+	//
+	//   - When a remote user joins a room this server hosts, the send_join path
+	//     records their device-list change synchronously at the join position.
+	//     The join-advertisement EDU (delivered asynchronously by the outbound
+	//     worker, after the sync engine's membership-based "newly shared room"
+	//     computation has already surfaced the user) is then a duplicate: the
+	//     user already has a record, so re-recording at a fresh token would
+	//     re-surface them in a later sync window (Complement's
+	//     TestDeviceListsUpdateOverFederation).
+	//   - A first EDU for a user with no record is a genuine change (e.g. a key
+	//     upload by a remote user whose server never advertised them at join);
+	//     it must be recorded at a fresh token so the change is delivered
+	//     (Complement's TestFederationKeyUploadQuery).
 	if len(c.PrevID) == 0 {
-		_ = a.Store.RecordDeviceListJoinEDU(ctx, c.UserID)
+		if has, err := a.Store.HasDeviceListChange(ctx, c.UserID); err == nil && !has {
+			if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, false); err != nil {
+				return err
+			}
+		}
 	} else if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, false); err != nil {
 		return err
 	}
