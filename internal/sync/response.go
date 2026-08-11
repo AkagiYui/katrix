@@ -24,6 +24,17 @@ type Response struct {
 	DeviceLists                  *DeviceLists   `json:"device_lists,omitempty"`
 	DeviceOneTimeKeysCount       map[string]int `json:"device_one_time_keys_count,omitempty"`
 	DeviceUnusedFallbackKeyTypes *[]string      `json:"device_unused_fallback_key_types,omitempty"`
+	// ProfileUpdates (MSC4429) carries profile-field changes for room peers,
+	// keyed by user ID -> {"profile_updates": {field: value}}. Only populated
+	// when the filter's profile_fields.ids is non-empty.
+	ProfileUpdates map[string]ProfileUpdatesForUser `json:"org.matrix.msc4429.users,omitempty"`
+}
+
+// ProfileUpdatesForUser is one user's profile-update payload in the sync
+// response (MSC4429): a null profile_updates tells the client to clear its
+// cached profile for that user (e.g. the user left the last shared room).
+type ProfileUpdatesForUser struct {
+	ProfileUpdates map[string]json.RawMessage `json:"profile_updates"`
 }
 
 // hasDeltas reports whether an incremental response carries any content beyond
@@ -262,6 +273,11 @@ type SyncFilter struct {
 	AccountDataNotTypesSet bool
 	AccountDataTypes       []string
 	AccountDataNotTypes    []string
+	// ProfileFields (MSC4429 filter.profile_fields.ids): when non-empty, the
+	// response carries profile-update events for room peers under
+	// org.matrix.msc4429.users, restricted to these field IDs. Absent or empty
+	// means profile updates are not delivered.
+	ProfileFields []string
 }
 
 // ParseSyncFilter decodes a raw filter JSON object into the subset /sync
@@ -300,6 +316,9 @@ func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
 			Types    []string `json:"types"`
 			NotTypes []string `json:"not_types"`
 		} `json:"account_data"`
+		ProfileFields struct {
+			IDs []string `json:"ids"`
+		} `json:"profile_fields"`
 	}
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil
@@ -328,6 +347,7 @@ func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
 		AccountDataTypesSet:       obj.AccountData.Types != nil,
 		AccountDataNotTypes:       obj.AccountData.NotTypes,
 		AccountDataNotTypesSet:    obj.AccountData.NotTypes != nil,
+		ProfileFields:             obj.ProfileFields.IDs,
 	}
 	if obj.Room.Timeline.Limit != nil {
 		f.TimelineLimit = *obj.Room.Timeline.Limit
@@ -348,7 +368,8 @@ func (f *SyncFilter) anySet() bool {
 		len(f.EventFields) > 0 ||
 		f.EventFormatFederation ||
 		f.AccountDataTypesSet || f.AccountDataNotTypesSet ||
-		len(f.AccountDataTypes) > 0 || len(f.AccountDataNotTypes) > 0
+		len(f.AccountDataTypes) > 0 || len(f.AccountDataNotTypes) > 0 ||
+		len(f.ProfileFields) > 0
 }
 
 // keepAccountData reports whether an account_data row passes the filter's
@@ -693,6 +714,16 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	// presence changed after the sync token (incremental) or all joined room
 	// peers (initial sync).
 	e.appendPresence(ctx, resp, opts)
+
+	// Profile updates (MSC4429): delivered only when the filter's
+	// profile_fields.ids is non-empty. On an incremental sync the response
+	// carries the fields that changed since the token (the latest value per
+	// user+field); on an initial sync it carries the current values of the
+	// requested fields for every room peer (mirror of Synapse's
+	// _generate_initial_sync_entry_for_profile_updates).
+	if opts.Filter != nil && len(opts.Filter.ProfileFields) > 0 {
+		resp.ProfileUpdates = e.profileUpdates(ctx, opts, opts.Filter.ProfileFields)
+	}
 
 	// Device list changes for the syncing user. Per the spec, the server only
 	// reports users whose device lists changed AND who share a room with the
@@ -1046,6 +1077,118 @@ func (e *Engine) appendPresence(ctx context.Context, resp *Response, opts SyncOp
 	if len(events) > 0 {
 		resp.Presence = &PresenceResp{Events: events}
 	}
+}
+
+// presenceEvents renders the stored presence rows for the given user IDs. A
+// profileUpdates computes the MSC4429 profile-updates section. On an initial
+// sync it carries the current values of the requested fields for every room
+// peer (and the syncer); on an incremental sync it carries the fields that
+// changed since the token (the latest value per user+field, filtered to the
+// requested field IDs). Local users' profile fields come from the profile
+// store; a user who no longer shares a room with the syncer (their leave was
+// recorded in the window) is emitted as a null profile_updates so the client
+// clears its cached profile (MSC4429; sytest "A user leaving the last shared
+// room returns a profile update of null").
+func (e *Engine) profileUpdates(ctx context.Context, opts SyncOptions, fields []string) map[string]ProfileUpdatesForUser {
+	want := map[string]bool{}
+	for _, f := range fields {
+		want[f] = true
+	}
+	out := map[string]ProfileUpdatesForUser{}
+
+	// Incremental: profile-field changes delivered to this receiver since the
+	// token, keeping the latest value per user+field.
+	if opts.Since.Stream > 0 {
+		updates, err := e.store.ProfileUpdatesSince(ctx, opts.Localpart, opts.Since.Stream)
+		if err != nil {
+			return nil
+		}
+		latest := map[string]map[string]json.RawMessage{} // userID -> field -> value
+		order := map[string]int64{}
+		for _, u := range updates {
+			if !want[u.Field] {
+				continue
+			}
+			if _, ok := latest[u.UserID]; !ok {
+				latest[u.UserID] = map[string]json.RawMessage{}
+			}
+			if u.StreamID >= order[u.UserID] {
+				order[u.UserID] = u.StreamID
+				latest[u.UserID][u.Field] = u.Value
+			}
+		}
+		for uid, fields := range latest {
+			out[uid] = ProfileUpdatesForUser{ProfileUpdates: fields}
+		}
+		// Users who stopped sharing a room with the syncer in the window: emit a
+		// null profile_updates so the client clears their cached profile.
+		roomIDs, _ := e.store.RoomsForUser(ctx, opts.UserID)
+		if nl, err := e.store.NewLeftPeersSince(ctx, roomIDs, opts.Since.Stream); err == nil {
+			for _, u := range nl {
+				out[u] = ProfileUpdatesForUser{ProfileUpdates: nil}
+			}
+		}
+		return out
+	}
+
+	// Initial sync: the current values of the requested fields for every room
+	// peer and the syncer.
+	peers := e.roomPeers(ctx, opts)
+	for u := range peers {
+		uid := u
+		if !isLocalUserSync(uid, opts.UserID) {
+			// Only local users' profiles are served (mirror of Synapse).
+			continue
+		}
+		localpart := localpartOfSync(uid)
+		pf, err := e.store.ProfileFields(ctx, localpart)
+		if err != nil {
+			continue
+		}
+		updates := map[string]json.RawMessage{}
+		for f, v := range pf {
+			if want[f] {
+				updates[f] = v
+			}
+		}
+		if len(updates) > 0 {
+			out[uid] = ProfileUpdatesForUser{ProfileUpdates: updates}
+		}
+	}
+	return out
+}
+
+// isLocalUserSync reports whether a user ID belongs to the same server as the
+// given local user (a lightweight check used by the profile-updates initial
+// sync, which serves local users only — mirror of Synapse's is_mine_id).
+func isLocalUserSync(userID, self string) bool {
+	di := -1
+	for i := len(userID) - 1; i >= 0; i-- {
+		if userID[i] == ':' {
+			di = i
+			break
+		}
+	}
+	if di < 0 {
+		return false
+	}
+	ds := -1
+	for i := len(self) - 1; i >= 0; i-- {
+		if self[i] == ':' {
+			ds = i
+			break
+		}
+	}
+	return ds >= 0 && userID[di+1:] == self[ds+1:]
+}
+
+func localpartOfSync(userID string) string {
+	for i := 0; i < len(userID); i++ {
+		if userID[i] == ':' {
+			return userID[1:i]
+		}
+	}
+	return userID
 }
 
 // presenceEvents renders the stored presence rows for the given user IDs. A
