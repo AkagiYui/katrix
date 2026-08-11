@@ -583,6 +583,12 @@ func (a *API) persistThirdPartyInvite(r *http.Request, auth *homeserver.Auth, ro
 	if _, err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
 		return err
 	}
+	// The event is part of the room's state: every server with a member in the
+	// room must learn it, so a remote member's sync can pick up the pending
+	// third-party invite (sytest "Can invite unbound 3pid over federation with
+	// users from both servers" awaits the m.room.third_party_invite event on the
+	// other server's user).
+	a.broadcastPDU(r.Context(), roomID, ev)
 	a.notifyRoomMembers(r.Context(), roomID)
 	return nil
 }
