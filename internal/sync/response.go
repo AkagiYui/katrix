@@ -246,6 +246,22 @@ type SyncFilter struct {
 	IncludeLeave bool
 	// EventFields narrows the per-event fields returned (JSON pointer paths).
 	EventFields []string
+	// EventFormatFederation renders timeline/state events in the federation
+	// format (the signed PDU shape with prev_events/auth_events/depth/hashes/
+	// signatures and a room_id) instead of the default stripped client format
+	// (filter.event_format: "federation", spec "Filtering").
+	EventFormatFederation bool
+	// Account-data filters (spec filter.account_data): applied to both the
+	// global account_data section and every room's account_data section. A
+	// present-but-empty `types: []` list matches nothing (the standard
+	// RoomEventFilter semantics — sytest "Latest account data appears in v2
+	// /sync" filters account_data.types=["my.test.type"] and expects exactly
+	// that type and nothing else, so the default push-rules entry must be
+	// filtered out).
+	AccountDataTypesSet    bool
+	AccountDataNotTypesSet bool
+	AccountDataTypes       []string
+	AccountDataNotTypes    []string
 }
 
 // ParseSyncFilter decodes a raw filter JSON object into the subset /sync
@@ -278,6 +294,12 @@ func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
 			IncludeLeave bool `json:"include_leave"`
 		} `json:"room"`
 		EventFields []string `json:"event_fields"`
+		// event_format: "client" (default) or "federation" (spec Filtering).
+		EventFormat string `json:"event_format"`
+		AccountData struct {
+			Types    []string `json:"types"`
+			NotTypes []string `json:"not_types"`
+		} `json:"account_data"`
 	}
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil
@@ -301,6 +323,11 @@ func ParseSyncFilter(raw json.RawMessage) *SyncFilter {
 		UnreadThreadNotifications: obj.Room.Timeline.UnreadThreadNotifications,
 		IncludeLeave:              obj.Room.IncludeLeave,
 		EventFields:               obj.EventFields,
+		EventFormatFederation:     obj.EventFormat == "federation",
+		AccountDataTypes:          obj.AccountData.Types,
+		AccountDataTypesSet:       obj.AccountData.Types != nil,
+		AccountDataNotTypes:       obj.AccountData.NotTypes,
+		AccountDataNotTypesSet:    obj.AccountData.NotTypes != nil,
 	}
 	if obj.Room.Timeline.Limit != nil {
 		f.TimelineLimit = *obj.Room.Timeline.Limit
@@ -318,7 +345,27 @@ func (f *SyncFilter) anySet() bool {
 		len(f.TimelineTypes) > 0 || len(f.TimelineNotTypes) > 0 || f.TimelineTypesSet ||
 		len(f.TimelineSenders) > 0 || len(f.TimelineNotSenders) > 0 ||
 		f.StateTypesSet || f.StateNotTypesSet || f.StateSendersSet || f.StateNotSendersSet ||
-		len(f.EventFields) > 0
+		len(f.EventFields) > 0 ||
+		f.EventFormatFederation ||
+		f.AccountDataTypesSet || f.AccountDataNotTypesSet ||
+		len(f.AccountDataTypes) > 0 || len(f.AccountDataNotTypes) > 0
+}
+
+// keepAccountData reports whether an account_data row passes the filter's
+// account_data section (spec filter.account_data: a RoomEventFilter applied to
+// both the global and per-room account_data sections). A present-but-empty
+// `types: []` matches nothing (standard RoomEventFilter semantics).
+func (f *SyncFilter) keepAccountData(eventType string) bool {
+	if f == nil {
+		return true
+	}
+	if f.AccountDataNotTypesSet && strIn(f.AccountDataNotTypes, eventType) {
+		return false
+	}
+	if f.AccountDataTypesSet && !strIn(f.AccountDataTypes, eventType) {
+		return false
+	}
+	return true
 }
 
 // keepState reports whether a room state event passes the filter's state
@@ -403,6 +450,66 @@ func (f *SyncFilter) applyEventFields(ev json.RawMessage) json.RawMessage {
 		}
 	}
 	b, _ := json.Marshal(out)
+	return b
+}
+
+// renderEvent renders a stored event row for a /sync response, honouring the
+// filter's event_format: "client" renders the stripped client-visible event,
+// "federation" renders the signed PDU shape (spec Filtering: "federation"
+// returns the event in its federation format). A redacted row renders with its
+// pruned content either way.
+func (f *SyncFilter) renderEvent(row *storage.EventRow) json.RawMessage {
+	if f != nil && f.EventFormatFederation {
+		return federationEvent(row, row.Redacted)
+	}
+	return clientEvent(row)
+}
+
+// renderEventErased is renderEvent for a sender who has been erased (spec
+// §Erasure): the content is always pruned regardless of the row's redaction
+// state.
+func (f *SyncFilter) renderEventErased(row *storage.EventRow) json.RawMessage {
+	if f != nil && f.EventFormatFederation {
+		return federationEvent(row, true)
+	}
+	return erasedClientEvent(row)
+}
+
+// federationEvent renders a stored PDU in the federation event format: the
+// signed event with prev_events, auth_events, depth, hashes and signatures
+// intact, plus a guaranteed room_id and event_id (v12+ events omit event_id in
+// their raw form; the row carries it). A redacted/erased event uses its pruned
+// content (mirror of clientEventCore).
+func federationEvent(row *storage.EventRow, redact bool) json.RawMessage {
+	raw := row.RawJSON
+	if redact {
+		if rules, ok := roomver.Get(roomver.Default); ok {
+			if red, err := events.Redact(raw, rules); err == nil {
+				if b, err := json.Marshal(red); err == nil {
+					raw = b
+				}
+			}
+		}
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		// Fall back to the client format if the raw PDU cannot be parsed.
+		return clientEventCore(row, redact)
+	}
+	// The row is authoritative for the IDs (v12 raw events carry no event_id,
+	// and the create event may omit room_id): stamp them so every federation
+	// event has the fields the spec guarantees.
+	id, _ := json.Marshal(row.EventID)
+	m["event_id"] = id
+	if rid, _ := json.Marshal(row.RoomID); row.RoomID != "" {
+		m["room_id"] = rid
+	}
+	if row.StateKey != "" {
+		if sk, _ := json.Marshal(row.StateKey); row.StateKey != "" {
+			m["state_key"] = sk
+		}
+	}
+	b, _ := json.Marshal(m)
 	return b
 }
 
@@ -527,7 +634,11 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 
 	resp.Rooms = rooms
 
-	// Account data (global + per-room).
+	// Account data (global + per-room). The filter's account_data section
+	// applies to both (spec filter.account_data): a client asking for only
+	// certain types sees those and nothing else — the default push-rules
+	// account-data entry is filtered out just like a timeline filter drops
+	// non-matching events.
 	adRows, err := e.store.AccountDataSince(ctx, opts.Localpart, opts.Since.Stream)
 	if err == nil {
 		globalAD := StateSet{Events: []json.RawMessage{}}
@@ -537,6 +648,9 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 			// incremental sync (as the delete signal, MSC3391) but never in an
 			// initial sync — a freshly-syncing client must not see deleted types.
 			if opts.Since.Stream == 0 && storage.IsAccountDataDeleted(a.Content) {
+				continue
+			}
+			if !opts.Filter.keepAccountData(a.Type) {
 				continue
 			}
 			ev := mustMarshalEvent(a.Type, "", "", a.Content, 0, "")
@@ -1066,7 +1180,7 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 				if filter.lazyLoadMembers() && !lazyLoadMemberEvent(&se, map[string]bool{}) {
 					continue
 				}
-				jr.State.Events = append(jr.State.Events, filter.applyEventFields(prevContent(clientEvent(&se), &se)))
+				jr.State.Events = append(jr.State.Events, filter.applyEventFields(prevContent(filter.renderEvent(&se), &se)))
 			}
 		} else {
 			jr.State.Events = []json.RawMessage{}
@@ -1331,9 +1445,9 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		}
 		var raw json.RawMessage
 		if erased[ev.Sender] && (vis == nil || vis.MembershipAt(ev.Depth) != "join") {
-			raw = filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(erasedClientEvent(&ev), &ev), &ev), ev.EventID))
+			raw = filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(filter.renderEventErased(&ev), &ev), &ev), ev.EventID))
 		} else {
-			raw = filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(clientEvent(&ev), &ev), &ev), ev.EventID))
+			raw = filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(filter.renderEvent(&ev), &ev), &ev), ev.EventID))
 		}
 		rendered = append(rendered, renderedEvent{raw: raw, send: ev.Sender, stream: ev.StreamOrdering})
 	}
@@ -1489,7 +1603,7 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 			if filter.lazyLoadMembers() && !lazyLoadMemberEvent(&se, senders) {
 				continue
 			}
-			jr.State.Events = append(jr.State.Events, filter.applyEventFields(prevContent(clientEvent(&se), &se)))
+			jr.State.Events = append(jr.State.Events, filter.applyEventFields(prevContent(filter.renderEvent(&se), &se)))
 		}
 	} else if opts.Since.Stream > 0 && (gapLimited || countLimited) {
 		// State delta for a limited incremental sync: the room_state tuples
@@ -1511,7 +1625,7 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 			// Limited syncs disable the LL member restriction for the delta
 			// part (mirror of Synapse: state_filter = StateFilter.all() when
 			// batch.limited).
-			jr.State.Events = append(jr.State.Events, filter.applyEventFields(prevContent(clientEvent(se), se)))
+			jr.State.Events = append(jr.State.Events, filter.applyEventFields(prevContent(filter.renderEvent(se), se)))
 		}
 	} else {
 		// A plain incremental sync with no full state renders `state.events` as
@@ -1571,7 +1685,7 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 					continue
 				}
 			}
-			jr.State.Events = append(jr.State.Events, filter.applyEventFields(prevContent(clientEvent(ev), ev)))
+			jr.State.Events = append(jr.State.Events, filter.applyEventFields(prevContent(filter.renderEvent(ev), ev)))
 		}
 		// Remember every membership event delivered in this response (in the
 		// state section and in the timeline) so the next incremental sync can
@@ -1623,7 +1737,7 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 			if filter.lazyLoadMembers() && !lazyLoadMemberEvent(&se, senders) {
 				continue
 			}
-			sa.Events = append(sa.Events, filter.applyEventFields(clientEvent(&se)))
+			sa.Events = append(sa.Events, filter.applyEventFields(filter.renderEvent(&se)))
 		}
 		jr.StateAfter = &sa
 	}
@@ -2130,7 +2244,7 @@ func (e *Engine) buildLeftRoom(ctx context.Context, roomID string, opts SyncOpti
 		if filter != nil && !filter.keepTimeline(&ev) {
 			continue
 		}
-		lr.Timeline.Events = append(lr.Timeline.Events, filter.applyEventFields(clientEvent(&ev)))
+		lr.Timeline.Events = append(lr.Timeline.Events, filter.applyEventFields(filter.renderEvent(&ev)))
 	}
 	// `state` must always be an array: it holds the state as of the leave when
 	// the timeline is empty (the leave event + pre-leave state), and is empty
@@ -2155,7 +2269,7 @@ func (e *Engine) buildLeftRoom(ctx context.Context, roomID string, opts SyncOpti
 					if filter != nil && !filter.keepState(&stateEvs[i]) {
 						continue
 					}
-					lr.State.Events = append(lr.State.Events, filter.applyEventFields(clientEvent(&stateEvs[i])))
+					lr.State.Events = append(lr.State.Events, filter.applyEventFields(filter.renderEvent(&stateEvs[i])))
 				}
 			}
 		}
