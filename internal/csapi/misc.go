@@ -1066,6 +1066,7 @@ func (a *API) PreviewURL(w http.ResponseWriter, r *http.Request) {
 		Timeout:         ssrf.DefaultLimits.Timeout,
 		MaxRedirects:    ssrf.DefaultLimits.MaxRedirects,
 		AllowPrivateIPs: a.Config.SSRFAllowPrivateIPs,
+		InsecureTLS:     a.Config.SSRFInsecureTLS,
 	}
 	resp, err := ssrf.Fetch(r.Context(), target, limits)
 	if err != nil {

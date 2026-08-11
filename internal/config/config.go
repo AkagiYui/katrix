@@ -74,6 +74,11 @@ type Config struct {
 	// production deployments must keep it off.
 	SSRFAllowPrivateIPs bool `yaml:"ssrf_allow_private_ips"`
 
+	// SSRFInsecureTLS skips TLS certificate verification on outbound guarded
+	// fetches (URL preview). Test harnesses only — sytest's URL-preview mock
+	// presents a self-signed certificate; production must keep it off.
+	SSRFInsecureTLS bool `yaml:"ssrf_insecure_tls"`
+
 	// IdentityServerInsecure skips TLS certificate verification for outbound
 	// identity-server requests. The sytest suite's mock identity server presents
 	// a self-signed certificate (keys/tls-selfsigned.crt), so this must be
@@ -270,6 +275,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("KATRIX_SSRF_ALLOW_PRIVATE_IPS"); v != "" {
 		c.SSRFAllowPrivateIPs = parseBool(v, c.SSRFAllowPrivateIPs)
+	}
+	if v := os.Getenv("KATRIX_SSRF_INSECURE_TLS"); v != "" {
+		c.SSRFInsecureTLS = parseBool(v, c.SSRFInsecureTLS)
 	}
 	if v := os.Getenv("KATRIX_RECAPTCHA_INSECURE"); v != "" {
 		c.RecaptchaInsecure = parseBool(v, c.RecaptchaInsecure)

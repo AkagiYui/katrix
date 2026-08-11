@@ -10,6 +10,7 @@ package ssrf
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -32,6 +33,10 @@ type Limits struct {
 	// serves its URL-preview fixture at host.docker.internal, which resolves
 	// to a reserved range); production must leave it off.
 	AllowPrivateIPs bool
+	// InsecureTLS skips TLS certificate verification on the fetch. Test
+	// harnesses only (sytest's URL-preview mock serves a self-signed cert);
+	// production must leave it off.
+	InsecureTLS bool
 }
 
 // DefaultLimits are the production-safe defaults for URL preview / remote media.
@@ -145,12 +150,12 @@ func checkURL(ctx context.Context, rawURL string, allowPrivate bool) error {
 // against IsBlocked. It catches DNS-rebinding because the check runs at connect
 // time on the actual address being dialled.
 func SafeTransport() *http.Transport {
-	return safeTransport(false)
+	return safeTransport(false, false)
 }
 
-func safeTransport(allowPrivate bool) *http.Transport {
+func safeTransport(allowPrivate, insecureTLS bool) *http.Transport {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	return &http.Transport{
+	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, _ := net.SplitHostPort(addr)
 			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
@@ -165,6 +170,10 @@ func safeTransport(allowPrivate bool) *http.Transport {
 			return dialer.DialContext(ctx, network, net.JoinHostPort(host, port))
 		},
 	}
+	if insecureTLS {
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // explicit test-harness opt-in
+	}
+	return tr
 }
 
 // Fetch performs an SSRF-guarded GET. It validates the URL before dialling,
@@ -183,7 +192,7 @@ func Fetch(ctx context.Context, rawURL string, l Limits) (*http.Response, error)
 	client := &http.Client{
 		Timeout:       l.Timeout,
 		CheckRedirect: redirectGuard(ctx, l.MaxRedirects, l.AllowPrivateIPs),
-		Transport:     safeTransport(l.AllowPrivateIPs),
+		Transport:     safeTransport(l.AllowPrivateIPs, l.InsecureTLS),
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
