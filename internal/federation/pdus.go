@@ -1308,24 +1308,15 @@ func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roo
 	if ev.StateKey != nil {
 		row.StateKey = *ev.StateKey
 	}
-	if _, err := a.Store.InsertEvent(ctx, row); err != nil {
-		return err
-	}
-	// A fetched missing event may itself sit on top of history we still do not
-	// hold (a partial gap fill): record the DAG discontinuity so /sync marks
-	// the timeline limited at this position.
-	if a.hasUnknownPrevEvents(ctx, raw) {
-		a.Store.RecordTimelineGap(ctx, roomID, row.StreamOrdering)
-	}
-	// Apply a redaction to its target (spec Handling redactions), mirroring the
-	// transaction ingest path.
-	if ev.Redacts != "" && ev.Type == "m.room.redaction" {
-		_, _ = eventstate.ApplyRedaction(ctx, a.Store, row)
-	} else if ev.Redacts == "" && ev.Type != "m.room.redaction" {
-		if red, err := a.Store.RedactionForEvent(ctx, id); err == nil && red != nil {
-			_, _ = eventstate.ApplyRedaction(ctx, a.Store, red)
-		}
-	}
+	// Decide rejection BEFORE persisting, so a rejected event can be inserted
+	// without touching the forward-extremity set: it is not part of the room's
+	// real DAG surface, so it must neither become an extremity nor displace its
+	// prevs (mirror of Synapse's _calculate_new_extremities, which excludes
+	// rejected events entirely — sytest "Forward extremities remain so even
+	// after the next events are populated as outliers" asserts B stays the sole
+	// extremity after a gap-filled event D and a sent event E are both
+	// rejected).
+	//
 	// Rejection propagates through auth_events: a fetched event whose own
 	// auth_events reference a soft-failed event is itself rejected (an event
 	// cannot be authorised by a rejected precedent). Marked rejected, never
@@ -1367,8 +1358,26 @@ func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roo
 			rejected = true
 		}
 	}
+	if _, err := a.Store.InsertEventWithMembership(ctx, row, nil, !rejected); err != nil {
+		return err
+	}
 	if rejected {
 		a.Store.MarkEventRejected(ctx, id)
+	}
+	// A fetched missing event may itself sit on top of history we still do not
+	// hold (a partial gap fill): record the DAG discontinuity so /sync marks
+	// the timeline limited at this position.
+	if a.hasUnknownPrevEvents(ctx, raw) {
+		a.Store.RecordTimelineGap(ctx, roomID, row.StreamOrdering)
+	}
+	// Apply a redaction to its target (spec Handling redactions), mirroring the
+	// transaction ingest path.
+	if ev.Redacts != "" && ev.Type == "m.room.redaction" {
+		_, _ = eventstate.ApplyRedaction(ctx, a.Store, row)
+	} else if ev.Redacts == "" && ev.Type != "m.room.redaction" {
+		if red, err := a.Store.RedactionForEvent(ctx, id); err == nil && red != nil {
+			_, _ = eventstate.ApplyRedaction(ctx, a.Store, red)
+		}
 	}
 	a.Store.IndexRelationFromRow(ctx, row)
 	if !rejected {

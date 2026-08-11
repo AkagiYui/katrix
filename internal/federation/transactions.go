@@ -488,10 +488,26 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	}
 	// A re-delivered PDU (a server restarting re-sends already-acknowledged
 	// transactions) must not re-trigger side effects; the accepted-event early
-	// return above covers the common case.
-	inboundStream, err := a.Store.InsertEventWithMembership(r.Context(), row, membershipRow)
+	// return above covers the common case. A rejected (soft-failed) event is
+	// persisted without touching the forward-extremity set: it is not part of
+	// the room's real DAG surface, so it neither becomes an extremity nor
+	// displaces its prevs (mirror of Synapse's _calculate_new_extremities,
+	// which excludes rejected events entirely).
+	inboundStream, err := a.Store.InsertEventWithMembership(r.Context(), row, membershipRow, !rejected)
 	if err != nil {
 		return evID, false
+	}
+	// An ACCEPTED event whose prev_events are soft-failed sits on a chain of
+	// rejected events: the rejected chain and the accepted ancestor behind it
+	// must leave the extremity set, or the ancestor dangles as an extremity the
+	// new event supersedes (Synapse's _get_prevs_before_rejected in
+	// _calculate_new_extremities; sytest "Inbound federation correctly handles
+	// soft failed events as extremities").
+	if !rejected && origin != "" {
+		prevs := storage.ParsePrevEvents(raw)
+		if hasRejected, _ := a.Store.AnyRejected(r.Context(), prevs); hasRejected {
+			_ = a.Store.RemovePrevsBehindRejected(r.Context(), ev.RoomID, prevs)
+		}
 	}
 	// Deliver HTTP push notifications and application-service events for the
 	// inbound event (spec Push Module + Application Services). A rejected
@@ -530,14 +546,13 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	}
 	// A soft-failed event is persisted (so the DAG stays connected) but marked
 	// rejected: it is excluded from client delivery, state snapshots and state
-	// resolution below. It must also not become a forward extremity nor
-	// displace its prev_events — a rejected event is not part of the room's
-	// real DAG surface, so later events must still build on the accepted
-	// leaves (Synapse #5090; sytest "Inbound federation accepts a second
-	// soft-failed event").
+	// resolution below. Its forward-extremity bookkeeping was skipped at insert
+	// time (InsertEventWithMembership maintainExtremities=false), so no undo is
+	// needed here — the accepted leaves the rejected event references remain the
+	// room's extremities (Synapse #5090; sytest "Inbound federation accepts a
+	// second soft-failed event").
 	if rejected {
 		a.Store.MarkEventRejected(r.Context(), evID)
-		a.Store.UndoExtremitiesForRejected(r.Context(), ev.RoomID, evID, storage.ParsePrevEvents(raw))
 	}
 	// Index the event's relates_to relation so /relations, /threads and the
 	// MSC2836 /event_relationships walk can answer for events ingested over

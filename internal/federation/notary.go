@@ -33,10 +33,15 @@ type notaryKey struct {
 type notaryCache struct {
 	mu   sync.Mutex
 	keys map[string]map[string]notaryKey // serverName -> keyID -> key
+	// added is when each server's cache was first populated (serverName -> ms).
+	// It feeds the same "more than halfway through the cached lifetime → refetch"
+	// freshness check Synapse applies to cached notary responses when the caller
+	// does not specify a minimum_valid_until_ts.
+	added map[string]int64
 }
 
 func newNotaryCache() *notaryCache {
-	return &notaryCache{keys: map[string]map[string]notaryKey{}}
+	return &notaryCache{keys: map[string]map[string]notaryKey{}, added: map[string]int64{}}
 }
 
 // get returns the cached keys of a server (empty when none).
@@ -70,33 +75,51 @@ func (n *notaryCache) validUntil(serverName string) int64 {
 
 // merge records the keys of one origin response, adding/updating each key
 // without evicting previously-seen keys absent from the new response (the
-// not-overwrite rule).
-func (n *notaryCache) merge(keys []notaryKey) {
+// not-overwrite rule). The server's added timestamp is set on first population.
+func (n *notaryCache) merge(keys []notaryKey, now int64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for _, k := range keys {
 		if n.keys[k.ServerName] == nil {
 			n.keys[k.ServerName] = map[string]notaryKey{}
 		}
+		if n.added[k.ServerName] == 0 {
+			n.added[k.ServerName] = now
+		}
 		n.keys[k.ServerName][k.KeyID] = k
 	}
 }
 
+// stale reports whether the cached keys need re-fetching, mirroring Synapse's
+// RemoteKey.query_keys miss logic: with a caller minimum_valid_until_ts, the
+// cache is stale when its valid_until is below the minimum; without one, the
+// cache is stale when it is more than halfway through its lifetime
+// ((added + valid_until) / 2 < now). A never-valid key set (valid_until 0) is
+// always stale.
+func (n *notaryCache) stale(serverName string, minValidUntilTS, now int64) bool {
+	vu := n.validUntil(serverName)
+	if vu == 0 {
+		return true
+	}
+	if minValidUntilTS > 0 {
+		return vu < minValidUntilTS
+	}
+	added, ok := n.added[serverName]
+	if !ok || added == 0 {
+		return true
+	}
+	return (added+vu)/2 < now
+}
+
 // notary answers a key query for the given server, returning the re-signed key
-// objects. A fetch is performed when the server's keys are not cached, when
-// the cached keys have expired (their valid_until_ts has passed — mirror of
-// Synapse's get_server_verify_keys_v2_direct, which re-fetches expired keys),
-// or when the caller's minimum_valid_until_ts exceeds the cached keys'
-// validity; a fetch failure falls back to the cached (possibly expired) keys.
+// objects. A fetch is performed when the server's keys are not cached or are
+// stale (mirror of Synapse's RemoteKey.query_keys: the caller's
+// minimum_valid_until_ts bounds the cached keys' validity, and a fresh query
+// refetches once the cache is more than halfway through its lifetime); a fetch
+// failure falls back to the cached (possibly expired) keys.
 func (a *API) notary(ctx context.Context, serverName string, minValidUntilTS int64) []json.RawMessage {
 	cached := a.notaryCache.get(serverName)
-	needFetch := len(cached) == 0
-	if vu := a.notaryCache.validUntil(serverName); vu > 0 && vu <= time.Now().UnixMilli() {
-		needFetch = true
-	}
-	if minValidUntilTS > 0 && a.notaryCache.validUntil(serverName) < minValidUntilTS {
-		needFetch = true
-	}
+	needFetch := len(cached) == 0 || a.notaryCache.stale(serverName, minValidUntilTS, time.Now().UnixMilli())
 	if needFetch {
 		if keys, err := a.client.FetchServerKeysFromOrigin(ctx, serverName); err == nil {
 			var merged []notaryKey
@@ -107,7 +130,7 @@ func (a *API) notary(ctx context.Context, serverName string, minValidUntilTS int
 				})
 			}
 			if len(merged) > 0 {
-				a.notaryCache.merge(merged)
+				a.notaryCache.merge(merged, time.Now().UnixMilli())
 				cached = a.notaryCache.get(serverName)
 			}
 		}

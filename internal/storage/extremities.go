@@ -90,21 +90,15 @@ func (s *Store) UpdateExtremitiesForEvent(ctx context.Context, roomID, eventID s
 }
 
 // EventIsDAGLeaf reports whether eventID is a DAG leaf in roomID — no other
-// ACCEPTED event in the room references it as a prev_event. The room's forward
+// event in the room references it as a prev_event. The room's forward
 // extremities table is authoritative for most rooms, but a partial-state resync
 // (MSC3902) re-seeds the extremities to the join event even when later events
 // were ingested during the partial window, so a leaf check against the events
 // table (parsing each event's prev_events from its JSON) is the robust way to
-// recognise "the state at this event is the room's current state". Rejected
-// (soft-failed) events are excluded: they are persisted for DAG continuity but
-// are not part of the room's real DAG surface, so a rejected event referencing
-// eventID must not make it look like a non-leaf — Synapse #5090 ("Inbound
-// federation accepts a second soft-failed event") expects M1 to stay an
-// extremity even after two soft-failed siblings reference it.
+// recognise "the state at this event is the room's current state".
 func (s *Store) EventIsDAGLeaf(ctx context.Context, roomID, eventID string) (bool, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT json FROM events WHERE room_id=$1
-		 AND NOT EXISTS (SELECT 1 FROM rejected_events r WHERE r.event_id = events.event_id)`, roomID)
+		`SELECT json FROM events WHERE room_id=$1`, roomID)
 	if err != nil {
 		return false, err
 	}
@@ -156,6 +150,73 @@ func (s *Store) UndoExtremitiesForRejected(ctx context.Context, roomID, eventID 
 		}
 	}
 	return nil
+}
+
+// RemovePrevsBehindRejected prunes the forward-extremity set of the accepted
+// ancestors that sit behind a chain of rejected (soft-failed) events
+// (Synapse's _get_prevs_before_rejected + difference_update in
+// _calculate_new_extremities). When an accepted event references a rejected
+// prev, the rejected event and everything it transitively references (down to
+// the last accepted ancestor) must not remain an extremity: the new accepted
+// event supersedes them, and leaving the ancestor would produce a dangling
+// extremity (sytest "Inbound federation correctly handles soft failed events
+// as extremities" — after M1 ← SF1 ← SF2 ← M2, M2's acceptance must remove M1
+// and SF1/SF2 so M2 is the sole extremity).
+//
+// eventIDs are the accepted event's prev_events. The walk starts there: for
+// each event that is itself rejected, its prevs are collected and recursed
+// into (an accepted event terminates the walk). The collected set therefore
+// holds the rejected chain's prevs plus the terminal accepted ancestors that
+// the new accepted event supersedes — exactly Synapse's existing_prevs, which
+// is what must leave the extremity set (e.g. after M1 ← SF1 ← SF2 ← M2,
+// M2's acceptance collects SF1 and M1, removing the dangling M1 extremity).
+func (s *Store) RemovePrevsBehindRejected(ctx context.Context, roomID string, eventIDs []string) error {
+	if len(eventIDs) == 0 {
+		return nil
+	}
+	collected := map[string]bool{}
+	batch := make([]string, 0, len(eventIDs))
+	for _, id := range eventIDs {
+		batch = append(batch, id)
+	}
+	for len(batch) > 0 {
+		var next []string
+		for _, id := range batch {
+			if collected[id] {
+				continue
+			}
+			rejected, err := s.IsEventRejected(ctx, id)
+			if err != nil {
+				continue
+			}
+			if !rejected {
+				// An accepted event terminates the walk.
+				continue
+			}
+			ev, err := s.GetEvent(ctx, id)
+			if err != nil {
+				continue
+			}
+			prevs := ParsePrevEvents(ev.RawJSON)
+			for _, p := range prevs {
+				if !collected[p] {
+					collected[p] = true
+					next = append(next, p)
+				}
+			}
+		}
+		batch = next
+	}
+	if len(collected) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(collected))
+	for id := range collected {
+		ids = append(ids, id)
+	}
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM forward_extremities WHERE room_id=$1 AND event_id = ANY($2)`, roomID, ids)
+	return err
 }
 
 // EventIDsReferencingPrev returns the event IDs in a room whose prev_events

@@ -326,7 +326,14 @@ const backfillLockKey = 0x6B61747269 // "katri"
 // event insert just advanced) before the membership upsert commits: the sync
 // would otherwise mint a token past the membership change without ever
 // delivering it. It returns the event's stream_ordering.
-func (s *Store) InsertEventWithMembership(ctx context.Context, e *EventRow, m *MembershipRow) (int64, error) {
+//
+// maintainExtremities controls the forward-extremity bookkeeping: a soft-failed
+// (rejected) event is persisted for DAG continuity but must never become a
+// forward extremity nor displace its prev_events, so its caller passes false
+// (mirror of Synapse, which excludes rejected events from the extremity
+// computation in _calculate_new_extremities). Accepted events pass true and
+// get the normal extremity update.
+func (s *Store) InsertEventWithMembership(ctx context.Context, e *EventRow, m *MembershipRow, maintainExtremities bool) (int64, error) {
 	var stateKey *string
 	if e.StateKey != "" {
 		sk := e.StateKey
@@ -366,6 +373,9 @@ func (s *Store) InsertEventWithMembership(ctx context.Context, e *EventRow, m *M
 		return 0, err
 	}
 	e.StreamOrdering = stream
+	if !maintainExtremities {
+		return stream, nil
+	}
 	prevs := e.PrevEvents
 	if prevs == nil {
 		prevs = ParsePrevEvents(e.RawJSON)

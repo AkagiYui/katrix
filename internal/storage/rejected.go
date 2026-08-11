@@ -61,6 +61,23 @@ func (s *Store) RejectedEventIDs(ctx context.Context, ids []string) (map[string]
 	return out, rows.Err()
 }
 
+// AnyRejected reports whether any of the given event IDs was soft-failed.
+func (s *Store) AnyRejected(ctx context.Context, ids []string) (bool, error) {
+	if len(ids) == 0 {
+		return false, nil
+	}
+	var one int
+	err := s.pool.QueryRow(ctx,
+		`SELECT 1 FROM rejected_events WHERE event_id = ANY($1) LIMIT 1`, ids).Scan(&one)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // EventAccepted reports whether the event is already persisted and has not been
 // soft-failed. A re-delivery of such an event must be treated as an idempotent
 // accept: its verdict was already established, and re-authorising against the
