@@ -3,6 +3,8 @@ package storage
 import (
 	"context"
 	"errors"
+	"regexp"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -19,6 +21,10 @@ type MediaRow struct {
 	Blurhash     string
 	CreatedTS    int64
 	CachedTS     int64 // when remote media was locally cached (0 for local)
+	// QuarantinedTS is non-zero when an admin quarantined the media (admin API
+	// POST /_synapse/admin/v1/room/{roomId}/media/quarantine); quarantined media
+	// is withheld from every download/thumbnail until unquarantined.
+	QuarantinedTS int64
 }
 
 // CreateMedia inserts media metadata. For local media OriginServer should be
@@ -38,9 +44,9 @@ func (s *Store) GetMedia(ctx context.Context, mediaID string) (*MediaRow, error)
 	var m MediaRow
 	var uploadName, blur *string
 	err := s.pool.QueryRow(ctx,
-		`SELECT media_id, COALESCE(origin_server,''), content_type, upload_name, user_id, size, sha256, blurhash, created_ts, COALESCE(cached_ts,0)
+		`SELECT media_id, COALESCE(origin_server,''), content_type, upload_name, user_id, size, sha256, blurhash, created_ts, COALESCE(cached_ts,0), COALESCE(quarantined_ts,0)
 		 FROM media WHERE media_id=$1`, mediaID,
-	).Scan(&m.MediaID, &m.OriginServer, &m.ContentType, &uploadName, &m.UserID, &m.Size, &m.SHA256, &blur, &m.CreatedTS, &m.CachedTS)
+	).Scan(&m.MediaID, &m.OriginServer, &m.ContentType, &uploadName, &m.UserID, &m.Size, &m.SHA256, &blur, &m.CreatedTS, &m.CachedTS, &m.QuarantinedTS)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -61,9 +67,9 @@ func (s *Store) GetRemoteMedia(ctx context.Context, originServer, mediaID string
 	var m MediaRow
 	var uploadName, blur *string
 	err := s.pool.QueryRow(ctx,
-		`SELECT media_id, COALESCE(origin_server,''), content_type, upload_name, user_id, size, sha256, blurhash, created_ts, COALESCE(cached_ts,0)
+		`SELECT media_id, COALESCE(origin_server,''), content_type, upload_name, user_id, size, sha256, blurhash, created_ts, COALESCE(cached_ts,0), COALESCE(quarantined_ts,0)
 		 FROM media WHERE origin_server=$1 AND media_id=$2`, originServer, mediaID,
-	).Scan(&m.MediaID, &m.OriginServer, &m.ContentType, &uploadName, &m.UserID, &m.Size, &m.SHA256, &blur, &m.CreatedTS, &m.CachedTS)
+	).Scan(&m.MediaID, &m.OriginServer, &m.ContentType, &uploadName, &m.UserID, &m.Size, &m.SHA256, &blur, &m.CreatedTS, &m.CachedTS, &m.QuarantinedTS)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -78,6 +84,87 @@ func (s *Store) GetRemoteMedia(ctx context.Context, originServer, mediaID string
 	}
 	return &m, nil
 }
+
+// QuarantineMediaInRoom marks every media whose mxc:// URL appears in any of
+// the room's events as quarantined (admin API "quarantine media in a room":
+// media that has been seen in the room becomes unavailable to all clients and
+// remote servers). The scan walks the room's stored events for mxc://
+// references, so a media ID is quarantined once regardless of whether it was
+// uploaded locally or cached from a remote server. Returns the number of media
+// rows newly quarantined.
+func (s *Store) QuarantineMediaInRoom(ctx context.Context, roomID string, now int64) (int64, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT json FROM events WHERE room_id=$1 ORDER BY stream_ordering DESC LIMIT 1000`, roomID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	type originID struct{ origin, mediaID string }
+	found := map[originID]bool{}
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return 0, err
+		}
+		for _, m := range mxcURLRegex.FindAllString(raw, -1) {
+			// mxc://<server>/<mediaID>
+			rest := m[len("mxc://"):]
+			slash := strings.IndexByte(rest, '/')
+			if slash <= 0 || slash == len(rest)-1 {
+				continue
+			}
+			origin := rest[:slash]
+			mediaID := rest[slash+1:]
+			// Trim any trailing punctuation the regex may have captured.
+			mediaID = strings.TrimRight(mediaID, `"',.})]`)
+			if mediaID == "" {
+				continue
+			}
+			found[originID{origin, mediaID}] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	var quarantined int64
+	for f := range found {
+		tag, err := s.pool.Exec(ctx,
+			`UPDATE media SET quarantined_ts=$1
+			 WHERE origin_server=$2 AND media_id=$3 AND quarantined_ts=0`,
+			now, f.origin, f.mediaID)
+		if err != nil {
+			continue
+		}
+		quarantined += tag.RowsAffected()
+	}
+	return quarantined, nil
+}
+
+// QuarantineMedia marks a single media row quarantined (admin API
+// "quarantine media by id"). Returns ErrNotFound when no row matches.
+func (s *Store) QuarantineMedia(ctx context.Context, originServer, mediaID string, now int64) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE media SET quarantined_ts=$1 WHERE origin_server=$2 AND media_id=$3`,
+		now, originServer, mediaID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UnquarantineMedia lifts the quarantine flag from a media row (admin API
+// "unquarantine media").
+func (s *Store) UnquarantineMedia(ctx context.Context, originServer, mediaID string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE media SET quarantined_ts=0 WHERE origin_server=$1 AND media_id=$2`,
+		originServer, mediaID)
+	return err
+}
+
+var mxcURLRegex = regexp.MustCompile(`mxc://[^"\s]+`)
 
 // ThumbnailRow is a media thumbnail row.
 type ThumbnailRow struct {

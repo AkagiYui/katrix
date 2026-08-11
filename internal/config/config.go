@@ -43,6 +43,15 @@ type Config struct {
 		Enabled      bool `yaml:"enabled"`
 		RequireToken bool `yaml:"require_token"`
 		AllowGuest   bool `yaml:"allow_guest"`
+
+		// SharedSecret (registration_shared_secret) enables the Synapse-compatible
+		// admin registration endpoint GET/POST /_synapse/admin/v1/register: a
+		// caller holding the secret can register users (optionally as admins)
+		// without going through User-Interactive Authentication. The HMAC uses the
+		// secret over the nonce+username+password+admin string, exactly as
+		// Synapse's AdminRegistrationServlet (sytest's
+		// matrix_admin_register_user_via_secret drives it).
+		SharedSecret string `yaml:"registration_shared_secret"`
 	} `yaml:"registration"`
 
 	Media struct {

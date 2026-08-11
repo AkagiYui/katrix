@@ -96,6 +96,11 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/federation/v1/media/thumbnail/{serverName}/{mediaID}", a.FedThumbnail)
 	mux.HandleFunc("GET /_matrix/federation/v1/media/thumbnail/{serverName}/{mediaID}/{fileName}", a.FedThumbnail)
 	mux.HandleFunc("GET /_matrix/federation/v1/media/thumbnail/{mediaID}", a.FedThumbnail)
+	// Admin media quarantine (Synapse-compatible admin API). Only local admin
+	// accounts may call these (mirror of the /_synapse/admin/v1/* surface).
+	mux.HandleFunc("POST /_synapse/admin/v1/room/{roomID}/media/quarantine", a.RequireAuth(a.AdminQuarantineRoomMedia))
+	mux.HandleFunc("POST /_synapse/admin/v1/media/quarantine/{serverName}/{mediaID}", a.RequireAuth(a.AdminQuarantineMedia))
+	mux.HandleFunc("POST /_synapse/admin/v1/media/unquarantine/{serverName}/{mediaID}", a.RequireAuth(a.AdminUnquarantineMedia))
 }
 
 // Config_ handles GET /_matrix/.../config.
@@ -103,6 +108,79 @@ func (a *API) Config_(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"m.upload.size": a.HS.Config.Media.MaxUploadBytes,
 	})
+}
+
+// requireAdmin authorizes a request as a local admin account. katrix has no
+// token-issued admin session beyond the account's Admin flag; the check mirrors
+// the CS admin API's isAdmin (a non-admin local user gets 403).
+func (a *API) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	u, err := a.Store.GetUser(r.Context(), auth.Localpart)
+	if err != nil || !u.Admin {
+		httpx.WriteError(w, httpx.ErrForbidden("admin privileges required"))
+		return false
+	}
+	return true
+}
+
+// quarantineMedia marks a single media row quarantined by its (origin server,
+// media ID) pair. Local uploads are keyed by the local server name; remote
+// cached media by the remote origin. Returns true when a row was updated.
+func (a *API) quarantineMedia(ctx context.Context, originServer, mediaID string, now int64) bool {
+	found := false
+	if err := a.Store.QuarantineMedia(ctx, originServer, mediaID, now); err == nil {
+		found = true
+	}
+	// A media ID uploaded locally but requested with the local server name (or
+	// an mxc:// from this server) is keyed by this server's name too.
+	if originServer != a.ServerName() {
+		if err := a.Store.QuarantineMedia(ctx, a.ServerName(), mediaID, now); err == nil {
+			found = true
+		}
+	}
+	return found
+}
+
+// AdminQuarantineRoomMedia handles POST
+// /_synapse/admin/v1/room/{roomId}/media/quarantine: every media referenced
+// by any event in the room is quarantined (spec §Admin API; the room's stored
+// events are scanned for mxc:// URLs). Local admins only.
+func (a *API) AdminQuarantineRoomMedia(w http.ResponseWriter, r *http.Request) {
+	if !a.requireAdmin(w, r) {
+		return
+	}
+	roomID := r.PathValue("roomID")
+	quarantined, err := a.Store.QuarantineMediaInRoom(r.Context(), roomID, a.Now())
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"num_quarantined": quarantined})
+}
+
+// AdminQuarantineMedia handles POST
+// /_synapse/admin/v1/media/quarantine/{serverName}/{mediaId}: quarantines a
+// single media by origin server + media ID.
+func (a *API) AdminQuarantineMedia(w http.ResponseWriter, r *http.Request) {
+	if !a.requireAdmin(w, r) {
+		return
+	}
+	serverName := r.PathValue("serverName")
+	mediaID := r.PathValue("mediaID")
+	a.quarantineMedia(r.Context(), serverName, mediaID, a.Now())
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{})
+}
+
+// AdminUnquarantineMedia handles POST
+// /_synapse/admin/v1/media/unquarantine/{serverName}/{mediaId}.
+func (a *API) AdminUnquarantineMedia(w http.ResponseWriter, r *http.Request) {
+	if !a.requireAdmin(w, r) {
+		return
+	}
+	serverName := r.PathValue("serverName")
+	mediaID := r.PathValue("mediaID")
+	_ = a.Store.UnquarantineMedia(r.Context(), serverName, mediaID)
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{})
 }
 
 // Upload handles POST /_matrix/media/v3/upload.
@@ -221,10 +299,15 @@ func (a *API) FedDownload(w http.ResponseWriter, r *http.Request) {
 // multipart/mixed per the server-server spec: the first part is an
 // application/json metadata object (currently empty), the second part carries
 // the media bytes with its Content-Type and Content-Disposition. A media that
-// was reserved but not yet uploaded returns M_NOT_YET_UPLOADED.
+// was reserved but not yet uploaded returns M_NOT_YET_UPLOADED. Quarantined
+// media is withheld with a 404.
 func (a *API) serveFedMedia(w http.ResponseWriter, r *http.Request, mediaID, fileName string) {
 	if _, err := a.Store.PendingMedia(r.Context(), mediaID); err == nil {
 		httpx.WriteError(w, httpx.NewError(http.StatusGatewayTimeout, "M_NOT_YET_UPLOADED", "the media has not yet been uploaded"))
+		return
+	}
+	if a.mediaQuarantined(r.Context(), a.ServerName(), mediaID) {
+		httpx.WriteError(w, httpx.ErrNotFound("media not found"))
 		return
 	}
 	f, meta, err := a.backend.Download(r.Context(), mediaID)
@@ -260,6 +343,22 @@ func (a *API) serveFedMedia(w http.ResponseWriter, r *http.Request, mediaID, fil
 	_ = mw.Close()
 }
 
+// mediaQuarantined reports whether the media identified by (originServer,
+// mediaID) is quarantined. Quarantined media is withheld from every download
+// and thumbnail (client and federation) with a 404, matching Synapse's
+// behaviour for a quarantined media row.
+func (a *API) mediaQuarantined(ctx context.Context, originServer, mediaID string) bool {
+	if originServer == "" || originServer == a.ServerName() {
+		if m, err := a.Store.GetMedia(ctx, mediaID); err == nil {
+			return m.QuarantinedTS != 0
+		}
+	}
+	if m, err := a.Store.GetRemoteMedia(ctx, originServer, mediaID); err == nil {
+		return m.QuarantinedTS != 0
+	}
+	return false
+}
+
 // serveDownload is the shared download path for the client and federation
 // endpoints. allowRemoteFetch controls whether a miss on a media belonging to
 // another server triggers a lazy federation fetch (client endpoints only). Per
@@ -270,6 +369,11 @@ func (a *API) serveDownload(w http.ResponseWriter, r *http.Request, serverName, 
 	// M_NOT_YET_UPLOADED (MSC2246).
 	if _, err := a.Store.PendingMedia(r.Context(), mediaID); err == nil {
 		httpx.WriteError(w, httpx.NewError(http.StatusGatewayTimeout, "M_NOT_YET_UPLOADED", "the media has not yet been uploaded"))
+		return
+	}
+	// Quarantined media is withheld: the row exists but serves nothing.
+	if a.mediaQuarantined(r.Context(), serverName, mediaID) {
+		httpx.WriteError(w, httpx.ErrNotFound("media not found"))
 		return
 	}
 	f, meta, err := a.backend.Download(r.Context(), mediaID)
@@ -323,10 +427,15 @@ func (a *API) FedThumbnail(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveFedThumbnail serves a federation thumbnail as multipart/mixed: the
-// metadata part (empty JSON) followed by the thumbnail bytes part.
+// metadata part (empty JSON) followed by the thumbnail bytes part. Quarantined
+// media is withheld with a 404.
 func (a *API) serveFedThumbnail(w http.ResponseWriter, r *http.Request, mediaID string) {
 	if _, err := a.Store.PendingMedia(r.Context(), mediaID); err == nil {
 		httpx.WriteError(w, httpx.NewError(http.StatusGatewayTimeout, "M_NOT_YET_UPLOADED", "the media has not yet been uploaded"))
+		return
+	}
+	if a.mediaQuarantined(r.Context(), a.ServerName(), mediaID) {
+		httpx.WriteError(w, httpx.ErrNotFound("media not found"))
 		return
 	}
 	q := r.URL.Query()
@@ -378,8 +487,12 @@ func (a *API) serveFedThumbnail(w http.ResponseWriter, r *http.Request, mediaID 
 
 // serveThumbnail is the shared thumbnail path for the client and federation
 // endpoints. allowRemoteFetch controls lazy federation fetching on a remote
-// miss (client endpoints only).
+// miss (client endpoints only). Quarantined media is withheld with a 404.
 func (a *API) serveThumbnail(w http.ResponseWriter, r *http.Request, serverName, mediaID string, allowRemoteFetch bool) {
+	if a.mediaQuarantined(r.Context(), serverName, mediaID) {
+		httpx.WriteError(w, httpx.ErrNotFound("media not found"))
+		return
+	}
 	if serverName != a.ServerName() {
 		// Ensure remote media is cached before generating a thumbnail.
 		if _, _, err := a.backend.Download(r.Context(), mediaID); err != nil {

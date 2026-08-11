@@ -116,6 +116,14 @@ sub _get_config
          enabled      => $JSON::true,
          require_token => $JSON::false,
          allow_guest  => $JSON::true,
+
+         # Enable the Synapse-compatible shared-secret admin registration
+         # endpoint (GET/POST /_synapse/admin/v1/register). sytest's
+         # local_admin_fixture registers admins via that flow
+         # (matrix_admin_register_user_via_secret signs with the literal
+         # "reg_secret", see tests/10apidoc/01register.pl), so the secret must
+         # match exactly.
+         registration_shared_secret => "reg_secret",
       },
 
       media => {

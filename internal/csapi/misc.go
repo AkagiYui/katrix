@@ -3,7 +3,11 @@ package csapi
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"io"
@@ -15,6 +19,7 @@ import (
 
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
+	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/netutil/ssrf"
 	"github.com/AkagiYui/katrix/internal/pushrules"
 	"github.com/AkagiYui/katrix/internal/storage"
@@ -70,6 +75,8 @@ func (a *API) registerMisc(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v1/media/preview_url", a.RequireAuth(a.PreviewURL))
 	mux.HandleFunc("GET /_matrix/media/v3/preview_url", a.RequireAuth(a.PreviewURL))
 	// Admin API (/_synapse/admin-style + /_matrix/client/r0/admin).
+	mux.HandleFunc("GET /_synapse/admin/v1/register", a.AdminRegisterGet)
+	mux.HandleFunc("POST /_synapse/admin/v1/register", a.AdminRegisterPost)
 	mux.HandleFunc("GET /_matrix/client/v3/admin/whois/{userID}", a.RequireAuth(a.AdminWhois))
 	mux.HandleFunc("POST /_matrix/client/v3/admin/users/{userID}/deactivate", a.RequireAuth(a.AdminDeactivate))
 	mux.HandleFunc("POST /_matrix/client/v3/admin/user/{userID}/password", a.RequireAuth(a.AdminSetPassword))
@@ -1158,6 +1165,98 @@ func extractOpenGraph(html string) map[string]any {
 }
 
 // ---- Admin API ----
+
+// Shared-secret admin registration (Synapse-compatible GET/POST
+// /_synapse/admin/v1/register). Enabled by the registration_shared_secret
+// config; the endpoint lets a holder of the secret register users (optionally
+// as admins) without User-Interactive Authentication. The HMAC-SHA1 is taken
+// over "nonce\0username\0password\0admin|notadmin" using the shared secret,
+// exactly as Synapse's AdminRegistrationServlet (sytest's
+// matrix_admin_register_user_via_secret drives this flow).
+
+var adminRegisterNonce = ids.RandomToken()
+
+// AdminRegisterGet handles GET /_synapse/admin/v1/register: returns the current
+// nonce the POST must sign.
+func (a *API) AdminRegisterGet(w http.ResponseWriter, r *http.Request) {
+	if a.Config.Registration.SharedSecret == "" {
+		httpx.WriteError(w, httpx.ErrForbidden("shared secret registration disabled"))
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"nonce": adminRegisterNonce})
+}
+
+// AdminRegisterPost handles POST /_synapse/admin/v1/register. The request must
+// sign (nonce, username, password, admin flag) with the shared secret.
+func (a *API) AdminRegisterPost(w http.ResponseWriter, r *http.Request) {
+	if a.Config.Registration.SharedSecret == "" {
+		httpx.WriteError(w, httpx.ErrForbidden("shared secret registration disabled"))
+		return
+	}
+	var req struct {
+		Nonce    string `json:"nonce"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Admin    bool   `json:"admin"`
+		Mac      string `json:"mac"`
+	}
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	if req.Nonce == "" || req.Username == "" || req.Password == "" {
+		httpx.WriteError(w, httpx.ErrInvalidParam("nonce, username and password are required"))
+		return
+	}
+	localpart := strings.ToLower(req.Username)
+	if !ids.ValidLocalpart(localpart) {
+		httpx.WriteError(w, httpx.ErrInvalidUsername("invalid username"))
+		return
+	}
+	admin := "notadmin"
+	if req.Admin {
+		admin = "admin"
+	}
+	expected := hmacSHA1Hex(a.Config.Registration.SharedSecret, req.Nonce+"\x00"+req.Username+"\x00"+req.Password+"\x00"+admin)
+	if !hmac.Equal([]byte(expected), []byte(req.Mac)) {
+		httpx.WriteError(w, httpx.ErrForbidden("HMAC mismatch"))
+		return
+	}
+	passwordHash, err := homeserver.HashPassword(req.Password)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	user := storage.User{Localpart: localpart, PasswordHash: passwordHash, Admin: req.Admin, CreatedTS: a.Now()}
+	if err := a.Store.CreateUser(r.Context(), user); err != nil {
+		if errors.Is(err, storage.ErrUserExists) {
+			httpx.WriteError(w, httpx.ErrUserInUse())
+			return
+		}
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	_ = a.savePushRules(localpart, pushrules.DefaultRuleset())
+	deviceID := ids.RandomDeviceID()
+	login, err := a.issueLogin(r, localpart, deviceID, "", false)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"user_id":      a.UserID(localpart),
+		"home_server":  a.ServerName(),
+		"device_id":    deviceID,
+		"access_token": login.AccessToken,
+	})
+}
+
+// hmacSHA1Hex computes the hex-encoded HMAC-SHA1 of msg with key.
+func hmacSHA1Hex(key, msg string) string {
+	mac := hmac.New(sha1.New, []byte(key))
+	_, _ = mac.Write([]byte(msg))
+	return hex.EncodeToString(mac.Sum(nil))
+}
 
 // AdminWhois handles GET /_matrix/client/v3/admin/whois/{userID}.
 // It reports every device of the target user, each with its sessions and the
