@@ -90,15 +90,21 @@ func (s *Store) UpdateExtremitiesForEvent(ctx context.Context, roomID, eventID s
 }
 
 // EventIsDAGLeaf reports whether eventID is a DAG leaf in roomID — no other
-// event in the room references it as a prev_event. The room's forward
+// ACCEPTED event in the room references it as a prev_event. The room's forward
 // extremities table is authoritative for most rooms, but a partial-state resync
 // (MSC3902) re-seeds the extremities to the join event even when later events
 // were ingested during the partial window, so a leaf check against the events
 // table (parsing each event's prev_events from its JSON) is the robust way to
-// recognise "the state at this event is the room's current state".
+// recognise "the state at this event is the room's current state". Rejected
+// (soft-failed) events are excluded: they are persisted for DAG continuity but
+// are not part of the room's real DAG surface, so a rejected event referencing
+// eventID must not make it look like a non-leaf — Synapse #5090 ("Inbound
+// federation accepts a second soft-failed event") expects M1 to stay an
+// extremity even after two soft-failed siblings reference it.
 func (s *Store) EventIsDAGLeaf(ctx context.Context, roomID, eventID string) (bool, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT json FROM events WHERE room_id=$1`, roomID)
+		`SELECT json FROM events WHERE room_id=$1
+		 AND NOT EXISTS (SELECT 1 FROM rejected_events r WHERE r.event_id = events.event_id)`, roomID)
 	if err != nil {
 		return false, err
 	}

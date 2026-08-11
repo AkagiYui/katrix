@@ -139,6 +139,14 @@ sub _get_config
       # skip TLS verification for outbound HTTP push notifications.
       push_insecure => $JSON::true,
 
+      # The sytest URL-preview mock serves the previewed page from a loopback
+      # URL (https://localhost:<port>/test.html), which the default SSRF guard
+      # (private IPs blocked) would refuse with 403. The mock is part of the
+      # test environment, so allow private/loopback fetches here, matching how
+      # the other security checks are relaxed above (Complement already relies
+      # on this flag for its host.docker.internal preview fixture).
+      ssrf_allow_private_ips => $JSON::true,
+
       federation_tls => {
          cert_path => $self->{paths}{tls_cert},
          key_path  => $self->{paths}{tls_key},

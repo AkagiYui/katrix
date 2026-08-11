@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/httpx"
@@ -82,12 +83,17 @@ func (n *notaryCache) merge(keys []notaryKey) {
 }
 
 // notary answers a key query for the given server, returning the re-signed key
-// objects. A fetch is performed when the server's keys are not cached, or when
-// the caller's minimum_valid_until_ts exceeds the cached keys' validity; a
-// fetch failure falls back to the cached (possibly expired) keys.
+// objects. A fetch is performed when the server's keys are not cached, when
+// the cached keys have expired (their valid_until_ts has passed — mirror of
+// Synapse's get_server_verify_keys_v2_direct, which re-fetches expired keys),
+// or when the caller's minimum_valid_until_ts exceeds the cached keys'
+// validity; a fetch failure falls back to the cached (possibly expired) keys.
 func (a *API) notary(ctx context.Context, serverName string, minValidUntilTS int64) []json.RawMessage {
 	cached := a.notaryCache.get(serverName)
 	needFetch := len(cached) == 0
+	if vu := a.notaryCache.validUntil(serverName); vu > 0 && vu <= time.Now().UnixMilli() {
+		needFetch = true
+	}
 	if minValidUntilTS > 0 && a.notaryCache.validUntil(serverName) < minValidUntilTS {
 		needFetch = true
 	}
