@@ -2587,15 +2587,31 @@ func (a *API) applyRemoteMembershipNotify(ctx context.Context, roomID, userID, m
 	}
 	// A LOCAL user joining a room (whether via the client path or a federated
 	// send_join whose PDU is ingested back) makes their presence newly visible
-	// to the room's remote servers: they have no baseline for the user, so push
-	// an m.presence EDU to each server sharing the room. The stored presence
-	// (or "online" when none) is broadcast; the join itself does NOT write a
-	// presence row — a row must only appear when the user actually declares
-	// presence (PUT /presence or a /sync set_presence), so a later declaration
-	// still counts as a change in the shared stream (sytest "User sees updates
-	// to presence from other users in the incremental sync." syncs the joiner
-	// and expects the other user to observe the online transition).
+	// to the room's other members and servers. When the user has no presence
+	// row yet (never declared presence), the join establishes one as "online"
+	// (the spec's /sync default) and records the change in the shared stream,
+	// so room peers observe the online transition (sytest "User sees updates to
+	// presence from other users in the incremental sync."). A user who already
+	// declared presence keeps their value — a join must not override it
+	// (sytest "Presence changes to UNAVAILABLE are reported to local room
+	// members"). The m.presence EDU is broadcast to the room's remote servers
+	// so federated peers learn the joiner's presence (sytest "New federated
+	// private chats get full presence information (SYN-115)").
 	if membership == "join" && a.IsLocalUser(userID) {
+		// Establish the row only when the user has none: a join means the user
+		// is present (spec /sync default "online"), and recording the change in
+		// the shared stream lets room peers observe the online transition
+		// (sytest "User sees updates to presence from other users in the
+		// incremental sync."). A user who already declared presence keeps their
+		// value — a join must not override it (sytest "Presence changes to
+		// UNAVAILABLE are reported to local room members"), and a settled row
+		// keeps later /sync set_presence calls no-ops (no spurious stream
+		// advancement).
+		if p, err := a.Store.GetPresence(ctx, userID); err != nil || p == nil {
+			if _, err := a.Store.SetPresence(ctx, userID, "online", "", a.Now()); err != nil {
+				return
+			}
+		}
 		presence := "online"
 		statusMsg := ""
 		if p, err := a.Store.GetPresence(ctx, userID); err == nil && p != nil {
