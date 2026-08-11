@@ -67,12 +67,16 @@ func (s *Store) SearchUserDirectory(ctx context.Context, serverName, term, searc
 	}
 
 	// Remote users: joined members of a public/world-readable room on this
-	// server, whose localpart (or full user ID) matches the term. A partial-
+	// server, whose display name, localpart or full user ID matches the term.
+	// The display name comes from the membership event (a remote join carries
+	// the member's profile), so a search by display name finds remote users —
+	// sytest "User in remote room doesn't appear in user directory after server
+	// left room" searches the remote creator by their display name. A partial-
 	// state room's memberships are applied by the resync, so these rows appear
 	// once the room is fully stated (Complement's "User directory is correctly
 	// updated once state re-sync completes").
 	remoteRows, err := s.pool.Query(ctx,
-		`SELECT DISTINCT rm.user_id
+		`SELECT DISTINCT rm.user_id, COALESCE(rm.display_name,'')
 		 FROM room_memberships rm
 		 JOIN room_state rs ON rs.room_id = rm.room_id
 		  AND rs.type='m.room.join_rules' AND rs.state_key=''
@@ -80,13 +84,14 @@ func (s *Store) SearchUserDirectory(ctx context.Context, serverName, term, searc
 		  AND je.content->>'join_rule' = 'public'
 		 WHERE rm.membership='join'
 		   AND rm.user_id NOT LIKE '@%:' || $2
-		   AND (LOWER(SUBSTRING(rm.user_id FROM '@([^:]*):')) LIKE '%'||$1||'%'
+		   AND (LOWER(COALESCE(rm.display_name,'')) LIKE '%'||$1||'%'
+		        OR LOWER(SUBSTRING(rm.user_id FROM '@([^:]*):')) LIKE '%'||$1||'%'
 		        OR LOWER(rm.user_id) LIKE '%'||$1||'%')
 		 LIMIT 500`, term, serverName)
 	if err == nil {
 		for remoteRows.Next() {
-			var userID string
-			if err := remoteRows.Scan(&userID); err != nil {
+			var userID, displayName string
+			if err := remoteRows.Scan(&userID, &displayName); err != nil {
 				remoteRows.Close()
 				break
 			}
@@ -99,7 +104,7 @@ func (s *Store) SearchUserDirectory(ctx context.Context, serverName, term, searc
 			if localpart == "" {
 				continue
 			}
-			candidates = append(candidates, UserDirectoryEntry{Localpart: localpart, FullID: userID})
+			candidates = append(candidates, UserDirectoryEntry{Localpart: localpart, FullID: userID, DisplayName: displayName})
 		}
 		remoteRows.Close()
 	}
@@ -117,7 +122,7 @@ func (s *Store) SearchUserDirectory(ctx context.Context, serverName, term, searc
 			continue
 		}
 		seen[userID] = true
-		if s.userVisibleToSearcher(ctx, userID, searcherUserID) {
+		if s.userVisibleToSearcher(ctx, serverName, userID, searcherUserID) {
 			out = append(out, c)
 			if len(out) >= 50 {
 				break
@@ -128,9 +133,9 @@ func (s *Store) SearchUserDirectory(ctx context.Context, serverName, term, searc
 }
 
 // userVisibleToSearcher reports whether userID is discoverable by searcherID:
-// the user is a joined member of a public/world_readable room, or shares a
-// joined room with the searcher.
-func (s *Store) userVisibleToSearcher(ctx context.Context, userID, searcherUserID string) bool {
+// the user is a joined member of a public/world_readable room (that the local
+// server still participates in), or shares a joined room with the searcher.
+func (s *Store) userVisibleToSearcher(ctx context.Context, serverName, userID, searcherUserID string) bool {
 	rows, err := s.pool.Query(ctx,
 		`SELECT room_id FROM room_memberships WHERE user_id=$1 AND membership='join'`, userID)
 	if err != nil {
@@ -143,7 +148,16 @@ func (s *Store) userVisibleToSearcher(ctx context.Context, userID, searcherUserI
 			return false
 		}
 		if s.roomIsPubliclyVisible(ctx, roomID) {
-			return true
+			// A remote user's entry via a public room only lasts while the local
+			// server still participates in the room: when the room's last local
+			// joined member leaves, the server is out of the room and the remote
+			// user must stop appearing in the local directory (sytest "User in
+			// remote room doesn't appear in user directory after server left
+			// room" — the remote creator disappears once the local member leaves
+			// the shared public room).
+			if s.roomHasLocalJoinedMember(ctx, roomID, serverName) {
+				return true
+			}
 		}
 		// Shared joined room with the searcher. The searcher's OWN membership does
 		// not make them visible to themselves: a user is only findable by searching
@@ -164,6 +178,20 @@ func (s *Store) userVisibleToSearcher(ctx context.Context, userID, searcherUserI
 	// A user is visible only when at least one joined room passed the public or
 	// shared checks above; having joined rooms alone is not enough.
 	return false
+}
+
+// roomHasLocalJoinedMember reports whether any local (this server's) user is a
+// joined member of the room. Used to gate a remote user's public-room
+// visibility on the server still participating in the room.
+func (s *Store) roomHasLocalJoinedMember(ctx context.Context, roomID, serverName string) bool {
+	var ok bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(
+		   SELECT 1 FROM room_memberships
+		   WHERE room_id=$1 AND membership='join'
+		     AND user_id LIKE '@%:' || $2)`,
+		roomID, serverName).Scan(&ok)
+	return err == nil && ok
 }
 
 // roomIsPubliclyVisible reports whether a room is "public" for user-directory
