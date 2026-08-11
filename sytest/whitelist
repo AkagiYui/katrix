@@ -803,3 +803,7 @@ setting 'm.room.name' respects room powerlevel
 setting 'm.room.power_levels' respects room powerlevel
 uploading self-signing key notifies over federation
 uploading signed devices gets propagated over federation
+POST /_synapse/admin/v1/register with shared secret
+POST /_synapse/admin/v1/register admin with shared secret
+POST /_synapse/admin/v1/register with shared secret downcases capitals
+POST /_synapse/admin/v1/register with shared secret disallows symbols

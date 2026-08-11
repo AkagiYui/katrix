@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"regexp"
@@ -102,19 +103,19 @@ func (s *Store) QuarantineMediaInRoom(ctx context.Context, roomID string, now in
 	type originID struct{ origin, mediaID string }
 	found := map[originID]bool{}
 	for rows.Next() {
-		var raw string
+		var raw []byte
 		if err := rows.Scan(&raw); err != nil {
 			return 0, err
 		}
-		for _, m := range mxcURLRegex.FindAllString(raw, -1) {
+		for _, m := range mxcURLRegex.FindAll(raw, -1) {
 			// mxc://<server>/<mediaID>
 			rest := m[len("mxc://"):]
-			slash := strings.IndexByte(rest, '/')
+			slash := bytes.IndexByte(rest, '/')
 			if slash <= 0 || slash == len(rest)-1 {
 				continue
 			}
-			origin := rest[:slash]
-			mediaID := rest[slash+1:]
+			origin := string(rest[:slash])
+			mediaID := string(rest[slash+1:])
 			// Trim any trailing punctuation the regex may have captured.
 			mediaID = strings.TrimRight(mediaID, `"',.})]`)
 			if mediaID == "" {
