@@ -1455,9 +1455,16 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 			erased = es
 		}
 	}
+	// Spec "Ignoring Users": events sent by users on the caller's
+	// m.ignored_user_list are excluded from paginated responses (mirror of
+	// Synapse's filter_events_for_client, applied to /messages too).
+	ignored := a.ignoredUsers(r.Context(), auth.Localpart)
 	for i := range evs {
 		e := evs[i]
 		if !flt.keep(&e) {
+			continue
+		}
+		if ignored[e.Sender] {
 			continue
 		}
 		if vis != nil && !vis.CanSeeRow(&e) {

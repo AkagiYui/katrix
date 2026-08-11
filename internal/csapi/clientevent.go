@@ -1,6 +1,7 @@
 package csapi
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 
@@ -107,6 +108,27 @@ func isStateTypeCSAPI(eventType string) bool {
 		return true
 	}
 	return false
+}
+
+// ignoredUsers returns the set of user IDs the given user has in their global
+// m.ignored_user_list account data, or nil if none. The set is honoured when
+// filtering room invites out of /sync and events out of /messages.
+func (a *API) ignoredUsers(ctx context.Context, localpart string) map[string]bool {
+	raw, err := a.Store.GetAccountData(ctx, localpart, "", "m.ignored_user_list")
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	var data struct {
+		IgnoredUsers map[string]json.RawMessage `json:"ignored_users"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil || len(data.IgnoredUsers) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(data.IgnoredUsers))
+	for u := range data.IgnoredUsers {
+		out[u] = true
+	}
+	return out
 }
 
 // clientEventFromRaw parses a raw PDU and returns the stripped client event.

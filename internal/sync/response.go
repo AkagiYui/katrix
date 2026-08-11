@@ -550,6 +550,10 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	if err != nil {
 		return nil, err
 	}
+	// Users whose events the syncer ignores (spec m.ignored_user_list): their
+	// timeline and state events are excluded from the sync, mirroring how the
+	// filter's room rules exclude events.
+	ignored := e.ignoredUsers(ctx, opts.Localpart)
 	for _, roomID := range joinedRoomIDs {
 		// A partial-state room (MSC3902) is omitted from eager /sync responses
 		// until its background resync completes: the full room state is not
@@ -572,7 +576,7 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 				}
 			}
 		}
-		jr, err := e.buildJoinedRoom(ctx, roomID, opts, maxStream)
+		jr, err := e.buildJoinedRoom(ctx, roomID, opts, maxStream, ignored)
 		if err != nil {
 			return nil, err
 		}
@@ -580,7 +584,6 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	}
 
 	// Rooms the user is invited to (membership=invite).
-	ignored := e.ignoredUsers(ctx, opts.Localpart)
 	invited, err := e.store.InvitedRooms(ctx, opts.UserID)
 	if err == nil {
 		for _, roomID := range invited {
@@ -611,7 +614,7 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 	leftRooms, _ := e.store.LeftRooms(ctx, opts.UserID, opts.Since.Stream, opts.Since.Stream > 0)
 	if leftRooms != nil {
 		for _, roomID := range leftRooms {
-			lr, err := e.buildLeftRoom(ctx, roomID, opts, maxStream)
+			lr, err := e.buildLeftRoom(ctx, roomID, opts, maxStream, ignored)
 			if err != nil {
 				continue
 			}
@@ -1141,7 +1144,12 @@ func (e *Engine) deviceListPeers(ctx context.Context, opts SyncOptions) map[stri
 }
 
 // buildJoinedRoom constructs the JoinedRoom section.
-func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOptions, maxStream int64) (JoinedRoom, error) {
+// buildJoinedRoom constructs the JoinedRoom section. ignored is the syncing
+// user's m.ignored_user_list: events sent by an ignored user are excluded from
+// the timeline (spec "Ignoring Users"; state events are not filtered — the
+// ignore list applies to timeline content only, mirror of Synapse's
+// filter_events_for_client being applied to timeline events but not state).
+func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOptions, maxStream int64, ignored map[string]bool) (JoinedRoom, error) {
 	jr := JoinedRoom{}
 	filter := opts.Filter
 	// Timeline limit: the filter's per-room timeline limit, else 50 (the spec
@@ -1441,6 +1449,12 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 	var rendered []renderedEvent
 	for _, ev := range evs {
 		if !filter.keepTimeline(&ev) {
+			continue
+		}
+		// Events sent by an ignored user are never delivered (spec "Ignoring
+		// Users"; mirror of Synapse, which applies filter_events_for_client to
+		// timeline events but not to state).
+		if ignored[ev.Sender] {
 			continue
 		}
 		if vis != nil && !currentState[ev.EventID] && !vis.CanSeeRow(&ev) {
@@ -2218,7 +2232,7 @@ func (e *Engine) buildKnockedRoom(ctx context.Context, roomID string) KnockedRoo
 // an empty timeline, `state` carries the leave-time state snapshot so clients
 // still learn the leave (and the pre-leave state) — the spec's archived-room
 // behaviour (cf. element-hq/synapse#16932).
-func (e *Engine) buildLeftRoom(ctx context.Context, roomID string, opts SyncOptions, maxStream int64) (LeftRoom, error) {
+func (e *Engine) buildLeftRoom(ctx context.Context, roomID string, opts SyncOptions, maxStream int64, ignored map[string]bool) (LeftRoom, error) {
 	lr := LeftRoom{}
 	filter := opts.Filter
 	// Where the user left: only events before (and including) the leave are in
@@ -2245,6 +2259,9 @@ func (e *Engine) buildLeftRoom(ctx context.Context, roomID string, opts SyncOpti
 	lr.Timeline.Events = make([]json.RawMessage, 0, len(evs))
 	for _, ev := range evs {
 		if filter != nil && !filter.keepTimeline(&ev) {
+			continue
+		}
+		if ignored[ev.Sender] {
 			continue
 		}
 		lr.Timeline.Events = append(lr.Timeline.Events, filter.applyEventFields(filter.renderEvent(&ev)))
