@@ -113,15 +113,13 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 	if sp == "" {
 		sp = "online"
 	}
-	if sp != "offline" {
-		if changed, err := a.Store.SetPresence(r.Context(), auth.UserID, sp, "", a.Now()); err == nil && changed {
-			// The client declared presence for the first time (or changed it):
-			// broadcast the m.presence EDU to every remote server sharing a room
-			// with the user, so federated peers learn the presence without
-			// waiting for a PUT /presence (sytest "New federated private chats
-			// get full presence information (SYN-115)").
-			a.broadcastLocalPresence(r.Context(), auth.UserID)
-		}
+	if changed, err := a.Store.SetPresence(r.Context(), auth.UserID, sp, "", a.Now()); err == nil && changed && sp != "offline" {
+		// The client declared presence for the first time (or changed it):
+		// broadcast the m.presence EDU to every remote server sharing a room
+		// with the user, so federated peers learn the presence without
+		// waiting for a PUT /presence (sytest "New federated private chats
+		// get full presence information (SYN-115)").
+		a.broadcastLocalPresence(r.Context(), auth.UserID)
 	}
 
 	// Long-poll: compute sync; if no new data, wait on the notifier and retry.
