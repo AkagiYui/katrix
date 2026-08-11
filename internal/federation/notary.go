@@ -60,7 +60,8 @@ func (n *notaryCache) get(serverName string) []notaryKey {
 }
 
 // validUntil returns the minimum valid_until_ts across a server's cached keys
-// (0 when none are cached).
+// (0 when none are cached). This is the validity the merged notary response
+// advertises.
 func (n *notaryCache) validUntil(serverName string) int64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -71,6 +72,24 @@ func (n *notaryCache) validUntil(serverName string) int64 {
 		}
 	}
 	return min
+}
+
+// freshestValidUntil returns the maximum valid_until_ts across a server's
+// cached keys (0 when none). A stale key retained under the not-overwrite rule
+// (e.g. an old key a previous test populated) must not force a re-fetch when
+// the server's current keys already satisfy the caller's minimum — Synapse
+// checks the requested key's own validity, and the freshest key is the one
+// that can satisfy it.
+func (n *notaryCache) freshestValidUntil(serverName string) int64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var max int64
+	for _, k := range n.keys[serverName] {
+		if k.ValidUntilTS > max {
+			max = k.ValidUntilTS
+		}
+	}
+	return max
 }
 
 // merge records the keys of one origin response, adding/updating each key
@@ -92,17 +111,19 @@ func (n *notaryCache) merge(keys []notaryKey, now int64) {
 
 // stale reports whether the cached keys need re-fetching, mirroring Synapse's
 // RemoteKey.query_keys miss logic: with a caller minimum_valid_until_ts, the
-// cache is stale when its valid_until is below the minimum; without one, the
-// cache is stale when it is more than halfway through its lifetime
+// cache is stale when its freshest key's validity is below the minimum (the
+// freshest key is the one that can satisfy the caller — a retained stale key
+// from the not-overwrite rule must not force a spurious fetch); without one,
+// the cache is stale when it is more than halfway through its lifetime
 // ((added + valid_until) / 2 < now). A never-valid key set (valid_until 0) is
 // always stale.
 func (n *notaryCache) stale(serverName string, minValidUntilTS, now int64) bool {
+	if minValidUntilTS > 0 {
+		return n.freshestValidUntil(serverName) < minValidUntilTS
+	}
 	vu := n.validUntil(serverName)
 	if vu == 0 {
 		return true
-	}
-	if minValidUntilTS > 0 {
-		return vu < minValidUntilTS
 	}
 	added, ok := n.added[serverName]
 	if !ok || added == 0 {
