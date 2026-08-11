@@ -1355,12 +1355,12 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 	// they left; cap the pagination window at their leave position. Applies to
 	// every room that is not world_readable (a world_readable room stays open
 	// to departed users — sytest's "non-joined users can get individual state
-	// for world_readable rooms after leaving").
+	// for world_readable rooms after leaving"). Applied AFTER the backward-page
+	// from/to normalisation below so the cap survives the `to=from` rewrite.
+	capAtLeave := int64(0)
 	if vis := a.historyVisibility(r.Context(), roomID); vis != "world_readable" {
 		if m, err := a.Store.GetMembership(r.Context(), roomID, auth.UserID); err == nil && m.Membership == rooms.MembershipLeave && m.StreamOrdering > 0 {
-			if to == 0 || m.StreamOrdering < to {
-				to = m.StreamOrdering
-			}
+			capAtLeave = m.StreamOrdering
 		}
 	}
 	limit := 30
@@ -1394,6 +1394,12 @@ func (a *API) RoomMessages(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteJSON(w, http.StatusOK, map[string]any{"chunk": []json.RawMessage{}, "start": formatIntToken(startTok)})
 			return
 		}
+	}
+	// Apply the SPEC-216 leave cap to the final upper bound (the from/to
+	// normalisation above may have rewritten `to`). The cap is inclusive: the
+	// user's own leave event marks the boundary and is itself visible.
+	if capAtLeave > 0 && (to == 0 || capAtLeave < to) {
+		to = capAtLeave
 	}
 	evs, err := a.Store.EventsForRoom(r.Context(), roomID, from, to, limit, dir)
 	if err != nil {
