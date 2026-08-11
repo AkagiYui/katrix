@@ -529,7 +529,18 @@ func (a *API) applyDeviceListEDU(ctx context.Context, origin string, content jso
 			cacheDeviceListFor(keys, master, selfSigning)
 		}
 	}
-	if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, false); err != nil {
+	// A join advertisement (the sender's very first update for the user, which
+	// the spec's prev_id contract leaves prev_id-less) is recorded coalesced
+	// into the user's join stream position rather than at a fresh token: the
+	// sync engine already reports the user in device_lists.changed via its
+	// membership-based "newly shared room" computation, and the EDU arrives
+	// asynchronously (the outbound worker delivers with a base delay), so a
+	// fresh-token record would re-surface the user in a later sync window
+	// (Complement's TestDeviceListsUpdateOverFederation). Genuine changes
+	// always carry a prev_id and are recorded as before.
+	if len(c.PrevID) == 0 {
+		_ = a.Store.RecordDeviceListJoinEDU(ctx, c.UserID)
+	} else if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, false); err != nil {
 		return err
 	}
 	a.wakeSharedRoomLocals(ctx, c.UserID)

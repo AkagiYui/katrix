@@ -326,6 +326,15 @@ func (a *API) KeysQuery(w http.ResponseWriter, r *http.Request) {
 				}); err == nil {
 					_ = a.Store.CacheRemoteDeviceList(r.Context(), u, raw)
 				}
+				// The resync is itself a device-list change signal: local syncs
+				// must surface the user in device_lists.changed so clients
+				// re-query (mirror of Synapse's user_device_resync, which calls
+				// notify_device_update after a successful fetch; sytest "Device
+				// list doesn't change if remote server is down" syncs until the
+				// remote user appears after the first keys/query).
+				if _, err := a.Store.RecordDeviceListChange(r.Context(), u, false); err == nil {
+					a.Notifier.NotifyUser(auth.UserID)
+				}
 			}
 			if len(query) == 0 {
 				continue

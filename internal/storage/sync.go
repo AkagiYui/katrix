@@ -391,6 +391,31 @@ func (s *Store) RecordDeviceListChange(ctx context.Context, userID string, isDel
 	return streamID, err
 }
 
+// RecordDeviceListJoinEDU records a device-list change for userID coalesced
+// into the stream position of the user's first joined room membership (the
+// position the sync engine's "newly shared room" computation already reports
+// the user at). An m.device_list_update EDU with no prev_id is the sender's
+// join advertisement — the receiving server has just begun sharing a room with
+// the user, and its sync engine already surfaces the user in
+// device_lists.changed from the membership row. Recording the change at a
+// fresh stream token instead would re-surface the user in a later sync window
+// (the EDU is delivered asynchronously, after the join window's token was
+// minted). When no joined membership exists (a stale delivery) or a change
+// record already exists (a genuine later change must not be displaced), the
+// record is skipped entirely — the existing signal already notifies.
+func (s *Store) RecordDeviceListJoinEDU(ctx context.Context, userID string) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO device_list_updates(user_id, stream_id, is_delete)
+		 SELECT $1, j.pos, false
+		 FROM (SELECT MIN(stream_ordering) AS pos
+		       FROM room_memberships
+		       WHERE user_id=$1 AND membership='join') j
+		 WHERE j.pos IS NOT NULL
+		   AND NOT EXISTS (SELECT 1 FROM device_list_updates WHERE user_id=$1)`,
+		userID)
+	return err
+}
+
 // DeviceListChangesSince returns the user IDs with device-list changes (changed
 // and left) after the given stream position, in stream order.
 func (s *Store) DeviceListChangesSince(ctx context.Context, since int64) (changed, left []string, err error) {
