@@ -353,6 +353,25 @@ func (s *Store) SetPresence(ctx context.Context, userID, presence, statusMsg str
 	return err == nil, err
 }
 
+// RecordPresenceChange records a presence change for userID in the shared sync
+// stream without altering the stored presence row. An explicit PUT /presence
+// that happens to repeat the current value (e.g. a room join seeded the
+// default "online" row first) must still surface as a visible change to the
+// user's room peers — the client explicitly declared presence, which is a
+// distinct event from the implicit per-/sync heartbeat (Complement
+// "TestPresenceSyncDifferentRooms" PUTs online after joining and expects room
+// peers to observe it).
+func (s *Store) RecordPresenceChange(ctx context.Context, userID string) error {
+	streamID, err := s.NextSyncStream(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx,
+		`INSERT INTO presence_changes(user_id, stream_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+		userID, streamID)
+	return err
+}
+
 // GetPresence returns a user's presence state, or nil if unset.
 func (s *Store) GetPresence(ctx context.Context, userID string) (*PresenceRow, error) {
 	var p PresenceRow

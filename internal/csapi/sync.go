@@ -442,14 +442,17 @@ func (a *API) PresencePut(w http.ResponseWriter, r *http.Request) {
 	if changed, err := a.Store.SetPresence(r.Context(), userID, req.Presence, req.StatusMsg, a.Now()); err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
-	} else if changed {
-		// Wake everyone who could see this presence change. Presence changes
-		// advance the shared sync stream, so any user's long-poll that is parked
-		// will wake and pick up the presence event. The set is small in practice
-		// (room peers); the self-notify covers the user's own other devices.
+	} else {
+		// An explicit PUT /presence is a user declaration: it must surface to the
+		// user's room peers even when it repeats the current value (e.g. a room
+		// join seeded the default "online" row first — Complement
+		// "TestPresenceSyncDifferentRooms" joins then PUTs online and expects the
+		// other member to observe it). Record a change when SetPresence found
+		// none, then wake the user's own devices and broadcast to remote servers.
+		if !changed {
+			_ = a.Store.RecordPresenceChange(r.Context(), userID)
+		}
 		a.Notifier.NotifyUser(userID)
-		// Broadcast the change to remote servers sharing a room with the user
-		// (m.presence EDU, spec "Presence in the federation API").
 		a.broadcastLocalPresence(r.Context(), userID)
 	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
