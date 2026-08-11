@@ -220,6 +220,7 @@ func (s *Store) MaxStreamOrdering(ctx context.Context) (int64, error) {
 			COALESCE((SELECT MAX(stream_id) FROM receipts), 0),
 			COALESCE((SELECT MAX(stream_id) FROM device_list_updates), 0),
 			COALESCE((SELECT MAX(stream_id) FROM presence_changes), 0),
+			COALESCE((SELECT MAX(stream_id) FROM profile_updates), 0),
 			0
 		)`).Scan(&n)
 	if err != nil {
