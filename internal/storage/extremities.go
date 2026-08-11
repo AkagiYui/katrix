@@ -163,18 +163,20 @@ func (s *Store) UndoExtremitiesForRejected(ctx context.Context, roomID, eventID 
 // as extremities" — after M1 ← SF1 ← SF2 ← M2, M2's acceptance must remove M1
 // and SF1/SF2 so M2 is the sole extremity).
 //
-// eventIDs are the accepted event's prev_events. The walk starts there: for
-// each event that is itself rejected, its prevs are collected and recursed
-// into (an accepted event terminates the walk). The collected set therefore
-// holds the rejected chain's prevs plus the terminal accepted ancestors that
-// the new accepted event supersedes — exactly Synapse's existing_prevs, which
-// is what must leave the extremity set (e.g. after M1 ← SF1 ← SF2 ← M2,
-// M2's acceptance collects SF1 and M1, removing the dangling M1 extremity).
+// eventIDs are the accepted event's prev_events. Following Synapse, the
+// collection is the PREVS of every rejected event in the walk (recursed while
+// the events are themselves rejected; an accepted event terminates the walk):
+// after M1 ← SF1 ← SF2 ← M2, the walk from SF2 collects SF1, and SF1's walk
+// collects M1 — so the deletion set {SF1, M1} removes both the dangling
+// accepted ancestor and the rejected chain. The rejected events themselves are
+// never extremities (they are inserted without extremity maintenance), so only
+// their prevs need deleting.
 func (s *Store) RemovePrevsBehindRejected(ctx context.Context, roomID string, eventIDs []string) error {
 	if len(eventIDs) == 0 {
 		return nil
 	}
 	collected := map[string]bool{}
+	visited := map[string]bool{}
 	batch := make([]string, 0, len(eventIDs))
 	for _, id := range eventIDs {
 		batch = append(batch, id)
@@ -182,15 +184,17 @@ func (s *Store) RemovePrevsBehindRejected(ctx context.Context, roomID string, ev
 	for len(batch) > 0 {
 		var next []string
 		for _, id := range batch {
-			if collected[id] {
+			if visited[id] {
 				continue
 			}
+			visited[id] = true
 			rejected, err := s.IsEventRejected(ctx, id)
 			if err != nil {
 				continue
 			}
 			if !rejected {
-				// An accepted event terminates the walk.
+				// An accepted event terminates the walk (its own ID is never
+				// collected — only the prevs of rejected events are).
 				continue
 			}
 			ev, err := s.GetEvent(ctx, id)
@@ -199,8 +203,8 @@ func (s *Store) RemovePrevsBehindRejected(ctx context.Context, roomID string, ev
 			}
 			prevs := ParsePrevEvents(ev.RawJSON)
 			for _, p := range prevs {
-				if !collected[p] {
-					collected[p] = true
+				collected[p] = true
+				if !visited[p] {
 					next = append(next, p)
 				}
 			}
