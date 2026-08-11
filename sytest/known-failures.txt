@@ -10,6 +10,14 @@
 # that now passes is "fixed", and a failing test not listed here is a "new
 # failure" (regression or flake) — which is the signal to act on.
 #
+# Updated 2026-08-11: removed the four tests fixed by the AS-query URL,
+# third-party-invite auth, presence-exchange and user-directory changes
+# ("Accesing an AS-hosted room alias asks the AS server", "Can invite unbound
+# 3pid over federation with users from both servers", "New federated private
+# chats get full presence information (SYN-115)", "User in remote room doesn't
+# appear in user directory after server left room"). What remains here is the
+# genuine upstream-sytest issue set, not katrix gaps.
+#
 # Regenerate after any run with:
 #   grep -hE '^not ok ' <both results.tap files> | sed -E 's/^not ok [0-9]+ (\(expected fail\) )?//' | sed -E 's/( \([0-9]+ subtests\))? # TODO expected fail$//' | sort -u
 #
@@ -40,7 +48,6 @@ AS can create a user with an underscore
 AS can publish rooms in their own list
 AS-ghosted users can use rooms themselves
 AS-ghosted users can use rooms via AS
-Accesing an AS-hosted room alias asks the AS server
 Asking for a remote rooms list, but supplying the local server's name, returns the local rooms list
 Banned servers cannot send events
 Banned user is kicked and may not rejoin until unbanned
@@ -57,7 +64,6 @@ Can get rooms/{roomId}/state for a departed room (SPEC-216)
 Can invite unbound 3pid
 Can invite unbound 3pid over federation
 Can invite unbound 3pid over federation with no ops into a private room
-Can invite unbound 3pid over federation with users from both servers
 Can invite unbound 3pid with no ops into a private room
 Can login with 3pid and password using m.login.password
 Can login with new user via CAS
@@ -81,6 +87,12 @@ Device list doesn't change if remote server is down
 Don't get pushed for rooms you've muted
 Ephemeral messages received from clients are correctly expired
 Ephemeral messages received from servers are correctly expired
+# "Events in rooms with AS-hosted room aliases are sent to AS server" builds a
+# plain room (room_fixture creates no aliases), so the appservice's aliases
+# namespace never matches and — per the spec's "interested" definition — the AS
+# should not receive the room's events. The test's title implies an AS-hosted
+# alias should be present, but the fixture never creates one; upstream
+# test-design issue (the alias-query sibling test creates the mapping itself).
 Events in rooms with AS-hosted room aliases are sent to AS server
 Federation handles empty auth_events in state_ids sanely
 Federation key API can act as a notary server via a GET request
@@ -121,7 +133,6 @@ Local delete device changes appear in v2 /sync
 Members from the gap are included in gappy incr LL sync
 Message history can be paginated over federation
 Named room comes with just joined member count summary
-New federated private chats get full presence information (SYN-115)
 Newly joined room includes presence in incremental sync
 Newly joined room is included in an incremental sync
 Notifications can be viewed with GET /notifications
@@ -165,6 +176,14 @@ Sync is woken up for leaves
 Test URL preview
 Test that a message is pushed
 Test that rejected pushers are removed.
+# "The only membership state included in a gapped incremental sync is for
+# senders in the timeline" carries an in-source "XXX: THIS SHOULD FAIL, as LL
+# is disabled for incremental syncs": the spec and Synapse ship the full state
+# delta on a gappy sync (lazy-loading is disabled for limited batches), so a
+# conforming server returns more than the senders' memberships. Pinned here
+# rather than "fixed" — changing katrix to deviate from Synapse would break the
+# sibling test that expects the full delta ("Gapped incremental syncs include
+# all state changes").
 The only membership state included in a gapped incremental sync is for senders in the timeline
 The only membership state included in an incremental sync is for senders in the timeline
 The operation must be consistent through an interactive authentication session
@@ -173,7 +192,6 @@ User can create and send/receive messages in a room with version 1
 User can create and send/receive messages in a room with version 2
 User can invite remote user to room with version 1
 User can invite remote user to room with version 2
-User in remote room doesn't appear in user directory after server left room
 User sees updates to presence from other users in the incremental sync.
 We do send redundant membership state across incremental syncs if asked
 We don't send redundant membership state across incremental syncs by default
