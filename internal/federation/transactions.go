@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AkagiYui/katrix/internal/canonicaljson"
@@ -202,6 +203,15 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 	}
 	if err := json.Unmarshal(raw, &ev); err != nil {
 		return "", false
+	}
+	// Serialise the per-room ingest so events of the same room are processed in
+	// order: the accepted-event pruning of rejected chains (and the
+	// rejection-flag propagation) must observe a settled view of the room
+	// (mirror of Synapse's per-room persistence serialisation).
+	if mu, _ := a.ingestMu.LoadOrStore(ev.RoomID, &sync.Mutex{}); mu != nil {
+		lock := mu.(*sync.Mutex)
+		lock.Lock()
+		defer lock.Unlock()
 	}
 	exists, err := a.Store.RoomExists(r.Context(), ev.RoomID)
 	if err != nil || !exists {

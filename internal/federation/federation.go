@@ -48,6 +48,16 @@ type API struct {
 
 	// notaryCache holds the key notary's per-server key cache (see notary.go).
 	notaryCache *notaryCache
+
+	// ingestMu serialises the per-room PDU ingest path so events of the same
+	// room are processed in order. The forward-extremity bookkeeping for an
+	// accepted event depends on its prev_events' rejection status being final:
+	// a soft-failed prev must be marked rejected BEFORE the accepted event is
+	// processed, or the accepted event's pruning of the rejected chain (see
+	// RemovePrevsBehindRejected) misses and the ancestor dangles as an
+	// extremity (mirror of Synapse's "Multiple instances of this function
+	// cannot be in flight at the same time for the same room").
+	ingestMu sync.Map // roomID -> *sync.Mutex
 }
 
 // SetPushDispatcher wires the CS API's push dispatcher so inbound federation
