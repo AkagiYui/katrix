@@ -400,9 +400,16 @@ func (s *Store) RecordDeviceListChange(ctx context.Context, userID string, isDel
 // device_lists.changed from the membership row. Recording the change at a
 // fresh stream token instead would re-surface the user in a later sync window
 // (the EDU is delivered asynchronously, after the join window's token was
-// minted). When no joined membership exists (a stale delivery) or a change
-// record already exists (a genuine later change must not be displaced), the
-// record is skipped entirely — the existing signal already notifies.
+// minted).
+//
+// A pre-existing record older than the join — e.g. the invite path's change
+// record, which sits at the invite's stream position — is superseded by the
+// join position: the join advertisement is the first signal after the join,
+// and the record must sit at the join position for the EDU receive path's
+// discriminator (DeviceListChangeAtJoinPosition) to recognise the
+// advertisement and not re-surface the user. A record at a NEWER position (a
+// genuine change already recorded after the join) is left untouched. When no
+// joined membership exists (a stale delivery) the record is skipped entirely.
 func (s *Store) RecordDeviceListJoinEDU(ctx context.Context, userID string) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO device_list_updates(user_id, stream_id, is_delete)
@@ -411,7 +418,8 @@ func (s *Store) RecordDeviceListJoinEDU(ctx context.Context, userID string) erro
 		       FROM room_memberships
 		       WHERE user_id=$1 AND membership='join') j
 		 WHERE j.pos IS NOT NULL
-		   AND NOT EXISTS (SELECT 1 FROM device_list_updates WHERE user_id=$1)`,
+		 ON CONFLICT (user_id) DO UPDATE SET stream_id=EXCLUDED.stream_id, is_delete=false
+		 WHERE device_list_updates.stream_id < EXCLUDED.stream_id`,
 		userID)
 	return err
 }
