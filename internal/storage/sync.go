@@ -440,6 +440,24 @@ func (s *Store) DeviceListChangesSince(ctx context.Context, since int64) (change
 	return changed, left, rows.Err()
 }
 
+// DeviceListChangeAtJoinPosition reports whether userID's device-list change
+// record sits exactly at their (earliest) joined-room membership position —
+// i.e. the record was created by the send_join path (RecordDeviceListJoinEDU)
+// and represents the join advertisement, not a genuine later change. The EDU
+// receive path uses it to tell a join advertisement apart from a genuine first
+// change (both are prev_id-less per the spec's prev_id contract).
+func (s *Store) DeviceListChangeAtJoinPosition(ctx context.Context, userID string) (bool, error) {
+	var one bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(
+		   SELECT 1 FROM device_list_updates u
+		   WHERE u.user_id=$1
+		     AND u.stream_id = (SELECT MIN(stream_ordering) FROM room_memberships
+		                        WHERE user_id=$1 AND membership='join')
+		 )`, userID).Scan(&one)
+	return one, err
+}
+
 // LastSeenRemoteDeviceStream returns the highest m.device_list_update stream_id
 // seen so far from origin for userID (0 when none). Used to detect gaps when a
 // fresh EDU carries a prev_id: if prev_id does not equal the last seen
