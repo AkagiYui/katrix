@@ -165,6 +165,12 @@ jobs:
           # (MSC4289 infinite creator power) makes unsatisfiable — see
           # sytest/patches/pin-powerlevel-tests-to-v11.patch.
           patch -p1 -d sytest-src < sytest/patches/pin-powerlevel-tests-to-v11.patch
+          # Run the shared-secret admin-registration tests for katrix (they were
+          # gated to synapse/dendrite, so can_register_with_secret was never
+          # proven and every local_admin_fixture test — including media
+          # quarantine — skipped) — see
+          # sytest/patches/unrestrict-shared-secret-register-tests.patch.
+          patch -p1 -d sytest-src < sytest/patches/unrestrict-shared-secret-register-tests.patch
       # The summary step below renders the TAP report with the Go tool.
       - uses: actions/setup-go@v7
         with:
