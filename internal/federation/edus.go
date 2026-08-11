@@ -86,6 +86,52 @@ func (a *API) BroadcastEDUToServers(ctx context.Context, eduType string, content
 	}
 }
 
+// advertiseDeviceListsToServer sends the room's local joined users' current
+// device lists to server — a server that just joined the room via send_join —
+// as m.device_list_update EDUs (spec: "Servers must send m.device_list_update
+// EDUs to all the servers who share a room with a given local user ... when
+// that user joins a room which contains servers which are not already
+// receiving updates for that user's device list"). Without the advertisement
+// a new server would never learn the residents' device lists, and the
+// residents' next genuine change (which carries a prev_id the new server
+// cannot chain onto anything) would be indistinguishable from a join
+// advertisement (Complement's msc-suites TestDeviceListUpdates).
+//
+// Each advertisement is deliberately prev_id-less: the receiving server treats
+// a first (prev_id-less) EDU as the join advertisement and coalesces it into
+// the user's join stream position (RecordDeviceListJoinEDU), so the user is
+// not re-surfaced in a later sync window. The outbound per-user counter still
+// advances, so the joining server chains the residents' next genuine change
+// (stream N+1, prev [N]) onto the advertisement it recorded.
+func (a *API) advertiseDeviceListsToServer(ctx context.Context, roomID, server string) {
+	if server == "" || server == a.ServerName() {
+		return
+	}
+	members, err := a.Store.Members(ctx, roomID, "join")
+	if err != nil {
+		return
+	}
+	for _, m := range members {
+		if !a.IsLocalUser(m.UserID) {
+			continue
+		}
+		prevID, streamID, err := a.Store.NextDeviceListSendStream(ctx, m.UserID)
+		if err != nil {
+			streamID = a.Now()
+		}
+		content := map[string]any{
+			"user_id":   m.UserID,
+			"device_id": "",
+			"deleted":   false,
+			"stream_id": streamID,
+		}
+		if prevID > 0 {
+			content["prev_id"] = []int64{prevID}
+		}
+		a.BroadcastEDUToServers(ctx, "m.device_list_update", content, []string{server})
+	}
+}
+
 // serversForRooms returns the server names of all remote members in the given
 // rooms (the local server name is excluded). Membership is looked up via the
 // denormalised membership table; a room with no remote members contributes
@@ -530,27 +576,18 @@ func (a *API) applyDeviceListEDU(ctx context.Context, origin string, content jso
 		}
 	}
 	// The sender's very first update for a user (which the spec's prev_id
-	// contract leaves prev_id-less) is either the join advertisement or a
-	// genuine first change, and the two must be told apart:
-	//
-	//   - When a remote user joins a room this server hosts, the send_join path
-	//     records their device-list change synchronously at the join position.
-	//     The join-advertisement EDU (delivered asynchronously by the outbound
-	//     worker, after the sync engine's membership-based "newly shared room"
-	//     computation has already surfaced the user) is then a duplicate: the
-	//     user already has a record, so re-recording at a fresh token would
-	//     re-surface them in a later sync window (Complement's
-	//     TestDeviceListsUpdateOverFederation).
-	//   - A first EDU for a user with no record is a genuine change (e.g. a key
-	//     upload by a remote user whose server never advertised them at join);
-	//     it must be recorded at a fresh token so the change is delivered
-	//     (Complement's TestFederationKeyUploadQuery).
+	// contract leaves prev_id-less) is the join advertisement: the joining
+	// server sends it when its user joins a room, and the resident servers send
+	// their local users' lists to the new server (ingestRemoteMember). The
+	// sync engine already surfaces the user via its membership-based "newly
+	// shared room" computation, and the advertisement arrives asynchronously
+	// (the outbound worker delivers with a base delay), so recording it at a
+	// fresh token would re-surface the user in a later sync window (Complement's
+	// TestDeviceListsUpdateOverFederation). Genuine device changes always carry
+	// a prev_id (the advertisement was stream 1) and are recorded at a fresh
+	// token as before.
 	if len(c.PrevID) == 0 {
-		if has, err := a.Store.HasDeviceListChange(ctx, c.UserID); err == nil && !has {
-			if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, false); err != nil {
-				return err
-			}
-		}
+		_ = a.Store.RecordDeviceListJoinEDU(ctx, c.UserID)
 	} else if _, err := a.Store.RecordDeviceListChange(ctx, c.UserID, false); err != nil {
 		return err
 	}

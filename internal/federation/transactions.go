@@ -2426,6 +2426,18 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 		// leave/knock direction.
 		if wantMembership == "join" && ev.StateKey != nil {
 			_ = a.Store.RecordDeviceListJoinEDU(r.Context(), *ev.StateKey)
+			// A full (non-partial) join gets the room's local users' device lists
+			// advertised to the joining server (spec: servers send
+			// m.device_list_update to every server they newly share a room with).
+			// This is what lets the joining server recognise a subsequent genuine
+			// change — which carries a prev_id — instead of conflating it with a
+			// join advertisement (Complement's msc-suites TestDeviceListUpdates).
+			// A partial-state join defers this: the joining server receives the
+			// residents' device lists when its resync completes (Complement's
+			// partial-state suite asserts no unexpected EDUs during the window).
+			if r.URL.Query().Get("omit_members") != "true" {
+				a.advertiseDeviceListsToServer(r.Context(), ev.RoomID, userDomain(ev.Sender))
+			}
 		}
 	}
 	statePDUs, _ := a.roomStatePDUs(r, ev.RoomID)
