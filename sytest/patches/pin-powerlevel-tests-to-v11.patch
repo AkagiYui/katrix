@@ -1,0 +1,32 @@
+Pin the "Users cannot set <ban|kick|redact> powerlevel higher than their own"
+tests to a pre-v12 room version.
+
+These tests were written for the pre-v12 semantics where the room creator holds
+an explicit finite power level (100): step 2 sets ban/kick/redact to 10000000
+and expects a 403 because that exceeds the creator's own level. Since sytest
+#1429 (2026-08-03) made TEST_ROOM_VERSION default to '12', the tests now run in
+room v12 (MSC4289), where the room creator's power is effectively infinite and
+the spec's "If the new value is higher than the sender's current power level,
+reject" rule does not block a finite value like 10000000 — the reference
+implementations (Synapse CREATOR_POWER_LEVEL = 2^53, gomatrixserverlib
+CreatorPowerLevel = 2^53) both accept it, and sytest never exercises these
+tests against them (the can_change_power_levels capability is only proved by
+the katrix-side unmask patch). The tests' intent is pre-v12 creator semantics,
+so pin them to room version 11, mirroring how sytest #1429 itself pinned
+30rooms/60version_upgrade.pl ("/upgrade ...") to v11 for the identical reason
+(infinite creator power). The sibling "notifications powerlevel" test already
+pins room_version => "6" for the same reason.
+
+If this stops applying against a newer sytest develop, rebase it (the hunk is
+in stable, old test code).
+
+--- a/tests/30rooms/08levels.pl
++++ b/tests/30rooms/08levels.pl
+@@ -141,7 +141,7 @@
+ foreach my $levelname (qw( ban kick redact )) {
+    multi_test "Users cannot set $levelname powerlevel higher than their own",
+-      requires => [ $creator_fixture, $user_fixture, lockeddown_room_fixture(),
++      requires => [ $creator_fixture, $user_fixture, lockeddown_room_fixture( room_version => "11" ),
+                     qw( can_change_power_levels )],
+ 
+       do => sub {

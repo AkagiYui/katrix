@@ -159,6 +159,12 @@ jobs:
           # mark_unread test that skipped itself on unsupported push actions —
           # see sytest/patches/unmask-sytest-skips.patch.
           patch -p1 -d sytest-src < sytest/patches/unmask-sytest-skips.patch
+          # Pin the "Users cannot set <ban|kick|redact> powerlevel higher than
+          # their own" tests to a pre-v12 room version: they encode the pre-v12
+          # creator-semantics (explicit finite power), which sytest's v12 default
+          # (MSC4289 infinite creator power) makes unsatisfiable — see
+          # sytest/patches/pin-powerlevel-tests-to-v11.patch.
+          patch -p1 -d sytest-src < sytest/patches/pin-powerlevel-tests-to-v11.patch
       # The summary step below renders the TAP report with the Go tool.
       - uses: actions/setup-go@v7
         with:
