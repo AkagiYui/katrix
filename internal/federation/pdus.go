@@ -1382,7 +1382,7 @@ func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roo
 		if ev.StateKey != nil {
 			stateKey = *ev.StateKey
 		}
-		st := a.memberStateSnapshotCtx(ctx, roomID, ev.Sender, stateKey)
+		st := a.memberStateSnapshotCtx(ctx, roomID, ev.Sender, stateKey, ev.Content)
 		if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, ev.StateKey != nil); err != nil {
 			rejected = true
 		}

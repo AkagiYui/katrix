@@ -42,10 +42,17 @@ func Lock(t *testing.T) {
 	defer cancel()
 	conn, err := pgx.Connect(ctx, DSN())
 	if err != nil {
+		// Release the process-local mutex before skipping: the skip returns
+		// without running the cleanup registered below, so a skipped test must
+		// not leave the lock held — otherwise the next test in the package
+		// blocks forever on Mu.Lock (testdb tests run without postgres on
+		// developer machines).
+		Mu.Unlock()
 		t.Skipf("postgres unavailable: %v", err)
 	}
 	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", advisoryLockKey); err != nil {
 		_ = conn.Close(ctx)
+		Mu.Unlock()
 		t.Fatalf("testdb: advisory lock: %v", err)
 	}
 	// Keep the connection alive for the whole test; release on cleanup.

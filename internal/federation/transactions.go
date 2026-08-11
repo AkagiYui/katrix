@@ -368,7 +368,7 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 			if ev.StateKey != nil {
 				stateKey = *ev.StateKey
 			}
-			st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey)
+			st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey, ev.Content)
 			// Restricted-rule room (MSC3083): a join event names its authoriser
 			// via join_authorised_via_users_server. The verdict is computed
 			// against the allow-listed rooms the local server participates in
@@ -423,7 +423,7 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 			if ev.StateKey != nil {
 				stateKey = *ev.StateKey
 			}
-			st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey)
+			st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey, ev.Content)
 			if ev.Type == "m.room.member" && len(st.SenderMember) == 0 {
 				// Unknown sender membership: accept leniently (revalidated later).
 			} else if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, true); err != nil {
@@ -2345,7 +2345,7 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 	// Authorization: the event must pass the room's auth rules (e.g. a banned
 	// user's join is rejected). Run before persisting.
 	if rules, ok := roomver.Get(version); ok {
-		st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, *ev.StateKey)
+		st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, *ev.StateKey, ev.Content)
 		// Restricted-rule join (MSC3083): the joining user must be a joined
 		// member of one of the allow-listed rooms, and the join event must name
 		// a joined member of this room as authoriser. Unlike the client path,
@@ -2472,13 +2472,20 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 // memberStateSnapshot builds the room state snapshot needed to authorize a
 // remote membership transition: the create/join_rules/power_levels state plus
 // the sender's and target's current member events.
-func (a *API) memberStateSnapshot(r *http.Request, roomID, sender, target string) rooms.StateSnapshot {
-	return a.memberStateSnapshotCtx(r.Context(), roomID, sender, target)
+func (a *API) memberStateSnapshot(r *http.Request, roomID, sender, target string, content ...json.RawMessage) rooms.StateSnapshot {
+	return a.memberStateSnapshotCtx(r.Context(), roomID, sender, target, content...)
 }
 
 // memberStateSnapshotCtx is the context-based form of memberStateSnapshot (the
-// gap-fill / state-reconcile paths have no *http.Request).
-func (a *API) memberStateSnapshotCtx(ctx context.Context, roomID, sender, target string) rooms.StateSnapshot {
+// gap-fill / state-reconcile paths have no *http.Request). When content is
+// non-nil (the member event being authorised) and it carries a
+// third_party_invite, the matching m.room.third_party_invite event is also
+// fetched — the auth rules verify the identity server's signature against the
+// keys that event published, so without it a third-party member invite
+// relayed from another server (the 3PID onbind exchange) is soft-failed here
+// and never reaches local syncs (sytest "Can invite unbound 3pid over
+// federation with users from both servers").
+func (a *API) memberStateSnapshotCtx(ctx context.Context, roomID, sender, target string, content ...json.RawMessage) rooms.StateSnapshot {
 	var st rooms.StateSnapshot
 	for _, tc := range []struct {
 		typ, sk string
@@ -2503,6 +2510,36 @@ func (a *API) memberStateSnapshotCtx(ctx context.Context, roomID, sender, target
 		if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.member", target); err == nil {
 			if ev, err := a.Store.GetEvent(ctx, id); err == nil {
 				st.TargetMember = ev.Content
+			}
+		}
+	}
+	// A member event authorised by a third-party invite names its
+	// m.room.third_party_invite via content.third_party_invite.signed.token
+	// (spec auth-event selection); fetch that event so the auth rules can
+	// verify the identity server's signature against the published keys. The
+	// content being authored takes precedence over the stored member state
+	// (the former covers member events that do not exist in state yet).
+	var mc *rooms.MemberContent
+	if len(content) > 0 && len(content[0]) > 0 {
+		mc, _ = rooms.ParseMember(content[0])
+	}
+	if mc == nil && len(st.TargetMember) > 0 {
+		mc, _ = rooms.ParseMember(st.TargetMember)
+	}
+	if mc == nil && len(st.SenderMember) > 0 {
+		mc, _ = rooms.ParseMember(st.SenderMember)
+	}
+	if mc != nil && len(mc.ThirdParty) > 0 {
+		var tp struct {
+			Signed struct {
+				Token string `json:"token"`
+			} `json:"signed"`
+		}
+		if err := json.Unmarshal(mc.ThirdParty, &tp); err == nil && tp.Signed.Token != "" {
+			if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.third_party_invite", tp.Signed.Token); err == nil {
+				if ev, err := a.Store.GetEvent(ctx, id); err == nil {
+					st.ThirdPartyInvite = ev.Content
+				}
 			}
 		}
 	}
