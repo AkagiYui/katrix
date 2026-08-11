@@ -702,33 +702,50 @@ func (a *API) authReferencesRejected(ctx context.Context, raw json.RawMessage) b
 	return len(rejected) > 0
 }
 
-// unknownDeepFrontier returns the first event two prev-hops away from the
-// event (a prev of a direct prev) that is not present locally, or "". A
-// non-empty result means the room's history is disconnected *behind* the
-// event's direct prevs — the chain get_missing_events just filled is
-// contiguous, but its own predecessors are missing — and the returned event is
-// the anchor a /state_ids snapshot should be requested as of. The direct
-// prevs must all be present for this to be meaningful (a missing direct prev
-// is simply rejected, not reconciled). The walk is depth-bounded because a
-// room's full known history must never be traversed per inbound event.
+// unknownDeepFrontier returns the first event behind the event's known
+// ancestry — an ancestor, not present locally, reached by following known
+// events' prev_events from the event's direct prevs — or "". A non-empty
+// result means the room's history is disconnected *behind* the chain
+// get_missing_events just filled: the chain itself is contiguous, but its own
+// predecessors are missing, and the returned event is the anchor a /state_ids
+// snapshot should be requested as of. The direct prevs must all be present for
+// this to be meaningful (a missing direct prev is simply rejected, not
+// reconciled). The walk is bounded because a room's full known history must
+// never be traversed unbounded per inbound event.
 func (a *API) unknownDeepFrontier(ctx context.Context, raw json.RawMessage) string {
-	// Depth 2: prevs of the (known) direct prevs.
-	for _, id := range prevEventIDs(raw) {
-		if id == "" {
+	// Walk the chain of known ancestors of the triggering event, following each
+	// known event's prev_events, until an unknown event is referenced. That
+	// unknown event is the frontier anchoring the historical state: its
+	// /state_ids snapshot is what the room needs to stay contiguous.
+	//
+	// The walk goes arbitrarily deep rather than stopping one level below the
+	// direct prevs: a single get_missing_events round-trip fills only a bounded
+	// window of the gap (Complement's MSC4297 state-res v2.1 tests return ten
+	// events per call), so the frontier sits far behind the events the fetch
+	// just delivered. The first unknown ancestor found (nearest to the trigger)
+	// is returned; a fork only changes which branch is walked first, never the
+	// correctness of reconciling from a frontier on any branch.
+	seen := map[string]bool{}
+	queue := prevEventIDs(raw)
+	visits := 0
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if id == "" || seen[id] {
 			continue
+		}
+		seen[id] = true
+		if visits++; visits > 5000 {
+			// A pathological room with a huge contiguous ancestry and no real gap
+			// must not stall the caller (the /send response) behind thousands of
+			// GetEvent round-trips; give up and let the caller reject the event.
+			return ""
 		}
 		e, err := a.Store.GetEvent(ctx, id)
 		if err != nil || e == nil {
-			continue
+			return id // unknown ancestor: the frontier
 		}
-		for _, pid := range prevEventIDs(e.RawJSON) {
-			if pid == "" {
-				continue
-			}
-			if _, err := a.Store.GetEvent(ctx, pid); err != nil {
-				return pid
-			}
-		}
+		queue = append(queue, prevEventIDs(e.RawJSON)...)
 	}
 	return ""
 }
