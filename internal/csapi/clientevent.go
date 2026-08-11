@@ -2,6 +2,7 @@ package csapi
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/roomver"
@@ -30,7 +31,30 @@ func erasedClientEvent(row *storage.EventRow) json.RawMessage {
 	return clientEventCore(row, true)
 }
 
+// selfDestructed reports whether the event's content declares an MSC2228
+// org.matrix.self_destruct_after timestamp that has now passed. An expired
+// event is served with its content pruned (the redacted form), hiding the
+// message body — mirror of Synapse's expire_event → redact_event, which
+// replaces the event's JSON with its redacted (pruned) form once the
+// timestamp passes. Only non-state events honour the key (Synapse:
+// `if type(expiry_ts) is not int or event.is_state(): return`).
+func selfDestructed(row *storage.EventRow, now int64) bool {
+	if row.StateKey != "" || isStateTypeCSAPI(row.Type) {
+		return false
+	}
+	var c struct {
+		SelfDestructAfter int64 `json:"org.matrix.self_destruct_after"`
+	}
+	if err := json.Unmarshal(row.Content, &c); err != nil || c.SelfDestructAfter == 0 {
+		return false
+	}
+	return now >= c.SelfDestructAfter
+}
+
 func clientEventCore(row *storage.EventRow, redact bool) json.RawMessage {
+	if selfDestructed(row, time.Now().UnixMilli()) {
+		redact = true
+	}
 	m := map[string]any{
 		"type":             row.Type,
 		"content":          json.RawMessage(row.Content),

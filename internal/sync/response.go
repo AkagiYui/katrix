@@ -482,6 +482,9 @@ func (f *SyncFilter) renderEventErased(row *storage.EventRow) json.RawMessage {
 // content (mirror of clientEventCore).
 func federationEvent(row *storage.EventRow, redact bool) json.RawMessage {
 	raw := row.RawJSON
+	if selfDestructed(row, time.Now().UnixMilli()) {
+		redact = true
+	}
 	if redact {
 		if rules, ok := roomver.Get(roomver.Default); ok {
 			if red, err := events.Redact(raw, rules); err == nil {
@@ -2346,7 +2349,28 @@ func erasedClientEvent(row *storage.EventRow) json.RawMessage {
 	return clientEventCore(row, true)
 }
 
+// selfDestructed reports whether the event's content declares an MSC2228
+// org.matrix.self_destruct_after timestamp that has now passed. An expired
+// event is served with its content pruned (the redacted form), hiding the
+// message body — mirror of Synapse's expire_event → redact_event. Only
+// non-state events honour the key.
+func selfDestructed(row *storage.EventRow, now int64) bool {
+	if row.StateKey != "" || isStateTypeSync(row.Type) {
+		return false
+	}
+	var c struct {
+		SelfDestructAfter int64 `json:"org.matrix.self_destruct_after"`
+	}
+	if err := json.Unmarshal(row.Content, &c); err != nil || c.SelfDestructAfter == 0 {
+		return false
+	}
+	return now >= c.SelfDestructAfter
+}
+
 func clientEventCore(row *storage.EventRow, redact bool) json.RawMessage {
+	if selfDestructed(row, time.Now().UnixMilli()) {
+		redact = true
+	}
 	m := map[string]any{
 		"type":             row.Type,
 		"content":          json.RawMessage(row.Content),
