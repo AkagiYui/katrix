@@ -623,7 +623,20 @@ func (a *API) fetchMissingEventsFor(ctx context.Context, roomID string, eventID 
 		}
 		valid[id] = rawEv
 	}
-	for id, rawEv := range valid {
+	// Persist the fetched events in the response's array order (the DAG order):
+	// stream orderings are allocated per insert, so persisting in a map
+	// iteration order would randomise the events' stream orderings and shuffle
+	// them out of chronological order in /sync timelines (Complement's
+	// TestGetMissingEventsGapFilling asserts the injected events arrive in
+	// order). The `valid` map is only consulted for membership.
+	for _, rawEv := range out.Events {
+		id := eventIDOf(rawEv)
+		if id == "" {
+			continue
+		}
+		if _, ok := valid[id]; !ok {
+			continue
+		}
 		drop := false
 		for _, prev := range prevEventIDs(rawEv) {
 			if poison[prev] {
@@ -635,7 +648,6 @@ func (a *API) fetchMissingEventsFor(ctx context.Context, roomID string, eventID 
 			continue
 		}
 		_ = a.persistVerifiedPDU(ctx, roomID, version, rules, rawEv, true)
-		_ = id
 	}
 	// The gap is only closed when every pulled event links into the local DAG.
 	// If one of them still references prev_events we do not hold, the sending
