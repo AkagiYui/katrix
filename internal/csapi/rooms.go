@@ -1243,6 +1243,14 @@ type roomEventFilter struct {
 	relTypes        map[string]bool
 	notRelTypes     map[string]bool
 	lazyLoadMembers bool
+	types           []string
+	notTypes        []string
+	senders         []string
+	notSenders      []string
+	typesSet        bool
+	notTypesSet     bool
+	sendersSet      bool
+	notSendersSet   bool
 }
 
 // parseRoomEventFilter parses the `filter` query param. The value is a JSON
@@ -1259,12 +1267,28 @@ func parseRoomEventFilter(raw string) (roomEventFilter, error) {
 		RelTypes        []string `json:"org.matrix.msc3874.rel_types"`
 		NotRelTypes     []string `json:"org.matrix.msc3874.not_rel_types"`
 		LazyLoadMembers bool     `json:"lazy_load_members"`
+		Types           []string `json:"types"`
+		NotTypes        []string `json:"not_types"`
+		Senders         []string `json:"senders"`
+		NotSenders      []string `json:"not_senders"`
 	}
 	if err := json.Unmarshal([]byte(raw), &v); err != nil {
 		return f, httpx.ErrInvalidParam("invalid filter: " + err.Error())
 	}
 	f.containsURL = v.ContainsURL
 	f.lazyLoadMembers = v.LazyLoadMembers
+	// The spec's RoomEventFilter carries the event-type/sender restrictions at
+	// the TOP level (spec §Filtering: a RoomEventFilter applied to /messages).
+	// A present-but-empty list matches nothing (the standard RoomEventFilter
+	// semantics), so the Set flags distinguish it from an absent list.
+	f.typesSet = v.Types != nil
+	f.notTypesSet = v.NotTypes != nil
+	f.sendersSet = v.Senders != nil
+	f.notSendersSet = v.NotSenders != nil
+	f.types = v.Types
+	f.notTypes = v.NotTypes
+	f.senders = v.Senders
+	f.notSenders = v.NotSenders
 	if len(v.RelTypes) > 0 {
 		f.relTypes = make(map[string]bool, len(v.RelTypes))
 		for _, rt := range v.RelTypes {
@@ -1287,6 +1311,20 @@ func (f roomEventFilter) keep(e *storage.EventRow) bool {
 			return false
 		}
 	}
+	// RoomEventFilter type/sender restrictions (spec §Filtering). An empty
+	// list matches nothing; an absent list is no restriction.
+	if f.notTypesSet && strInAny(f.notTypes, e.Type) {
+		return false
+	}
+	if f.typesSet && !strInAny(f.types, e.Type) {
+		return false
+	}
+	if f.notSendersSet && strInAny(f.notSenders, e.Sender) {
+		return false
+	}
+	if f.sendersSet && !strInAny(f.senders, e.Sender) {
+		return false
+	}
 	if f.relTypes != nil {
 		rt := contentRelType(e.Content)
 		if !f.relTypes[rt] {
@@ -1300,6 +1338,16 @@ func (f roomEventFilter) keep(e *storage.EventRow) bool {
 		}
 	}
 	return true
+}
+
+// strInAny reports whether s appears in list.
+func strInAny(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // contentHasURL reports whether the event content has a top-level "url" string

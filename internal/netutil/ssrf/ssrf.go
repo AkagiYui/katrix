@@ -49,38 +49,43 @@ func IsBlocked(ip net.IP) bool {
 
 // isBlocked reports whether an IP is in a range the SSRF guard must reject.
 // allowPrivate relaxes the guard for test harnesses whose fixtures live on
-// private/reserved ranges (Complement's host.docker.internal): the private,
-// this-network (0.0.0.0/8), CGNAT, TEST-NET and reserved ranges become
-// fetchable, while loopback, link-local (which includes the cloud metadata
-// address 169.254.169.254), unspecified and multicast addresses stay blocked.
+// private/reserved ranges (Complement's host.docker.internal, sytest's
+// localhost URL-preview fixture): the private, this-network (0.0.0.0/8),
+// CGNAT, TEST-NET, reserved and loopback ranges become fetchable, while
+// link-local (which includes the cloud metadata address 169.254.169.254),
+// unspecified and multicast addresses stay blocked — those are never
+// legitimate fetch targets, test harness included.
 func isBlocked(ip net.IP, allowPrivate bool) bool {
 	if ip == nil {
 		return true
 	}
-	// Always blocked: loopback, link-local (cloud metadata), unspecified and
-	// multicast are never legitimate fetch targets, test harness included.
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+	if allowPrivate {
+		// The private, loopback and reserved ranges are the SSRF-sensitive
+		// ones; the test harness explicitly opts into reaching them.
+		if ip.IsPrivate() || ip.IsLoopback() {
+			return false
+		}
+	} else if ip.IsLoopback() || ip.IsPrivate() {
+		return true
+	}
+	// Always blocked: link-local (cloud metadata), unspecified and multicast
+	// are never legitimate fetch targets, test harness included.
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsInterfaceLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
 		return true
 	}
-	if allowPrivate {
-		// The remaining ranges are the SSRF-sensitive ones; the test harness
-		// explicitly opts into reaching them.
-		return false
-	}
-	if ip.IsPrivate() {
-		return true
-	}
-	// IPv4-mapped IPv6 (::ffff:a.b.c.d) reduces to the v4 check above.
-	if v4 := ip.To4(); v4 != nil {
-		// 0.0.0.0/8 (this-network), 100.64.0.0/10 (CGNAT), 192.0.2.0/24,
-		// 198.51.100.0/24, 203.0.113.0/24 (TEST-NET), 240.0.0.0/4 (reserved).
-		if v4[0] == 0 || (v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127) ||
-			(v4[0] == 192 && v4[1] == 0 && v4[2] == 2) ||
-			(v4[0] == 198 && v4[1] == 51 && v4[2] == 100) ||
-			(v4[0] == 203 && v4[1] == 0 && v4[2] == 113) ||
-			v4[0] >= 240 {
-			return true
+	if !allowPrivate {
+		// IPv4-mapped IPv6 (::ffff:a.b.c.d) reduces to the v4 check above.
+		if v4 := ip.To4(); v4 != nil {
+			// 0.0.0.0/8 (this-network), 100.64.0.0/10 (CGNAT), 192.0.2.0/24,
+			// 198.51.100.0/24, 203.0.113.0/24 (TEST-NET), 240.0.0.0/4 (reserved).
+			if v4[0] == 0 || (v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127) ||
+				(v4[0] == 192 && v4[1] == 0 && v4[2] == 2) ||
+				(v4[0] == 198 && v4[1] == 51 && v4[2] == 100) ||
+				(v4[0] == 203 && v4[1] == 0 && v4[2] == 113) ||
+				v4[0] >= 240 {
+				return true
+			}
 		}
 	}
 	return false
