@@ -114,7 +114,14 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 		sp = "online"
 	}
 	if sp != "offline" {
-		_ = a.Store.SetPresence(r.Context(), auth.UserID, sp, "", a.Now())
+		if changed, err := a.Store.SetPresence(r.Context(), auth.UserID, sp, "", a.Now()); err == nil && changed {
+			// The client declared presence for the first time (or changed it):
+			// broadcast the m.presence EDU to every remote server sharing a room
+			// with the user, so federated peers learn the presence without
+			// waiting for a PUT /presence (sytest "New federated private chats
+			// get full presence information (SYN-115)").
+			a.broadcastLocalPresence(r.Context(), auth.UserID)
+		}
 	}
 
 	// Long-poll: compute sync; if no new data, wait on the notifier and retry.
@@ -426,23 +433,19 @@ func (a *API) PresencePut(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	if err := a.Store.SetPresence(r.Context(), userID, req.Presence, req.StatusMsg, a.Now()); err != nil {
+	if changed, err := a.Store.SetPresence(r.Context(), userID, req.Presence, req.StatusMsg, a.Now()); err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
+	} else if changed {
+		// Wake everyone who could see this presence change. Presence changes
+		// advance the shared sync stream, so any user's long-poll that is parked
+		// will wake and pick up the presence event. The set is small in practice
+		// (room peers); the self-notify covers the user's own other devices.
+		a.Notifier.NotifyUser(userID)
+		// Broadcast the change to remote servers sharing a room with the user
+		// (m.presence EDU, spec "Presence in the federation API").
+		a.broadcastLocalPresence(r.Context(), userID)
 	}
-	// Wake everyone who could see this presence change. Presence changes advance
-	// the shared sync stream, so any user's long-poll that is parked will wake
-	// and pick up the presence event. The set is small in practice (room peers);
-	// the self-notify covers the user's own other devices.
-	a.Notifier.NotifyUser(userID)
-	// Broadcast the change to remote servers sharing a room with the user
-	// (m.presence EDU, spec "Presence in the federation API").
-	a.broadcastPresence(r.Context(), userID, &storage.PresenceRow{
-		UserID:       userID,
-		Presence:     req.Presence,
-		StatusMsg:    req.StatusMsg,
-		LastActiveTS: a.Now(),
-	})
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 

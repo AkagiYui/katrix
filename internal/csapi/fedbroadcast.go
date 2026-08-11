@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/AkagiYui/katrix/internal/events"
-	"github.com/AkagiYui/katrix/internal/storage"
 )
 
 // broadcastPDU queues a locally-created event for delivery to every remote
@@ -209,23 +208,44 @@ func (a *API) recordDeviceRemoval(ctx context.Context, userID, localpart, device
 	a.notifyDeviceListPeers(ctx, userID)
 }
 
-// broadcastPresence queues an m.presence EDU for userID to every remote server
-// sharing a room with the user.
-func (a *API) broadcastPresence(ctx context.Context, userID string, p *storage.PresenceRow) {
-	if a.fed == nil {
+// presenceContentFor builds the m.presence EDU content for userID. A user with
+// no presence row is reported as "online": the spec's presence default ("If
+// this parameter is omitted then the client is automatically marked as online
+// when it uses this API"), and the row only appears once the user first
+// /syncs or PUTs /presence — a peer who joins before that must still learn the
+// user is online (sytest "New federated private chats get full presence
+// information (SYN-115)" seeds the event-stream token via the legacy /events
+// endpoint, which never writes a presence row). It returns nil only when the
+// user is unknown to this server.
+func (a *API) presenceContentFor(ctx context.Context, userID string) map[string]any {
+	presence := "online"
+	statusMsg := ""
+	if p, err := a.Store.GetPresence(ctx, userID); err == nil && p != nil {
+		presence = p.Presence
+		statusMsg = p.StatusMsg
+	}
+	content := map[string]any{
+		"user_id":   userID,
+		"presence":  presence,
+		"stream_id": a.Now(),
+	}
+	if statusMsg != "" {
+		content["status_msg"] = statusMsg
+	}
+	return content
+}
+
+// broadcastLocalPresence queues an m.presence EDU for a LOCAL user to every
+// remote server sharing a room with the user. Callers (a PUT /presence, a
+// first /sync set_presence, a room join) need not carry the presence row; a
+// user with no row yet is broadcast as online (see presenceContentFor).
+func (a *API) broadcastLocalPresence(ctx context.Context, userID string) {
+	if a.fed == nil || !a.IsLocalUser(userID) {
 		return
 	}
 	rooms, err := a.Store.RoomsForUser(ctx, userID)
 	if err != nil || len(rooms) == 0 {
 		return
 	}
-	content := map[string]any{
-		"user_id":   userID,
-		"presence":  p.Presence,
-		"stream_id": a.Now(),
-	}
-	if p.StatusMsg != "" {
-		content["status_msg"] = p.StatusMsg
-	}
-	a.fed.BroadcastEDUToRooms(ctx, "m.presence", content, rooms)
+	a.fed.BroadcastEDUToRooms(ctx, "m.presence", a.presenceContentFor(ctx, userID), rooms)
 }

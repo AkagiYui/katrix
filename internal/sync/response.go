@@ -1016,10 +1016,10 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 func (e *Engine) appendPresence(ctx context.Context, resp *Response, opts SyncOptions) {
 	peers := e.roomPeers(ctx, opts)
 	if len(peers) == 0 && opts.Since.Stream == 0 {
-		// Initial sync with no room peers: still echo own presence.
-		if p, err := e.store.GetPresence(ctx, opts.UserID); err == nil && p != nil {
-			resp.Presence = &PresenceResp{Events: []json.RawMessage{presenceEvent(p)}}
-		}
+		// Initial sync with no room peers: still echo own presence. A user with
+		// no presence row yet (never /sync'd, or joined via a path that does not
+		// write one) is reported as online — the spec's /sync default.
+		resp.Presence = &PresenceResp{Events: []json.RawMessage{presenceEventFor(ctx, e.store, opts.UserID)}}
 		return
 	}
 
@@ -1057,15 +1057,11 @@ func (e *Engine) appendPresence(ctx context.Context, resp *Response, opts SyncOp
 		}
 		// Own presence only when it changed after the token (see doc comment).
 		if own {
-			if p, err := e.store.GetPresence(ctx, opts.UserID); err == nil && p != nil {
-				events = append(events, presenceEvent(p))
-			}
+			events = append(events, presenceEventFor(ctx, e.store, opts.UserID))
 		}
 	} else {
 		// Initial sync: own presence plus every joined room peer.
-		if p, err := e.store.GetPresence(ctx, opts.UserID); err == nil && p != nil {
-			events = append(events, presenceEvent(p))
-		}
+		events = append(events, presenceEventFor(ctx, e.store, opts.UserID))
 		var userIDs []string
 		for u := range peers {
 			if u != opts.UserID {
@@ -1201,16 +1197,26 @@ func localpartOfSync(userID string) string {
 func presenceEvents(ctx context.Context, store *storage.Store, userIDs []string) []json.RawMessage {
 	var out []json.RawMessage
 	for _, u := range userIDs {
-		if p, err := store.GetPresence(ctx, u); err == nil && p != nil {
-			out = append(out, presenceEvent(p))
-		} else {
-			out = append(out, presenceEvent(&storage.PresenceRow{
-				UserID:   u,
-				Presence: "offline",
-			}))
-		}
+		out = append(out, presenceEventFor(ctx, store, u))
 	}
 	return out
+}
+
+// presenceEventFor renders the m.presence event for one user, falling back to
+// "online" when the user has no presence row yet. A user who exists but has
+// never PUT /presence or /sync'd (or joined via a path that writes no row) is
+// online per the spec's /sync default ("If this parameter is omitted then the
+// client is automatically marked as online"), and a peer must still be able to
+// learn it (sytest "New federated private chats get full presence information
+// (SYN-115)").
+func presenceEventFor(ctx context.Context, store *storage.Store, userID string) json.RawMessage {
+	if p, err := store.GetPresence(ctx, userID); err == nil && p != nil {
+		return presenceEvent(p)
+	}
+	return presenceEvent(&storage.PresenceRow{
+		UserID:   userID,
+		Presence: "online",
+	})
 }
 
 // presenceEvent marshals a stored presence row as an m.presence client event.

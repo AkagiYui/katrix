@@ -2585,6 +2585,73 @@ func (a *API) applyRemoteMembershipNotify(ctx context.Context, roomID, userID, m
 	if membership == "join" || membership == "leave" || membership == "ban" {
 		a.notifyRoomMembers(ctx, roomID)
 	}
+	// A LOCAL user joining a room (whether via the client path or a federated
+	// send_join whose PDU is ingested back) makes their presence newly visible
+	// to the room's remote servers: they have no baseline for the user, so push
+	// an m.presence EDU to each server sharing the room. A user with no
+	// presence row yet (never /sync'd) is reported as online — the spec's
+	// /sync default (sytest "New federated private chats get full presence
+	// information (SYN-115)" seeds the event-stream token via the legacy
+	// /events endpoint, which never writes a presence row).
+	if membership == "join" && a.IsLocalUser(userID) {
+		// Establish the user's presence row: a join means the user is present
+		// (spec /sync default "online"). Without it, an initial /sync from the
+		// joining user omits their own presence event and the client never
+		// learns they are online — the test needs the joiner to see both peers'
+		// presence immediately.
+		if _, err := a.Store.SetPresence(ctx, userID, "online", "", a.Now()); err != nil {
+			return
+		}
+		presence := "online"
+		statusMsg := ""
+		if p, err := a.Store.GetPresence(ctx, userID); err == nil && p != nil {
+			presence = p.Presence
+			statusMsg = p.StatusMsg
+		}
+		content := map[string]any{
+			"user_id":   userID,
+			"presence":  presence,
+			"stream_id": a.Now(),
+		}
+		if statusMsg != "" {
+			content["status_msg"] = statusMsg
+		}
+		if rooms, err := a.Store.RoomsForUser(ctx, userID); err == nil {
+			a.BroadcastEDUToRooms(ctx, "m.presence", content, rooms)
+		}
+	}
+	// A remote user joining a room makes the room's LOCAL users' presence newly
+	// visible to the joiner's server: it has no baseline for them (the shared
+	// room is new), so push an m.presence EDU for each local joined user to the
+	// joiner's server — otherwise the joiner never learns their presence until
+	// the next local change (spec "Presence in the federation API"; sytest
+	// "New federated private chats get full presence information (SYN-115)").
+	if membership == "join" && !a.IsLocalUser(userID) {
+		if d := ids.DomainOf(userID); d != "" && d != a.ServerName() {
+			if members, err := a.Store.Members(ctx, roomID, "join"); err == nil {
+				for _, m := range members {
+					if !a.IsLocalUser(m.UserID) {
+						continue
+					}
+					presence := "online"
+					statusMsg := ""
+					if p, err := a.Store.GetPresence(ctx, m.UserID); err == nil && p != nil {
+						presence = p.Presence
+						statusMsg = p.StatusMsg
+					}
+					content := map[string]any{
+						"user_id":   m.UserID,
+						"presence":  presence,
+						"stream_id": a.Now(),
+					}
+					if statusMsg != "" {
+						content["status_msg"] = statusMsg
+					}
+					a.BroadcastEDUToServers(ctx, "m.presence", content, []string{d})
+				}
+			}
+		}
+	}
 }
 
 // roomStatePDUs returns the current room state as raw PDUs.

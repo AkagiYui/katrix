@@ -2939,6 +2939,18 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 			_, _ = a.Store.RecordDeviceListChange(r.Context(), target, mc.Membership != "join")
 			if mc.Membership == "join" {
 				a.broadcastDeviceListForUser(r.Context(), target)
+				// A local user's join makes their presence newly visible to the
+				// room's other members. Mark them online (the spec's /sync
+				// default — a client that never PUT /presence is online) so the
+				// change is recorded in the shared stream and their own /sync
+				// carries them, and broadcast the m.presence EDU to the room's
+				// remote servers — their shared-room relationship is new, so the
+				// change broadcast is the only way they learn it (spec "Presence
+				// in the federation API"; sytest "New federated private chats get
+				// full presence information (SYN-115)").
+				if _, err := a.Store.SetPresence(r.Context(), target, "online", "", a.Now()); err == nil {
+					a.broadcastLocalPresence(r.Context(), target)
+				}
 			} else {
 				a.broadcastDeviceListDelete(r.Context(), target, roomID)
 				// The reverse direction: the user leaving/being banned stops

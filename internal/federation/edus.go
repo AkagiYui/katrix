@@ -367,7 +367,7 @@ func (a *API) applyPresenceEDU(ctx context.Context, content json.RawMessage) {
 	if err := json.Unmarshal(content, &c); err != nil || c.UserID == "" || c.Presence == "" {
 		return
 	}
-	_ = a.Store.SetPresence(ctx, c.UserID, c.Presence, c.StatusMsg, a.Now())
+	_, _ = a.Store.SetPresence(ctx, c.UserID, c.Presence, c.StatusMsg, a.Now())
 	a.wakeSharedRoomLocals(ctx, c.UserID)
 }
 

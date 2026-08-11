@@ -195,7 +195,9 @@ func (a *API) SlidingSync(w http.ResponseWriter, r *http.Request) {
 		sp = "online"
 	}
 	if sp != "offline" {
-		_ = a.Store.SetPresence(r.Context(), auth.UserID, sp, "", a.Now())
+		if changed, err := a.Store.SetPresence(r.Context(), auth.UserID, sp, "", a.Now()); err == nil && changed {
+			a.broadcastLocalPresence(r.Context(), auth.UserID)
+		}
 	}
 
 	compute := func() *slidingSyncResponse {

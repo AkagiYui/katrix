@@ -309,8 +309,10 @@ type PresenceRow struct {
 }
 
 // SetPresence upserts a user's presence state and records a presence change in
-// the shared sync stream so other users' /sync deltas pick it up.
-func (s *Store) SetPresence(ctx context.Context, userID, presence, statusMsg string, ts int64) error {
+// the shared sync stream so other users' /sync deltas pick it up. It returns
+// whether the presence/status actually changed (a call that only touches
+// last_active_ts reports false).
+func (s *Store) SetPresence(ctx context.Context, userID, presence, statusMsg string, ts int64) (bool, error) {
 	// A presence update is only a *change* when the stored presence/status
 	// actually differs. Clients commonly send set_presence=online on every
 	// /sync; writing a presence_changes row each time would advance the sync
@@ -330,12 +332,12 @@ func (s *Store) SetPresence(ctx context.Context, userID, presence, statusMsg str
 				 VALUES ($1,$2,$3,$4)
 				 ON CONFLICT (user_id) DO UPDATE SET last_active_ts=EXCLUDED.last_active_ts`,
 				userID, presence, statusMsg, ts)
-			return nil
+			return false, nil
 		}
 	}
 	streamID, err := s.NextSyncStream(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	_, err = s.pool.Exec(ctx,
 		`INSERT INTO presence(user_id, presence, status_msg, last_active_ts)
@@ -343,12 +345,12 @@ func (s *Store) SetPresence(ctx context.Context, userID, presence, statusMsg str
 		 ON CONFLICT (user_id) DO UPDATE SET presence=$2, status_msg=$3, last_active_ts=$4`,
 		userID, presence, statusMsg, ts)
 	if err != nil {
-		return err
+		return false, err
 	}
 	_, err = s.pool.Exec(ctx,
 		`INSERT INTO presence_changes(user_id, stream_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
 		userID, streamID)
-	return err
+	return err == nil, err
 }
 
 // GetPresence returns a user's presence state, or nil if unset.
