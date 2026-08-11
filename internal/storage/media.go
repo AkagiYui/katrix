@@ -129,14 +129,19 @@ func (s *Store) QuarantineMediaInRoom(ctx context.Context, roomID string, now in
 	}
 	var quarantined int64
 	for f := range found {
-		tag, err := s.pool.Exec(ctx,
-			`UPDATE media SET quarantined_ts=$1
-			 WHERE origin_server=$2 AND media_id=$3 AND quarantined_ts=0`,
-			now, f.origin, f.mediaID)
-		if err != nil {
-			continue
+		// The local row is stored with an empty origin_server (see CreateMedia);
+		// the mxc:// URL carries the server name, so match both the named-origin
+		// row (remote cached media) and the empty-origin row (local upload).
+		for _, origin := range []string{f.origin, ""} {
+			tag, err := s.pool.Exec(ctx,
+				`UPDATE media SET quarantined_ts=$1
+				 WHERE origin_server=$2 AND media_id=$3 AND quarantined_ts=0`,
+				now, origin, f.mediaID)
+			if err != nil {
+				continue
+			}
+			quarantined += tag.RowsAffected()
 		}
-		quarantined += tag.RowsAffected()
 	}
 	return quarantined, nil
 }
