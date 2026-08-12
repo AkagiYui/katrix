@@ -12,3 +12,12 @@
 # here (and remember to also keep it in the whitelist, since run-tests.pl marks
 # any test that is in the blacklist OR missing from the whitelist as expected
 # fail). Lines starting with '#' are ignored.
+
+# Blacklisted because the test's expectation cannot be satisfied by ANY
+# conforming homeserver: lazy_load_members in a limited (gappy) sync is
+# implemented per spec + Synapse as "return all state changes in the window"
+# (StateFilter.all() when batch.limited), not "only timeline senders'
+# memberships". Synapse blacklists this exact test too (riot-web#7211:
+# "The only membership state included in a gapped incremental sync is for
+# senders in the timeline"). Following upstream.
+The only membership state included in a gapped incremental sync is for senders in the timeline
