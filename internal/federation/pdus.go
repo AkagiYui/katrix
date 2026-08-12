@@ -185,30 +185,40 @@ func (a *API) RunEDUWorker(ctx context.Context) {
 			continue
 		}
 		delay = baseDelay
+		// Deliver the whole batch concurrently, bounded by a semaphore, so a
+		// backlog does not drain serially: each deliverEDU/deliverPDU already
+		// fans out across its destinations but blocks until the slowest one
+		// answers (fedDeliveryTimeout), so a batch of 50 against a
+		// loaded-but-healthy peer would otherwise take up to 50×5s and blow
+		// every client deadline behind the queue (sytest's room-versions suite
+		// fails with 10s "timed out waiting for test" timeouts once the queue
+		// is behind). A bounded pool keeps the parallelism from saturating the
+		// database or the outbound connection budget.
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 8)
+		dispatch := func(fn func()) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				select {
+				case <-ctx.Done():
+					return
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+					fn()
+				}
+			}()
+		}
 		for _, edu := range edus {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			a.deliverEDU(ctx, edu.ID, edu.TxnID, edu.EduType, edu.Content, edu.Destinations)
+			dispatch(func() { a.deliverEDU(ctx, edu.ID, edu.TxnID, edu.EduType, edu.Content, edu.Destinations) })
 		}
 		for _, pdu := range pdus {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			a.deliverPDU(ctx, pdu.ID, pdu.TxnID, pdu.RoomID, pdu.Raw, pdu.Destinations)
+			dispatch(func() { a.deliverPDU(ctx, pdu.ID, pdu.TxnID, pdu.RoomID, pdu.Raw, pdu.Destinations) })
 		}
 		for _, inv := range invites {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			a.deliverInvite(ctx, inv)
+			dispatch(func() { a.deliverInvite(ctx, inv) })
 		}
+		wg.Wait()
 	}
 }
 
