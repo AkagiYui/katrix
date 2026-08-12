@@ -89,33 +89,33 @@ func TestVisibilityEvaluatorJoinedBoundary(t *testing.T) {
 	}
 
 	// msg1 (sent under joined, before bob joined) is not visible.
-	if ev.CanSee(msg1.StreamOrdering, msg1.Type) {
+	if ev.CanSee(msg1.Depth, msg1.Type) {
 		t.Fatalf("msg1 should be hidden (joined, pre-join)")
 	}
 	// msg2 (sent under invited, before bob was invited) is not visible.
-	if ev.CanSee(msg2.StreamOrdering, msg2.Type) {
+	if ev.CanSee(msg2.Depth, msg2.Type) {
 		t.Fatalf("msg2 should be hidden (invited, pre-invite)")
 	}
 	// msg3 (sent under shared) is visible.
-	if !ev.CanSee(msg3.StreamOrdering, msg3.Type) {
+	if !ev.CanSee(msg3.Depth, msg3.Type) {
 		t.Fatalf("msg3 should be visible (shared)")
 	}
 	// The hv=joined change event is evaluated under the least restrictive of
 	// (default shared, joined) = shared, so it is visible.
-	if !ev.CanSee(hvJoined.StreamOrdering, hvJoined.Type) {
+	if !ev.CanSee(hvJoined.Depth, hvJoined.Type) {
 		t.Fatalf("hv(joined) change should be visible (boundary rule)")
 	}
 	// The hv=invited change: old=joined, new=invited → least = invited; bob was
 	// not invited at that point, so it is hidden.
-	if ev.CanSee(hvInvited.StreamOrdering, hvInvited.Type) {
+	if ev.CanSee(hvInvited.Depth, hvInvited.Type) {
 		t.Fatalf("hv(invited) change should be hidden (invited, pre-invite)")
 	}
 	// The hv=shared change: old=invited, new=shared → least = shared → visible.
-	if !ev.CanSee(hvShared.StreamOrdering, hvShared.Type) {
+	if !ev.CanSee(hvShared.Depth, hvShared.Type) {
 		t.Fatalf("hv(shared) change should be visible (boundary rule)")
 	}
 	// The join itself is visible.
-	if !ev.CanSee(join.StreamOrdering, join.Type) {
+	if !ev.CanSee(join.Depth, join.Type) {
 		t.Fatalf("join should be visible")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/AkagiYui/katrix/internal/storage"
+	"github.com/AkagiYui/katrix/internal/testdb"
 )
 
 func TestPushRulesDefaultAndGet(t *testing.T) {
@@ -123,7 +124,7 @@ func setUserAdmin(t *testing.T, localpart string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	store, err := storage.Open(ctx, "postgres://pg18:pg18@localhost:5432/katrix_test?sslmode=disable")
+	store, err := storage.Open(ctx, testdb.DSN())
 	if err != nil {
 		t.Skipf("postgres unavailable: %v", err)
 		return

@@ -89,6 +89,11 @@ func TestRecordDeviceListJoinEDU(t *testing.T) {
 		t.Fatalf("bob event: %v", err)
 	}
 	bobStream := bobEv.StreamOrdering
+	// RecordDeviceListJoinEDU anchors the record at the user's join position,
+	// which it reads from the denormalised membership table (MIN(stream_ordering)
+	// of the user's join rows). Bob's join row must exist for the backdate to
+	// land at his join stream position.
+	_ = s.UpsertMembership(ctx, MembershipRow{RoomID: room, UserID: bob, Membership: "join", EventID: "$bob-join:test", StreamOrdering: bobStream, Depth: 2})
 
 	// The join advertisement backdates bob into his join stream position.
 	if err := s.RecordDeviceListJoinEDU(ctx, bob); err != nil {
