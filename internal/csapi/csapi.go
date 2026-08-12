@@ -4,7 +4,6 @@ package csapi
 
 import (
 	"net/http"
-	"sync"
 
 	"github.com/AkagiYui/katrix/internal/federation"
 	"github.com/AkagiYui/katrix/internal/homeserver"
@@ -23,11 +22,6 @@ type API struct {
 	// og:image blob so the response can carry an mxc:// URL. Set by
 	// SetMediaBackend during HTTP server assembly.
 	media *media.FileBackend
-	// stateMu serialises state-event writes so the idempotency check
-	// (read current state, compare content, write if different) is atomic
-	// under concurrent clients. Without it two identical concurrent PUTs both
-	// pass the check and fork the room with duplicate events.
-	stateMu sync.Mutex
 	// ssConns tracks per (user, conn_id) sliding-sync connection state: which
 	// rooms have been delivered with initial=true and the subscription config
 	// each room was delivered with. When a client adds a room_subscription for

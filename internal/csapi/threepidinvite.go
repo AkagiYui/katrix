@@ -317,8 +317,8 @@ func (a *API) exchangeAndJoinWithThirdParty(r *http.Request, auth *homeserver.Au
 // the denormalised membership, wakes the invitee's sync and broadcasts the
 // event to the room's servers.
 func (a *API) persistThirdPartyMemberInvite(ctx context.Context, sender, target, roomID string, contentRaw json.RawMessage) error {
-	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
+	unlock := a.Store.LockRoom(roomID)
+	defer unlock()
 	room, err := a.Store.GetRoom(ctx, roomID)
 	if err != nil {
 		return newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")

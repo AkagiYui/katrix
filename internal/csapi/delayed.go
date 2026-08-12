@@ -160,6 +160,8 @@ func (a *API) fireDelayedEvent(ctx context.Context, localpart, delayID string) e
 // buildAndPersistMessageCtx is buildAndPersistMessage with an explicit context
 // (the firing path has no HTTP request).
 func (a *API) buildAndPersistMessageCtx(ctx context.Context, auth *homeserver.Auth, roomID, eventType, _txnID string, content []byte) (*events.Event, error) {
+	unlock := a.Store.LockRoom(roomID)
+	defer unlock()
 	room, err := a.Store.GetRoom(ctx, roomID)
 	if err != nil {
 		return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
@@ -193,6 +195,8 @@ func (a *API) buildAndPersistMessageCtx(ctx context.Context, auth *homeserver.Au
 
 // buildAndPersistStateCtx is buildAndPersistState with an explicit context.
 func (a *API) buildAndPersistStateCtx(ctx context.Context, auth *homeserver.Auth, roomID, eventType, stateKey string, content []byte) (*events.Event, error) {
+	unlock := a.Store.LockRoom(roomID)
+	defer unlock()
 	room, err := a.Store.GetRoom(ctx, roomID)
 	if err != nil {
 		return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")

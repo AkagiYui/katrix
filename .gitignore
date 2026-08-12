@@ -21,3 +21,7 @@ internal/webui/dist/assets/
 # Compiled helper binaries
 /testreport
 sytest-logs-local/
+
+# Local sytest repro harness (sytest checkout + run logs); CI re-checkouts both.
+/sytest-src/
+/sytest-logs/

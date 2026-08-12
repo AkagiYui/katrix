@@ -10,29 +10,64 @@ import (
 )
 
 // roomLocks is a fixed set of striped mutexes serialising per-room write
-// pipelines (event persistence + state maintenance). Writers for the same room
-// must not interleave their state rewrites: room_state, event_state_snapshots
-// and forward_extremities are maintained by DELETE-then-INSERT rewrites, and
-// concurrent transactions that touch the same rows in different orders deadlock
-// in Postgres (SQLSTATE 40P01 — seen under concurrent /send calls into one room
-// and when a federation seed join overlaps inbound PDUs). Striping keeps
-// different rooms parallel while guaranteeing mutual exclusion per room.
+// pipelines. Two independent stripe sets are used:
+//
+//   - write stripes back WithRoomWrite: event-state maintenance (snapshots,
+//     room_state, forward extremities) runs inside one transaction per room so
+//     concurrent writers cannot interleave their DELETE-then-INSERT rewrites
+//     into a Postgres deadlock (SQLSTATE 40P01 — seen under concurrent /send
+//     calls into one room and when a federation seed join overlaps inbound
+//     PDUs).
+//   - send stripes back LockRoom: the CS-API local send path serialises its
+//     depth/tip read (dagTipFor) together with the event insert, so concurrent
+//     /send requests cannot both read the same forward-extremity snapshot and
+//     mint identical depths (a sync window ordered by (depth, stream) would
+//     then truncate to a mix of old and new events at one depth). These are a
+//     separate set from the write stripes because LockRoom's critical section
+//     still calls persistEventInRoom, whose eventstate.Maintain takes the
+//     write stripe — a single shared stripe would be a non-reentrant-mutex
+//     deadlock. Striping keeps different rooms parallel while guaranteeing
+//     mutual exclusion per room within each set.
 type roomLocks struct {
-	locks []sync.Mutex
+	write []sync.Mutex
+	send  []sync.Mutex
 }
 
 func newRoomLocks(n int) *roomLocks {
-	return &roomLocks{locks: make([]sync.Mutex, n)}
+	return &roomLocks{
+		write: make([]sync.Mutex, n),
+		send:  make([]sync.Mutex, n),
+	}
 }
 
-// lock returns the stripe lock for a room ID and acquires it. The caller must
-// unlock it (WithRoomWrite does).
-func (rl *roomLocks) lock(roomID string) *sync.Mutex {
+// lock acquires the stripe lock for a room ID in the given set. The caller
+// must unlock it.
+func lockStripe(set []sync.Mutex, roomID string) *sync.Mutex {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(roomID))
-	l := &rl.locks[h.Sum32()%uint32(len(rl.locks))]
+	l := &set[h.Sum32()%uint32(len(set))]
 	l.Lock()
 	return l
+}
+
+// LockRoom acquires the CS-API local-send stripe lock for a room without
+// opening a transaction. Callers that build and persist events outside
+// WithRoomWrite — the CS-API local send path, which computes the event's
+// prev_events/depth (dagTipFor → buildEvent → InsertEvent) before any storage
+// work — must hold it so concurrent writers read a settled
+// forward-extremity/depth view: without the exclusion two parallel /send
+// requests both read the same extremity snapshot and mint the same depth,
+// and a sync window ordered by (depth, stream) then truncates to a mix of old
+// and new events at one depth. This is the mirror of Synapse's per-room
+// persistence serialisation (persist_events.py: "we can have only one
+// _persist_events per room being called at a time"). The returned release
+// function must be called (deferred) by the caller. LockRoom is deliberately
+// a different stripe set from WithRoomWrite: the locked critical section
+// still runs eventstate.Maintain (which takes the write stripe), so sharing a
+// stripe would deadlock the non-reentrant mutex.
+func (s *Store) LockRoom(roomID string) (unlock func()) {
+	l := lockStripe(s.roomLocks.send, roomID)
+	return l.Unlock
 }
 
 // WithRoomWrite serialises a room's write pipeline and runs fn inside a single
@@ -46,7 +81,7 @@ func (rl *roomLocks) lock(roomID string) *sync.Mutex {
 // fn must use only the tx-based Store methods (Tx*): mixing in pool-based
 // writes would both bypass the transaction and defeat the serialisation.
 func (s *Store) WithRoomWrite(ctx context.Context, roomID string, fn func(tx pgx.Tx) error) (err error) {
-	l := s.roomLocks.lock(roomID)
+	l := lockStripe(s.roomLocks.write, roomID)
 	defer l.Unlock()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {

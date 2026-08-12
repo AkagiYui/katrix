@@ -563,8 +563,8 @@ func (a *API) RoomInvite(w http.ResponseWriter, r *http.Request) {
 // the public key material the identity server will use to sign the eventual
 // third-party membership.
 func (a *API) persistThirdPartyInvite(r *http.Request, auth *homeserver.Auth, roomID string, si *identity.StoredInvite) error {
-	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
+	unlock := a.Store.LockRoom(roomID)
+	defer unlock()
 	room, err := a.Store.GetRoom(r.Context(), roomID)
 	if err != nil {
 		return newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
@@ -1794,6 +1794,11 @@ func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 	delete(c, "redacts")
 	content, _ = json.Marshal(c)
 
+	// Serialise the redaction build + persist on the room's write lock (same
+	// reasoning as buildAndPersistMessage: the depth/tip read must be atomic
+	// with the insert).
+	unlock := a.Store.LockRoom(roomID)
+	defer unlock()
 	room, err := a.Store.GetRoom(r.Context(), roomID)
 	if err != nil {
 		writeRoomErr(w, err)
@@ -2785,9 +2790,10 @@ func memberContent(mc *rooms.MemberContent) map[string]any {
 // event with the given content (which must include "membership"). It returns
 // the persisted event ID (idempotent repeats return the existing event's ID).
 func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth, roomID, target string, content map[string]any) (string, error) {
-	// Serialise with state writes so the join-idempotency check is atomic.
-	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
+	// Serialise with the room's write lock so the join-idempotency check and the
+	// depth/tip read are atomic.
+	unlock := a.Store.LockRoom(roomID)
+	defer unlock()
 	room, err := a.Store.GetRoom(r.Context(), roomID)
 	if err != nil {
 		return "", newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
@@ -3032,6 +3038,10 @@ func isBlockedInviteError(err error) bool {
 
 // sendStateEvent is a helper used by createRoom for name/topic events.
 func (a *API) sendStateEvent(r *http.Request, auth *homeserver.Auth, roomID string, version roomver.Version, eventType, stateKey string, content any) {
+	// Serialise on the room's write lock (same reasoning as
+	// buildAndPersistMessage: atomic depth/tip read + insert).
+	unlock := a.Store.LockRoom(roomID)
+	defer unlock()
 	// content may already be raw event JSON (json.RawMessage from a state copy,
 	// or a []byte from a marshalled map): json.Marshal would base64-encode a
 	// []byte and double-encode a RawMessage's bytes, so pass it through
@@ -3058,6 +3068,14 @@ func (a *API) sendStateEvent(r *http.Request, auth *homeserver.Auth, roomID stri
 
 // buildAndPersistMessage builds and persists a non-state (message) event.
 func (a *API) buildAndPersistMessage(r *http.Request, auth *homeserver.Auth, roomID, eventType, txnID string, content json.RawMessage) (*events.Event, error) {
+	// Serialise on the room's write lock: dagTipFor (the prev/depth read) must
+	// be atomic with the insert, or concurrent /send requests both read the
+	// same forward-extremity snapshot and mint identical depths — a sync
+	// window ordered by (depth, stream) then truncates to a mix of old and new
+	// events at one depth (mirror of Synapse's per-room persistence
+	// serialisation; the lazy-load senders are derived from that window).
+	unlock := a.Store.LockRoom(roomID)
+	defer unlock()
 	room, err := a.Store.GetRoom(r.Context(), roomID)
 	if err != nil {
 		return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
@@ -3078,10 +3096,12 @@ func (a *API) buildAndPersistMessage(r *http.Request, auth *homeserver.Auth, roo
 
 // buildAndPersistState builds, authorises and persists a state event.
 func (a *API) buildAndPersistState(r *http.Request, auth *homeserver.Auth, roomID, eventType, stateKey string, content json.RawMessage) (*events.Event, error) {
-	// Serialise the idempotency check + write so concurrent identical PUTs
-	// yield the same event rather than forking the room.
-	a.stateMu.Lock()
-	defer a.stateMu.Unlock()
+	// Serialise the idempotency check + write on the room's write lock so
+	// concurrent identical PUTs yield the same event rather than forking the
+	// room, and so the depth/tip read (dagTipFor) is atomic with the insert
+	// (mirror of Synapse's per-room persistence serialisation).
+	unlock := a.Store.LockRoom(roomID)
+	defer unlock()
 	room, err := a.Store.GetRoom(r.Context(), roomID)
 	if err != nil {
 		return nil, newRoomError(http.StatusNotFound, "M_NOT_FOUND", "room not found")
