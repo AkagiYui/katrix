@@ -165,17 +165,17 @@ func (a *API) RunEDUWorker(ctx context.Context) {
 		case <-time.After(delay):
 		}
 		// Drain the queues in batches; keep the backoff if nothing was left.
-		edus, err := a.Store.PendingOutboundEDUs(ctx, 50)
+		edus, err := a.Store.PendingOutboundEDUs(ctx, 200)
 		if err != nil {
 			delay = minDuration(delay*2, maxDelay)
 			continue
 		}
-		pdus, err2 := a.Store.PendingOutboundPDUs(ctx, 50)
+		pdus, err2 := a.Store.PendingOutboundPDUs(ctx, 200)
 		if err2 != nil {
 			delay = minDuration(delay*2, maxDelay)
 			continue
 		}
-		invites, err3 := a.Store.PendingOutboundInvites(ctx, 50, a.Now())
+		invites, err3 := a.Store.PendingOutboundInvites(ctx, 200, a.Now())
 		if err3 != nil {
 			delay = minDuration(delay*2, maxDelay)
 			continue
@@ -184,41 +184,63 @@ func (a *API) RunEDUWorker(ctx context.Context) {
 			delay = minDuration(delay*2, maxDelay)
 			continue
 		}
-		delay = baseDelay
 		// Deliver the whole batch concurrently, bounded by a semaphore, so a
 		// backlog does not drain serially: each deliverEDU/deliverPDU already
 		// fans out across its destinations but blocks until the slowest one
-		// answers (fedDeliveryTimeout), so a batch of 50 against a
-		// loaded-but-healthy peer would otherwise take up to 50×5s and blow
-		// every client deadline behind the queue (sytest's room-versions suite
-		// fails with 10s "timed out waiting for test" timeouts once the queue
-		// is behind). A bounded pool keeps the parallelism from saturating the
+		// answers (fedDeliveryTimeout), so a batch against a loaded-but-healthy
+		// peer would otherwise take items×5s and blow every client deadline
+		// behind the queue (sytest's room-versions and presence suites fail
+		// with 10-30s "timed out waiting for test" timeouts once the queue is
+		// behind). A bounded pool keeps the parallelism from saturating the
 		// database or the outbound connection budget.
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, 8)
-		dispatch := func(fn func()) {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				select {
-				case <-ctx.Done():
-					return
-				case sem <- struct{}{}:
-					defer func() { <-sem }()
-					fn()
-				}
-			}()
+		// The 2s baseDelay is skipped while a batch is being drained AND the
+		// queues are still non-empty: with 200-item batches under a sustained
+		// backlog, waiting 2s between every batch would let the backlog grow
+		// unboundedly (the sytest suite feeds events faster than one batch per
+		// 2s), pushing late-queued items (e.g. a presence EDU) past the
+		// client's test deadline. Only back off when a full drain found nothing
+		// left to do.
+		delay = baseDelay
+		drained := false
+		for {
+			var wg sync.WaitGroup
+			sem := make(chan struct{}, 32)
+			dispatch := func(fn func()) {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					select {
+					case <-ctx.Done():
+						return
+					case sem <- struct{}{}:
+						defer func() { <-sem }()
+						fn()
+					}
+				}()
+			}
+			for _, edu := range edus {
+				dispatch(func() { a.deliverEDU(ctx, edu.ID, edu.TxnID, edu.EduType, edu.Content, edu.Destinations) })
+			}
+			for _, pdu := range pdus {
+				dispatch(func() { a.deliverPDU(ctx, pdu.ID, pdu.TxnID, pdu.RoomID, pdu.Raw, pdu.Destinations) })
+			}
+			for _, inv := range invites {
+				dispatch(func() { a.deliverInvite(ctx, inv) })
+			}
+			wg.Wait()
+			// Peek whether the queues still hold work; if they do, drain the
+			// next slice immediately (no 2s sleep). A fully-drained set ends
+			// the inner loop and returns to the normal wake/backoff cadence.
+			if drained {
+				break
+			}
+			edus, _ = a.Store.PendingOutboundEDUs(ctx, 200)
+			pdus, _ = a.Store.PendingOutboundPDUs(ctx, 200)
+			invites, _ = a.Store.PendingOutboundInvites(ctx, 200, a.Now())
+			if len(edus) == 0 && len(pdus) == 0 && len(invites) == 0 {
+				drained = true
+			}
 		}
-		for _, edu := range edus {
-			dispatch(func() { a.deliverEDU(ctx, edu.ID, edu.TxnID, edu.EduType, edu.Content, edu.Destinations) })
-		}
-		for _, pdu := range pdus {
-			dispatch(func() { a.deliverPDU(ctx, pdu.ID, pdu.TxnID, pdu.RoomID, pdu.Raw, pdu.Destinations) })
-		}
-		for _, inv := range invites {
-			dispatch(func() { a.deliverInvite(ctx, inv) })
-		}
-		wg.Wait()
 	}
 }
 
