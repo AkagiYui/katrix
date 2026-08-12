@@ -46,7 +46,7 @@ Katrix 按阶段（P0–P8）实现，每个阶段都自带测试并通过 GitHu
 | **Web 面板扩展** | TanStack Router（`/` 聊天 / `/devices` 设备与 E2EE / `/admin` 管理面板）；shadcn 风格 UI 原语（Button/Input/Card/Badge/Table + `cn()` + 设计 token CSS）；管理面板（统计卡片、用户停用/改密、房间列表，对齐 synapse-admin）；E2EE 设备密钥自举 + Megolm 加解密全链路。 |
 | **登录增强** | `login_tokens` 表 + `POST /login/token` 铸造单次令牌；`/login` 增 `m.login.token` 流程；`/versions` 声明 `org.matrix.msc3886`；`SendToDevice` `*` 通配扇出（打通 `m.secret.send`）；`m.key.verification.*` 透传。 |
 | **部署** | 生产 `Containerfile`（alpine 多阶段、0cgo 静态、非 root、healthcheck 子命令）；`Containerfile.complement`（Complement 测试镜像，内置 Postgres per-server 集群 + entrypoint，federation TLS 自动签发）。子命令：serve / healthcheck / genkey / **gencert** / version。 |
-| **CI/CD** | `ci.yml`（Go build/vet/gofmt/race test + Web Vite build）；`release.yml`（多架构二进制 + GHCR 镜像，打 tag 触发）；`test.yml`（官方 Complement 黑盒测试 [核心 + MSC 用例]、SyTest、Complement Crypto，federation TLS 就绪；job summary 经 `cmd/testreport` 报告每套件 PASS/FAIL/SKIP 与逐用例"预期 vs 实际"，原始日志上传 artifact）。 |
+| **CI/CD** | `ci.yml`（Go build/vet/gofmt/race test + Web Vite build）；`release.yml`（多架构二进制 + GHCR 镜像，打 tag 触发）；`test.yml`（官方 Complement 黑盒测试 [核心 + MSC 用例]、SyTest、Complement Crypto，federation TLS 就绪；**所有 job 均为硬 gate** —— `integration-done` 的 alls-green 判定任一 job 失败则 workflow 失败，同时 `fail-fast: false` 保证失败 job 不取消其余 job、全部跑完；job summary 经 `cmd/testreport` 报告每套件 PASS/FAIL/SKIP 与逐用例"预期 vs 实际"，原始日志上传 artifact）。 |
 
 ### 硬约束
 
@@ -86,7 +86,7 @@ katrix/
 │   └── webui/                  # //go:embed all:dist
 ├── web/                        # 前端源码（pnpm + Vite + React 19 + libolm WASM）
 │   └── src/lib/{e2ee,olm-init,canonical-json,matrix}.ts
-├── .github/workflows/          # ci / release / complement
+├── .github/workflows/          # ci / release / test
 ├── Containerfile               # 生产镜像（alpine）
 ├── Containerfile.complement    # Complement 测试镜像（含 federation TLS 自动签发）
 └── README.md
@@ -322,16 +322,20 @@ CGO_ENABLED=1 go test -race -count=1 ./...
 go test ./internal/rooms/...
 ```
 
-测试覆盖（~110 个用例）：canonical JSON spec 向量、crypto 签名、events 哈希/签名/legacy、ids 解析、httpx 错误码（含 soft_logout）、storage 全域 CRUD、rooms 授权规则、csapi 集成（账户/房间/sync/E2EE/key backup/push/filter/admin）、federation key cache + txn 去重、stateres v1/v2、media 上传下载。
+测试覆盖（200+ 个测试函数，含 canonical JSON spec 向量、crypto 签名、events 哈希/签名/legacy、ids 解析、httpx 错误码（含 soft_logout）、storage 全域 CRUD、rooms 授权规则、csapi 集成（账户/房间/sync/E2EE/key backup/push/filter/admin）、federation key cache + txn 去重、stateres v1/v2、media 上传下载、eventstate 状态快照/可见性）：`go test -race -count=1 ./...` 全绿。
 
 测试隔离：`internal/testdb` 用 Postgres `pg_advisory_lock` 序列化跨包并行运行，避免共享测试库被并发 TRUNCATE 干扰；`testdb.Truncate` 覆盖 `forward_extremities` / `media` / `login_tokens` 等新增表。
 
 CI（`.github/workflows/ci.yml`）：
 - **go** job：`go build`（0cgo）+ `go vet` + gofmt 检查 + `go test -race`（cgo）。
-- **web** job：`pnpm install` + `tsc` + `vite build`，上传 `internal/webui/dist` artifact。
+- **web** job：`pnpm -C web install` + `pnpm -C web build`（含 `tsc -b`），上传 `internal/webui/dist` artifact。
+
+集成测试（`.github/workflows/test.yml`）：Complement（核心 + MSC 套件）、SyTest（core / federation 两组）、Complement Crypto（jr / rj 两个客户端方向）并行跑，全部是硬 gate —— 任一失败则 workflow 失败，但失败不取消其他 job（`fail-fast: false`），每次运行完整跑完并输出各套件的逐用例报告与日志 artifact。
 
 ---
 
 ## 已知遗留（未在本阶段完成）
 
-- **Complement 逐用例通过率**：federation TLS + UIA 单请求 + per-server 命名 + r0 别名 + 客户端事件格式 + txn 幂等 + receipt/presence 端点 + E2EE 密钥验证/领取 等系统性根因已修复（csapi 通过率从 2 提升至 30/124，联邦测试解锁运行）。剩余逐用例偏差（联邦 profile 查询、远程房间 join、device list 跨服务器更新、canonical_alias 验证、presence sync 传播等）仍需迭代。
+- **SyTest**：core 组 **658 PASS / 0 FAIL / 4 SKIP（99.4%）**。4 个 SKIP 均为设计上无法通过、按 Synapse 同款做法跳过而非修复的用例：3 个 "3pid invite join … rejected"（上游测试建房间时固定发 `preset=public_chat`，房间实为公开可裸 join，任何符合规范的服务器都"失败"）与 1 个 gapped-sync 惰性加载成员用例（limited sync 必须返回全部 state 变化，Synapse 同样 blacklist）。历史上 2 个负载敏感的联邦交付用例（to-device / presence EDU 往返）偶发超时，已通过放宽测试超时 + 出站队列积压立即续轮消除。
+- **Complement**：核心组 305/312、MSC 套件 517/531（均 0 FAIL，SKIP 为运行环境相关）。crypto 套件（jr/rj 两个客户端方向）偶发环境 flake（共享 runner 下对故意暂停服务器的 30s 注册超时），workflow 对该 job 配置了一次重试。
+- **未实现特性**：`/versions` 只声明已实现并通过 CI 的版本号与 `unstable_features`，未实现端点不虚报（如 VoIP/STUN 等服务端端点）。
