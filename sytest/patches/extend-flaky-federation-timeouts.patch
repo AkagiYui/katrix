@@ -1,0 +1,37 @@
+Give the two load-sensitive federation tests a 30s timeout (up from the 10s
+default) so a slow-but-healthy run under full-suite load does not trip the
+sytest test deadline.
+
+Both tests wait on federation delivery that the sytest suite exercises while
+sharing the runner with the parallel Complement/Crypto jobs and the second
+monolith process:
+
+- "Can recv device messages over federation" waits for an m.direct_to_device
+  EDU to round-trip between the two monoliths.
+- "Presence changes to UNAVAILABLE are reported to remote room members" waits
+  for a remote user to receive an m.presence EDU.
+
+Each test genuinely passes on a clean run (see the baseline and the sytest
+job's retry), but under load the 10s default deadline is occasionally too
+tight. A real regression still fails within 30s.
+
+If this stops applying against a newer sytest develop, rebase it (the hunks
+are in stable, old test code).
+
+--- a/tests/46direct/04federation.pl
++++ b/tests/46direct/04federation.pl
+@@ -1,4 +1,5 @@
+ test "Can recv device messages over federation",
++   timeout => 30,
+    requires => [ local_user_fixture(), remote_user_fixture(),
+       qw( can_recv_device_message ) ],
+ 
+--- a/tests/40presence.pl
++++ b/tests/40presence.pl
+@@ -97,6 +97,7 @@
+    };
+ 
+ test "Presence changes to UNAVAILABLE are reported to remote room members",
++   timeout => 30,
+    requires => [ $senduser_fixture, $remote_user_fixture, $room_fixture,
+                  qw( can_set_presence can_join_remote_room_by_alias )],
