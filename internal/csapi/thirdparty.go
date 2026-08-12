@@ -3,10 +3,27 @@ package csapi
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 
 	"github.com/AkagiYui/katrix/internal/appservice"
 	"github.com/AkagiYui/katrix/internal/httpx"
 )
+
+// sortInstancesByDesc orders a merged third-party protocol instance list by its
+// `desc` field, so the combined listing is stable regardless of the appservice
+// iteration (and cache) order. The spec does not mandate an instance ordering,
+// but sytest asserts the merged list sorted by desc ("sort the instances list
+// for consistency", tests/60app-services/05lookup3pe.pl), and a deterministic
+// order keeps the API response stable for clients.
+func sortInstancesByDesc(instances []any) {
+	sort.SliceStable(instances, func(i, j int) bool {
+		a, _ := instances[i].(map[string]any)
+		b, _ := instances[j].(map[string]any)
+		da, _ := a["desc"].(string)
+		db, _ := b["desc"].(string)
+		return da < db
+	})
+}
 
 // Third-party network metadata proxying (spec §Third-party networks): the
 // homeserver exposes the appservices' third-party protocols to clients via
@@ -59,6 +76,9 @@ func (a *API) ThirdPartyProtocols(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for proto, meta := range protocols {
+		if instances, ok := meta["instances"].([]any); ok {
+			sortInstancesByDesc(instances)
+		}
 		out[proto] = meta
 	}
 	httpx.WriteJSON(w, http.StatusOK, out)
@@ -124,6 +144,9 @@ func (a *API) ThirdPartyProtocol(w http.ResponseWriter, r *http.Request) {
 			cur, _ := merged["instances"].([]any)
 			merged["instances"] = append(cur, instances...)
 		}
+	}
+	if instances, ok := merged["instances"].([]any); ok {
+		sortInstancesByDesc(instances)
 	}
 	if !have || merged == nil {
 		httpx.WriteError(w, httpx.ErrNotFound("protocol not found"))
