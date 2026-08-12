@@ -2585,57 +2585,23 @@ func (a *API) applyRemoteMembershipNotify(ctx context.Context, roomID, userID, m
 	if membership == "join" || membership == "leave" || membership == "ban" {
 		a.notifyRoomMembers(ctx, roomID)
 	}
-	// A LOCAL user joining a room (whether via the client path or a federated
-	// send_join whose PDU is ingested back) makes their presence newly visible
-	// to the room's other members and servers. When the user has no presence
-	// row yet (never declared presence), the join establishes one as "online"
-	// (the spec's /sync default) and records the change in the shared stream,
-	// so room peers observe the online transition (sytest "User sees updates to
-	// presence from other users in the incremental sync."). A user who already
-	// declared presence keeps their value — a join must not override it
-	// (sytest "Presence changes to UNAVAILABLE are reported to local room
-	// members"). The m.presence EDU is broadcast to the room's remote servers
-	// so federated peers learn the joiner's presence (sytest "New federated
-	// private chats get full presence information (SYN-115)").
-	if membership == "join" && a.IsLocalUser(userID) {
-		// Establish the row only when the user has none: a join means the user
-		// is present (spec /sync default "online"), and recording the change in
-		// the shared stream lets room peers observe the online transition
-		// (sytest "User sees updates to presence from other users in the
-		// incremental sync."). A user who already declared presence keeps their
-		// value — a join must not override it (sytest "Presence changes to
-		// UNAVAILABLE are reported to local room members"), and a settled row
-		// keeps later /sync set_presence calls no-ops (no spurious stream
-		// advancement).
-		if p, err := a.Store.GetPresence(ctx, userID); err != nil || p == nil {
-			if _, err := a.Store.SetPresence(ctx, userID, "online", "", a.Now()); err != nil {
-				return
-			}
-		}
-		presence := "online"
-		statusMsg := ""
-		if p, err := a.Store.GetPresence(ctx, userID); err == nil && p != nil {
-			presence = p.Presence
-			statusMsg = p.StatusMsg
-		}
-		content := map[string]any{
-			"user_id":   userID,
-			"presence":  presence,
-			"stream_id": a.Now(),
-		}
-		if statusMsg != "" {
-			content["status_msg"] = statusMsg
-		}
-		if rooms, err := a.Store.RoomsForUser(ctx, userID); err == nil {
-			a.BroadcastEDUToRooms(ctx, "m.presence", content, rooms)
-		}
-	}
 	// A remote user joining a room makes the room's LOCAL users' presence newly
 	// visible to the joiner's server: it has no baseline for them (the shared
-	// room is new), so push an m.presence EDU for each local joined user to the
-	// joiner's server — otherwise the joiner never learns their presence until
-	// the next local change (spec "Presence in the federation API"; sytest
-	// "New federated private chats get full presence information (SYN-115)").
+	// room is new), so push an m.presence EDU for each local joined user who has
+	// actually declared presence to the joiner's server (spec "Presence in the
+	// federation API"; sytest "New federated private chats get full presence
+	// information (SYN-115)"). Users without a presence row are omitted: they
+	// have never declared presence, and the receiving server's /sync renders a
+	// row-less peer as online by default (the spec's /sync presence default), so
+	// fabricating an EDU for them would both waste a transaction and misreport a
+	// user who has not opted into presence tracking. The join path itself never
+	// writes a presence row — presence is declared only by an explicit PUT
+	// /presence or a /sync set_presence, which is what broadcasts the change
+	// (writing a row at the join's stream position would advance the shared
+	// stream before the joiner's peers had synced past it, and a later /sync
+	// declaration would then be a non-change, silently dropping the peer's
+	// presence event — sytest "User sees updates to presence from other users in
+	// the incremental sync.").
 	if membership == "join" && !a.IsLocalUser(userID) {
 		if d := ids.DomainOf(userID); d != "" && d != a.ServerName() {
 			if members, err := a.Store.Members(ctx, roomID, "join"); err == nil {
@@ -2643,19 +2609,17 @@ func (a *API) applyRemoteMembershipNotify(ctx context.Context, roomID, userID, m
 					if !a.IsLocalUser(m.UserID) {
 						continue
 					}
-					presence := "online"
-					statusMsg := ""
-					if p, err := a.Store.GetPresence(ctx, m.UserID); err == nil && p != nil {
-						presence = p.Presence
-						statusMsg = p.StatusMsg
+					p, err := a.Store.GetPresence(ctx, m.UserID)
+					if err != nil || p == nil {
+						continue
 					}
 					content := map[string]any{
 						"user_id":   m.UserID,
-						"presence":  presence,
+						"presence":  p.Presence,
 						"stream_id": a.Now(),
 					}
-					if statusMsg != "" {
-						content["status_msg"] = statusMsg
+					if p.StatusMsg != "" {
+						content["status_msg"] = p.StatusMsg
 					}
 					a.BroadcastEDUToServers(ctx, "m.presence", content, []string{d})
 				}

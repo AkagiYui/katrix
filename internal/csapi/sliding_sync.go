@@ -197,6 +197,9 @@ func (a *API) SlidingSync(w http.ResponseWriter, r *http.Request) {
 	if sp != "offline" {
 		if changed, err := a.Store.SetPresence(r.Context(), auth.UserID, sp, "", a.Now()); err == nil && changed {
 			a.broadcastLocalPresence(r.Context(), auth.UserID)
+			// Wake local room peers so their parked long-polls deliver the
+			// change promptly (mirror of the /v3/sync handler).
+			a.notifyDeviceListPeers(r.Context(), auth.UserID)
 		}
 	}
 

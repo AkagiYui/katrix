@@ -123,10 +123,18 @@ func (a *API) Sync(w http.ResponseWriter, r *http.Request) {
 		if changed, err := a.Store.SetPresence(r.Context(), auth.UserID, sp, "", a.Now()); err == nil && changed {
 			// The client declared presence for the first time (or changed it):
 			// broadcast the m.presence EDU to every remote server sharing a room
-			// with the user, so federated peers learn the presence without
-			// waiting for a PUT /presence (sytest "New federated private chats
-			// get full presence information (SYN-115)").
+			// with the user, and wake the LOCAL users who share a room so their
+			// parked /sync long-polls return promptly with the change (the change
+			// advances the shared stream, but a peer's long-poll only re-queries
+			// when woken — sytest "User sees updates to presence from other users
+			// in the incremental sync.").
 			a.broadcastLocalPresence(r.Context(), auth.UserID)
+			// Wake the LOCAL users who share a room so their parked /sync
+			// long-polls return promptly with the change (the change advances the
+			// shared stream, but a peer's long-poll only re-queries when woken —
+			// sytest "User sees updates to presence from other users in the
+			// incremental sync.").
+			a.notifyDeviceListPeers(r.Context(), auth.UserID)
 		}
 	}
 
