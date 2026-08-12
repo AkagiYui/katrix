@@ -13,19 +13,6 @@
 # Regenerate after any run with:
 #   grep -hE '^not ok ' <both results.tap files> | sed -E 's/^not ok [0-9]+ (\(expected fail\) )?//' | sed -E 's/( \([0-9]+ subtests\))? # TODO expected fail$//' | sort -u
 #
-# The following three "3pid invite join ... rejected" tests (added upstream
-# 2026-08-03, sytest d87ce84) build the room with matrix_create_room_synced(
-# visibility => "private"), but sytest's matrix_create_room always sends
-# preset=public_chat (its default), so the room's join_rule is public and a
-# naked join by anyone — including the third-party invitee — is allowed per the
-# spec's public-join-rule semantics. The tests assume the room is invite-only,
-# which is not the case; Synapse behaves identically (preset determines
-# join_rule; visibility does not). These are upstream test-design issues, not
-# server gaps, so they are pinned here rather than chased.
-3pid invite join valid signature but revoked keys are rejected
-3pid invite join valid signature but unreachable ID server are rejected
-3pid invite join with wrong but valid signature are rejected
-
 # Blacklisted (sytest/blacklist), mirroring Synapse: a limited (gappy) sync
 # under lazy_load_members returns ALL state changes in the window per spec and
 # Synapse (StateFilter.all() when batch.limited), so the test's expectation of
