@@ -21,7 +21,6 @@ import (
 	"github.com/AkagiYui/katrix/internal/ids"
 	"github.com/AkagiYui/katrix/internal/rooms"
 	"github.com/AkagiYui/katrix/internal/roomver"
-	"github.com/AkagiYui/katrix/internal/storage"
 )
 
 // registerThirdPartyInvite wires the federation 3PID onbind endpoint (spec
@@ -353,18 +352,9 @@ func (a *API) persistThirdPartyMemberInvite(ctx context.Context, sender, target,
 	if err != nil {
 		return err
 	}
-	stream, err := persistEventInRoom(ctx, a.Store, ev, version, roomID)
+	_, err = persistEventInRoom(ctx, a.Store, ev, version, roomID, membershipRowFromEvent(roomID, ev))
 	if err != nil {
 		return err
-	}
-	mc, _ := rooms.ParseMember(contentRaw)
-	if mc != nil {
-		if err := a.Store.UpsertMembership(ctx, storage.MembershipRow{
-			RoomID: roomID, UserID: target, Membership: mc.Membership,
-			EventID: ev.EventID(), StreamOrdering: stream, Depth: ev.Depth(),
-		}); err != nil {
-			return err
-		}
 	}
 	// The invitee is remote in the federated cases; notify local syncs and
 	// deliver the invite PDU to the room's servers (including the invitee's).

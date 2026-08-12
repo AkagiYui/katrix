@@ -342,20 +342,10 @@ func (a *API) persistNewRoom(r *http.Request, auth *homeserver.Auth, oldRoomID, 
 		return err
 	}
 	for _, ev := range initRes.Events {
-		stream, err := persistEventInRoom(r.Context(), a.Store, ev, version, newRoomID)
-		if err != nil {
+		// Member events persist their membership row atomically with the event
+		// (see persistEventInRoom).
+		if _, err := persistEventInRoom(r.Context(), a.Store, ev, version, newRoomID, membershipRowFromEvent(newRoomID, ev)); err != nil {
 			return err
-		}
-		if ev.Type() == "m.room.member" {
-			sk, _ := ev.StateKey()
-			mc, _ := rooms.ParseMember(ev.Content())
-			if mc != nil {
-				_ = a.Store.UpsertMembership(r.Context(), storage.MembershipRow{
-					RoomID: newRoomID, UserID: sk, Membership: mc.Membership,
-					EventID: ev.EventID(), DisplayName: mc.DisplayName, AvatarURL: mc.AvatarURL,
-					StreamOrdering: stream, Depth: ev.Depth(),
-				})
-			}
 		}
 	}
 	a.broadcastPDU(r.Context(), newRoomID, initRes.Create)

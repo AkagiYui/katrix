@@ -181,23 +181,15 @@ func (a *API) CreateRoom(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, ev := range initRes.Events {
-			stream, err := persistEventInRoom(r.Context(), a.Store, ev, version, roomID)
+			// room_state is maintained by persistEventInRoom (snapshot + recompute).
+			// Member events persist their denormalised membership row atomically
+			// with the event (see persistEventInRoom) — the room create and the
+			// creator's join must never be visible to a concurrent sync without
+			// the membership row already reflecting it.
+			_, err := persistEventInRoom(r.Context(), a.Store, ev, version, roomID, membershipRowFromEvent(roomID, ev))
 			if err != nil {
 				httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 				return
-			}
-			// room_state is maintained by persistEventInRoom (snapshot + recompute).
-			// Update memberships for m.room.member.
-			if ev.Type() == "m.room.member" {
-				sk, _ := ev.StateKey()
-				mc, _ := rooms.ParseMember(ev.Content())
-				if mc != nil {
-					_ = a.Store.UpsertMembership(r.Context(), storage.MembershipRow{
-						RoomID: roomID, UserID: sk, Membership: mc.Membership,
-						EventID: ev.EventID(), DisplayName: mc.DisplayName, AvatarURL: mc.AvatarURL,
-						StreamOrdering: stream, Depth: ev.Depth(),
-					})
-				}
 			}
 		}
 		// Optional alias.
@@ -2898,35 +2890,42 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 			return m.EventID, nil
 		}
 	}
+	// The target's membership BEFORE this event must be read before the event is
+	// persisted: a member(join) event whose target was already joined is a
+	// profile update (displayname/avatar_url re-emission), not a join — the
+	// device list did not change, so no device-list change/EDU is recorded
+	// (Complement's partial-state suite fails the run on an unexpected
+	// m.device_list_update EDU for a mere display-name change). Reading it here
+	// keeps it accurate even though the membership row is updated atomically
+	// with the event insert below.
+	prevMembership := ""
+	if pm, err := a.Store.GetMembership(r.Context(), roomID, target); err == nil {
+		prevMembership = pm.Membership
+	}
 	ev, err := a.buildEvent(r, auth, roomID, version, "m.room.member", target, ids.RandomTxnSuffix(), true, contentRaw)
 	if err != nil {
 		return "", err
 	}
-	stream, err := persistEvent(r.Context(), a.Store, ev, version)
+	// The event and its denormalised membership row are persisted atomically (see
+	// persistEventInRoom): a concurrent /sync or sliding-sync must never observe
+	// the stream position advancing past a membership transition without the
+	// membership row already reflecting it — otherwise an invited user's own
+	// join could be minted into the past and never delivered.
+	mc, _ := rooms.ParseMember(contentRaw)
+	var membershipRow *storage.MembershipRow
+	if mc != nil {
+		membershipRow = &storage.MembershipRow{
+			RoomID: roomID, UserID: target, Membership: mc.Membership,
+			EventID: ev.EventID(), DisplayName: mc.DisplayName, AvatarURL: mc.AvatarURL,
+			StreamOrdering: ev.Depth(), Depth: ev.Depth(),
+		}
+	}
+	stream, err := persistEventWithMembership(r.Context(), a.Store, ev, version, roomID, membershipRow)
 	if err != nil {
 		return "", err
 	}
 	// room_state is maintained by persistEvent (snapshot + recompute).
-	// Update the denormalised membership table.
-	mc, _ := rooms.ParseMember(contentRaw)
 	if mc != nil {
-		// The target's membership BEFORE this event: a member(join) event whose
-		// target was already joined is a profile update (displayname/avatar_url
-		// re-emission), not a join — the device list did not change, so no
-		// device-list change/EDU is recorded (Complement's partial-state suite
-		// fails the run on an unexpected m.device_list_update EDU for a mere
-		// display-name change). Must be read BEFORE UpsertMembership below,
-		// which would otherwise already reflect the new membership.
-		prevMembership := ""
-		if pm, err := a.Store.GetMembership(r.Context(), roomID, target); err == nil {
-			prevMembership = pm.Membership
-		}
-		if err := a.Store.UpsertMembership(r.Context(), storage.MembershipRow{
-			RoomID: roomID, UserID: target, Membership: mc.Membership,
-			EventID: ev.EventID(), StreamOrdering: stream, Depth: ev.Depth(),
-		}); err != nil {
-			return "", err
-		}
 		// A join/leave changes the user's device-list visibility to the room's
 		// other members: their /sync must learn the user in device_lists.changed
 		// (join) or device_lists.left (leave/ban). The change advances the shared
@@ -3059,7 +3058,16 @@ func (a *API) sendStateEvent(r *http.Request, auth *homeserver.Auth, roomID stri
 	if err != nil {
 		return
 	}
-	if _, err := persistEvent(r.Context(), a.Store, ev, version); err != nil {
+	// A state event that is an m.room.member event (createRoom initial_state /
+	// room-upgrade membership re-seeding) persists its denormalised membership
+	// row atomically with the event, mirroring the dedicated membership path —
+	// otherwise a concurrent sync could observe the stream position past the
+	// transition without the membership row reflecting it.
+	var membershipRow *storage.MembershipRow
+	if eventType == "m.room.member" {
+		membershipRow = membershipRowFromEvent(roomID, ev)
+	}
+	if _, err := persistEventWithMembership(r.Context(), a.Store, ev, version, roomID, membershipRow); err != nil {
 		return
 	}
 	// room_state is maintained by persistEvent (snapshot + recompute).
@@ -3592,7 +3600,36 @@ func (a *API) buildStateSnapshot(ctx context.Context, roomID, target, sender str
 // persistEvent inserts an event row derived from a signed Event and returns
 // its stream_ordering.
 func persistEvent(ctx context.Context, store *storage.Store, ev *events.Event, version roomver.Version) (int64, error) {
-	return persistEventInRoom(ctx, store, ev, version, ev.RoomID())
+	return persistEventInRoom(ctx, store, ev, version, ev.RoomID(), nil)
+}
+
+// persistEventWithMembership is persistEventInRoom with an optional membership
+// row that is persisted atomically with the event. See persistEventInRoom for
+// the atomicity rationale.
+func persistEventWithMembership(ctx context.Context, store *storage.Store, ev *events.Event, version roomver.Version, roomID string, membershipRow *storage.MembershipRow) (int64, error) {
+	return persistEventInRoom(ctx, store, ev, version, roomID, membershipRow)
+}
+
+// membershipRowFromEvent builds the denormalised membership row for an
+// m.room.member event, or nil when the event is not a membership event (or its
+// content carries no membership). The row's StreamOrdering/Depth are seeded
+// with the event's DAG depth as a placeholder — InsertEventWithMembership
+// overwrites the StreamOrdering with the event's real assigned stream position
+// before the row is written.
+func membershipRowFromEvent(roomID string, ev *events.Event) *storage.MembershipRow {
+	if ev.Type() != "m.room.member" {
+		return nil
+	}
+	sk, _ := ev.StateKey()
+	mc, err := rooms.ParseMember(ev.Content())
+	if err != nil || mc == nil || mc.Membership == "" {
+		return nil
+	}
+	return &storage.MembershipRow{
+		RoomID: roomID, UserID: sk, Membership: mc.Membership,
+		EventID: ev.EventID(), DisplayName: mc.DisplayName, AvatarURL: mc.AvatarURL,
+		StreamOrdering: ev.Depth(), Depth: ev.Depth(),
+	}
 }
 
 // persistEventInRoom inserts an event row, using roomID when the event itself
@@ -3602,7 +3639,16 @@ func persistEvent(ctx context.Context, store *storage.Store, ev *events.Event, v
 // recomputes the room's current state from the forward extremities, so that
 // forks are resolved correctly via the snapshot table rather than via a blind
 // last-writer-wins UpsertState. It returns the assigned stream_ordering.
-func persistEventInRoom(ctx context.Context, store *storage.Store, ev *events.Event, version roomver.Version, roomID string) (int64, error) {
+//
+// When membershipRow is non-nil the event and the denormalised membership row
+// are written in one transaction: a concurrent /sync (or sliding-sync) must
+// never observe the shared stream position advancing — the event insert —
+// without the membership row already reflecting it. Otherwise a sync woken by
+// the event insert could mint a token past the transition while still reading
+// the stale membership (e.g. an invited user's own join), and that transition
+// is then lost forever because the client's next token is already beyond it.
+// This mirrors the federation ingest path (InsertEventWithMembership).
+func persistEventInRoom(ctx context.Context, store *storage.Store, ev *events.Event, version roomver.Version, roomID string, membershipRow *storage.MembershipRow) (int64, error) {
 	sk, _ := ev.StateKey()
 	if roomID == "" {
 		roomID = ev.RoomID()
@@ -3621,7 +3667,13 @@ func persistEventInRoom(ctx context.Context, store *storage.Store, ev *events.Ev
 		PrevEvents:     ev.PrevEvents(),
 		Redacts:        ev.Redacts(),
 	}
-	stream, err := store.InsertEvent(ctx, row)
+	var stream int64
+	var err error
+	if membershipRow != nil {
+		stream, err = store.InsertEventWithMembership(ctx, row, membershipRow, true)
+	} else {
+		stream, err = store.InsertEvent(ctx, row)
+	}
 	if err != nil {
 		return 0, err
 	}
