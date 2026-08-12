@@ -178,6 +178,12 @@ jobs:
           # counts them as SKIP, not FAIL — see
           # sytest/patches/skip-3pid-invite-join-rejected.patch.
           patch -p1 -d sytest-src < sytest/patches/skip-3pid-invite-join-rejected.patch
+          # Skip the gapped-sync lazy-load membership test (unsatisfiable by any
+          # conforming homeserver: a limited sync returns all state changes in
+          # the window per spec/Synapse; Synapse blacklists it, riot-web#7211).
+          # Skipped rather than blacklisted so the run report counts it as SKIP,
+          # not FAIL — see sytest/patches/skip-gapped-ll-membership-test.patch.
+          patch -p1 -d sytest-src < sytest/patches/skip-gapped-ll-membership-test.patch
       # The summary step below renders the TAP report with the Go tool.
       - uses: actions/setup-go@v7
         with:

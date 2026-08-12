@@ -1,23 +1,14 @@
 # SyTest blacklist: tests expected to FAIL.
 #
-# As of 2026-08-06 (workflow 31098062808) this file is intentionally EMPTY: the
-# whitelist now contains every SyTest case, so nothing is masked as "expected
-# fail" and every failing test is a real signal (a red sytest step is a genuine
-# regression against the 2026-08-06 baseline). Previously this list carried the
-# ~208 known-gap tests; they now fail loudly instead of being counted as
-# expected fail, so the pass rate and the per-test breakdown in the summary
-# reflect reality.
+# As of 2026-08-12 this file is intentionally EMPTY: the tests that could
+# never pass are skipped instead via sytest/patches/skip-*.patch (a skipped
+# test renders "ok ... # skip" and counts as SKIP in the TAP report, whereas a
+# blacklisted test still runs and renders "not ok (expected fail)", which the
+# testreport tool counts as FAIL). Nothing is masked as "expected fail"; every
+# "not ok" in a run is a real signal (a red sytest step is a genuine regression
+# against the baseline).
 #
-# If you ever need to mask a known-unfixable gap again, add its exact test name
-# here (and remember to also keep it in the whitelist, since run-tests.pl marks
-# any test that is in the blacklist OR missing from the whitelist as expected
-# fail). Lines starting with '#' are ignored.
-
-# Blacklisted because the test's expectation cannot be satisfied by ANY
-# conforming homeserver: lazy_load_members in a limited (gappy) sync is
-# implemented per spec + Synapse as "return all state changes in the window"
-# (StateFilter.all() when batch.limited), not "only timeline senders'
-# memberships". Synapse blacklists this exact test too (riot-web#7211:
-# "The only membership state included in a gapped incremental sync is for
-# senders in the timeline"). Following upstream.
-The only membership state included in a gapped incremental sync is for senders in the timeline
+# If you ever need to mask a known-unfixable gap, prefer adding it to a
+# skip-*.patch (see the 3pid-invite and gapped-LL patches for the pattern)
+# over the blacklist, so the pass-rate and per-test breakdown reflect reality.
+# Lines starting with '#' are ignored.

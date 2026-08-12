@@ -1,0 +1,32 @@
+Skip "The only membership state included in a gapped incremental sync is for
+senders in the timeline" for katrix.
+
+The test asserts that a limited (gappy) incremental sync under
+lazy_load_members returns only the timeline senders' membership events. That
+expectation cannot be satisfied by any conforming homeserver: per the spec and
+Synapse, a limited sync returns ALL state changes in the window
+(StateFilter.all() when batch.limited) regardless of lazy-loading. Synapse
+blacklists this exact test (riot-web#7211), and the sytest source itself marks
+it "# XXX: N.B. THIS TEST IS DISABLED ATM AS WE HAVE DISABLED LL IN GAPPY
+SYNCS".
+
+It is SKIPPED (not blacklisted) so the run report counts it as SKIP rather
+than FAIL: run-tests.pl skips a test whose requires contains a non-fixture
+token missing from %proven ("lack of $req"), before any fixture runs. This
+keeps the per-run diff detector honest — a skipped test is not a failing
+signal.
+
+If this stops applying against a newer sytest develop, rebase it (the hunk is
+in stable, old test code).
+
+--- a/tests/31sync/15lazy-members.pl
++++ b/tests/31sync/15lazy-members.pl
+@@ -203,7 +203,7 @@
+ # XXX: N.B. THIS TEST IS DISABLED ATM AS WE HAVE DISABLED LL IN GAPPY SYNCS
+ test "The only membership state included in a gapped incremental sync is for senders in the timeline",
+    requires => [ local_user_fixtures( 4 ),
+-                 qw( can_sync ) ],
++                 qw( can_sync katrix_skips_gapped_ll_membership_test ) ],
+ 
+    check => sub {
+       my ( $alice, $bob, $charlie, $dave ) = @_;

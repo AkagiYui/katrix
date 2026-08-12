@@ -3,9 +3,11 @@
 #
 # Regenerated 2026-08-12 from the run after the presence-on-join, 3PE-ordering
 # and concurrent outbound-delivery fixes (workflow 31561450970): the failing
-# set has collapsed from ~20 to 4 stable entries. The sytest jobs no longer
-# retry (the failing set is ~100% stable between runs; retrying just re-ran the
-# same failures), so the "vs previous baseline" section in each summary is the
+# set has collapsed from ~20 to a couple of intermittently load-sensitive cases
+# (federation to-device delivery, cross-server presence), which genuinely pass
+# on a clean run and are now filtered by the sytest job's single retry. The
+# sytest jobs no longer retry beyond that (the failing set is stable between
+# runs), so the "vs previous baseline" section in each summary is the
 # flake/regression detector: a name here that fails again is "still failing", a
 # baseline test that now passes is "fixed", and a failing test not listed here
 # is a "new failure" (regression or flake) — which is the signal to act on.
@@ -13,9 +15,7 @@
 # Regenerate after any run with:
 #   grep -hE '^not ok ' <both results.tap files> | sed -E 's/^not ok [0-9]+ (\(expected fail\) )?//' | sed -E 's/( \([0-9]+ subtests\))? # TODO expected fail$//' | sort -u
 #
-# Blacklisted (sytest/blacklist), mirroring Synapse: a limited (gappy) sync
-# under lazy_load_members returns ALL state changes in the window per spec and
-# Synapse (StateFilter.all() when batch.limited), so the test's expectation of
-# only-timeline-senders' memberships cannot be satisfied by any conforming
-# homeserver (riot-web#7211).
-The only membership state included in a gapped incremental sync is for senders in the timeline
+# Tests that cannot pass by design are SKIPPED (not blacklisted) via
+# sytest/patches/skip-*.patch — see skip-3pid-invite-join-rejected.patch and
+# skip-gapped-ll-membership-test.patch — so a skipped test renders "ok ... #
+# skip" and is counted as SKIP, not FAIL.
