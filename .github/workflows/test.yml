@@ -6,14 +6,16 @@ name: test
 # (federation vs everything else — 50federation's files share the mock
 # federation server, so they stay together), and Complement Crypto as two
 # client-direction jobs (jr / rj) — all so no single `go test` package binary
-# or sytest process can hit a per-package timeout and truncate the run. All
-# jobs are informational baselines (continue-on-error) while katrix is still
-# early — they establish a progress baseline rather than blocking PRs. The
-# integration-done gate is therefore effectively a no-op today. Run steps
-# surface failures honestly (set -o pipefail, no `|| true` swallowing), so a
-# failing suite shows a red step with the real exit code; to turn a job into a
-# hard gate, drop its `continue-on-error: true` once its pass rate is high
-# enough.
+# or sytest process can hit a per-package timeout and truncate the run.
+#
+# Every job is a hard gate: the integration-done alls-green step fails the
+# workflow unless ALL jobs succeed, so a failing suite marks the run red. Jobs
+# still run to completion even when one of them fails — fail-fast: false keeps
+# the matrix rows from cancelling each other, and the gate's `if: !cancelled()`
+# runs the check regardless of upstream conclusions — so a single flaky suite
+# never hides the results of the others, and the per-job summary reports are
+# always produced. Run steps surface failures honestly (set -o pipefail, no
+# `|| true` swallowing).
 #
 # Each job's summary step renders a per-test report (PASS/FAIL/SKIP per suite,
 # plus expected-vs-actual for every failing test) via cmd/testreport, fed by
@@ -41,7 +43,6 @@ jobs:
   complement:
     name: Complement (${{ matrix.group }})
     runs-on: ubuntu-latest
-    continue-on-error: true # informational baseline; katrix is early
     strategy:
       fail-fast: false
       matrix:
@@ -125,7 +126,6 @@ jobs:
   sytest:
     name: SyTest (${{ matrix.group }})
     runs-on: ubuntu-latest
-    continue-on-error: true # informational baseline; katrix is early
     strategy:
       fail-fast: false
       matrix:
@@ -291,7 +291,6 @@ jobs:
     # for the same reason. Revisit when GitHub retires the 22.04 image (then
     # patch chrome.go to add --no-sandbox instead).
     runs-on: ubuntu-22.04
-    continue-on-error: true # informational baseline; katrix is early
     strategy:
       fail-fast: false
       matrix:
@@ -440,6 +439,13 @@ jobs:
           name: complement-crypto-log-${{ matrix.axis }}
           path: /tmp/crypto.log
 
+  # Hard gate: the workflow succeeds only when EVERY integration job succeeds.
+  # `if: !cancelled()` keeps this job running even when an upstream job failed
+  # (a failed `needs` would otherwise skip it), so alls-green can assess the
+  # real results — and because no job uses continue-on-error, a failing suite
+  # surfaces as a real failure here and reds the whole workflow. fail-fast:
+  # false above guarantees the other matrix rows/jobs still run to completion,
+  # so one flaky suite never hides the rest of the results.
   integration-done:
     name: integration tests done
     needs: [complement, sytest, complement-crypto]
