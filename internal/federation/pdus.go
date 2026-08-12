@@ -165,80 +165,121 @@ func (a *API) RunEDUWorker(ctx context.Context) {
 		case <-time.After(delay):
 		}
 		// Drain the queues in batches; keep the backoff if nothing was left.
+		hadWork, err := a.drainOutbound(ctx, &delay, baseDelay, maxDelay)
+		if err != nil || !hadWork {
+			delay = minDuration(delay*2, maxDelay)
+		}
+	}
+}
+
+// drainOutbound delivers the outbound queues in batches until they are empty,
+// returning whether any work was found. EDUs are drained to empty BEFORE any
+// PDU or invite batch is dispatched: a presence or device-list EDU must not
+// wait behind a PDU backlog, where each 200-item batch can take up to
+// fedDeliveryTimeout per slow destination (a loaded-but-healthy peer makes a
+// batch linger for seconds), or the client-side test deadline blows before the
+// EDU lands. The inner loop returns to the EDU phase after every PDU batch, so
+// a late-queued EDU waits at most one PDU batch, not the whole backlog.
+func (a *API) drainOutbound(ctx context.Context, delay *time.Duration, baseDelay, maxDelay time.Duration) (bool, error) {
+	// Quick peek: nothing queued at all means no work and the caller backs off.
+	edus, err := a.Store.PendingOutboundEDUs(ctx, 1)
+	if err != nil {
+		return false, err
+	}
+	pdus, err := a.Store.PendingOutboundPDUs(ctx, 1)
+	if err != nil {
+		return false, err
+	}
+	invites, err := a.Store.PendingOutboundInvites(ctx, 1, a.Now())
+	if err != nil {
+		return false, err
+	}
+	if len(edus) == 0 && len(pdus) == 0 && len(invites) == 0 {
+		return false, nil
+	}
+	// Deliver each batch concurrently, bounded by a semaphore, so a backlog
+	// does not drain serially: each deliverEDU/deliverPDU already fans out
+	// across its destinations but blocks until the slowest one answers
+	// (fedDeliveryTimeout), so a batch against a loaded-but-healthy peer would
+	// otherwise take items×5s and blow every client deadline behind the queue
+	// (sytest's room-versions and presence suites fail with 10-30s "timed out
+	// waiting for test" timeouts once the queue is behind). A bounded pool
+	// keeps the parallelism from saturating the database or the outbound
+	// connection budget.
+	sem := make(chan struct{}, 32)
+	dispatch := func(wg *sync.WaitGroup, fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+				fn()
+			}
+		}()
+	}
+	// Drain the EDU queue to empty first (multiple sub-batches if it exceeds
+	// 200 rows), so fresh presence/device-list EDUs never queue behind PDUs.
+	for {
 		edus, err := a.Store.PendingOutboundEDUs(ctx, 200)
 		if err != nil {
-			delay = minDuration(delay*2, maxDelay)
-			continue
+			return true, err
 		}
-		pdus, err2 := a.Store.PendingOutboundPDUs(ctx, 200)
-		if err2 != nil {
-			delay = minDuration(delay*2, maxDelay)
-			continue
+		if len(edus) == 0 {
+			break
 		}
-		invites, err3 := a.Store.PendingOutboundInvites(ctx, 200, a.Now())
-		if err3 != nil {
-			delay = minDuration(delay*2, maxDelay)
-			continue
+		var wg sync.WaitGroup
+		for _, edu := range edus {
+			dispatch(&wg, func() { a.deliverEDU(ctx, edu.ID, edu.TxnID, edu.EduType, edu.Content, edu.Destinations) })
 		}
-		if len(edus) == 0 && len(pdus) == 0 && len(invites) == 0 {
-			delay = minDuration(delay*2, maxDelay)
-			continue
+		wg.Wait()
+	}
+	// Then one PDU+invite batch, and keep looping (back to the EDU phase) until
+	// the PDU/invite queues are also drained. The 2s baseDelay is skipped while
+	// a batch is being drained AND the queues are still non-empty: with
+	// 200-item batches under a sustained backlog, waiting 2s between every
+	// batch would let the backlog grow unboundedly (the sytest suite feeds
+	// events faster than one batch per 2s), pushing late-queued items past the
+	// client's test deadline. Only back off when a full drain found nothing
+	// left to do.
+	*delay = baseDelay
+	for {
+		pdus, err := a.Store.PendingOutboundPDUs(ctx, 200)
+		if err != nil {
+			return true, err
 		}
-		// Deliver the whole batch concurrently, bounded by a semaphore, so a
-		// backlog does not drain serially: each deliverEDU/deliverPDU already
-		// fans out across its destinations but blocks until the slowest one
-		// answers (fedDeliveryTimeout), so a batch against a loaded-but-healthy
-		// peer would otherwise take items×5s and blow every client deadline
-		// behind the queue (sytest's room-versions and presence suites fail
-		// with 10-30s "timed out waiting for test" timeouts once the queue is
-		// behind). A bounded pool keeps the parallelism from saturating the
-		// database or the outbound connection budget.
-		// The 2s baseDelay is skipped while a batch is being drained AND the
-		// queues are still non-empty: with 200-item batches under a sustained
-		// backlog, waiting 2s between every batch would let the backlog grow
-		// unboundedly (the sytest suite feeds events faster than one batch per
-		// 2s), pushing late-queued items (e.g. a presence EDU) past the
-		// client's test deadline. Only back off when a full drain found nothing
-		// left to do.
-		delay = baseDelay
-		drained := false
-		for {
-			var wg sync.WaitGroup
-			sem := make(chan struct{}, 32)
-			dispatch := func(fn func()) {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					select {
-					case <-ctx.Done():
-						return
-					case sem <- struct{}{}:
-						defer func() { <-sem }()
-						fn()
-					}
-				}()
-			}
+		invites, err := a.Store.PendingOutboundInvites(ctx, 200, a.Now())
+		if err != nil {
+			return true, err
+		}
+		if len(pdus) == 0 && len(invites) == 0 {
+			return true, nil
+		}
+		var wg sync.WaitGroup
+		for _, pdu := range pdus {
+			dispatch(&wg, func() { a.deliverPDU(ctx, pdu.ID, pdu.TxnID, pdu.RoomID, pdu.Raw, pdu.Destinations) })
+		}
+		for _, inv := range invites {
+			dispatch(&wg, func() { a.deliverInvite(ctx, inv) })
+		}
+		wg.Wait()
+		// Peek the EDU queue again before the next PDU batch: EDUs queued while
+		// this batch was in flight must go out first.
+		edus, err := a.Store.PendingOutboundEDUs(ctx, 200)
+		if err != nil {
+			return true, err
+		}
+		for len(edus) > 0 {
+			var wg2 sync.WaitGroup
 			for _, edu := range edus {
-				dispatch(func() { a.deliverEDU(ctx, edu.ID, edu.TxnID, edu.EduType, edu.Content, edu.Destinations) })
+				dispatch(&wg2, func() { a.deliverEDU(ctx, edu.ID, edu.TxnID, edu.EduType, edu.Content, edu.Destinations) })
 			}
-			for _, pdu := range pdus {
-				dispatch(func() { a.deliverPDU(ctx, pdu.ID, pdu.TxnID, pdu.RoomID, pdu.Raw, pdu.Destinations) })
-			}
-			for _, inv := range invites {
-				dispatch(func() { a.deliverInvite(ctx, inv) })
-			}
-			wg.Wait()
-			// Peek whether the queues still hold work; if they do, drain the
-			// next slice immediately (no 2s sleep). A fully-drained set ends
-			// the inner loop and returns to the normal wake/backoff cadence.
-			if drained {
-				break
-			}
-			edus, _ = a.Store.PendingOutboundEDUs(ctx, 200)
-			pdus, _ = a.Store.PendingOutboundPDUs(ctx, 200)
-			invites, _ = a.Store.PendingOutboundInvites(ctx, 200, a.Now())
-			if len(edus) == 0 && len(pdus) == 0 && len(invites) == 0 {
-				drained = true
+			wg2.Wait()
+			edus, err = a.Store.PendingOutboundEDUs(ctx, 200)
+			if err != nil {
+				return true, err
 			}
 		}
 	}
