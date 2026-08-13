@@ -119,11 +119,11 @@ func (a *API) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	}
 	if ad.Auth.Type == "" && ad.Auth.Session == "" {
 		// No auth supplied: issue a fresh UIA challenge describing the flows
-		// (password always; SSO when CAS is configured), bound to this device
-		// so the session cannot be replayed against another one.
+		// (password always; SSO when a provider is configured), bound to this
+		// device so the session cannot be replayed against another one.
 		id, _ := a.uia.create("password", auth.Localpart, deviceID)
 		flows := []uiaFlow{{Stages: []string{"m.login.password"}}}
-		if a.casEnabled() {
+		if a.ssoEnabled() {
 			flows = append(flows, uiaFlow{Stages: []string{"m.login.sso"}})
 		}
 		httpx.WriteJSON(w, http.StatusUnauthorized, uiaChallenge{

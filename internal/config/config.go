@@ -152,6 +152,30 @@ type Config struct {
 	// deployments should leave it off.
 	CASInsecure bool `yaml:"cas_insecure"`
 
+	// OIDC configures OpenID Connect SSO login (spec §SSO login). Issuer is the
+	// IdP's base URL, from which the discovery document
+	// (/.well-known/openid-configuration) is fetched at first use;
+	// ClientID/ClientSecret identify this homeserver to the IdP. The
+	// authorization-code flow is used; the user's Matrix localpart is derived
+	// from the userinfo `sub` claim via the same escaping as CAS usernames.
+	// EnableRegistration creates the user on first login (Synapse's
+	// oidc_enable_registration). When both CAS and OIDC are configured,
+	// /login/sso/redirect prefers OIDC while the legacy /login/cas/redirect
+	// keeps using CAS.
+	OIDC struct {
+		Issuer             string   `yaml:"issuer"`
+		ClientID           string   `yaml:"client_id"`
+		ClientSecret       string   `yaml:"client_secret"`
+		Scopes             []string `yaml:"scopes"`
+		EnableRegistration bool     `yaml:"enable_registration"`
+	} `yaml:"oidc"`
+
+	// OIDCInsecure skips TLS certificate verification for outbound requests to
+	// the OIDC provider (discovery, token and userinfo endpoints). Test
+	// harnesses present self-signed certificates; production deployments
+	// should leave it off.
+	OIDCInsecure bool `yaml:"oidc_insecure"`
+
 	// SMTP configures the email sender used by the /requestToken endpoints to
 	// deliver 3PID validation emails (spec §3PID validation). When unset, email
 	// requestToken endpoints return an error.
@@ -197,6 +221,9 @@ func Default() *Config {
 	// CAS SSO registers the user on first login by default (Synapse's
 	// cas_enable_registration defaults to true).
 	c.CAS.EnableRegistration = true
+	// OIDC SSO registers the user on first login by default (Synapse's
+	// oidc_enable_registration defaults to true).
+	c.OIDC.EnableRegistration = true
 	return c
 }
 
@@ -307,6 +334,24 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("KATRIX_CAS_INSECURE"); v != "" {
 		c.CASInsecure = parseBool(v, c.CASInsecure)
+	}
+	if v := os.Getenv("KATRIX_OIDC_ISSUER"); v != "" {
+		c.OIDC.Issuer = v
+	}
+	if v := os.Getenv("KATRIX_OIDC_CLIENT_ID"); v != "" {
+		c.OIDC.ClientID = v
+	}
+	if v := os.Getenv("KATRIX_OIDC_CLIENT_SECRET"); v != "" {
+		c.OIDC.ClientSecret = v
+	}
+	if v := os.Getenv("KATRIX_OIDC_SCOPES"); v != "" {
+		c.OIDC.Scopes = splitCSV(v)
+	}
+	if v := os.Getenv("KATRIX_OIDC_ENABLE_REGISTRATION"); v != "" {
+		c.OIDC.EnableRegistration = parseBool(v, c.OIDC.EnableRegistration)
+	}
+	if v := os.Getenv("KATRIX_OIDC_INSECURE"); v != "" {
+		c.OIDCInsecure = parseBool(v, c.OIDCInsecure)
 	}
 	if v := os.Getenv("KATRIX_APPSERVICE_DIR"); v != "" {
 		c.AppServiceDir = v

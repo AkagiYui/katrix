@@ -4,6 +4,8 @@ package csapi
 
 import (
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/AkagiYui/katrix/internal/federation"
 	"github.com/AkagiYui/katrix/internal/homeserver"
@@ -41,11 +43,22 @@ type API struct {
 	// /requestToken endpoints (spec §3PID validation) until their confirmation
 	// link is followed or they expire.
 	emailValidations *emailValidationStore
+	// oidc holds the OIDC discovery cache (fetched from the IdP's
+	// .well-known/openid-configuration on first use) and the in-flight
+	// authorization states of pending /login/sso/redirects. Guarded by
+	// oidcMu.
+	oidcMu           sync.Mutex
+	oidcDoc          *oidcDiscoveryDoc
+	oidcDocFetchedAt int64
+	oidcStates       map[string]oidcState
+	// emailPushInterval is the email-pusher worker's scan period (tests shrink
+	// it; the shipped default is 30s).
+	emailPushInterval time.Duration
 }
 
 // New constructs the CS API surface.
 func New(hs *homeserver.HS) *API {
-	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, hs.Typing), ssConns: newSSConnStore(), push: newPushDispatcher(hs.Config.PushInsecure), emailValidations: newEmailValidationStore(), tpMeta: newTPMetaCache()}
+	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, hs.Typing), ssConns: newSSConnStore(), push: newPushDispatcher(hs.Config.PushInsecure), emailValidations: newEmailValidationStore(), tpMeta: newTPMetaCache(), oidcStates: map[string]oidcState{}, emailPushInterval: 30 * time.Second}
 	api.push.a = api
 	return api
 }

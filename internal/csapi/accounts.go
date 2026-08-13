@@ -519,11 +519,14 @@ func (a *API) LoginFlows(w http.ResponseWriter, r *http.Request) {
 		{"type": "m.login.password"},
 		{"type": "m.login.token"},
 	}
-	if a.casEnabled() {
+	if a.ssoEnabled() {
 		// SSO login: m.login.sso is the spec's SSO login type; m.login.cas is
-		// kept for legacy clients that call /login/cas/redirect directly.
+		// kept for legacy clients that call /login/cas/redirect directly (only
+		// advertised when CAS is configured).
 		flows = append(flows, map[string]any{"type": "m.login.sso"})
-		flows = append(flows, map[string]any{"type": "m.login.cas"})
+		if a.casEnabled() {
+			flows = append(flows, map[string]any{"type": "m.login.cas"})
+		}
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"flows": flows})
 }
