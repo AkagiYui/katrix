@@ -439,6 +439,50 @@ jobs:
           name: complement-crypto-log-${{ matrix.axis }}
           path: /tmp/crypto.log
 
+  # Spec-required Client-Server endpoints that Complement and SyTest do not
+  # exercise at all (reporting content, VoIP TURN credentials, and listing a
+  # user's 3PIDs). A dedicated job runs the endpoint tests against a real
+  # Postgres — ci.yml's `go test ./...` cannot execute them because it has no
+  # database (the tests self-skip), so without this job those routes could
+  # silently disappear with no failing gate. `integration-done` folds this job
+  # into the same alls-green hard gate as the black-box suites.
+  csapi-spec-endpoints:
+    name: CS API spec endpoints (report / turn / 3pid)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: katrix
+          POSTGRES_PASSWORD: katrix
+          POSTGRES_DB: katrix_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U katrix"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      KATRIX_TEST_DSN: postgres://katrix:katrix@localhost:5432/katrix_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: run spec-endpoint tests
+        run: |
+          set -o pipefail
+          go test -count=1 -v \
+            -run 'TestReportRoom|TestReportEvent|TestReportUser|TestTurnServer|TestList3PIDs|TestSpecRequiredEndpointsRegistered' \
+            ./internal/csapi/ 2>&1 | tee /tmp/csapi-endpoints.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: csapi-endpoints-log
+          path: /tmp/csapi-endpoints.log
+
   # Hard gate: the workflow succeeds only when EVERY integration job succeeds.
   # `if: !cancelled()` keeps this job running even when an upstream job failed
   # (a failed `needs` would otherwise skip it), so alls-green can assess the
@@ -448,7 +492,7 @@ jobs:
   # so one flaky suite never hides the rest of the results.
   integration-done:
     name: integration tests done
-    needs: [complement, sytest, complement-crypto]
+    needs: [complement, sytest, complement-crypto, csapi-spec-endpoints]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
