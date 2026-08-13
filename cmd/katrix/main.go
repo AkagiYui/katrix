@@ -163,11 +163,14 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	// Start background workers: the MSC4140 delayed-event firing worker and the
+	// Start background workers: the MSC4140 delayed-event firing worker, the
 	// outbound federation EDU/PDU delivery worker (device-list updates, presence,
-	// typing, room events — spec transaction delivery with retries). Both run
-	// on goroutines so the HTTP servers below can start immediately.
+	// typing, room events — spec transaction delivery with retries), and the
+	// email-pusher summary worker (spec pusher kind "email": aggregates each
+	// user's pending room notifications into one email per throttle window).
+	// All run on goroutines so the HTTP servers below can start immediately.
 	handler.CSAPI().StartDelayedWorker(ctx)
+	handler.CSAPI().StartEmailPushWorker(ctx)
 	go handler.Federation().RunEDUWorker(ctx)
 	// Resume any partial-state resyncs that were interrupted by a restart
 	// (MSC3902): a room still flagged partial-state must keep fetching its full

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/smtp"
 	"net/url"
@@ -233,30 +234,44 @@ func (a *API) sendValidationEmail(ctx context.Context, address, token, clientSec
 	}
 	link := fmt.Sprintf("%s/_matrix/client/unstable/registration/email/submit_token?token=%s&client_secret=%s&sid=%s",
 		base, url.QueryEscape(token), url.QueryEscape(clientSecret), url.QueryEscape(sid))
+	body := fmt.Sprintf("Click the link below to validate your email address:\r\n%s\r\n", link)
+	return a.sendEmailMessage(ctx, address, "Validate your email address", body)
+}
+
+// sendEmailMessage delivers a plain-text email to one recipient over the
+// configured SMTP server (a.Config.SMTP). The conversation is driven manually
+// rather than via smtp.SendMail so a server that closes the connection right
+// after accepting the message body (some test mail servers do) does not turn a
+// successful delivery into an error: once the DATA command completes the
+// message is delivered, and a failed QUIT must not fail the send. The sender
+// address is notif_from, falling back to noreply@<server_name>.
+func (a *API) sendEmailMessage(ctx context.Context, to, subject, text string) error {
 	from := a.Config.SMTP.NotifFrom
 	if from == "" {
 		from = "noreply@" + a.ServerName()
 	}
-	body := fmt.Sprintf("To: %s\r\nFrom: %s\r\nSubject: Validate your email address\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n"+
-		"Click the link below to validate your email address:\r\n%s\r\n", address, from, link)
+	body := fmt.Sprintf("To: %s\r\nFrom: %s\r\nSubject: %s\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s",
+		to, from, subject, text)
 	addr := fmt.Sprintf("%s:%d", a.Config.SMTP.Host, a.Config.SMTP.Port)
 	if a.Config.SMTP.Port == 0 {
 		addr = a.Config.SMTP.Host
 	}
-	// Deliver the message over SMTP. The conversation is driven manually rather
-	// than via smtp.SendMail so a server that closes the connection right after
-	// accepting the message body (some test mail servers do) does not turn a
-	// successful delivery into an error: once the DATA command completes the
-	// message is delivered, and a failed QUIT must not fail the request.
-	c, err := smtp.Dial(addr)
+	d := net.Dialer{Timeout: 15 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
+		return err
+	}
+	host, _, _ := net.SplitHostPort(addr)
+	c, err := smtp.NewClient(conn, host)
+	if err != nil {
+		conn.Close()
 		return err
 	}
 	defer c.Close()
 	if err := c.Mail(from); err != nil {
 		return err
 	}
-	if err := c.Rcpt(address); err != nil {
+	if err := c.Rcpt(to); err != nil {
 		return err
 	}
 	w, err := c.Data()

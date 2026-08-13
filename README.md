@@ -42,6 +42,8 @@ Katrix 按阶段（P0–P8）实现，每个阶段都自带测试并通过 GitHu
 | **状态解析（核心）** | `stateres.ResolveV2`：规范的出度模型反向拓扑 Kahn 排序（祖先优先），**发送者 power-level 为主排序键**（从候选事件的 auth_events 解析 m.room.power_levels 的 users map；v12 creator 无限 power = 2^53），mainline depth 对齐 Synapse（最老祖先 depth=1，head depth=len，无匹配 depth=0）。v1 前向时序。 |
 | **E2EE 中转 + 客户端 Megolm（P7）** | 服务端：`keys/upload`（device + one-time + fallback）、`keys/query`、`keys/claim`（原子消费 OTK）、`keys/changes`、`sendToDevice`（经 /sync 派发后删除，`*` 通配扇出）、cross-signing、**密钥备份**（`/room_keys/*`）。服务端不做加密，只中转。**前端**：`@matrix-org/olm`（libolm WASM）完整集成 — Ed25519/Curve25519 设备密钥（canonical JSON 签名 + keys/upload）、one-time/fallback keys、IndexedDB 持久化、Megolm 出站会话（m.megolm.v1.aes-sha2 加密 m.room.message → m.room.encrypted）、Megolm 入站会话（room key 导入 + 解密）、Olm 1:1 会话（keys/claim + sendToDevice m.room_key 分发）、to-device m.encrypted 解密处理、keys/query 设备密钥缓存。 |
 | **补全（P8）** | push rules（默认规则集 + 增删改查）、filters、`publicRooms`、`preview_url`（OpenGraph 解析 + SSRF 防护：DNS 解析后 IP 段校验 [loopback/私网/link-local/CGNAT/metadata/IPv6 ULA/TEST-NET] + 连接时校验防 DNS rebinding + 重定向/大小/超时限制）、admin API（whois / 停用 / 改密 / 用户列表 / 房间列表 / 统计，按 `users.admin` 鉴权）。 |
+| **SSO** | CAS（`cas.server_url`，`/login/sso/redirect` + `/login/cas/ticket` 票证校验，`cas_enable_registration` 语义）+ **OIDC**（`oidc.issuer/client_id/client_secret`，授权码流：discovery → authorization endpoint → token exchange → userinfo `sub` → localpart 映射，`/login/oidc/redirect` + `/login/oidc/callback`，单 provider）。两 provider 共用 `m.login.sso` 登录流与 UIA stage（首次登录按 `enable_registration` 自动建号，登录 token 页面兼容 sytest 提取）。 |
+| **推送** | push rules（默认规则集 + 增删改查）、HTTP pusher（`/pushers/set`，spec `/notify` 负载投递推送网关，坏 pushkey 自动删除）+ **email pusher**（spec `kind: "email"`：通知按房间聚合，后台 worker 按节流窗口每用户一封汇总邮件，×144 退避封顶 24h、静默 12h 重置，SMTP 复用 `smtp.*` 配置）；`GET /notifications`。 |
 | **性能与可观测性** | `forward_extremities` 表 + `InsertEvent` 维护 extremity 集（/sync 增量 delta 无需全量重扫）；`database.max_conns/min_conns` 配置项；`internal/metrics` 依赖-free Prometheus `/metrics` 端点（Go runtime + katrix events/sync/federation/media 计数器）。 |
 | **Web 面板扩展** | TanStack Router（`/` 聊天 / `/devices` 设备与 E2EE / `/admin` 管理面板）；shadcn 风格 UI 原语（Button/Input/Card/Badge/Table + `cn()` + 设计 token CSS）；管理面板（统计卡片、用户停用/改密、房间列表，对齐 synapse-admin）；E2EE 设备密钥自举 + Megolm 加解密全链路。 |
 | **登录增强** | `login_tokens` 表 + `POST /login/token` 铸造单次令牌；`/login` 增 `m.login.token` 流程；`/versions` 声明 `org.matrix.msc3886`；`SendToDevice` `*` 通配扇出（打通 `m.secret.send`）；`m.key.verification.*` 透传。 |
@@ -259,6 +261,22 @@ media:
   max_upload_bytes: 52428800
   store_path: media_store
 federation_enabled: true
+
+# SSO（可选）：CAS 与 OIDC 可同时配置；/login/sso/redirect 优先 OIDC
+# cas:
+#   server_url: https://cas.example.com
+#   enable_registration: true
+# oidc:
+#   issuer: https://accounts.example.com
+#   client_id: katrix
+#   client_secret: s3cret
+#   enable_registration: true
+
+# SMTP（可选）：3PID 验证邮件 + email pusher 通知邮件
+# smtp:
+#   host: smtp.example.com
+#   port: 25
+#   notif_from: "Katrix <noreply@example.com>"
 ```
 
 ### 3. 准备数据库

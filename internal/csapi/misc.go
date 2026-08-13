@@ -514,6 +514,14 @@ func (a *API) PushSet(w http.ResponseWriter, r *http.Request) {
 	if req.Kind == "" {
 		req.Kind = "http"
 	}
+	if req.Kind == "email" {
+		// An email pusher's pushkey is the email address to send notifications
+		// to (spec); reject values that cannot be one before storing them.
+		if !strings.Contains(req.PushKey, "@") {
+			httpx.WriteError(w, httpx.ErrInvalidParam("email pusher pushkey must be an email address"))
+			return
+		}
+	}
 	if len(req.Data) == 0 {
 		req.Data = json.RawMessage(`{}`)
 	}

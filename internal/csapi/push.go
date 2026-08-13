@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -178,7 +180,16 @@ func (d *pushDispatcher) dispatchForUser(ctx context.Context, a *API, roomID, ev
 	}
 
 	for _, p := range pushers {
-		if p.Kind != "http" {
+		switch p.Kind {
+		case "email":
+			// Email pushers (spec pusher kind "email") are not delivered inline:
+			// the notification is recorded per room and the background worker
+			// aggregates each user's pending rooms into one summary email once
+			// the room's throttle window passes (see sendDueEmailSummaries).
+			a.recordEmailPending(ctx, localpart, p.PushKey, roomID, eventID, eventType, sender, stateKey, content, notif)
+			continue
+		case "http":
+		default:
 			continue
 		}
 		var data map[string]any
@@ -227,6 +238,206 @@ func (d *pushDispatcher) dispatchForUser(ctx context.Context, a *API, roomID, ev
 			_ = a.Store.DeletePusher(context.Background(), localpart, p.AppID, p.PushKey)
 		}
 	}
+}
+
+// ---- Email pushers ----
+//
+// The email pusher (spec pusher kind "email": "a pusher that emails the user
+// with unread notifications") delivers summary emails through the configured
+// SMTP server instead of a push gateway. Notifications are not emailed
+// inline: dispatchForUser records the pending notification per room in
+// email_pusher_state, and the background worker (StartEmailPushWorker /
+// sendDueEmailSummaries) sends one aggregated email per user once a room's
+// throttle window has passed — mirroring Synapse's email pusher, which
+// coalesces everything that arrived during a room's throttle interval into a
+// single mail and backs off (×144, capped at 24h, reset after a 12h quiet
+// gap) so a busy room does not spam the inbox.
+
+// recordEmailPending upserts the per-room pending state for a user's email
+// pusher. The email address is the pusher's pushkey (spec); when the user has
+// several email pushers the same summary email would be sent to each, so only
+// the first is recorded. SMTP must be configured or the push is dropped
+// (mirror of the /requestToken guard: email sending needs smtp.host).
+func (a *API) recordEmailPending(ctx context.Context, localpart, pushkey, roomID, eventID, eventType, sender, stateKey string, content map[string]any, notif map[string]any) {
+	if a.Config.SMTP.Host == "" {
+		return
+	}
+	st := storage.EmailPushState{
+		UserLocalpart:  localpart,
+		RoomID:         roomID,
+		PendingEventID: eventID,
+		PendingSender:  sender,
+		RoomName:       roomNameOf(notif),
+		Unread:         unreadOf(notif),
+	}
+	// The sender's display name and the message body come from the event
+	// content; membership events carry no body, so the summary falls back to a
+	// membership description.
+	var mc struct {
+		Body       string `json:"body"`
+		Membership string `json:"membership"`
+	}
+	_ = json.Unmarshal(mustJSON(content), &mc)
+	if dn := senderDNOf(notif); dn != "" {
+		st.PendingSenderDN = dn
+	}
+	switch {
+	case mc.Body != "":
+		st.PendingBody = mc.Body
+	case eventType == "m.room.member" && mc.Membership != "":
+		st.PendingBody = mc.Membership
+	}
+	// First pending event for the room is due immediately (the 1s base
+	// throttle only applies to INSERT; later pending rows retain the row's
+	// grown throttle via the upsert). The throttle bookkeeping is shared with
+	// the worker: ready_at is pushed to last_sent + throttle after a mail
+	// goes out, so a busy room coalesces instead of emailing per message.
+	st.ThrottleMS = 1000
+	st.ReadyAt = a.Now()
+	st.LastEventTS = a.Now()
+	_ = a.Store.UpsertEmailPushPending(ctx, st)
+}
+
+// roomNameOf returns the notification's room_name, if the dispatcher resolved
+// one.
+func roomNameOf(notif map[string]any) string {
+	name, _ := notif["room_name"].(string)
+	return name
+}
+
+// senderDNOf returns the notification's sender_display_name, if resolved.
+func senderDNOf(notif map[string]any) string {
+	dn, _ := notif["sender_display_name"].(string)
+	return dn
+}
+
+// unreadOf returns the notification's counts.unread badge value.
+func unreadOf(notif map[string]any) int64 {
+	counts, _ := notif["counts"].(map[string]any)
+	n, _ := counts["unread"].(float64)
+	return int64(n)
+}
+
+// StartEmailPushWorker runs the background email-pusher worker: every
+// emailPushInterval it sends the due summary emails (rooms whose ready_at has
+// passed). It exits when ctx is cancelled.
+func (a *API) StartEmailPushWorker(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(a.emailPushInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = a.sendDueEmailSummaries(context.WithoutCancel(ctx))
+			}
+		}
+	}()
+}
+
+// sendDueEmailSummaries sends one aggregated summary email per user covering
+// every pending room whose ready_at has passed, then advances the throttle
+// bookkeeping. It is also the test hook: tests drive it directly (with a
+// shortened interval) instead of waiting for the worker tick. A failed send
+// backs the room off (throttle ×2, re-armed) so a wedged SMTP server does not
+// cause a retry storm.
+func (a *API) sendDueEmailSummaries(ctx context.Context) error {
+	if a.Config.SMTP.Host == "" {
+		return nil
+	}
+	due, err := a.Store.DueEmailPushStates(ctx, a.Now())
+	if err != nil {
+		return err
+	}
+	// Group the due rows per user; each user gets one email listing every room.
+	byUser := map[string][]storage.EmailPushState{}
+	for _, st := range due {
+		byUser[st.UserLocalpart] = append(byUser[st.UserLocalpart], st)
+	}
+	for localpart, rooms := range byUser {
+		// The user's email pushers: the summary is delivered to each pushkey
+		// that has a pending room (a user may have multiple email addresses).
+		pushers, err := a.Store.ListPushers(ctx, localpart)
+		if err != nil {
+			continue
+		}
+		emails := map[string]bool{}
+		for _, p := range pushers {
+			if p.Kind == "email" && p.PushKey != "" {
+				emails[p.PushKey] = true
+			}
+		}
+		subject, text := a.emailSummary(localpart, rooms)
+		for to := range emails {
+			if err := a.sendEmailMessage(ctx, to, subject, text); err == nil {
+				// The mail went out: clear every pending room. Failed sends
+				// leave the rows pending and back them off.
+				for _, st := range rooms {
+					_ = a.Store.ClearEmailPushPending(ctx, localpart, st.RoomID, a.Now())
+				}
+			} else {
+				for _, st := range rooms {
+					_ = a.Store.BackoffEmailPushPending(ctx, localpart, st.RoomID, a.Now())
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// emailSummary renders the subject and body of a user's aggregated summary
+// email. A single room yields "[server] Alice says: hello" (the classic
+// notification subject); several rooms yield a count subject and a body
+// listing each room with its sender, message preview and unread count.
+func (a *API) emailSummary(localpart string, rooms []storage.EmailPushState) (subject, text string) {
+	app := a.ServerName()
+	if len(rooms) == 1 {
+		room := rooms[0]
+		from := room.PendingSenderDN
+		if from == "" {
+			from = room.PendingSender
+		}
+		if from != "" {
+			subject = fmt.Sprintf("[%s] %s says: %s", app, from, room.PendingBody)
+		} else {
+			subject = fmt.Sprintf("[%s] You have unread messages in %s", app, roomName(room))
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "Room: %s\n", roomName(room))
+		if room.PendingSenderDN != "" {
+			fmt.Fprintf(&b, "From: %s\n", room.PendingSenderDN)
+		}
+		if room.PendingBody != "" {
+			fmt.Fprintf(&b, "Message: %s\n", room.PendingBody)
+		}
+		if room.Unread > 0 {
+			fmt.Fprintf(&b, "Unread notifications: %d\n", room.Unread)
+		}
+		return subject, b.String()
+	}
+	subject = fmt.Sprintf("[%s] You have unread messages in %d rooms", app, len(rooms))
+	var b strings.Builder
+	for _, room := range rooms {
+		fmt.Fprintf(&b, "• %s", roomName(room))
+		if room.PendingSenderDN != "" {
+			fmt.Fprintf(&b, " — %s: %s", room.PendingSenderDN, room.PendingBody)
+		}
+		if room.Unread > 0 {
+			fmt.Fprintf(&b, " (%d unread)", room.Unread)
+		}
+		b.WriteString("\n")
+	}
+	return subject, b.String()
+}
+
+// roomName renders a room's display name for email summaries, falling back to
+// the room ID.
+func roomName(st storage.EmailPushState) string {
+	if st.RoomName != "" {
+		return st.RoomName
+	}
+	return st.RoomID
 }
 
 // postNotify POSTs the notify payload to the push gateway, returning whether
