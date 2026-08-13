@@ -160,6 +160,20 @@ type Config struct {
 		Port      int    `yaml:"port"`
 		NotifFrom string `yaml:"notif_from"`
 	} `yaml:"smtp"`
+
+	// Voip configures the TURN credentials served by GET /voip/turnServer
+	// (spec §Voice over IP). Mirrors Synapse's voip section: either a shared
+	// secret (time-limited HMAC-SHA1 credentials, the standard TURN REST API
+	// scheme) or a static username/password pair. When neither is configured the
+	// endpoint returns {} — "no TURN server available".
+	Voip struct {
+		TURNURIs         []string `yaml:"turn_uris"`
+		TURNSharedSecret string   `yaml:"turn_shared_secret"`
+		TURNUsername     string   `yaml:"turn_username"`
+		TURNPassword     string   `yaml:"turn_password"`
+		TURNUserLifetime int64    `yaml:"turn_user_lifetime"` // milliseconds
+		TURNAllowGuests  bool     `yaml:"turn_allow_guests"`
+	} `yaml:"voip"`
 }
 
 // Default returns a config populated with development defaults.
@@ -297,6 +311,39 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("KATRIX_APPSERVICE_DIR"); v != "" {
 		c.AppServiceDir = v
 	}
+	if v := os.Getenv("KATRIX_TURN_URIS"); v != "" {
+		c.Voip.TURNURIs = splitCSV(v)
+	}
+	if v := os.Getenv("KATRIX_TURN_SHARED_SECRET"); v != "" {
+		c.Voip.TURNSharedSecret = v
+	}
+	if v := os.Getenv("KATRIX_TURN_USERNAME"); v != "" {
+		c.Voip.TURNUsername = v
+	}
+	if v := os.Getenv("KATRIX_TURN_PASSWORD"); v != "" {
+		c.Voip.TURNPassword = v
+	}
+	if v := os.Getenv("KATRIX_TURN_USER_LIFETIME"); v != "" {
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n > 0 {
+			c.Voip.TURNUserLifetime = n
+		}
+	}
+	if v := os.Getenv("KATRIX_TURN_ALLOW_GUESTS"); v != "" {
+		c.Voip.TURNAllowGuests = parseBool(v, c.Voip.TURNAllowGuests)
+	}
+}
+
+// splitCSV splits a comma-separated environment value, trimming whitespace and
+// dropping empty segments. Used for list-valued config such as turn_uris.
+func splitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func parseBool(s string, def bool) bool {

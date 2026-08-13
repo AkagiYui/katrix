@@ -63,14 +63,45 @@ func (s *Store) DeleteAllThreePIDBindings(ctx context.Context, localpart string)
 }
 
 // StoreUserThreePID records a validated 3PID in the user's account (spec:
-// POST /account/3pid). Upserts on repeat adds.
+// POST /account/3pid). Upserts on repeat adds. Katrix only stores 3PIDs after
+// validation, so validated_ts mirrors added_ts.
 func (s *Store) StoreUserThreePID(ctx context.Context, localpart, medium, address string, now int64) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO user_threepids(user_localpart, medium, address, added_ts)
-		 VALUES ($1,$2,$3,$4)
-		 ON CONFLICT (user_localpart, medium, address) DO UPDATE SET added_ts=EXCLUDED.added_ts`,
+		`INSERT INTO user_threepids(user_localpart, medium, address, added_ts, validated_ts)
+		 VALUES ($1,$2,$3,$4,$4)
+		 ON CONFLICT (user_localpart, medium, address) DO UPDATE SET added_ts=EXCLUDED.added_ts, validated_ts=EXCLUDED.validated_ts`,
 		localpart, medium, address, now)
 	return err
+}
+
+// UserThreePID is one 3PID associated with a user's account, as returned by
+// GET /account/3pid.
+type UserThreePID struct {
+	Medium      string
+	Address     string
+	ValidatedTS int64
+	AddedTS     int64
+}
+
+// UserThreePIDs returns every 3PID associated with the account (spec
+// GET /account/3pid), sorted by added_ts for a stable response.
+func (s *Store) UserThreePIDs(ctx context.Context, localpart string) ([]UserThreePID, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT medium, address, COALESCE(validated_ts, added_ts), added_ts
+		 FROM user_threepids WHERE user_localpart=$1 ORDER BY added_ts`, localpart)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []UserThreePID{}
+	for rows.Next() {
+		var t UserThreePID
+		if err := rows.Scan(&t.Medium, &t.Address, &t.ValidatedTS, &t.AddedTS); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 // LocalpartForThreePID resolves a user's localpart from a (medium, address)

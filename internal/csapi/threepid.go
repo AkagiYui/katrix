@@ -13,6 +13,7 @@ import (
 // delete or unbind existing bindings. Email validation sessions are created via
 // /account/3pid/email/requestToken and confirmed through the email link.
 func (a *API) register3PID(mux *http.ServeMux) {
+	mux.HandleFunc("GET /_matrix/client/v3/account/3pid", a.RequireUserAuth(a.List3PIDs))
 	mux.HandleFunc("POST /_matrix/client/v3/account/3pid/email/requestToken", a.account3PIDEmailRequestToken)
 	mux.HandleFunc("POST /_matrix/client/v3/account/3pid", a.RequireUserAuth(a.Add3PID))
 	mux.HandleFunc("POST /_matrix/client/unstable/account/3pid/bind", a.RequireUserAuth(a.Bind3PID))
@@ -58,6 +59,31 @@ func (a *API) Add3PID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// List3PIDs handles GET /_matrix/client/v3/account/3pid. It returns the
+// third-party identifiers the homeserver has associated with the account (spec
+// §Account management) — distinct from the list of identifiers bound to the
+// Matrix ID at identity servers. The response is always a JSON object with a
+// (possibly empty) threepids array.
+func (a *API) List3PIDs(w http.ResponseWriter, r *http.Request) {
+	auth, _ := homeserver.AuthFrom(r.Context())
+	pids, err := a.Store.UserThreePIDs(r.Context(), auth.Localpart)
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	type threepid struct {
+		Medium      string `json:"medium"`
+		Address     string `json:"address"`
+		ValidatedAt int64  `json:"validated_at"`
+		AddedAt     int64  `json:"added_at"`
+	}
+	items := make([]threepid, 0, len(pids))
+	for _, p := range pids {
+		items = append(items, threepid{Medium: p.Medium, Address: p.Address, ValidatedAt: p.ValidatedTS, AddedAt: p.AddedTS})
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"threepids": items})
 }
 
 // Bind3PID handles POST /_matrix/client/{unstable,v3}/account/3pid/bind.
