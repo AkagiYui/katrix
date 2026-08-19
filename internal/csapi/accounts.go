@@ -243,7 +243,7 @@ func (a *API) RegisterAccount(w http.ResponseWriter, r *http.Request) {
 		InhibitLogin: req.InhibitLogin,
 		RefreshToken: req.RefreshToken,
 	}
-	sessionID, ok, err := a.processRegisterUIA(w, r, body, a.Config.Registration.RequireToken, params)
+	sessionID, ok, err := a.processRegisterUIA(w, r, body, a.Config.Registration.RequireToken, params, true)
 	if err != nil {
 		httpx.WriteError(w, err)
 		return
@@ -357,7 +357,7 @@ func (a *API) upgradeGuestAccount(w http.ResponseWriter, r *http.Request, body [
 		DisplayName:  req.InitialDeviceDisplayName,
 		InhibitLogin: req.InhibitLogin,
 		RefreshToken: req.RefreshToken,
-	})
+	}, false)
 	if err != nil {
 		httpx.WriteError(w, err)
 		return

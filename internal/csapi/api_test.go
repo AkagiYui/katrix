@@ -218,6 +218,56 @@ func TestRegisterUsernameInUse(t *testing.T) {
 	}
 }
 
+// A sessionless auth dict registers in one request (sytest's
+// matrix_register_user and the whole 10apidoc/01register file work this way),
+// but only until this server has issued a session for that username: after the
+// challenge, dropping the session must not complete the registration behind the
+// flow's back (Complement "Registration without a session fails").
+func TestRegisterSessionlessAuth(t *testing.T) {
+	_, srv := testAPI(t)
+
+	// No prior challenge for "shortcut": the single-request shortcut applies.
+	code, body := doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/register", "",
+		map[string]any{
+			"username": "shortcut", "password": "pw",
+			"auth": map[string]any{"type": "m.login.dummy"},
+		})
+	if code != 200 {
+		t.Fatalf("sessionless register: status=%d body=%v", code, body)
+	}
+
+	// Take a challenge for "insession", then resubmit without the session.
+	code, body = doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/register", "",
+		map[string]any{"username": "insession", "password": "pw"})
+	if code != 401 {
+		t.Fatalf("challenge: status=%d body=%v", code, body)
+	}
+	session, _ := body["session"].(string)
+	if session == "" {
+		t.Fatal("no session in challenge")
+	}
+	code, body = doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/register", "",
+		map[string]any{
+			"username": "insession", "password": "pw",
+			"auth": map[string]any{"type": "m.login.dummy"},
+		})
+	if code != 401 {
+		t.Fatalf("sessionless resubmit: status=%d body=%v, want 401", code, body)
+	}
+	if _, ok := body["access_token"]; ok {
+		t.Fatalf("sessionless resubmit registered the account: %v", body)
+	}
+	// The original session still completes the flow.
+	code, body = doJSON(t, srv, http.MethodPost, "/_matrix/client/v3/register", "",
+		map[string]any{
+			"username": "insession", "password": "pw",
+			"auth": map[string]any{"type": "m.login.dummy", "session": session},
+		})
+	if code != 200 {
+		t.Fatalf("complete with session: status=%d body=%v", code, body)
+	}
+}
+
 func TestRegisterAvailable(t *testing.T) {
 	_, srv := testAPI(t)
 	code, body := getJSON(t, srv, "/_matrix/client/v3/register/available?username=carol", "")

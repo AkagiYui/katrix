@@ -125,6 +125,27 @@ func (s *uiaStore) create(op, localpart, target string) (string, *uiaSession) {
 	return id, sess
 }
 
+// pendingRegistration reports whether a live registration session is already
+// outstanding for username — created, not yet expired, and not yet completed.
+// It is how a sessionless auth submission is told apart from a client that
+// already holds a session for the registration it is attempting.
+func (s *uiaStore) pendingRegistration(username string) bool {
+	if username == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, sess := range s.sessions {
+		if sess.op != "register" || sess.expired() || sess.registeredLocalpart != "" {
+			continue
+		}
+		if p, ok := sess.params.(registerSessionParams); ok && p.Username == username {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *uiaStore) delete(id string) {
 	s.mu.Lock()
 	delete(s.sessions, id)
@@ -260,7 +281,13 @@ func (a *API) registerChallengeParams() map[string]any {
 // whether authentication is complete, and an error. When auth is not complete a
 // 401 challenge has been written. On completion the session is kept (marked by
 // its registered localpart) so re-completing the same session is idempotent.
-func (a *API) processRegisterUIA(w http.ResponseWriter, r *http.Request, raw json.RawMessage, requireToken bool, params registerSessionParams) (string, bool, error) {
+//
+// enforceSession makes an auth dict without a valid session id fail with a
+// fresh challenge once a session is already outstanding for the same username;
+// the guest-upgrade path passes false, because sytest completes that upgrade
+// with a sessionless auth dict after taking the challenge (see the comment on
+// the sessionless shortcut below).
+func (a *API) processRegisterUIA(w http.ResponseWriter, r *http.Request, raw json.RawMessage, requireToken bool, params registerSessionParams, enforceSession bool) (string, bool, error) {
 	flows := a.registerFlows(requireToken)
 	challengeParams := a.registerChallengeParams()
 
@@ -273,19 +300,37 @@ func (a *API) processRegisterUIA(w http.ResponseWriter, r *http.Request, raw jso
 		}
 	}
 
-	if body.Auth == nil {
-		id, _ := a.uia.create("register", "", "")
-		a.uia.get(id).params = params
-		a.writeUIAChallenge(w, flows, challengeParams, id, nil)
-		return id, false, nil
+	var sess *uiaSession
+	if body.Auth != nil {
+		if s := a.uia.get(body.Auth.Session); s != nil && s.op == "register" {
+			sess = s
+		}
 	}
-
-	// If the client supplied an auth type but no session, start a new session
-	// and fall through to process the supplied stage immediately.
-	sess := a.uia.get(body.Auth.Session)
-	if sess == nil || sess.op != "register" {
+	if sess == nil {
+		// Either no auth dict at all, or one naming a session this server does
+		// not hold (never issued, expired, or belonging to another operation).
+		//
+		// A sessionless auth dict is normally taken as a single-request
+		// shortcut: the stage is processed against a freshly created session,
+		// so a one-stage flow (m.login.dummy) registers in one call. sytest
+		// registers this way throughout — matrix_register_user and every
+		// 10apidoc/01register test send auth without a session — as Synapse,
+		// Dendrite and Conduit all permit.
+		//
+		// The shortcut stops once this server has already handed a session to
+		// a registration for the same username: that client asked for a flow,
+		// got a session id, and must use it (Complement's "Registration
+		// without a session fails" asserts the resubmission is rejected).
+		// Taking the shortcut there would register the account behind the back
+		// of the flow the client is in the middle of.
+		shortcut := body.Auth != nil && body.Auth.Type != "" &&
+			(!enforceSession || !a.uia.pendingRegistration(params.Username))
 		id, s := a.uia.create("register", "", "")
 		s.params = params
+		if !shortcut {
+			a.writeUIAChallenge(w, flows, challengeParams, id, nil)
+			return id, false, nil
+		}
 		sess = s
 		body.Auth.Session = id
 	}
