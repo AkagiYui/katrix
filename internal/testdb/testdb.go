@@ -77,6 +77,7 @@ func Acquire(ctx context.Context) (*pgx.Conn, error) {
 func Truncate(ctx context.Context, pool pgxConn) error {
 	_, err := pool.Exec(ctx, `
 		TRUNCATE TABLE
+			remote_presence_streams,
 			forward_extremities,
 			login_tokens,
 			event_txns,

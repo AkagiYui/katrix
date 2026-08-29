@@ -227,12 +227,25 @@ func (a *API) presenceContentFor(ctx context.Context, userID string) map[string]
 	content := map[string]any{
 		"user_id":   userID,
 		"presence":  presence,
-		"stream_id": a.Now(),
+		"stream_id": a.nextPresenceStreamID(),
 	}
 	if statusMsg != "" {
 		content["status_msg"] = statusMsg
 	}
 	return content
+}
+
+func (a *API) nextPresenceStreamID() int64 {
+	next := a.Now()
+	for {
+		previous := a.presenceStream.Load()
+		if next <= previous {
+			next = previous + 1
+		}
+		if a.presenceStream.CompareAndSwap(previous, next) {
+			return next
+		}
+	}
 }
 
 // broadcastLocalPresence queues an m.presence EDU for a LOCAL user to every

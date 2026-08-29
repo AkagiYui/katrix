@@ -353,6 +353,66 @@ func (s *Store) SetPresence(ctx context.Context, userID, presence, statusMsg str
 	return err == nil, err
 }
 
+// SetRemotePresenceIfNewer applies a federated presence update only when its
+// sender-side stream ID is newer than the last one accepted for that
+// (origin,user) pair. Outbound EDU transactions are intentionally concurrent,
+// so completion order is not delivery order: without this guard a slow older
+// "online" transaction can overwrite a newer "unavailable" update.
+//
+// The ordering claim and the client-visible presence change are committed in
+// one transaction. An EDU without a positive stream ID cannot be ordered and
+// falls back to arrival order for compatibility with older peers.
+func (s *Store) SetRemotePresenceIfNewer(ctx context.Context, origin, userID, presence, statusMsg string, sourceStreamID, receivedTS int64) (bool, error) {
+	if sourceStreamID <= 0 {
+		return s.SetPresence(ctx, userID, presence, statusMsg, receivedTS)
+	}
+	if origin == "" {
+		return false, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var acceptedStreamID int64
+	err = tx.QueryRow(ctx,
+		`INSERT INTO remote_presence_streams(origin, user_id, stream_id)
+		 VALUES ($1,$2,$3)
+		 ON CONFLICT (origin, user_id) DO UPDATE SET stream_id=EXCLUDED.stream_id
+		 WHERE remote_presence_streams.stream_id < EXCLUDED.stream_id
+		 RETURNING stream_id`,
+		origin, userID, sourceStreamID).Scan(&acceptedStreamID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx,
+		`INSERT INTO presence(user_id, presence, status_msg, last_active_ts)
+		 VALUES ($1,$2,$3,$4)
+		 ON CONFLICT (user_id) DO UPDATE
+		 SET presence=EXCLUDED.presence, status_msg=EXCLUDED.status_msg,
+		     last_active_ts=EXCLUDED.last_active_ts`,
+		userID, presence, statusMsg, receivedTS); err != nil {
+		return false, err
+	}
+	var localStreamID int64
+	if err = tx.QueryRow(ctx, `SELECT nextval('sync_stream')`).Scan(&localStreamID); err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx,
+		`INSERT INTO presence_changes(user_id, stream_id) VALUES ($1,$2)`,
+		userID, localStreamID); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // RecordPresenceChange records a presence change for userID in the shared sync
 // stream without altering the stored presence row. An explicit PUT /presence
 // that happens to repeat the current value (e.g. a room join seeded the

@@ -5,6 +5,7 @@ package csapi
 import (
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AkagiYui/katrix/internal/federation"
@@ -20,6 +21,9 @@ type API struct {
 	uia        *uiaStore
 	syncEngine *syncEngine
 	fed        *federation.API
+	// presenceStream makes the federation m.presence stream_id strictly
+	// monotonic even when two updates are broadcast in the same millisecond.
+	presenceStream atomic.Int64
 	// media is the content-repository backend, used by URL preview to store the
 	// og:image blob so the response can carry an mxc:// URL. Set by
 	// SetMediaBackend during HTTP server assembly.

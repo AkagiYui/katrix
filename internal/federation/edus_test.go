@@ -10,6 +10,37 @@ import (
 	"github.com/AkagiYui/katrix/internal/storage"
 )
 
+// TestPresenceEDUIgnoresOutOfOrderUpdates covers the federation race where
+// concurrent transactions complete in the opposite order from their sender
+// stream IDs. The newer unavailable state must survive a late older online
+// delivery.
+func TestPresenceEDUIgnoresOutOfOrderUpdates(t *testing.T) {
+	store := testStore(t)
+	hs := homeserver.New(&config.Config{ServerName: "receiver.test"}, store, nil)
+	api := &API{HS: hs}
+	ctx := context.Background()
+	userID := "@alice:sender.test"
+
+	api.applyPresenceEDU(ctx, "sender.test", json.RawMessage(`{
+		"user_id":"@alice:sender.test",
+		"presence":"unavailable",
+		"stream_id":2
+	}`))
+	api.applyPresenceEDU(ctx, "sender.test", json.RawMessage(`{
+		"user_id":"@alice:sender.test",
+		"presence":"online",
+		"stream_id":1
+	}`))
+
+	presence, err := store.GetPresence(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presence == nil || presence.Presence != "unavailable" {
+		t.Fatalf("stale presence overwrote newer state: %+v", presence)
+	}
+}
+
 // TestApplyReceiptEDU verifies applyReceiptEDU parses the spec's federated
 // m.receipt EDU shape (room -> receipt_type -> user -> {data, event_ids}),
 // persists one row per event_id, extracts ts/thread_id from data, and only

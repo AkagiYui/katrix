@@ -281,7 +281,7 @@ func (a *API) handleEDU(ctx context.Context, origin string, edu json.RawMessage)
 		}
 		a.applyTypingEDU(ctx, e.Content)
 	case eduPresence:
-		a.applyPresenceEDU(ctx, e.Content)
+		a.applyPresenceEDU(ctx, origin, e.Content)
 	case eduDeviceListUpdate:
 		// Device-list updates are hints to re-query /keys/query; the local
 		// server needs no action other than reflecting the change in /sync
@@ -358,17 +358,19 @@ func (a *API) applyTypingEDU(ctx context.Context, content json.RawMessage) {
 // applyPresenceEDU applies an inbound m.presence EDU to the presence store so
 // local users sharing a room with the remote user see it in /sync. Local users
 // who share a room are woken so parked long-polls pick up the change.
-func (a *API) applyPresenceEDU(ctx context.Context, content json.RawMessage) {
+func (a *API) applyPresenceEDU(ctx context.Context, origin string, content json.RawMessage) {
 	var c struct {
 		UserID    string `json:"user_id"`
 		Presence  string `json:"presence"`
 		StatusMsg string `json:"status_msg,omitempty"`
+		StreamID  int64  `json:"stream_id"`
 	}
-	if err := json.Unmarshal(content, &c); err != nil || c.UserID == "" || c.Presence == "" {
+	if err := json.Unmarshal(content, &c); err != nil || c.UserID == "" || c.Presence == "" || userDomain(c.UserID) != origin {
 		return
 	}
-	_, _ = a.Store.SetPresence(ctx, c.UserID, c.Presence, c.StatusMsg, a.Now())
-	a.wakeSharedRoomLocals(ctx, c.UserID)
+	if applied, _ := a.Store.SetRemotePresenceIfNewer(ctx, origin, c.UserID, c.Presence, c.StatusMsg, c.StreamID, a.Now()); applied {
+		a.wakeSharedRoomLocals(ctx, c.UserID)
+	}
 }
 
 // applyDeviceListEDU applies an inbound m.device_list_update EDU: it records a
