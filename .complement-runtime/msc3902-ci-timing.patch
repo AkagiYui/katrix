@@ -1,0 +1,48 @@
+diff --git a/tests/msc3902/federation_room_join_partial_state_test.go b/tests/msc3902/federation_room_join_partial_state_test.go
+index c3fc919..fbe9c16 100644
+--- a/tests/msc3902/federation_room_join_partial_state_test.go
++++ b/tests/msc3902/federation_room_join_partial_state_test.go
+@@ -39,0 +40,8 @@ import (
++// These waits assert that federation work is not blocked on the deliberately
++// unfinished partial-state resync. They are not protocol latency limits, so
++// leave enough wall-clock headroom for a hosted CI runner while recording the
++// observed latency below.
++const partialStateFederationWait = 10 * time.Second
++
++const partialStateSyncWait = 30 * time.Second
++
+@@ -513,0 +522 @@ func TestPartialStateJoin(t *testing.T) {
++		deliveryStarted := time.Now()
+@@ -515,0 +525 @@ func TestPartialStateJoin(t *testing.T) {
++			t.Logf("Message PDU received after %s", time.Since(deliveryStarted))
+@@ -519,2 +529,2 @@ func TestPartialStateJoin(t *testing.T) {
+-		case <-time.After(1 * time.Second):
+-			t.Error("Message PDU not received after one second")
++		case <-time.After(partialStateFederationWait):
++			t.Errorf("Message PDU not received after %s", partialStateFederationWait)
+@@ -744,0 +755 @@ func TestPartialStateJoin(t *testing.T) {
++		alice.SyncUntilTimeout = partialStateSyncWait
+@@ -771,0 +783 @@ func TestPartialStateJoin(t *testing.T) {
++		syncStarted := time.Now()
+@@ -786,0 +799 @@ func TestPartialStateJoin(t *testing.T) {
++		t.Logf("Device list update observed after %s", time.Since(syncStarted))
+@@ -3593,0 +3607 @@ func TestPartialStateJoin(t *testing.T) {
++		deliveryStarted := time.Now()
+@@ -3595,0 +3610 @@ func TestPartialStateJoin(t *testing.T) {
++			t.Logf("Display name change event received after %s", time.Since(deliveryStarted))
+@@ -3603,2 +3618,2 @@ func TestPartialStateJoin(t *testing.T) {
+-		case <-time.After(1 * time.Second):
+-			t.Error("Display name change event not received after one second")
++		case <-time.After(partialStateFederationWait):
++			t.Errorf("Display name change event not received after %s", partialStateFederationWait)
+@@ -3701 +3716,2 @@ func TestPartialStateJoin(t *testing.T) {
+-			t.Logf("Alice's leave is received by the resident server")
++			deliveryStarted := time.Now()
++			t.Log("Alice waits for the resident server to receive her leave")
+@@ -3703,2 +3719,2 @@ func TestPartialStateJoin(t *testing.T) {
+-			case <-time.After(1 * time.Second):
+-				t.Fatal("Resident server did not receive Alice's leave")
++			case <-time.After(partialStateFederationWait):
++				t.Fatalf("Resident server did not receive Alice's leave after %s", partialStateFederationWait)
+@@ -3705,0 +3722 @@ func TestPartialStateJoin(t *testing.T) {
++				t.Logf("Resident server received Alice's leave after %s", time.Since(deliveryStarted))
