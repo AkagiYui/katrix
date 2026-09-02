@@ -78,6 +78,8 @@ func Truncate(ctx context.Context, pool pgxConn) error {
 	_, err := pool.Exec(ctx, `
 		TRUNCATE TABLE
 			remote_presence_streams,
+			outbound_edus, outbound_pdus, outbound_invites,
+			federation_destinations,
 			forward_extremities,
 			login_tokens,
 			event_txns,

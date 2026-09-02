@@ -131,6 +131,10 @@ func (a *API) SendTransaction(w http.ResponseWriter, r *http.Request) {
 			"transaction exceeds the 50 PDU limit"))
 		return
 	}
+	// The origin just proved it is reachable. Drop any outbound backoff we
+	// were holding against it so events queued while it was down go out on the
+	// next pass instead of waiting out the retry schedule.
+	a.NoteDestinationAlive(r.Context(), body.Origin)
 	seen, err := a.Store.FederationTxnSeen(r.Context(), body.Origin, txnID)
 	if err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))

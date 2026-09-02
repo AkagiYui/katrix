@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/AkagiYui/katrix/internal/ids"
@@ -166,49 +165,6 @@ func minDuration(a, b time.Duration) time.Duration {
 // federation timeout; a bounded fetch returns quickly and the device list is
 // re-fetched on the next /keys/query.
 const fedKeyFetchTimeout = 3 * time.Second
-
-// deliverEDU sends one queued EDU to each of its remaining destinations. Each
-// destination is delivered in its own transaction (transaction IDs are
-// per-destination); a destination is dropped on success and retried on the
-// next pass on failure. Once every destination has acknowledged, the row is
-// deleted.
-//
-// Destinations are delivered concurrently, each attempt bounded by
-// fedDeliveryTimeout, so one unresponsive server cannot block the others (or
-// the rest of the queue): the worker re-enters its retry loop as soon as the
-// slowest attempt times out.
-func (a *API) deliverEDU(ctx context.Context, id int64, txnID, eduType string, content json.RawMessage, destinations []string) {
-	var (
-		remaining bool
-		mu        sync.Mutex
-		wg        sync.WaitGroup
-	)
-	for _, dest := range destinations {
-		if dest == a.ServerName() {
-			continue
-		}
-		dest := dest
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			tctx, cancel := context.WithTimeout(ctx, fedDeliveryTimeout)
-			defer cancel()
-			if err := a.sendTransaction(tctx, dest, txnID, nil, []json.RawMessage{
-				mustJSON(map[string]any{"edu_type": eduType, "content": json.RawMessage(content)}),
-			}); err != nil {
-				mu.Lock()
-				remaining = true
-				mu.Unlock()
-				return
-			}
-			_ = a.Store.RemoveEDUDestination(ctx, id, dest)
-		}()
-	}
-	wg.Wait()
-	if !remaining {
-		_ = a.Store.DeleteOutboundEDU(ctx, id)
-	}
-}
 
 // mustJSON marshals a value into json.RawMessage, best-effort.
 func mustJSON(v any) json.RawMessage {

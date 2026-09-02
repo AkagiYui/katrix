@@ -3,8 +3,11 @@ package federation
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -27,15 +30,11 @@ import (
 
 // fedDeliveryTimeout bounds a single outbound transaction attempt. A remote
 // server that stops responding (frozen, partitioned, or merely slow) must not
-// pin the delivery worker: the outbound queues serve every destination in the
-// room, and a single hung PUT /send would otherwise stall all delivery behind
-// the client's 30s HTTP timeout. The budget sits at 5s as a balance between
-// responsiveness and headroom: any shorter and a healthy-but-loaded peer (the
-// sytest mock federation server under parallel load) gets its transactions
-// misclassified as hung, the attempts fail, and the retry backlog pushes
-// otherwise-fine tests past their own deadlines. Complement's offline-server
-// tests pause a peer; the immediate-retry loop, not a short budget, is what
-// gets the queued events delivered promptly once the peer returns.
+// pin its destination's queue for the client's full 30s HTTP timeout. The
+// budget sits at 5s as a balance between responsiveness and headroom: any
+// shorter and a healthy-but-loaded peer (the sytest mock federation server
+// under parallel load) gets its transactions misclassified as hung, the
+// attempts fail, and the destination is parked on a backoff it did not earn.
 const fedDeliveryTimeout = 5 * time.Second
 
 // BroadcastPDUToRoom queues a locally-created event for delivery to every
@@ -151,8 +150,9 @@ func (a *API) wakeDeliveries() {
 
 // RunEDUWorker delivers queued outbound EDUs, PDUs and parked invites until
 // ctx is cancelled. It is started once at server startup and also woken by the
-// broadcast helpers. Failed deliveries are retried with an exponential backoff
-// cap; a delivery is only acknowledged after the remote server returns 200.
+// broadcast helpers. A delivery is only acknowledged after the remote server
+// returns 200; a destination that fails backs off on its own schedule (see
+// destinationBackoff) without holding up any other destination.
 func (a *API) RunEDUWorker(ctx context.Context) {
 	const baseDelay = 2 * time.Second
 	const maxDelay = 5 * time.Minute
@@ -164,50 +164,132 @@ func (a *API) RunEDUWorker(ctx context.Context) {
 		case <-a.eduWake:
 		case <-time.After(delay):
 		}
-		// Drain the queues in batches; keep the backoff if nothing was left.
-		hadWork, err := a.drainOutbound(ctx, &delay, baseDelay, maxDelay)
+		hadWork, err := a.drainOutbound(ctx)
 		if err != nil || !hadWork {
 			delay = minDuration(delay*2, maxDelay)
+		} else {
+			delay = baseDelay
+		}
+		// The loop's own backoff answers "is there anything to do at all" and
+		// grows to minutes when the server is quiet. A destination parked on a
+		// much shorter retry window must not wait that long, so never sleep
+		// past the moment the earliest parked destination comes due.
+		if due, ok, derr := a.Store.NextDestinationDue(ctx); derr == nil && ok {
+			wait := time.Duration(due-a.Now()) * time.Millisecond
+			if wait < destWakeFloor {
+				wait = destWakeFloor
+			}
+			delay = minDuration(delay, wait)
 		}
 	}
 }
 
-// drainOutbound delivers the outbound queues in batches until they are empty,
-// returning whether any work was found. EDUs are drained to empty BEFORE any
-// PDU or invite batch is dispatched: a presence or device-list EDU must not
-// wait behind a PDU backlog, where each 200-item batch can take up to
-// fedDeliveryTimeout per slow destination (a loaded-but-healthy peer makes a
-// batch linger for seconds), or the client-side test deadline blows before the
-// EDU lands. The inner loop returns to the EDU phase after every PDU batch, so
-// a late-queued EDU waits at most one PDU batch, not the whole backlog.
-func (a *API) drainOutbound(ctx context.Context, delay *time.Duration, baseDelay, maxDelay time.Duration) (bool, error) {
-	// Quick peek: nothing queued at all means no work and the caller backs off.
-	edus, err := a.Store.PendingOutboundEDUs(ctx, 1)
+// destWakeFloor keeps the wake-up for an already-due destination off a tight
+// loop when a pass had to leave some destinations for the next round.
+const destWakeFloor = 100 * time.Millisecond
+
+// Transaction sizing and retry schedule.
+//
+// The spec caps a transaction at "at most 50 PDUs and 100 EDUs", and requires
+// that "the sending server must wait and retry for a 200 OK response before
+// sending a transaction with a different txnId to the receiving server". Both
+// shape the worker: events for one destination are batched up to those limits
+// into a single transaction, and a destination is delivered to strictly one
+// transaction at a time.
+const (
+	fedMaxPDUsPerTxn = 50
+	fedMaxEDUsPerTxn = 100
+
+	// destBaseBackoff/destMaxBackoff bound the per-destination retry delay
+	// after a failed transaction: exponential in the number of consecutive
+	// failures, so a flapping peer recovers in a second and a server that is
+	// down for good costs one failed connect every half minute.
+	//
+	// The cap is deliberately short. A destination that comes back must be
+	// picked up promptly (Complement and sytest both pause a peer, resume it,
+	// and expect the queued events to land inside a client-visible deadline),
+	// and the cost of probing a dead server every 30s is one refused TCP
+	// connect. Inbound contact from a destination clears its backoff outright
+	// (see NoteDestinationAlive), so in practice a returning peer that talks
+	// to us first is retried immediately rather than waiting out the cap.
+	destBaseBackoff = 1 * time.Second
+	destMaxBackoff  = 30 * time.Second
+
+	// maxDestBatchesPerPass bounds how many transactions one destination gets
+	// per drain pass, so a single busy peer cannot monopolise the worker and a
+	// pathological "delivered but not acknowledged locally" loop cannot spin.
+	maxDestBatchesPerPass = 64
+
+	// outboundEDUMaxAge is how long an undelivered EDU is kept. EDUs are
+	// ephemeral (the spec: they "are not persisted and are not part of the
+	// history of a room"), so presence and typing notices that have been
+	// undeliverable for an hour are stale and are dropped rather than kept
+	// forever against an unreachable server. PDUs are never dropped.
+	outboundEDUMaxAge = time.Hour
+
+	// maxDestinationsPerPass bounds the destinations considered in one pass.
+	maxDestinationsPerPass = 256
+)
+
+// destinationBackoff is the retry delay after n consecutive failed
+// transactions to a destination.
+func destinationBackoff(failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	if failures > 20 {
+		failures = 20
+	}
+	return minDuration(destBaseBackoff<<uint(failures-1), destMaxBackoff)
+}
+
+// NoteDestinationAlive clears a destination's retry backoff because it has
+// just been observed to be up — it sent us a transaction. A server that is
+// talking to us is reachable, so anything queued for it should go out now
+// rather than waiting out an exponential delay earned while it was down
+// (mirror of Synapse waking a destination's queue on inbound contact).
+func (a *API) NoteDestinationAlive(ctx context.Context, dest string) {
+	if dest == "" || dest == a.ServerName() {
+		return
+	}
+	if err := a.Store.ClearDestinationBackoff(ctx, dest); err != nil {
+		return
+	}
+	a.wakeDeliveries()
+}
+
+// drainOutbound delivers the outbound queues one destination at a time,
+// returning whether any work was found.
+//
+// Delivery is organised per destination rather than per queue row. That is
+// what the spec asks for — one transaction in flight per receiving server,
+// retried until it is acknowledged before a different txnId is sent — and it
+// is also what keeps a single unreachable peer from stalling everyone else:
+// destinations are processed concurrently with each other, serially within
+// themselves, and a failing one is parked on its own backoff schedule instead
+// of being retried inline (which used to spin the whole worker forever).
+func (a *API) drainOutbound(ctx context.Context) (bool, error) {
+	// Ephemeral events that have been undeliverable for too long are dropped
+	// before the scan, so a dead destination's queue cannot grow without bound.
+	_, _ = a.Store.DropExpiredOutboundEDUs(ctx, a.Now()-outboundEDUMaxAge.Milliseconds())
+
+	dests, err := a.Store.DueDestinations(ctx, a.Now(), maxDestinationsPerPass)
 	if err != nil {
 		return false, err
 	}
-	pdus, err := a.Store.PendingOutboundPDUs(ctx, 1)
+	invites, err := a.Store.PendingOutboundInvites(ctx, 200, a.Now())
 	if err != nil {
 		return false, err
 	}
-	invites, err := a.Store.PendingOutboundInvites(ctx, 1, a.Now())
-	if err != nil {
-		return false, err
-	}
-	if len(edus) == 0 && len(pdus) == 0 && len(invites) == 0 {
+	if len(dests) == 0 && len(invites) == 0 {
 		return false, nil
 	}
-	// Deliver each batch concurrently, bounded by a semaphore, so a backlog
-	// does not drain serially: each deliverEDU/deliverPDU already fans out
-	// across its destinations but blocks until the slowest one answers
-	// (fedDeliveryTimeout), so a batch against a loaded-but-healthy peer would
-	// otherwise take items×5s and blow every client deadline behind the queue
-	// (sytest's room-versions and presence suites fail with 10-30s "timed out
-	// waiting for test" timeouts once the queue is behind). A bounded pool
-	// keeps the parallelism from saturating the database or the outbound
-	// connection budget.
+	// Bounded fan-out across destinations: each one blocks on its own peer for
+	// up to fedDeliveryTimeout per transaction, so they must not run serially,
+	// but nor should a thousand-server room saturate the connection budget.
 	sem := make(chan struct{}, 32)
-	dispatch := func(wg *sync.WaitGroup, fn func()) {
+	var wg sync.WaitGroup
+	dispatch := func(fn func()) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -220,69 +302,114 @@ func (a *API) drainOutbound(ctx context.Context, delay *time.Duration, baseDelay
 			}
 		}()
 	}
-	// Drain the EDU queue to empty first (multiple sub-batches if it exceeds
-	// 200 rows), so fresh presence/device-list EDUs never queue behind PDUs.
-	for {
-		edus, err := a.Store.PendingOutboundEDUs(ctx, 200)
-		if err != nil {
-			return true, err
-		}
-		if len(edus) == 0 {
-			break
-		}
-		var wg sync.WaitGroup
-		for _, edu := range edus {
-			dispatch(&wg, func() { a.deliverEDU(ctx, edu.ID, edu.TxnID, edu.EduType, edu.Content, edu.Destinations) })
-		}
-		wg.Wait()
+	for _, dest := range dests {
+		dest := dest
+		dispatch(func() { a.deliverToDestination(ctx, dest) })
 	}
-	// Then one PDU+invite batch, and keep looping (back to the EDU phase) until
-	// the PDU/invite queues are also drained. The 2s baseDelay is skipped while
-	// a batch is being drained AND the queues are still non-empty: with
-	// 200-item batches under a sustained backlog, waiting 2s between every
-	// batch would let the backlog grow unboundedly (the sytest suite feeds
-	// events faster than one batch per 2s), pushing late-queued items past the
-	// client's test deadline. Only back off when a full drain found nothing
-	// left to do.
-	*delay = baseDelay
-	for {
-		pdus, err := a.Store.PendingOutboundPDUs(ctx, 200)
+	for _, inv := range invites {
+		inv := inv
+		dispatch(func() { a.deliverInvite(ctx, inv) })
+	}
+	wg.Wait()
+	return true, nil
+}
+
+// deliverToDestination flushes everything queued for one remote server, one
+// transaction at a time, and returns as soon as a transaction fails.
+//
+// Returning on the first failure is the spec requirement, not just a
+// convenience: a different txnId must not be sent until the current one has
+// been acknowledged. The destination is parked on an exponential backoff and
+// picked up again by a later pass.
+func (a *API) deliverToDestination(ctx context.Context, dest string) {
+	// The broadcast helpers already filter the local server out of a
+	// destination set, but a row that names it anyway (written before a
+	// server_name change, say) must still be retired: left queued it would
+	// keep the destination permanently "due" and the worker permanently awake.
+	// Such a row is treated as delivered without a transaction.
+	isSelf := dest == a.ServerName()
+	for pass := 0; pass < maxDestBatchesPerPass; pass++ {
+		if ctx.Err() != nil {
+			return
+		}
+		edus, err := a.Store.PendingEDUsForDestination(ctx, dest, fedMaxEDUsPerTxn)
 		if err != nil {
-			return true, err
+			return
 		}
-		invites, err := a.Store.PendingOutboundInvites(ctx, 200, a.Now())
+		pdus, err := a.Store.PendingPDUsForDestination(ctx, dest, fedMaxPDUsPerTxn)
 		if err != nil {
-			return true, err
+			return
 		}
-		if len(pdus) == 0 && len(invites) == 0 {
-			return true, nil
-		}
-		var wg sync.WaitGroup
+		// A destination that no longer belongs in a queued event's room is
+		// pruned rather than delivered to (spec transaction delivery is scoped
+		// to the servers with users in the room; a server whose last member
+		// left must not be sent events it can only reject).
+		kept := pdus[:0]
 		for _, pdu := range pdus {
-			dispatch(&wg, func() { a.deliverPDU(ctx, pdu.ID, pdu.TxnID, pdu.RoomID, pdu.Raw, pdu.Destinations) })
+			if a.serverSharesRoom(ctx, pdu.RoomID, dest, pdu.Raw) {
+				kept = append(kept, pdu)
+				continue
+			}
+			_ = a.Store.RemovePDUDestination(ctx, pdu.ID, dest)
 		}
-		for _, inv := range invites {
-			dispatch(&wg, func() { a.deliverInvite(ctx, inv) })
+		pdus = kept
+		if len(edus) == 0 && len(pdus) == 0 {
+			// Nothing left owed to this server: drop any backoff it carried.
+			_ = a.Store.ClearDestinationBackoff(ctx, dest)
+			return
 		}
-		wg.Wait()
-		// Peek the EDU queue again before the next PDU batch: EDUs queued while
-		// this batch was in flight must go out first.
-		edus, err := a.Store.PendingOutboundEDUs(ctx, 200)
+		pduRaws := make([]json.RawMessage, 0, len(pdus))
+		for _, pdu := range pdus {
+			pduRaws = append(pduRaws, pdu.Raw)
+		}
+		eduRaws := make([]json.RawMessage, 0, len(edus))
+		for _, edu := range edus {
+			eduRaws = append(eduRaws, mustJSON(map[string]any{
+				"edu_type": edu.EduType,
+				"content":  json.RawMessage(edu.Content),
+			}))
+		}
+		if !isSelf {
+			txnID := batchTxnID(pdus, edus)
+			tctx, cancel := context.WithTimeout(ctx, fedDeliveryTimeout)
+			err = a.sendTransaction(tctx, dest, txnID, pduRaws, eduRaws)
+			cancel()
+		}
 		if err != nil {
-			return true, err
-		}
-		for len(edus) > 0 {
-			var wg2 sync.WaitGroup
-			for _, edu := range edus {
-				dispatch(&wg2, func() { a.deliverEDU(ctx, edu.ID, edu.TxnID, edu.EduType, edu.Content, edu.Destinations) })
+			failures, berr := a.Store.BackoffDestination(ctx, dest, a.Now(), func(n int) int64 {
+				return a.Now() + destinationBackoff(n).Milliseconds()
+			})
+			if berr == nil && failures == 1 {
+				log.Printf("katrix: federation delivery to %s failed (%v); backing off", dest, err)
 			}
-			wg2.Wait()
-			edus, err = a.Store.PendingOutboundEDUs(ctx, 200)
-			if err != nil {
-				return true, err
-			}
+			return
 		}
+		// Acknowledged: this destination owes nothing for the rows just sent.
+		for _, pdu := range pdus {
+			_ = a.Store.RemovePDUDestination(ctx, pdu.ID, dest)
+		}
+		for _, edu := range edus {
+			_ = a.Store.RemoveEDUDestination(ctx, edu.ID, dest)
+		}
+		_ = a.Store.ClearDestinationBackoff(ctx, dest)
 	}
+}
+
+// batchTxnID derives a transaction ID from the exact rows a transaction
+// carries. The receiving server de-duplicates on (origin, txnId) and answers a
+// repeat with an empty result, so a retry must reuse the ID — and a batch with
+// different contents must NOT, or the peer would acknowledge events it never
+// saw. Hashing the row IDs gives both: an unchanged batch retries under the
+// same ID, a changed one is a new transaction.
+func batchTxnID(pdus []storage.OutboundPDU, edus []storage.OutboundEDU) string {
+	h := sha256.New()
+	for _, p := range pdus {
+		fmt.Fprintf(h, "p%d;", p.ID)
+	}
+	for _, e := range edus {
+		fmt.Fprintf(h, "e%d;", e.ID)
+	}
+	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
 // deliverInvite retries a parked outbound invite against its destination
@@ -327,52 +454,6 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// deliverPDU sends one queued PDU to each of its remaining destinations, each
-// in its own transaction. A destination is dropped on success and retried on
-// the next pass on failure. A destination that no longer shares the room is
-// pruned rather than retried (spec transaction delivery is scoped to the
-// servers with users in the room; a server whose last member left must not be
-// sent events it can only reject).
-//
-// Destinations are delivered concurrently, each attempt bounded by
-// fedDeliveryTimeout, so one unresponsive server cannot block the others (or
-// the rest of the queue): the worker re-enters its retry loop as soon as the
-// slowest attempt times out.
-func (a *API) deliverPDU(ctx context.Context, id int64, txnID, roomID string, raw json.RawMessage, destinations []string) {
-	var (
-		remaining bool
-		mu        sync.Mutex
-		wg        sync.WaitGroup
-	)
-	for _, dest := range destinations {
-		if dest == a.ServerName() {
-			continue
-		}
-		dest := dest
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if !a.serverSharesRoom(ctx, roomID, dest, raw) {
-				_ = a.Store.RemovePDUDestination(ctx, id, dest)
-				return
-			}
-			tctx, cancel := context.WithTimeout(ctx, fedDeliveryTimeout)
-			defer cancel()
-			if err := a.sendTransaction(tctx, dest, txnID, []json.RawMessage{raw}, nil); err != nil {
-				mu.Lock()
-				remaining = true
-				mu.Unlock()
-				return
-			}
-			_ = a.Store.RemovePDUDestination(ctx, id, dest)
-		}()
-	}
-	wg.Wait()
-	if !remaining {
-		_ = a.Store.DeleteOutboundPDU(ctx, id)
-	}
 }
 
 // serverSharesRoom reports whether dest still belongs in roomID's delivery

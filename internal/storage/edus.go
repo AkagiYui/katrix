@@ -3,6 +3,8 @@ package storage
 import (
 	"context"
 	"encoding/json"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // OutboundEDU is one queued federation EDU awaiting delivery to a set of
@@ -27,18 +29,8 @@ func (s *Store) InsertOutboundEDU(ctx context.Context, txnID, eduType string, co
 	return err
 }
 
-// PendingOutboundEDUs returns up to limit undelivered EDUs (those still
-// carrying at least one destination), oldest first.
-func (s *Store) PendingOutboundEDUs(ctx context.Context, limit int) ([]OutboundEDU, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, txn_id, edu_type, content, destinations, created_ts
-		 FROM outbound_edus
-		 WHERE array_length(destinations, 1) > 0
-		 ORDER BY id ASC LIMIT $1`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+// scanOutboundEDUs materialises an outbound_edus result set.
+func scanOutboundEDUs(rows pgx.Rows) ([]OutboundEDU, error) {
 	var out []OutboundEDU
 	for rows.Next() {
 		var e OutboundEDU
@@ -53,16 +45,24 @@ func (s *Store) PendingOutboundEDUs(ctx context.Context, limit int) ([]OutboundE
 }
 
 // RemoveEDUDestination drops a destination from a queued EDU after a
-// successful delivery to that server.
+// successful delivery to that server. A row whose last destination is removed
+// is deleted outright: delivery is driven per destination, so nothing would
+// ever revisit a drained row to clean it up.
 func (s *Store) RemoveEDUDestination(ctx context.Context, id int64, dest string) error {
-	_, err := s.pool.Exec(ctx,
-		`UPDATE outbound_edus SET destinations = array_remove(destinations, $2) WHERE id=$1`,
+	// Delete first, in its own statement: a row whose only remaining
+	// destination is this one is finished. Postgres does not support a
+	// data-modifying CTE that updates and deletes the same row — the delete
+	// silently matches nothing — so the two must not be combined.
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM outbound_edus WHERE id = $1 AND destinations <@ ARRAY[$2::text]`, id, dest)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	_, err = s.pool.Exec(ctx,
+		`UPDATE outbound_edus SET destinations = array_remove(destinations, $2) WHERE id = $1`,
 		id, dest)
-	return err
-}
-
-// DeleteOutboundEDU removes a fully-delivered (or stale) queued EDU.
-func (s *Store) DeleteOutboundEDU(ctx context.Context, id int64) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM outbound_edus WHERE id=$1`, id)
 	return err
 }

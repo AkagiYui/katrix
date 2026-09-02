@@ -3,6 +3,8 @@ package storage
 import (
 	"context"
 	"encoding/json"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // OutboundPDU is one locally-created event queued for delivery to a set of
@@ -26,17 +28,8 @@ func (s *Store) InsertOutboundPDU(ctx context.Context, txnID, roomID, eventID st
 	return err
 }
 
-// PendingOutboundPDUs returns up to limit undelivered PDUs, oldest first.
-func (s *Store) PendingOutboundPDUs(ctx context.Context, limit int) ([]OutboundPDU, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, txn_id, room_id, event_id, raw, destinations, created_ts
-		 FROM outbound_pdus
-		 WHERE array_length(destinations, 1) > 0
-		 ORDER BY id ASC LIMIT $1`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+// scanOutboundPDUs materialises an outbound_pdus result set.
+func scanOutboundPDUs(rows pgx.Rows) ([]OutboundPDU, error) {
 	var out []OutboundPDU
 	for rows.Next() {
 		var p OutboundPDU
@@ -51,17 +44,26 @@ func (s *Store) PendingOutboundPDUs(ctx context.Context, limit int) ([]OutboundP
 }
 
 // RemovePDUDestination drops a destination from a queued PDU after a
-// successful delivery to that server.
+// successful delivery to that server (or because the destination no longer
+// belongs in the room). A row whose last destination is removed is deleted
+// outright: delivery is driven per destination, so nothing would ever revisit
+// a drained row to clean it up.
 func (s *Store) RemovePDUDestination(ctx context.Context, id int64, dest string) error {
-	_, err := s.pool.Exec(ctx,
-		`UPDATE outbound_pdus SET destinations = array_remove(destinations, $2) WHERE id=$1`,
+	// Delete first, in its own statement: a row whose only remaining
+	// destination is this one is finished. Postgres does not support a
+	// data-modifying CTE that updates and deletes the same row — the delete
+	// silently matches nothing — so the two must not be combined.
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM outbound_pdus WHERE id = $1 AND destinations <@ ARRAY[$2::text]`, id, dest)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	_, err = s.pool.Exec(ctx,
+		`UPDATE outbound_pdus SET destinations = array_remove(destinations, $2) WHERE id = $1`,
 		id, dest)
-	return err
-}
-
-// DeleteOutboundPDU removes a fully-delivered (or stale) queued PDU.
-func (s *Store) DeleteOutboundPDU(ctx context.Context, id int64) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM outbound_pdus WHERE id=$1`, id)
 	return err
 }
 
