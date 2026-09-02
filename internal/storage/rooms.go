@@ -133,10 +133,18 @@ func jsonBOrNull(v []string) any {
 	return string(b)
 }
 
-// SetRoomVisibility updates a room's is_public flag (public room directory).
-func (s *Store) SetRoomVisibility(ctx context.Context, roomID string, isPublic bool) error {
-	_, err := s.pool.Exec(ctx, `UPDATE rooms SET is_public=$2 WHERE room_id=$1`, roomID, isPublic)
-	return err
+// SetRoomVisibility updates a room's is_public flag (public room directory),
+// reporting whether a row was actually updated. A server can be asked about a
+// room it does not know — an inbound tombstone names a replacement room this
+// server has not joined yet — and the flag then has nowhere to live: callers
+// transferring a directory entry between rooms must not retire the old entry
+// unless the new one really took it over.
+func (s *Store) SetRoomVisibility(ctx context.Context, roomID string, isPublic bool) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE rooms SET is_public=$2 WHERE room_id=$1`, roomID, isPublic)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // RoomExists reports whether a room exists.

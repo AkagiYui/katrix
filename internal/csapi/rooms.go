@@ -2160,7 +2160,7 @@ func (a *API) DirectoryListRoomPut(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = httpx.DecodeJSON(w, r, &req)
 	isPublic := req.Visibility == "public"
-	if err := a.Store.SetRoomVisibility(r.Context(), roomID, isPublic); err != nil {
+	if _, err := a.Store.SetRoomVisibility(r.Context(), roomID, isPublic); err != nil {
 		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 		return
 	}
@@ -2185,7 +2185,7 @@ func (a *API) DirectoryListRoomGet(w http.ResponseWriter, r *http.Request) {
 // DirectoryListRoomDelete handles DELETE /_matrix/client/v3/directory/list/room/{roomID}.
 func (a *API) DirectoryListRoomDelete(w http.ResponseWriter, r *http.Request) {
 	roomID := r.PathValue("roomID")
-	_ = a.Store.SetRoomVisibility(r.Context(), roomID, false)
+	_, _ = a.Store.SetRoomVisibility(r.Context(), roomID, false)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 

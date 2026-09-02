@@ -791,8 +791,17 @@ func (a *API) copyPushRulesOnRemoteTombstone(ctx context.Context, oldRoomID stri
 	// "Local and remote users' homeservers remove a room from their public
 	// directory on upgrade" checks both servers' /publicRooms).
 	if old, err := a.Store.GetRoom(ctx, oldRoomID); err == nil && old.IsPublic {
-		_ = a.Store.SetRoomVisibility(ctx, tc.ReplacementRoom, true)
-		_ = a.Store.SetRoomVisibility(ctx, oldRoomID, false)
+		// Only retire the old room's directory entry once the replacement has
+		// actually taken it over. This server may not know the replacement
+		// room yet — an inbound tombstone arrives well before the local users
+		// join the new room — and dropping the old entry against a room that
+		// has no local row would unpublish the upgrade on this server
+		// entirely, with nothing left to migrate when the join does arrive
+		// (sytest "Local and remote users' homeservers remove a room from
+		// their public directory on upgrade" then sees an empty list).
+		if published, err := a.Store.SetRoomVisibility(ctx, tc.ReplacementRoom, true); err == nil && published {
+			_, _ = a.Store.SetRoomVisibility(ctx, oldRoomID, false)
+		}
 	}
 	// Repoint every alias this server's directory holds for the old room at
 	// the replacement room (spec upgrade semantics; sytest "/upgrade moves

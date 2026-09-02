@@ -228,7 +228,7 @@ func (a *API) RoomUpgrade(w http.ResponseWriter, r *http.Request) {
 	// public directory on upgrade" asserts the old room_id is absent from
 	// /publicRooms and the new one present).
 	if oldRoom.IsPublic {
-		_ = a.Store.SetRoomVisibility(r.Context(), roomID, false)
+		_, _ = a.Store.SetRoomVisibility(r.Context(), roomID, false)
 	}
 	// Copy per-room push rules for every local user in the old room.
 	a.copyPushRulesForAllLocalUsers(r.Context(), roomID, newRoomID)

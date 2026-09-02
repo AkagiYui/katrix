@@ -1183,8 +1183,17 @@ func (a *API) migratePredecessor(ctx context.Context, newRoomID, oldRoomID strin
 	// room from their public directory on upgrade" lists the new room and
 	// removes the old one).
 	if old, err := a.Store.GetRoom(ctx, oldRoomID); err == nil && old.IsPublic {
-		_ = a.Store.SetRoomVisibility(ctx, newRoomID, true)
-		_ = a.Store.SetRoomVisibility(ctx, oldRoomID, false)
+		// Only retire the old room's directory entry once the replacement has
+		// actually taken it over. This server may not know the replacement
+		// room yet — an inbound tombstone arrives well before the local users
+		// join the new room — and dropping the old entry against a room that
+		// has no local row would unpublish the upgrade on this server
+		// entirely, with nothing left to migrate when the join does arrive
+		// (sytest "Local and remote users' homeservers remove a room from
+		// their public directory on upgrade" then sees an empty list).
+		if published, err := a.Store.SetRoomVisibility(ctx, newRoomID, true); err == nil && published {
+			_, _ = a.Store.SetRoomVisibility(ctx, oldRoomID, false)
+		}
 	}
 	// Copy each local user's room tags from the old room.
 	a.copyTagsForMembers(ctx, oldRoomID, newRoomID)
