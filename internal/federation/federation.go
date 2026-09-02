@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/federation/fedverify"
@@ -48,6 +49,11 @@ type API struct {
 
 	// notaryCache holds the key notary's per-server key cache (see notary.go).
 	notaryCache *notaryCache
+
+	// lastEDUExpiry is when the outbound-EDU expiry sweep last ran, in
+	// milliseconds. The sweep is a table-wide DELETE, so drainOutbound rate-
+	// limits it rather than paying for one on every pass (see eduExpirySweep).
+	lastEDUExpiry atomic.Int64
 
 	// ingestMu serialises the per-room PDU ingest path so events of the same
 	// room are processed in order. The forward-extremity bookkeeping for an

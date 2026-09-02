@@ -269,9 +269,7 @@ func (a *API) NoteDestinationAlive(ctx context.Context, dest string) {
 // themselves, and a failing one is parked on its own backoff schedule instead
 // of being retried inline (which used to spin the whole worker forever).
 func (a *API) drainOutbound(ctx context.Context) (bool, error) {
-	// Ephemeral events that have been undeliverable for too long are dropped
-	// before the scan, so a dead destination's queue cannot grow without bound.
-	_, _ = a.Store.DropExpiredOutboundEDUs(ctx, a.Now()-outboundEDUMaxAge.Milliseconds())
+	a.expireStaleEDUs(ctx)
 
 	dests, err := a.Store.DueDestinations(ctx, a.Now(), maxDestinationsPerPass)
 	if err != nil {
@@ -313,6 +311,26 @@ func (a *API) drainOutbound(ctx context.Context) (bool, error) {
 	wg.Wait()
 	return true, nil
 }
+
+// expireStaleEDUs drops ephemeral events that have been undeliverable for too
+// long, so a parked destination's queue cannot grow without bound. The sweep
+// is a table-wide DELETE and the deadline it enforces is measured in hours, so
+// running one per drain pass would be a write transaction every couple of
+// seconds to no purpose; it is rate-limited to eduExpirySweep instead.
+func (a *API) expireStaleEDUs(ctx context.Context) {
+	now := a.Now()
+	last := a.lastEDUExpiry.Load()
+	if now-last < eduExpirySweep.Milliseconds() {
+		return
+	}
+	if !a.lastEDUExpiry.CompareAndSwap(last, now) {
+		return // another pass is sweeping
+	}
+	_, _ = a.Store.DropExpiredOutboundEDUs(ctx, now-outboundEDUMaxAge.Milliseconds())
+}
+
+// eduExpirySweep is how often the outbound-EDU expiry sweep may run.
+const eduExpirySweep = time.Minute
 
 // deliverToDestination flushes everything queued for one remote server, one
 // transaction at a time, and returns as soon as a transaction fails.
