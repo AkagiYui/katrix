@@ -433,7 +433,9 @@ jobs:
           LD_LIBRARY_PATH: ${{ env.RUST_SDK_LIB }}
           COMPLEMENT_CRYPTO_RPC_BINARY: ${{ github.workspace }}/complement-crypto/rpc
         with:
-          timeout_minutes: 45
+          # Two attempts at up to 25m of `go test` each, plus container churn
+          # between them, needs more than the 45m this step used to allow.
+          timeout_minutes: 60
           # Rerun once on any failure: the crypto suite is timing-sensitive
           # (pause/unpause a peer server, then wait for the SDK's keys/claim
           # backoff to expire) and headless-Chrome startup is a known source of
@@ -446,7 +448,14 @@ jobs:
           command: |
             cd complement-crypto
             set -o pipefail
-            go test -p 3 -v -json -tags='jssdk,rust' -count=1 -timeout 15m \
+            # `-timeout` is the wall-clock cap for the whole ./tests package,
+            # not a per-test one. That package normally takes ~10m, so the
+            # previous 15m left only ~5m of headroom: on 2026-09-02 a slow
+            # runner stretched every test by 1.5-2x and both attempts were
+            # killed mid-suite (`panic: test timed out after 15m0s`) with all
+            # executed tests passing. 25m absorbs that variance and still
+            # bounds a genuine hang.
+            go test -p 3 -v -json -tags='jssdk,rust' -count=1 -timeout 25m \
               ./tests ./tests/js ./tests/rust 2>&1 | tee /tmp/crypto.log
       - name: summary
         if: always()
