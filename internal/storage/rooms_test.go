@@ -62,8 +62,8 @@ func TestInsertEventAndGetEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Type != "m.room.message" {
-		t.Fatalf("type=%s", got.Type)
+	if got.Type != "m.room.message" || got.RoomVersion != "11" {
+		t.Fatalf("event type=%s room_version=%s", got.Type, got.RoomVersion)
 	}
 }
 

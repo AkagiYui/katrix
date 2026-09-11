@@ -80,6 +80,66 @@ func TestRedactionCreateKeepsAllInV11(t *testing.T) {
 	}
 }
 
+func TestMSC3389RedactionKeepsRelationIdentity(t *testing.T) {
+	rules := roomver.MustGet("org.matrix.msc3389.10")
+	raw := []byte(`{"type":"m.reaction","sender":"@a:x","room_id":"!r:x","content":{"m.relates_to":{"rel_type":"m.annotation","event_id":"$parent","key":"thumbs-up"},"extra":"remove"},"origin_server_ts":1,"depth":1,"auth_events":[],"prev_events":[]}`)
+	redacted, err := Redact(raw, rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var content map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(redacted["content"], &content); err != nil {
+		t.Fatalf("decode redacted content: %v", err)
+	}
+	relation, ok := content["m.relates_to"]
+	if !ok {
+		t.Fatal("m.relates_to was removed")
+	}
+	if got := string(relation["rel_type"]); got != `"m.annotation"` {
+		t.Errorf("rel_type = %s, want m.annotation", got)
+	}
+	if got := string(relation["event_id"]); got != `"$parent"` {
+		t.Errorf("event_id = %s, want $parent", got)
+	}
+	if _, ok := relation["key"]; ok {
+		t.Error("relation key survived redaction")
+	}
+	if _, ok := content["extra"]; ok {
+		t.Error("unrelated content survived redaction")
+	}
+}
+
+func TestMSC3389RedactionDropsInvalidOrEmptyRelation(t *testing.T) {
+	rules := roomver.MustGet("org.matrix.msc3389.10")
+	for name, relatesTo := range map[string]string{
+		"not an object":         `"$parent"`,
+		"empty after redaction": `{"key":"thumbs-up"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw := []byte(`{"type":"m.reaction","content":{"m.relates_to":` + relatesTo + `}}`)
+			redacted, err := Redact(raw, rules)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := string(redacted["content"]); got != `{}` {
+				t.Errorf("content = %s, want {}", got)
+			}
+		})
+	}
+}
+
+func TestRedactionStripsRelationWithoutMSC3389(t *testing.T) {
+	rules := roomver.MustGet("10")
+	raw := []byte(`{"type":"m.reaction","content":{"m.relates_to":{"rel_type":"m.annotation","event_id":"$parent"}}}`)
+	redacted, err := Redact(raw, rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(redacted["content"]); got != `{}` {
+		t.Errorf("content = %s, want {}", got)
+	}
+}
+
 // TestContentHashSpecVector reproduces synapse's test_sign_message content
 // hash, proving byte-exact canonical JSON + sha256 agreement.
 func TestContentHashSpecVector(t *testing.T) {

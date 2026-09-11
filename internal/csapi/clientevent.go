@@ -69,10 +69,14 @@ func clientEventCore(row *storage.EventRow, redact bool) json.RawMessage {
 	}
 	if redact {
 		// Apply the redaction algorithm to obtain the pruned content the client
-		// should see. We use the room-version redaction rules; for events whose
-		// original room version is unknown we fall back to the default rules,
-		// which is correct for v12 (the version Complement creates rooms as).
-		rules, ok := roomver.Get(roomver.Default)
+		// should see. Stored event rows carry their room's version because the
+		// redacted content contributes to reference hashes and is version-specific.
+		// Rows synthesized by tests or legacy call sites fall back to the default.
+		version := roomver.Version(row.RoomVersion)
+		if version == "" {
+			version = roomver.Default
+		}
+		rules, ok := roomver.Get(version)
 		if ok {
 			if red, err := events.Redact(row.RawJSON, rules); err == nil {
 				if c, exists := red["content"]; exists {

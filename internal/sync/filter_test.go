@@ -147,3 +147,32 @@ func TestSelfDestructedEventPrunesContent(t *testing.T) {
 		t.Fatal("state events must not be self-destructed")
 	}
 }
+
+func TestClientEventUsesStoredRoomVersionForRedaction(t *testing.T) {
+	raw := []byte(`{"type":"m.reaction","sender":"@a:test","room_id":"!r:test","content":{"m.relates_to":{"rel_type":"m.annotation","event_id":"$parent","key":"thumbs-up"}},"origin_server_ts":1}`)
+	rendered := clientEvent(&storage.EventRow{
+		EventID:     "$event",
+		RoomID:      "!r:test",
+		RoomVersion: "org.matrix.msc3389.10",
+		Type:        "m.reaction",
+		Sender:      "@a:test",
+		Content:     json.RawMessage(`{"m.relates_to":{"rel_type":"m.annotation","event_id":"$parent","key":"thumbs-up"}}`),
+		RawJSON:     raw,
+		Redacted:    true,
+	})
+	var event struct {
+		Content struct {
+			Relation map[string]json.RawMessage `json:"m.relates_to"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(rendered, &event); err != nil {
+		t.Fatal(err)
+	}
+	if string(event.Content.Relation["rel_type"]) != `"m.annotation"` ||
+		string(event.Content.Relation["event_id"]) != `"$parent"` {
+		t.Fatalf("redacted relation = %s", event.Content.Relation)
+	}
+	if _, ok := event.Content.Relation["key"]; ok {
+		t.Fatal("relation-specific key survived redaction")
+	}
+}

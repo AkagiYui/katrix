@@ -234,7 +234,8 @@ func (s *Store) EventsForNotificationCount(ctx context.Context, roomID, root str
 	}
 	q := `SELECT e.event_id, e.room_id, e.type, COALESCE(e.state_key,''), e.sender, e.depth,
 	              e.origin_server_ts, e.stream_ordering, e.content, e.json,
-	              COALESCE(e.redacts,''), e.redacted, COALESCE(e.redacted_by,''), e.outlier
+	              COALESCE(e.redacts,''), e.redacted, COALESCE(e.redacted_by,''), e.outlier,
+	              COALESCE((SELECT version FROM rooms WHERE room_id=e.room_id),'')
 	       FROM events e
 	       WHERE e.room_id=$1 AND e.stream_ordering>$2 AND e.type='m.room.message' AND e.outlier=false`
 	args := []any{roomID, since}

@@ -1,0 +1,25 @@
+diff --git a/tests/msc3389/msc3389_test.go b/tests/msc3389/msc3389_test.go
+--- a/tests/msc3389/msc3389_test.go
++++ b/tests/msc3389/msc3389_test.go
+@@ -62,3 +62,3 @@ func TestMSC3389RedactionPreservesRelation(t *testing.T) {
+-		match.JSONKeyEqual("content.m.relates_to.rel_type", "m.annotation"),
+-		match.JSONKeyEqual("content.m.relates_to.event_id", parentID),
+-		match.JSONKeyEqual("content.m.relates_to.key", "👍"),
++		match.JSONKeyEqual("content.m\\.relates_to.rel_type", "m.annotation"),
++		match.JSONKeyEqual("content.m\\.relates_to.event_id", parentID),
++		match.JSONKeyEqual("content.m\\.relates_to.key", "👍"),
+@@ -73,3 +73,3 @@ func TestMSC3389RedactionPreservesRelation(t *testing.T) {
+-		match.JSONKeyEqual("content.m.relates_to.rel_type", "m.annotation"),
+-		match.JSONKeyEqual("content.m.relates_to.event_id", parentID),
+-		match.JSONKeyMissing("content.m.relates_to.key"),
++		match.JSONKeyEqual("content.m\\.relates_to.rel_type", "m.annotation"),
++		match.JSONKeyEqual("content.m\\.relates_to.event_id", parentID),
++		match.JSONKeyMissing("content.m\\.relates_to.key"),
+@@ -108 +108 @@ func TestMSC3389RedactionStripsRelationInOlderVersions(t *testing.T) {
+-		match.JSONKeyMissing("content.m.relates_to"),
++		match.JSONKeyMissing("content.m\\.relates_to"),
+@@ -152,2 +152,2 @@ func TestMSC3389RedactionPreservesPlainRelation(t *testing.T) {
+-		match.JSONKeyEqual("content.m.relates_to.rel_type", "m.thread"),
+-		match.JSONKeyEqual("content.m.relates_to.event_id", parentID),
++		match.JSONKeyEqual("content.m\\.relates_to.rel_type", "m.thread"),
++		match.JSONKeyEqual("content.m\\.relates_to.event_id", parentID),

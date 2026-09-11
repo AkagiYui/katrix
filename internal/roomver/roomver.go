@@ -75,9 +75,14 @@ type Rules struct {
 	RestrictedJoinAllowed  bool
 	KnockRestrictedAllowed bool
 
-	// RedactionKeepsRelations: MSC3389/updated redaction keeps m.relates_to
-	// event content and additional top-level keys (room version 11).
+	// UpdatedRedaction enables the complete room-version-11 redaction and event
+	// format changes. It is deliberately separate from MSC3389: the unstable
+	// MSC room version is based on v10 and only changes relation redaction.
 	UpdatedRedaction bool
+
+	// RedactionKeepsRelations enables MSC3389: redaction preserves only the
+	// rel_type and event_id fields of content.m.relates_to.
+	RedactionKeepsRelations bool
 
 	// NotificationsPowerLevel: the notifications key in m.room.power_levels is
 	// honoured (room version 6+).
@@ -184,6 +189,14 @@ func init() {
 	msc3757.Version = "org.matrix.msc3757.10"
 	msc3757.OwnedState = true
 	register(msc3757)
+
+	// MSC3389 changes only the redaction algorithm relative to room version 10.
+	// Keep it independent of UpdatedRedaction so the alias does not inherit the
+	// unrelated room-version-11 event-format and redaction changes.
+	msc3389 := v10
+	msc3389.Version = "org.matrix.msc3389.10"
+	msc3389.RedactionKeepsRelations = true
+	register(msc3389)
 }
 
 // Default is the room version used for new rooms when the client does not
@@ -197,7 +210,10 @@ const Default Version = "11"
 
 // Supported lists every room version this server implements.
 func Supported() []Version {
-	return []Version{"1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"}
+	return []Version{
+		"1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12",
+		"org.matrix.msc3389.10", "org.matrix.msc3757.10",
+	}
 }
 
 // Get returns the rules for a version and whether it is known.

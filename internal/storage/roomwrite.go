@@ -105,7 +105,8 @@ func (s *Store) TxGetEvent(ctx context.Context, tx pgx.Tx, eventID string) (*Eve
 	return scanEvent(tx.QueryRow(ctx,
 		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier,
+		        COALESCE((SELECT version FROM rooms WHERE room_id=events.room_id),'')
 		 FROM events WHERE event_id=$1`, eventID))
 }
 
@@ -117,7 +118,8 @@ func (s *Store) TxEventsByIDs(ctx context.Context, tx pgx.Tx, ids []string) ([]E
 	rows, err := tx.Query(ctx,
 		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier,
+		        COALESCE((SELECT version FROM rooms WHERE room_id=events.room_id),'')
 		 FROM events WHERE event_id = ANY($1)`, ids)
 	if err != nil {
 		return nil, err

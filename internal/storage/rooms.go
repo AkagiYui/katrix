@@ -161,6 +161,7 @@ func (s *Store) RoomExists(ctx context.Context, roomID string) (bool, error) {
 type EventRow struct {
 	EventID        string
 	RoomID         string
+	RoomVersion    string
 	Type           string
 	StateKey       string // "" for non-state events
 	Sender         string
@@ -478,7 +479,8 @@ func (s *Store) GetEvent(ctx context.Context, eventID string) (*EventRow, error)
 	return scanEvent(s.pool.QueryRow(ctx,
 		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier,
+		        COALESCE((SELECT version FROM rooms WHERE room_id=events.room_id),'')
 		 FROM events WHERE event_id=$1`, eventID))
 }
 
@@ -526,7 +528,8 @@ func (s *Store) EventsForRoom(ctx context.Context, roomID string, from, to int64
 	}
 	q := `SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 	              origin_server_ts, stream_ordering, content, json,
-	              COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
+	              COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier,
+	              COALESCE((SELECT version FROM rooms WHERE room_id=events.room_id),'')
 	       FROM events
 	       WHERE room_id=$1 AND stream_ordering>$2 AND stream_ordering<=$3 AND outlier=false`
 	// `from` is exclusive (events at or before the token were already seen);
@@ -575,7 +578,8 @@ func (s *Store) EventsForRoomByDepth(ctx context.Context, roomID string, uptoDep
 	rows, err := s.pool.Query(ctx,
 		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier,
+		        COALESCE((SELECT version FROM rooms WHERE room_id=events.room_id),'')
 		 FROM events
 		 WHERE room_id=$1 AND depth<=$2 AND outlier=false
 		 ORDER BY depth DESC, stream_ordering DESC LIMIT $3`, roomID, uptoDepth, limit)
@@ -614,7 +618,8 @@ func (s *Store) HasEventsBelowDepth(ctx context.Context, roomID string, depth in
 func (s *Store) EventByTimestamp(ctx context.Context, roomID string, ts int64, dir string) (*EventRow, error) {
 	q := `SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 	              origin_server_ts, stream_ordering, content, json,
-	              COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
+	              COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier,
+	              COALESCE((SELECT version FROM rooms WHERE room_id=events.room_id),'')
 	       FROM events WHERE room_id=$1`
 	args := []any{roomID}
 	// MSC3030: when multiple events share the same timestamp the "next event"
@@ -648,7 +653,8 @@ func (s *Store) LatestEvent(ctx context.Context, roomID string) (*EventRow, erro
 	return scanEvent(s.pool.QueryRow(ctx,
 		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier,
+		        COALESCE((SELECT version FROM rooms WHERE room_id=events.room_id),'')
 		 FROM events WHERE room_id=$1 AND outlier=false
 		 ORDER BY stream_ordering DESC LIMIT 1`, roomID))
 }
@@ -833,7 +839,8 @@ func (s *Store) EventsByIDs(ctx context.Context, ids []string) ([]EventRow, erro
 	rows, err := s.pool.Query(ctx,
 		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier,
+		        COALESCE((SELECT version FROM rooms WHERE room_id=events.room_id),'')
 		 FROM events WHERE event_id = ANY($1)`, ids)
 	if err != nil {
 		return nil, err
@@ -868,7 +875,8 @@ func (s *Store) RedactionForEvent(ctx context.Context, redactedEventID string) (
 	return scanEvent(s.pool.QueryRow(ctx,
 		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier,
+		        COALESCE((SELECT version FROM rooms WHERE room_id=events.room_id),'')
 		 FROM events WHERE redacts=$1 LIMIT 1`, redactedEventID))
 }
 
@@ -947,7 +955,8 @@ func (s *Store) GetState(ctx context.Context, roomID string) ([]StateRow, error)
 func (s *Store) CurrentStateDeltasSince(ctx context.Context, roomID string, since int64) ([]EventRow, error) {
 	q := `SELECT e.event_id, e.room_id, e.type, COALESCE(e.state_key,''), e.sender, e.depth,
 	              e.origin_server_ts, e.stream_ordering, e.content, e.json,
-	              COALESCE(e.redacts,''), e.redacted, COALESCE(e.redacted_by,''), e.outlier
+	              COALESCE(e.redacts,''), e.redacted, COALESCE(e.redacted_by,''), e.outlier,
+	              COALESCE((SELECT version FROM rooms WHERE room_id=e.room_id),'')
 	       FROM room_state rs
 	       JOIN events e ON e.event_id = rs.event_id
 	       WHERE rs.room_id=$1 AND e.stream_ordering>$2
@@ -1049,7 +1058,8 @@ func (s *Store) LatestMembershipEvent(ctx context.Context, roomID, userID string
 	row := s.pool.QueryRow(ctx,
 		`SELECT event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier,
+		        COALESCE((SELECT version FROM rooms WHERE room_id=events.room_id),'')
 		 FROM events
 		 WHERE room_id=$1 AND type='m.room.member' AND state_key=$2
 		 ORDER BY stream_ordering DESC LIMIT 1`, roomID, userID)
@@ -1304,7 +1314,8 @@ func (s *Store) MemberEventsAt(ctx context.Context, roomID string, at int64) ([]
 	rows, err := s.pool.Query(ctx,
 		`SELECT DISTINCT ON (state_key) event_id, room_id, type, COALESCE(state_key,''), sender, depth,
 		        origin_server_ts, stream_ordering, content, json,
-		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier
+		        COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier,
+		        COALESCE((SELECT version FROM rooms WHERE room_id=events.room_id),'')
 		 FROM events
 		 WHERE room_id=$1 AND type='m.room.member' AND stream_ordering <= $2
 		 ORDER BY state_key, stream_ordering DESC`, roomID, at)
@@ -1470,7 +1481,8 @@ func scanEvent(row pgx.Row) (*EventRow, error) {
 	var e EventRow
 	var stateKey, redacts, redactedBy *string
 	err := row.Scan(&e.EventID, &e.RoomID, &e.Type, &stateKey, &e.Sender, &e.Depth,
-		&e.OriginServerTS, &e.StreamOrdering, &e.Content, &e.RawJSON, &redacts, &e.Redacted, &redactedBy, &e.Outlier)
+		&e.OriginServerTS, &e.StreamOrdering, &e.Content, &e.RawJSON, &redacts, &e.Redacted, &redactedBy, &e.Outlier,
+		&e.RoomVersion)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -1494,7 +1506,8 @@ func scanEventRows(rows pgx.Rows) (EventRow, error) {
 	var e EventRow
 	var stateKey, redacts, redactedBy *string
 	err := rows.Scan(&e.EventID, &e.RoomID, &e.Type, &stateKey, &e.Sender, &e.Depth,
-		&e.OriginServerTS, &e.StreamOrdering, &e.Content, &e.RawJSON, &redacts, &e.Redacted, &redactedBy, &e.Outlier)
+		&e.OriginServerTS, &e.StreamOrdering, &e.Content, &e.RawJSON, &redacts, &e.Redacted, &redactedBy, &e.Outlier,
+		&e.RoomVersion)
 	if err != nil {
 		return EventRow{}, err
 	}

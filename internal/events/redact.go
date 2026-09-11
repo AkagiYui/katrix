@@ -129,6 +129,15 @@ func Redact(raw []byte, r roomver.Rules) (map[string]json.RawMessage, error) {
 						}
 					}
 				}
+				// MSC3389 retains the identity of a relation after redaction while
+				// removing relation-specific data such as an annotation's key.
+				if r.RedactionKeepsRelations {
+					if relatesTo, ok := content["m.relates_to"]; ok {
+						if relation := redactRelation(relatesTo); relation != nil {
+							pruned["m.relates_to"] = relation
+						}
+					}
+				}
 				b, _ := json.Marshal(pruned)
 				out["content"] = b
 			}
@@ -137,6 +146,26 @@ func Redact(raw []byte, r roomver.Rules) (map[string]json.RawMessage, error) {
 		out["content"] = json.RawMessage(`{}`)
 	}
 	return out, nil
+}
+
+// redactRelation applies MSC3389 to content.m.relates_to. Non-object values
+// and objects containing neither rel_type nor event_id disappear entirely.
+func redactRelation(raw json.RawMessage) json.RawMessage {
+	var relation map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &relation); err != nil || relation == nil {
+		return nil
+	}
+	kept := make(map[string]json.RawMessage, 2)
+	for _, key := range []string{"rel_type", "event_id"} {
+		if value, ok := relation[key]; ok {
+			kept[key] = value
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	b, _ := json.Marshal(kept)
+	return b
 }
 
 // extractSigned rebuilds {"third_party_invite":{"signed":...}} preserving only

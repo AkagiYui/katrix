@@ -78,6 +78,22 @@ jobs:
         # checked-in patch also logs delivery latency, and fails loudly if the
         # upstream source changes underneath it.
         run: patch -p1 -d complement < .complement-runtime/msc3902-ci-timing.patch
+      - name: fix MSC3389 GJSON paths
+        if: matrix.group == 'msc-suites'
+        # GJSON treats dots as path separators. Complement's MSC3389 test must
+        # escape the dot in the literal `m.relates_to` JSON key; otherwise it
+        # rejects an untouched event that visibly contains the relation. Stop
+        # applying the local patch once upstream carries the same correction,
+        # while still failing loudly on any unexpected test-source drift.
+        run: |
+          if grep -Fq 'content.m.relates_to.rel_type' complement/tests/msc3389/msc3389_test.go; then
+            patch -p1 -d complement < .complement-runtime/msc3389-gjson-path.patch
+          elif grep -Fq 'content.m\\.relates_to.rel_type' complement/tests/msc3389/msc3389_test.go; then
+            echo 'Complement already contains the MSC3389 GJSON path fix'
+          else
+            echo 'Complement MSC3389 test changed unexpectedly' >&2
+            exit 1
+          fi
       - name: run complement
         uses: nick-fields/retry@v3
         env:

@@ -507,7 +507,11 @@ func federationEvent(row *storage.EventRow, redact bool) json.RawMessage {
 		redact = true
 	}
 	if redact {
-		if rules, ok := roomver.Get(roomver.Default); ok {
+		version := roomver.Version(row.RoomVersion)
+		if version == "" {
+			version = roomver.Default
+		}
+		if rules, ok := roomver.Get(version); ok {
 			if red, err := events.Redact(raw, rules); err == nil {
 				if b, err := json.Marshal(red); err == nil {
 					raw = b
@@ -2548,7 +2552,11 @@ func clientEventCore(row *storage.EventRow, redact bool) json.RawMessage {
 		m["state_key"] = row.StateKey
 	}
 	if redact {
-		if rules, ok := roomver.Get(roomver.Default); ok {
+		version := roomver.Version(row.RoomVersion)
+		if version == "" {
+			version = roomver.Default
+		}
+		if rules, ok := roomver.Get(version); ok {
 			if red, err := events.Redact(row.RawJSON, rules); err == nil {
 				if c, exists := red["content"]; exists {
 					m["content"] = c
