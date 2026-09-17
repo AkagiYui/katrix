@@ -54,16 +54,24 @@ func TestProfileFieldDelete(t *testing.T) {
 		t.Fatalf("no-op delete recorded an update: %+v", again)
 	}
 
-	// Keys outside the spec grammar or length limit are rejected.
+	// Keys outside the Common Namespaced Identifier Grammar or the length limit
+	// are rejected.
 	for key, errcode := range map[string]string{
-		"nonamespace":                   "M_INVALID_PARAM",
 		"Com.Example":                   "M_INVALID_PARAM",
+		"1com.example":                  "M_INVALID_PARAM",
+		"com.example~field":             "M_INVALID_PARAM",
 		"a." + strings.Repeat("b", 255): "M_KEY_TOO_LARGE",
 	} {
 		code, body := doJSON(t, srv, http.MethodDelete, "/_matrix/client/v3/profile/@ivan:test.katrix/"+key, tok, nil)
 		if code != 400 || body["errcode"] != errcode {
 			t.Errorf("delete key %.20q: code=%d body=%v, want 400 %s", key, code, body, errcode)
 		}
+	}
+	// Hyphens are part of the grammar (Complement uses such a key).
+	const hyphenated = "/_matrix/client/v3/profile/@ivan:test.katrix/complement.made-up-profile-field"
+	if code, body := doJSON(t, srv, http.MethodPut, hyphenated, tok,
+		map[string]any{"complement.made-up-profile-field": "x"}); code != 200 {
+		t.Errorf("set hyphenated key: code=%d body=%v", code, body)
 	}
 }
 

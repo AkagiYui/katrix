@@ -360,9 +360,13 @@ func (a *API) DeleteProfileField(w http.ResponseWriter, r *http.Request) {
 // maxProfileKeyBytes is the spec's maximum profile key length (M_KEY_TOO_LARGE).
 const maxProfileKeyBytes = 255
 
-// profileKeyPattern is the spec's keyName grammar: a defined key, or a custom
-// key following the Common Namespaced Identifier Grammar.
-var profileKeyPattern = regexp.MustCompile(`^(avatar_url|displayname|m\.tz|[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+)$`)
+// profileKeyPattern is the Common Namespaced Identifier Grammar (spec
+// appendices), which profile keyNames follow; displayname, avatar_url and m.tz
+// all satisfy it. This is the normative prose rule: the OpenAPI pattern for the
+// endpoint is stricter (no '-', namespacing required) and would reject keys the
+// grammar allows, such as Complement's "complement.made-up-profile-field".
+// Namespacing is only a SHOULD, so it is not enforced.
+var profileKeyPattern = regexp.MustCompile(`^[a-z][a-z0-9._-]*$`)
 
 // validateProfileKey checks a profile field keyName against the spec's
 // length limit and grammar.
