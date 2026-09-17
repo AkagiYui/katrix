@@ -24,12 +24,50 @@ func (s *Store) GetPushRules(ctx context.Context, localpart string) ([]byte, err
 	return rules, nil
 }
 
-// SetPushRules stores a user's full push ruleset.
-func (s *Store) SetPushRules(ctx context.Context, localpart string, rules []byte) error {
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO push_rules(user_localpart, rules) VALUES ($1,$2)
-		 ON CONFLICT (user_localpart) DO UPDATE SET rules=EXCLUDED.rules`, localpart, rules)
-	return err
+// PushRulesAccountDataType is the account data type mirroring a user's push
+// ruleset (delivered in /sync and read by GET /pushrules).
+const PushRulesAccountDataType = "m.push_rules"
+
+// pushRulesLockClass namespaces the per-user advisory locks taken by
+// UpdatePushRules (the two-key lock space is disjoint from single-key locks).
+const pushRulesLockClass = 0x70757368 // "push"
+
+// UpdatePushRules atomically rewrites a user's push ruleset. fn receives the
+// stored ruleset (nil when none is stored yet) and returns its replacement, or
+// nil to leave it untouched; an error from fn aborts the update and is returned
+// as is. The read, the push_rules write and the m.push_rules account data
+// mirror run in one transaction under a per-user advisory lock (a row lock
+// cannot cover a user who has no row yet), so concurrent mutations — two rule
+// PUTs, or a PUT racing a room-upgrade rule copy — serialise instead of losing
+// each other's changes, and GET /pushrules and /sync never diverge.
+func (s *Store) UpdatePushRules(ctx context.Context, localpart string, fn func(current []byte) ([]byte, error)) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, hashtext($2))`,
+			pushRulesLockClass, localpart); err != nil {
+			return err
+		}
+		var current []byte
+		err := tx.QueryRow(ctx, `SELECT rules FROM push_rules WHERE user_localpart=$1`, localpart).Scan(&current)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		next, err := fn(current)
+		if err != nil || next == nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO push_rules(user_localpart, rules) VALUES ($1,$2)
+			 ON CONFLICT (user_localpart) DO UPDATE SET rules=EXCLUDED.rules`, localpart, next); err != nil {
+			return err
+		}
+		// Allocate the stream position under the lock so this user's successive
+		// ruleset versions reach /sync in commit order.
+		var streamID int64
+		if err := tx.QueryRow(ctx, `SELECT nextval('sync_stream')`).Scan(&streamID); err != nil {
+			return err
+		}
+		return upsertAccountDataTx(ctx, tx, localpart, "", PushRulesAccountDataType, next, streamID)
+	})
 }
 
 // ---- Filters ----

@@ -229,14 +229,6 @@ func (a *API) PutPushRuleEnabled(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrInvalidParam("malformed push rule path"))
 		return
 	}
-	// Enabling/disabling a rule that does not exist is a 404 (spec §PUT
-	// /pushrules/.../enabled: the rule must exist; sytest's "Enabling an
-	// unknown default rule fails with 404"). Unlike PUT of a whole rule, the
-	// enabled sub-resource cannot create a rule.
-	if !a.pushRuleExists(auth.Localpart, r.PathValue("kind"), r.PathValue("ruleID")) {
-		httpx.WriteError(w, httpx.ErrNotFound("push rule not found"))
-		return
-	}
 	var req struct {
 		Enabled bool `json:"enabled"`
 	}
@@ -244,11 +236,18 @@ func (a *API) PutPushRuleEnabled(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	if a.mutateRule(auth.Localpart, r.PathValue("kind"), r.PathValue("ruleID"), func(rule map[string]any) {
+	// Enabling/disabling a rule that does not exist is a 404 (spec §PUT
+	// /pushrules/.../enabled: the rule must exist; sytest's "Enabling an
+	// unknown default rule fails with 404"). Unlike PUT of a whole rule, the
+	// enabled sub-resource cannot create a rule.
+	err := a.mutateRule(r.Context(), auth.Localpart, r.PathValue("kind"), r.PathValue("ruleID"), func(rule map[string]any) {
 		rule["enabled"] = req.Enabled
-	}) {
-		a.Notifier.NotifyUser(auth.UserID)
+	})
+	if err != nil {
+		writePushRuleError(w, err)
+		return
 	}
+	a.Notifier.NotifyUser(auth.UserID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
 }
 
@@ -275,14 +274,6 @@ func (a *API) PutPushRuleActions(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrInvalidParam("malformed push rule path"))
 		return
 	}
-	// Changing the actions of a rule that does not exist is a 404 (spec §PUT
-	// /pushrules/.../actions: the rule must exist; sytest's "Changing the
-	// actions of an unknown [default] rule fails with 404"). Unlike PUT of a
-	// whole rule, the actions sub-resource cannot create a rule.
-	if !a.pushRuleExists(auth.Localpart, r.PathValue("kind"), r.PathValue("ruleID")) {
-		httpx.WriteError(w, httpx.ErrNotFound("push rule not found"))
-		return
-	}
 	var req struct {
 		Actions []json.RawMessage `json:"actions"`
 	}
@@ -290,26 +281,19 @@ func (a *API) PutPushRuleActions(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, err)
 		return
 	}
-	if a.mutateRule(auth.Localpart, r.PathValue("kind"), r.PathValue("ruleID"), func(rule map[string]any) {
+	// Changing the actions of a rule that does not exist is a 404 (spec §PUT
+	// /pushrules/.../actions: the rule must exist; sytest's "Changing the
+	// actions of an unknown [default] rule fails with 404"). Unlike PUT of a
+	// whole rule, the actions sub-resource cannot create a rule.
+	err := a.mutateRule(r.Context(), auth.Localpart, r.PathValue("kind"), r.PathValue("ruleID"), func(rule map[string]any) {
 		rule["actions"] = req.Actions
-	}) {
-		a.Notifier.NotifyUser(auth.UserID)
+	})
+	if err != nil {
+		writePushRuleError(w, err)
+		return
 	}
+	a.Notifier.NotifyUser(auth.UserID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
-}
-
-// pushRuleExists reports whether a rule with the given kind/rule_id exists in
-// the user's global ruleset.
-func (a *API) pushRuleExists(localpart, kind, ruleID string) bool {
-	rules := a.loadRules(localpart)
-	global, _ := rules["global"].(map[string]any)
-	list, _ := global[kind].([]any)
-	for _, e := range list {
-		if em, ok := e.(map[string]any); ok && em["rule_id"] == ruleID {
-			return true
-		}
-	}
-	return false
 }
 
 // PutPushRule handles PUT a single rule. The optional before/after query
@@ -343,35 +327,35 @@ func (a *API) PutPushRule(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrInvalidParam(err.Error()))
 		return
 	}
-	rules := a.loadRules(auth.Localpart)
-	global := rules["global"].(map[string]any)
-	list, _ := global[kind].([]any)
-	// Remove an existing rule with the same ID, remembering its position.
-	pos := -1
-	for i, e := range list {
-		if em, ok := e.(map[string]any); ok && em["rule_id"] == ruleID {
-			pos = i
-			list = append(list[:i], list[i+1:]...)
-			break
-		}
-	}
 	before := r.URL.Query().Get("before")
 	after := r.URL.Query().Get("after")
-	switch {
-	case before != "":
-		list = insertBefore(list, before, newRule)
-	case after != "":
-		list = insertAfter(list, after, newRule)
-	case pos >= 0 && pos < len(list):
-		list = append(list[:pos], append([]any{newRule}, list[pos:]...)...)
-	default:
-		// New rules take precedence over existing ones: prepend.
-		list = append([]any{newRule}, list...)
-	}
-	global[kind] = list
-	rules["global"] = global
-	if err := a.savePushRules(auth.Localpart, rules); err != nil {
-		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+	err = a.updatePushRules(r.Context(), auth.Localpart, func(global map[string]any) error {
+		list, _ := global[kind].([]any)
+		// Remove an existing rule with the same ID, remembering its position.
+		pos := -1
+		for i, e := range list {
+			if em, ok := e.(map[string]any); ok && em["rule_id"] == ruleID {
+				pos = i
+				list = append(list[:i], list[i+1:]...)
+				break
+			}
+		}
+		switch {
+		case before != "":
+			list = insertBefore(list, before, newRule)
+		case after != "":
+			list = insertAfter(list, after, newRule)
+		case pos >= 0 && pos < len(list):
+			list = append(list[:pos], append([]any{newRule}, list[pos:]...)...)
+		default:
+			// New rules take precedence over existing ones: prepend.
+			list = append([]any{newRule}, list...)
+		}
+		global[kind] = list
+		return nil
+	})
+	if err != nil {
+		writePushRuleError(w, err)
 		return
 	}
 	a.Notifier.NotifyUser(auth.UserID)
@@ -388,20 +372,20 @@ func (a *API) DeletePushRule(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrInvalidParam("malformed push rule path"))
 		return
 	}
-	rules := a.loadRules(auth.Localpart)
-	global := rules["global"].(map[string]any)
-	list, _ := global[kind].([]any)
-	next := list[:0]
-	for _, e := range list {
-		if em, ok := e.(map[string]any); ok && em["rule_id"] == ruleID {
-			continue
+	err := a.updatePushRules(r.Context(), auth.Localpart, func(global map[string]any) error {
+		list, _ := global[kind].([]any)
+		next := list[:0]
+		for _, e := range list {
+			if em, ok := e.(map[string]any); ok && em["rule_id"] == ruleID {
+				continue
+			}
+			next = append(next, e)
 		}
-		next = append(next, e)
-	}
-	global[kind] = next
-	rules["global"] = global
-	if err := a.savePushRules(auth.Localpart, rules); err != nil {
-		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		global[kind] = next
+		return nil
+	})
+	if err != nil {
+		writePushRuleError(w, err)
 		return
 	}
 	a.Notifier.NotifyUser(auth.UserID)
@@ -576,33 +560,56 @@ func (a *API) PushGet(w http.ResponseWriter, r *http.Request) {
 
 // ---- push rules helpers ----
 
-// savePushRules persists a user's ruleset to the push_rules table AND mirrors
-// it into the m.push_rules account data entry. The mirror is what delivers the
-// ruleset in /sync (initial + incremental) and wakes the long-poll on any
-// change; GET /pushrules reads the canonical table.
+// errPushRuleNotFound aborts a ruleset update whose target rule does not exist.
+var errPushRuleNotFound = errors.New("push rule not found")
+
+// writePushRuleError maps a failed ruleset update to its Matrix error.
+func writePushRuleError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errPushRuleNotFound) {
+		httpx.WriteError(w, httpx.ErrNotFound(err.Error()))
+		return
+	}
+	httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+}
+
+// savePushRules replaces a user's ruleset outright (used to seed the default
+// ruleset for a new account). See updatePushRules for how it is persisted.
 func (a *API) savePushRules(localpart string, rules map[string]any) error {
 	out, err := json.Marshal(rules)
 	if err != nil {
 		return err
 	}
-	if err := a.Store.SetPushRules(context.Background(), localpart, out); err != nil {
-		return err
-	}
-	_, err = a.Store.SetAccountData(context.Background(), localpart, "", pushrules.PushRulesAccountDataType, out)
-	return err
+	return a.Store.UpdatePushRules(context.Background(), localpart, func([]byte) ([]byte, error) {
+		return out, nil
+	})
+}
+
+// updatePushRules applies fn to the user's global ruleset (the spec default
+// when none is stored) and persists the result to the push_rules table AND the
+// m.push_rules account data mirror. The mirror is what delivers the ruleset in
+// /sync (initial + incremental) and wakes the long-poll on any change; GET
+// /pushrules reads the canonical table. The whole read-modify-write is atomic
+// per user, so concurrent rule edits never overwrite each other. An error from
+// fn aborts the update and is returned as is.
+func (a *API) updatePushRules(ctx context.Context, localpart string, fn func(global map[string]any) error) error {
+	return a.Store.UpdatePushRules(ctx, localpart, func(current []byte) ([]byte, error) {
+		rules := pushrules.Decode(current)
+		global, _ := rules["global"].(map[string]any)
+		if global == nil {
+			global = map[string]any{}
+			rules["global"] = global
+		}
+		if err := fn(global); err != nil {
+			return nil, err
+		}
+		return json.Marshal(rules)
+	})
 }
 
 // loadRules returns the user's ruleset map, defaulting when unset.
 func (a *API) loadRules(localpart string) map[string]any {
 	raw, _ := a.Store.GetPushRules(context.Background(), localpart)
-	if len(raw) == 0 {
-		return pushrules.DefaultRuleset()
-	}
-	var rules map[string]any
-	if err := json.Unmarshal(raw, &rules); err != nil || rules == nil || rules["global"] == nil {
-		return pushrules.DefaultRuleset()
-	}
-	return rules
+	return pushrules.Decode(raw)
 }
 
 // findRule returns a rule by kind+ID within the user's ruleset, or nil.
@@ -618,25 +625,19 @@ func (a *API) findRule(localpart, kind, ruleID string) map[string]any {
 	return nil
 }
 
-// mutateRule applies fn to a rule (creating it if absent) and persists the
-// ruleset (including the m.push_rules account data mirror). It reports whether
-// a change was persisted.
-func (a *API) mutateRule(localpart, kind, ruleID string, fn func(map[string]any)) bool {
-	rules := a.loadRules(localpart)
-	global := rules["global"].(map[string]any)
-	list, _ := global[kind].([]any)
-	for _, e := range list {
-		if em, ok := e.(map[string]any); ok && em["rule_id"] == ruleID {
-			fn(em)
-			return a.savePushRules(localpart, rules) == nil
+// mutateRule atomically applies fn to an existing rule and persists the
+// ruleset, returning errPushRuleNotFound when the rule does not exist.
+func (a *API) mutateRule(ctx context.Context, localpart, kind, ruleID string, fn func(map[string]any)) error {
+	return a.updatePushRules(ctx, localpart, func(global map[string]any) error {
+		list, _ := global[kind].([]any)
+		for _, e := range list {
+			if em, ok := e.(map[string]any); ok && em["rule_id"] == ruleID {
+				fn(em)
+				return nil
+			}
 		}
-	}
-	// Create the rule if it does not exist (enabled default true).
-	rule := map[string]any{"rule_id": ruleID, "enabled": true}
-	fn(rule)
-	global[kind] = append(list, rule)
-	rules["global"] = global
-	return a.savePushRules(localpart, rules) == nil
+		return errPushRuleNotFound
+	})
 }
 
 // insertBefore places rule before the rule with the given ID (or at the start).

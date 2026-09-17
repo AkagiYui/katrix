@@ -12,15 +12,13 @@ import (
 
 // PushRulesAccountDataType is the account data type carrying a user's push
 // rules (delivered in /sync and read by GET /pushrules).
-const PushRulesAccountDataType = "m.push_rules"
+const PushRulesAccountDataType = storage.PushRulesAccountDataType
 
 // RulesStore is the subset of the storage API that push-rule mutation needs.
 // It lets the room-upgrade copy logic run from both the CS API and the
 // federation packages without importing each other.
 type RulesStore interface {
-	GetPushRules(ctx context.Context, localpart string) ([]byte, error)
-	SetPushRules(ctx context.Context, localpart string, rules []byte) error
-	SetAccountData(ctx context.Context, userLocalpart, roomID, eventType string, content []byte) (int64, error)
+	UpdatePushRules(ctx context.Context, localpart string, fn func(current []byte) ([]byte, error)) error
 }
 
 // CopyRulesForRoom clones each listed user's per-room push rule for oldRoomID
@@ -33,43 +31,52 @@ type RulesStore interface {
 // delivers the copied rules to the user's devices in /sync.
 func CopyRulesForRoom(ctx context.Context, store RulesStore, localparts []string, oldRoomID, newRoomID string) {
 	for _, lp := range localparts {
-		copyRulesForUser(ctx, store, lp, oldRoomID, newRoomID)
+		_ = store.UpdatePushRules(ctx, lp, func(current []byte) ([]byte, error) {
+			return copyRoomRule(current, oldRoomID, newRoomID)
+		})
 	}
 }
 
-// copyRulesForUser clones one user's per-room push rule for oldRoomID to
-// newRoomID (best-effort: a missing ruleset or a missing old-room rule is a
-// no-op).
-func copyRulesForUser(ctx context.Context, store RulesStore, localpart, oldRoomID, newRoomID string) {
-	raw, err := store.GetPushRules(ctx, localpart)
-	if err != nil || len(raw) == 0 {
-		return // default ruleset has no per-room rules
+// copyRoomRule returns the ruleset with the per-room rule for oldRoomID cloned
+// to newRoomID, or nil when there is nothing to copy: no stored ruleset (the
+// default ruleset has no per-room rules), no rule for the old room, or a rule
+// for the new room already present (the tombstone can be observed more than
+// once, e.g. by the local /upgrade and again over federation).
+func copyRoomRule(raw []byte, oldRoomID, newRoomID string) ([]byte, error) {
+	if len(raw) == 0 {
+		return nil, nil
 	}
 	var rules map[string]any
-	if json.Unmarshal(raw, &rules) != nil || rules["global"] == nil {
-		return
+	if json.Unmarshal(raw, &rules) != nil {
+		return nil, nil
 	}
 	global, _ := rules["global"].(map[string]any)
+	if global == nil {
+		return nil, nil
+	}
 	list, _ := global["room"].([]any)
+	var clone map[string]any
 	for _, e := range list {
 		em, ok := e.(map[string]any)
-		if !ok || em["rule_id"] != oldRoomID {
+		if !ok {
 			continue
 		}
-		clone := make(map[string]any, len(em))
-		for k, v := range em {
-			clone[k] = v
+		switch em["rule_id"] {
+		case newRoomID:
+			return nil, nil
+		case oldRoomID:
+			clone = make(map[string]any, len(em))
+			for k, v := range em {
+				clone[k] = v
+			}
+			clone["rule_id"] = newRoomID
 		}
-		clone["rule_id"] = newRoomID
-		global["room"] = append(list, clone)
-		out, err := json.Marshal(rules)
-		if err != nil {
-			return
-		}
-		_ = store.SetPushRules(ctx, localpart, out)
-		_, _ = store.SetAccountData(ctx, localpart, "", PushRulesAccountDataType, out)
-		return
 	}
+	if clone == nil {
+		return nil, nil
+	}
+	global["room"] = append(list, clone)
+	return json.Marshal(rules)
 }
 
 // Rule kinds, in spec evaluation order.
@@ -156,6 +163,12 @@ func DefaultRuleset() map[string]any {
 // Shared by the CS API handlers (mutate/read) and the push delivery path.
 func LoadRules(ctx context.Context, store *storage.Store, localpart string) map[string]any {
 	raw, _ := store.GetPushRules(ctx, localpart)
+	return Decode(raw)
+}
+
+// Decode parses a stored ruleset, falling back to the default ruleset when it
+// is unset or unusable.
+func Decode(raw []byte) map[string]any {
 	if len(raw) == 0 {
 		return DefaultRuleset()
 	}

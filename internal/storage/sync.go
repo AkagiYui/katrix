@@ -38,13 +38,19 @@ func (s *Store) SetAccountData(ctx context.Context, userLocalpart, roomID, event
 	if err != nil {
 		return 0, err
 	}
-	_, err = s.pool.Exec(ctx,
+	return streamID, upsertAccountDataTx(ctx, s.pool, userLocalpart, roomID, eventType, content, streamID)
+}
+
+// upsertAccountDataTx is the SQL body of SetAccountData, usable inside a
+// transaction. The caller allocates streamID from the shared sync stream.
+func upsertAccountDataTx(ctx context.Context, ex execer, userLocalpart, roomID, eventType string, content []byte, streamID int64) error {
+	_, err := ex.Exec(ctx,
 		`INSERT INTO account_data(user_localpart, room_id, type, content, stream_id)
 		 VALUES ($1,$2,$3,$4,$5)
 		 ON CONFLICT (user_localpart, room_id, type) DO UPDATE SET content=EXCLUDED.content, stream_id=EXCLUDED.stream_id`,
 		userLocalpart, roomID, eventType, content, streamID,
 	)
-	return streamID, err
+	return err
 }
 
 // GetAccountData returns the content for a global (roomID="") account_data
