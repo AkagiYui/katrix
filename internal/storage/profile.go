@@ -53,6 +53,60 @@ func (s *Store) SetProfileField(ctx context.Context, localpart, userID, field st
 	})
 }
 
+// DeleteProfileField removes a profile field from a local user's profile and,
+// when something was actually removed, records the removal on the sync stream
+// as a JSON null profile update delivered to the given receiver localparts
+// (MSC4429: a cleared field is reported as null). displayname and avatar_url
+// also live in the users row, which is cleared in the same transaction. It
+// reports whether the field existed; deleting an unset field is a no-op.
+func (s *Store) DeleteProfileField(ctx context.Context, localpart, userID, field string, receivers []string) (bool, error) {
+	var removed bool
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx,
+			`DELETE FROM profile_fields WHERE user_localpart=$1 AND field=$2`, localpart, field)
+		if err != nil {
+			return err
+		}
+		removed = tag.RowsAffected() > 0
+		var column string // a constant column name, never caller input
+		switch field {
+		case "displayname":
+			column = "display_name"
+		case "avatar_url":
+			column = "avatar_url"
+		}
+		if column != "" {
+			tag, err := tx.Exec(ctx,
+				`UPDATE users SET `+column+`=NULL WHERE localpart=$1 AND COALESCE(`+column+`,'')<>''`, localpart)
+			if err != nil {
+				return err
+			}
+			removed = removed || tag.RowsAffected() > 0
+		}
+		if !removed {
+			return nil
+		}
+		var streamID int64
+		if err := tx.QueryRow(ctx, `SELECT nextval('sync_stream')`).Scan(&streamID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO profile_updates(stream_id, updated_user, field, value) VALUES ($1,$2,$3,'null'::jsonb)`,
+			streamID, userID, field); err != nil {
+			return err
+		}
+		for _, r := range receivers {
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO profile_updates_delivery(stream_id, receiver_localpart) VALUES ($1,$2)
+				 ON CONFLICT DO NOTHING`, streamID, r); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return removed, err
+}
+
 // ProfileField returns the current value of one profile field for a local user,
 // or ErrNotFound when the field is unset.
 func (s *Store) ProfileField(ctx context.Context, localpart, field string) (json.RawMessage, error) {

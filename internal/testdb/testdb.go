@@ -93,7 +93,8 @@ func Truncate(ctx context.Context, pool pgxConn) error {
 			media_thumbnails, media,
 			access_tokens, devices, users,
 			delayed_events, thread_subscriptions,
-			pushers, push_rules, filters, email_pusher_state
+			pushers, push_rules, filters, email_pusher_state,
+			profile_fields, profile_updates, profile_updates_delivery
 		CASCADE`)
 	return err
 }

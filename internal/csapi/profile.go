@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"regexp"
 
 	"github.com/AkagiYui/katrix/internal/federation"
 	"github.com/AkagiYui/katrix/internal/homeserver"
@@ -22,9 +23,11 @@ func (a *API) registerProfile(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /_matrix/client/v3/profile/{userId}/displayname", a.RequireAuth(a.SetDisplayName))
 	mux.HandleFunc("GET /_matrix/client/v3/profile/{userId}/avatar_url", a.GetAvatarURL)
 	mux.HandleFunc("PUT /_matrix/client/v3/profile/{userId}/avatar_url", a.RequireAuth(a.SetAvatarURL))
-	// Extended profile fields (MSC4133): GET/PUT /profile/{userId}/{keyName}.
+	// Extended profile fields (MSC4133, spec v1.16):
+	// GET/PUT/DELETE /profile/{userId}/{keyName}.
 	mux.HandleFunc("GET /_matrix/client/v3/profile/{userId}/{keyName}", a.GetProfileField)
 	mux.HandleFunc("PUT /_matrix/client/v3/profile/{userId}/{keyName}", a.RequireAuth(a.SetProfileField))
+	mux.HandleFunc("DELETE /_matrix/client/v3/profile/{userId}/{keyName}", a.RequireAuth(a.DeleteProfileField))
 }
 
 // GetProfile handles GET /_matrix/client/v3/profile/{userId}.
@@ -284,6 +287,10 @@ func (a *API) SetProfileField(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	keyName := r.PathValue("keyName")
+	if err := validateProfileKey(keyName); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
 	body, err := readBody(r)
 	if err != nil {
 		httpx.WriteError(w, err)
@@ -313,6 +320,60 @@ func (a *API) SetProfileField(w http.ResponseWriter, r *http.Request) {
 	}
 	a.Notifier.NotifyUser(auth.UserID)
 	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// DeleteProfileField handles DELETE /_matrix/client/v3/profile/{userId}/{keyName}
+// (spec v1.16 / MSC4133): removes a field, key and value, from the user's own
+// profile. Deleting a field that is not set succeeds. When a field is actually
+// removed, peers sharing a room receive a null profile update (MSC4429), and
+// removing displayname/avatar_url also re-emits the member events.
+func (a *API) DeleteProfileField(w http.ResponseWriter, r *http.Request) {
+	auth, err := a.actingAuth(r)
+	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	if auth.UserID != r.PathValue("userId") {
+		httpx.WriteError(w, httpx.ErrForbidden("can only delete own profile fields"))
+		return
+	}
+	keyName := r.PathValue("keyName")
+	if err := validateProfileKey(keyName); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	removed, err := a.Store.DeleteProfileField(r.Context(), auth.Localpart, auth.UserID, keyName,
+		a.profileUpdateReceivers(r.Context(), auth.UserID))
+	if err != nil {
+		httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+		return
+	}
+	if removed {
+		a.Notifier.NotifyUser(auth.UserID)
+		if keyName == "displayname" || keyName == "avatar_url" {
+			a.broadcastProfileUpdate(w, r, auth)
+		}
+	}
+	httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+}
+
+// maxProfileKeyBytes is the spec's maximum profile key length (M_KEY_TOO_LARGE).
+const maxProfileKeyBytes = 255
+
+// profileKeyPattern is the spec's keyName grammar: a defined key, or a custom
+// key following the Common Namespaced Identifier Grammar.
+var profileKeyPattern = regexp.MustCompile(`^(avatar_url|displayname|m\.tz|[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+)$`)
+
+// validateProfileKey checks a profile field keyName against the spec's
+// length limit and grammar.
+func validateProfileKey(keyName string) error {
+	if len(keyName) > maxProfileKeyBytes {
+		return httpx.NewError(http.StatusBadRequest, "M_KEY_TOO_LARGE", "profile key exceeds 255 bytes")
+	}
+	if !profileKeyPattern.MatchString(keyName) {
+		return httpx.NewError(http.StatusBadRequest, "M_INVALID_PARAM", "invalid profile key")
+	}
+	return nil
 }
 
 // profileUpdateReceivers returns the local users who share a room with the
