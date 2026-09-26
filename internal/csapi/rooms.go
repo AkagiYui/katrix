@@ -26,6 +26,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/rooms"
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
+	"github.com/AkagiYui/katrix/internal/strippedstate"
 )
 
 // registerRooms wires P2 room routes.
@@ -383,6 +384,11 @@ func (a *API) knockRoom(r *http.Request, auth *homeserver.Auth, roomID string, v
 	// same 403/404 the remote returned, per the spec (a knock on a non-knock
 	// room is rejected with 403 M_FORBIDDEN).
 	if a.fed != nil {
+		if len(via) == 0 {
+			// A re-knock (or a knock after an invite) without via servers: the
+			// servers named by the user's out-of-band membership.
+			via = a.fed.OutOfBandServers(r.Context(), roomID, auth.UserID)
+		}
 		if err := a.fed.KnockRemoteRoom(r.Context(), auth.UserID, roomID, via, body.Reason); err != nil {
 			status := http.StatusNotFound
 			code := "M_NOT_FOUND"
@@ -442,24 +448,23 @@ func (a *API) RoomLeave(w http.ResponseWriter, r *http.Request) {
 	default:
 		// e.g. banned: cannot leave without unban; let the auth rules reject.
 	}
-	// A leave in a room this server does not locally authorise — the room was
-	// learned only via an inbound invite that carried no stripped state (v1
-	// invites deliver the bare event, so the local room view has no
-	// m.room.create) — is performed by federating with the room's origin
-	// server (make_leave/send_leave), and the local leave is recorded by
-	// LeaveRemoteRoom (persisting the leave event + membership). Best-effort:
-	// an invite rejection must succeed locally even when the remote refuses or
-	// is unreachable (sytest "Inbound federation can receive invite and reject
-	// when remote replies with a 403/500/unreachable"), so the local leave is
-	// recorded regardless of the federation outcome.
-	if a.fed != nil {
-		if _, serr := a.Store.GetStateEvent(r.Context(), roomID, "m.room.create", ""); serr != nil {
-			if dom := ids.DomainOf(roomID); dom != "" && dom != a.ServerName() {
-				_ = a.fed.LeaveRemoteRoom(r.Context(), dom, auth.UserID, roomID)
-			}
-			httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+	// Rejecting an invite or retracting a knock while no local user is in the
+	// room (mirror of Synapse's remote reject) cannot be done by authoring an
+	// event on this server's view of the DAG: it holds no state for the room
+	// (the membership is out of band), or only a stale view of a room that
+	// lives on other servers. The leave is performed by federating with the
+	// room's servers (make_leave/send_leave), and recorded locally even when
+	// they refuse or are unreachable (sytest "Inbound federation can receive
+	// invite and reject when remote replies with a 403/500/unreachable").
+	if a.fed != nil && (m.Membership == rooms.MembershipInvite || m.Membership == rooms.MembershipKnock) &&
+		!a.Store.ServerHasJoinedMember(r.Context(), roomID, a.ServerName()) &&
+		(!a.Store.HasRoomState(r.Context(), roomID) || len(a.fed.OutOfBandServers(r.Context(), roomID, auth.UserID)) > 0) {
+		if err := a.fed.LeaveRemoteRoom(r.Context(), auth.UserID, roomID); err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
 		}
+		httpx.WriteJSON(w, http.StatusOK, httpx.EmptyJSON)
+		return
 	}
 	if err := a.sendMemberEvent(r, auth, roomID, "", auth.UserID, rooms.MembershipLeave, ""); err != nil {
 		writeRoomErr(w, err)
@@ -2423,7 +2428,7 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 		}
 		return nil, nil
 	}
-	if _, err := a.Store.GetRoom(r.Context(), roomID); err == nil {
+	if a.Store.HasRoomState(r.Context(), roomID) {
 		// A user whose membership state is known locally as "ban" must be refused
 		// the join outright, regardless of federation: the ban is the room's
 		// current state as far as this server knows (it may have been ingested as
@@ -2480,13 +2485,8 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 				candidates = via
 				if len(candidates) == 0 {
 					// The client supplied no via servers and the local server is
-					// not in the room. The servers to delegate to are the room's
-					// known members' domains — for an invite-only room that is
-					// the inviter's server. This matters for hash-derived room
-					// IDs (room version 12, MSC4291) which carry no :domain for
-					// ids.DomainOf to fall back on (sytest "Remote user can
-					// backfill in a room with version 12" invites the remote
-					// user first, then joins with no via).
+					// not in the room: delegate to the servers of the room's
+					// (last known) members.
 					if m, err := a.Store.Members(r.Context(), roomID, ""); err == nil {
 						seen := map[string]bool{}
 						for _, row := range m {
@@ -2536,9 +2536,30 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 		}
 		return nil, nil
 	}
-	// Not a local room: federated join (make_join/send_join against a remote
-	// server, then persist the delivered room state).
+	// A room this server holds no state for: federated join (make_join /
+	// send_join against a remote server, then persist the delivered room
+	// state).
 	if a.fed != nil {
+		if len(via) == 0 {
+			// The client supplied no via servers. For a room the user was
+			// invited to (or knocked on), the servers named by that out-of-band
+			// membership are the candidates — the inviter's server first. This
+			// matters for hash-derived room IDs (room version 12, MSC4291),
+			// which carry no domain to fall back on (sytest "Remote user can
+			// backfill in a room with version 12" invites the remote user
+			// first, then joins with no via).
+			via = a.fed.OutOfBandServers(r.Context(), roomID, auth.UserID)
+		}
+		// Guests may only join a room whose m.room.guest_access is "can_join".
+		// The remote server has no notion of the local guest account, so the
+		// check is local — against the stripped state of the invite, the only
+		// thing this server knows about the room (the room's guest_access is
+		// part of the stripped state it shares).
+		if u, err := a.Store.GetUser(r.Context(), a.LocalpartOf(auth.UserID)); err == nil && u.IsGuest {
+			if !guestAccessAllowsJoin(strippedstate.ContentFor(r.Context(), a.Store, roomID, auth.UserID, "m.room.guest_access", "")) {
+				return nil, newRoomError(http.StatusForbidden, "M_FORBIDDEN", "guests may not join this room (guest_access is not 'can_join')")
+			}
+		}
 		partial, err := a.fed.JoinRemoteRoom(r.Context(), auth.UserID, roomID, via, a.localProfile(r.Context(), auth.UserID))
 		if err != nil {
 			// A remote rejection (e.g. the room's join_rule is knock, or the
@@ -2931,14 +2952,30 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 			StreamOrdering: ev.Depth(), Depth: ev.Depth(),
 		}
 	}
+	// An invite or knock is accompanied by the room's stripped state, captured
+	// now so the invitee / knocker sees the room as it was when the membership
+	// was created.
+	strippedState, hasStrippedState := a.prejoinSnapshot(r.Context(), roomID, ev)
+	// A remote invitee's server must accept the invite before it exists: it is
+	// delivered via PUT /_matrix/federation/v2/invite/{roomID}/{eventID} (spec
+	// "inviting a user to a room") carrying the stripped state, and the
+	// doubly-signed event it returns is what gets persisted. A rejection fails
+	// the client's request and nothing is persisted; an unreachable server
+	// does not (delivery is queued for retry).
+	if mc != nil && mc.Membership == rooms.MembershipInvite && a.fed != nil && !a.IsLocalUser(target) {
+		signed, err := a.fed.SendRemoteInvite(r.Context(), roomID, target, ev, version, strippedState)
+		if err != nil {
+			return "", remoteInviteError(err)
+		}
+		ev = signed
+	}
 	stream, err := persistEventWithMembership(r.Context(), a.Store, ev, version, roomID, membershipRow)
 	if err != nil {
 		return "", err
 	}
-	// An invite or knock is accompanied by the room's stripped state, captured
-	// now so the invitee / knocker sees the room as it was when the membership
-	// was created.
-	a.recordStrippedState(r.Context(), roomID, ev, version)
+	if hasStrippedState {
+		a.saveStrippedState(r.Context(), roomID, ev, version, strippedState)
+	}
 	// room_state is maintained by persistEvent (snapshot + recompute).
 	if mc != nil {
 		// A join/leave changes the user's device-list visibility to the room's
@@ -3018,36 +3055,35 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	// not apply to a third party's invite), and a join notifies the room's other
 	// users.
 	a.deliverPushFor(r.Context(), roomID, ev, stream, false)
-	// A remote invite must also be delivered directly to the invitee's server
-	// via PUT /_matrix/federation/v2/invite/{roomID}/{eventID} (spec "inviting
-	// a user to a room"). Generic PDU broadcast cannot reach the invitee's
-	// server before it knows the room exists — the invite endpoint creates the
-	// room view there. A rejection by the invitee's server (MSC4155 blocked
-	// invite, or an auth failure) is propagated to the caller so the client's
-	// invite request fails with the remote server's status (e.g. 403
-	// M_INVITE_BLOCKED); a transport error (server unreachable) is best-effort.
-	if mc != nil && mc.Membership == "invite" && a.fed != nil && !a.IsLocalUser(target) {
-		if err := a.fed.SendRemoteInvite(r.Context(), roomID, target, ev, version); err != nil {
-			if isBlockedInviteError(err) {
-				return "", newRoomError(http.StatusForbidden, "M_INVITE_BLOCKED", "the invite was blocked by the invitee's permission settings")
-			}
-			// A peer response that fails Canonical JSON (or a peer that
-			// rejected the invite event outright) surfaces as a client error
-			// (spec; sytest "Outbound federation rejects invite response which
-			// include invalid JSON for room version 6" expects M_BAD_JSON).
-			if strings.Contains(err.Error(), "not Canonical JSON") {
-				return "", newRoomError(http.StatusBadRequest, "M_BAD_JSON", "the invitee's server returned an invalid invite event")
-			}
-			_ = err
-		}
-	}
 	return ev.EventID(), nil
 }
 
-// isBlockedInviteError reports whether a SendRemoteInvite error came from the
-// invitee's server rejecting the invite with M_INVITE_BLOCKED.
-func isBlockedInviteError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "M_INVITE_BLOCKED")
+// remoteInviteError maps the invitee's server refusing an invite to the error
+// the inviting client receives.
+//
+//   - 403 (e.g. M_INVITE_BLOCKED under MSC4155, or M_FORBIDDEN) is the
+//     invitee's decision and is passed through.
+//   - A doubly-signed event that is not Canonical JSON in a room version that
+//     requires it is 400 M_BAD_JSON (sytest "Outbound federation rejects
+//     invite response which include invalid JSON for room version 6").
+//   - Anything else the peer answered — notably 400 M_MISSING_PARAM /
+//     M_INVALID_PARAM when it cannot accept the invite_room_state — is nothing
+//     the client can fix, so it becomes 502 (MSC4311: SHOULD be translated to
+//     a 5xx error over the Client-Server API).
+func remoteInviteError(err error) error {
+	var fe *federation.FedHTTPError
+	switch {
+	case errors.Is(err, federation.ErrInviteResponseNotCanonical):
+		return newRoomError(http.StatusBadRequest, "M_BAD_JSON", "the invitee's server returned an invalid invite event")
+	case errors.As(err, &fe) && fe.HTTPCode() == http.StatusForbidden:
+		code := fe.ErrCode()
+		if code == "" {
+			code = "M_FORBIDDEN"
+		}
+		return newRoomError(http.StatusForbidden, code, "the invitee's server refused the invite")
+	default:
+		return newRoomError(http.StatusBadGateway, "M_UNKNOWN", "the invitee's server could not accept the invite: "+err.Error())
+	}
 }
 
 // sendStateEvent is a helper used by createRoom for name/topic events.

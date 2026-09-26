@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -73,10 +74,10 @@ func (e *FedHTTPError) ErrCode() string { return e.errcode }
 // absent).
 func (e *FedHTTPError) RoomVersion() string { return e.roomVersion }
 
-// newFedHTTPError builds a FedHTTPError for a non-2xx federation response,
+// NewFedHTTPError builds a FedHTTPError for a non-2xx federation response,
 // extracting the errcode (and room_version) from a Matrix error body when
 // present.
-func newFedHTTPError(code int, msg string, body []byte) error {
+func NewFedHTTPError(code int, msg string, body []byte) error {
 	errcode, roomVersion := "", ""
 	if len(body) > 0 {
 		var e struct {
@@ -304,128 +305,106 @@ func (a *API) knockRemoteRoomFrom(ctx context.Context, userID, roomID, dest, rea
 	return a.ingestRemoteKnock(ctx, roomID, version, rules, ev, state)
 }
 
-// ingestRemoteKnock persists the room view returned by send_knock: the room
-// row, the delivered knock_room_state PDUs and the knock event itself, marking
-// the knocking user as knocking so their /sync (and the room's other servers)
-// reflect the pending request.
+// ingestRemoteKnock records a knock performed through a remote server. The
+// knocking user is not in the room, and this server does not join it: the
+// knock is an out-of-band membership. The knock event is persisted (for the
+// user's /sync) without entering room state or the DAG this server tracks,
+// and the delivered knock_room_state is kept only as the knock's stripped
+// state — it carries no auth chain and is never treated as room state. The
+// knock has already happened by the time the state arrives, so entries
+// failing validation are dropped rather than failing the knock (MSC4311).
 func (a *API) ingestRemoteKnock(ctx context.Context, roomID string, version roomver.Version, rules roomver.Rules, ev *events.Event, state []json.RawMessage) error {
-	// The create event anchors the room; refuse to build a room view on an
-	// unverifiable create event.
-	if !a.stateContainsVerifiableCreate(ctx, state, rules) {
-		return fmt.Errorf("federation: could not verify m.room.create in send_knock state")
+	if exists, _ := a.Store.RoomExists(ctx, roomID); !exists {
+		_ = a.Store.CreateRoom(ctx, storage.Room{RoomID: roomID, Version: string(version), CreatedTS: a.Now()})
 	}
-	exists, _ := a.Store.RoomExists(ctx, roomID)
-	if !exists {
-		_ = a.Store.CreateRoom(ctx, storage.Room{
-			RoomID: roomID, Version: string(version),
-			Creator: creatorFromState(state), CreatedTS: a.Now(),
-		})
+	knockState := strippedstate.Validate(ctx, a.verifier, roomID, version, state)
+	if len(knockState.Problems) > 0 {
+		log.Printf("katrix: knock %s: dropped %d invalid knock_room_state entries: %v",
+			ev.EventID(), len(knockState.Problems), (&strippedstate.InvalidError{Problems: knockState.Problems}).Error())
 	}
-	// Insert the knock event first so its forward-extremity bookkeeping runs on
-	// a clean slate; the delivered state PDUs are inserted afterwards (their
-	// extremities are reset by SeedRemoteJoin).
-	knockRow := &storage.EventRow{
+	if err := a.Store.SaveStrippedState(ctx, storage.StrippedState{
+		EventID: ev.EventID(), RoomID: roomID, RoomVersion: string(version), PDUs: knockState.PDUs,
+	}, a.Now()); err != nil {
+		return fmt.Errorf("federation: persist knock stripped state: %w", err)
+	}
+	row := &storage.EventRow{
 		EventID: ev.EventID(), RoomID: roomID, Type: ev.Type(), Sender: ev.Sender(),
-		Depth: ev.Depth(), OriginServerTS: ev.OriginServerTS(),
+		StateKey: ev.Sender(), Depth: ev.Depth(), OriginServerTS: ev.OriginServerTS(),
 		Content: ev.Content(), RawJSON: ev.Raw(),
-		AuthEvents: ev.AuthEvents(), PrevEvents: ev.PrevEvents(),
 	}
-	if sk, ok := ev.StateKey(); ok {
-		knockRow.StateKey = sk
-	}
-	if _, err := a.Store.InsertEvent(ctx, knockRow); err != nil {
+	if _, err := a.Store.InsertOutOfBandMembership(ctx, row,
+		storage.MembershipRow{RoomID: roomID, UserID: ev.Sender(), Membership: "knock"}, false); err != nil {
 		return fmt.Errorf("federation: persist knock event: %w", err)
 	}
-	stateRows := a.persistRemotePDUs(ctx, roomID, rules, state, true)
-	if err := eventstate.SeedRemoteJoin(ctx, a.Store, roomID, rules, knockRow, stateRows); err != nil {
-		return fmt.Errorf("federation: seed remote room state: %w", err)
-	}
-	// The send_knock response is authoritative for the knock event; clear a
-	// soft-fail a racing PDU broadcast may have recorded (see ingestRemoteJoin).
-	if rejected, err := a.Store.IsEventRejected(ctx, ev.EventID()); err == nil && rejected {
-		a.Store.UnmarkEventRejected(ctx, ev.EventID())
-	}
-	// Keep the delivered knock_room_state as the knock's stripped-state
-	// snapshot, shown to the knocker in /sync knock_state.
-	_ = a.Store.SaveStrippedState(ctx, storage.StrippedState{
-		EventID: ev.EventID(), RoomID: roomID, RoomVersion: string(version),
-		PDUs: wellFormedStrippedState(state),
-	}, a.Now())
-	// Mark the knocking user as knocking.
-	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
-		RoomID: roomID, UserID: ev.Sender(), Membership: "knock",
-		EventID: ev.EventID(), StreamOrdering: knockRow.StreamOrdering, Depth: ev.Depth(),
-	})
-	a.notifyRoomMembers(ctx, roomID)
+	a.Notifier.NotifyUsers(ev.Sender())
 	return nil
 }
+
+// ErrInviteResponseNotCanonical reports that the invitee's server answered an
+// invite in a room version requiring Canonical JSON (v6+) with an event that
+// is not Canonical JSON.
+var ErrInviteResponseNotCanonical = errors.New("federation: invite response is not Canonical JSON")
 
 // SendRemoteInvite delivers a local invite to the invitee's server via
 // PUT /_matrix/federation/v2/invite/{roomID}/{eventID}, per the spec's
 // "inviting a user to a room" flow. The v2 body is an envelope carrying the
-// signed invite event plus the room's stripped state (invite_room_state) so
-// the receiving server can create its view of the room. The remote server
-// adds its signature and returns the doubly-signed event, which we persist in
-// place of our own (the room's other servers then see the invite signed by
-// both parties).
+// signed invite event plus the room's stripped state (invite_room_state: the
+// prejoin state as full PDUs, which MUST include m.room.create — MSC4311).
 //
-// Delivery is best-effort *reliable*: the synchronous attempt runs against
-// the request's own deadline (the client's invite call may 200 and return
-// while the event is still queued, mirroring how Synapse's transaction queue
-// delivers membership events asynchronously). A transport failure — the peer
-// is slow, partitioned, or down — parks the invite in the outbound retry
-// queue instead of dropping it, so a transient failure never loses an invite
-// (the invitee's server would otherwise never learn the room exists). An
-// application-level rejection (the peer returned a non-200, e.g. M_INVITE
-// _BLOCKED) is returned to the caller unchanged, exactly as before.
-func (a *API) SendRemoteInvite(ctx context.Context, roomID, invitee string, ev *events.Event, version roomver.Version) error {
+// It is called before the invite is persisted: the invitee's server must
+// accept the invite for it to exist. It returns the invite event to persist —
+// the doubly-signed event the invitee's server returned, so the room's other
+// servers see the invite signed by both parties. An application-level
+// rejection (the peer answered non-200) is returned as a *FedHTTPError, or
+// ErrInviteResponseNotCanonical, and the invite must not be persisted.
+//
+// Delivery is best-effort *reliable*: a transport failure — the peer is slow,
+// partitioned, or down — parks the invite in the outbound retry queue instead
+// of failing it (mirroring how Synapse's transaction queue delivers membership
+// events asynchronously), and ev is returned as-is; the retry later replaces
+// the stored copy with the doubly-signed event.
+func (a *API) SendRemoteInvite(ctx context.Context, roomID, invitee string, ev *events.Event, version roomver.Version, inviteRoomState []json.RawMessage) (*events.Event, error) {
 	dom := userDomain(invitee)
 	if dom == "" || dom == a.ServerName() {
-		return nil
+		return ev, nil
 	}
-	// Stripped state: the room's current state (create, power_levels,
-	// join_rules, member events, etc.) is what the receiving server seeds its
-	// invite view from.
-	stripped := a.roomStatePDUsFor(ctx, roomID)
+	if inviteRoomState == nil {
+		inviteRoomState = []json.RawMessage{}
+	}
 	body := map[string]any{
 		"room_version":      string(version),
 		"event":             json.RawMessage(ev.Raw()),
-		"invite_room_state": stripped,
+		"invite_room_state": inviteRoomState,
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	err = a.sendRemoteInviteOnce(ctx, dom, roomID, ev.EventID(), raw, version, "v2")
-	if err == nil {
-		return nil
-	}
+	signed, err := a.sendRemoteInviteOnce(ctx, dom, roomID, ev.EventID(), raw, version, "v2")
 	// The v2 endpoint may not be recognised by an older peer (it answers 404
 	// M_UNRECOGNIZED to /v2/invite). Per Synapse, fall back to the v1 endpoint
 	// when the room version uses old-style event IDs (room versions 1 and 2) —
 	// the only versions whose invite flow the v1 API can describe (sytest's
 	// "Outbound federation can send invites via v1 API" and the v1 invite
 	// rejection tests run their rooms at room_version 1/2).
-	if isUnknownInviteEndpoint(err) && roomverRulesV1V2(version) {
-		rules, ok := roomver.Get(version)
-		if !ok || rules.EventFormatV1 {
-			if err1 := a.sendRemoteInviteOnce(ctx, dom, roomID, ev.EventID(), json.RawMessage(ev.Raw()), version, "v1"); err1 == nil {
-				return nil
-			} else {
-				err = err1
-			}
-		}
+	if err != nil && isUnknownInviteEndpoint(err) && roomverRulesV1V2(version) {
+		signed, err = a.sendRemoteInviteOnce(ctx, dom, roomID, ev.EventID(), json.RawMessage(ev.Raw()), version, "v1")
 	}
-	// A rejection by the peer (non-200) must surface to the caller — the client
-	// invite request fails with the remote server's status. Only transport
-	// failures (timeouts, connection errors) are retried.
-	if !isInviteTransportError(err) {
-		return err
+	switch {
+	case err == nil:
+		if signed == nil {
+			return ev, nil
+		}
+		return events.New(signed, version)
+	case !isInviteTransportError(err):
+		// A rejection by the peer surfaces to the caller — the client invite
+		// request fails. Only transport failures are retried.
+		return nil, err
 	}
 	log.Printf("katrix: federation invite for %s to %s failed (%v); queued for retry", ev.EventID(), dom, err)
 	_ = a.Store.InsertOutboundInvite(ctx, roomID, ev.EventID(), dom, raw, a.Now())
 	a.wakeDeliveries()
-	return nil
+	return ev, nil
 }
 
 // inviteEventFromEnvelope extracts the bare signed event from a v2 invite
@@ -452,86 +431,68 @@ func roomverRulesV1V2(version roomver.Version) bool {
 
 // isUnknownInviteEndpoint reports whether an invite delivery error means the
 // peer did not recognise the endpoint (404/405 with an M_UNRECOGNIZED errcode,
-// or a non-JSON/empty body — older Dendrites/Conduits answer 404 with no
-// body), per Synapse's is_unknown_endpoint. Only such errors trigger the
-// v2 -> v1 invite fallback.
+// or a 404 without a Matrix error body — older Dendrites/Conduits answer 404
+// with no body), per Synapse's is_unknown_endpoint. Only such errors trigger
+// the v2 -> v1 invite fallback.
 func isUnknownInviteEndpoint(err error) bool {
-	if err == nil {
+	var fe *FedHTTPError
+	if !errors.As(err, &fe) {
 		return false
 	}
-	msg := err.Error()
-	if !strings.Contains(msg, "HTTP 404") && !strings.Contains(msg, "HTTP 405") {
-		return false
+	switch fe.HTTPCode() {
+	case http.StatusNotFound:
+		return fe.ErrCode() == "" || fe.ErrCode() == "M_UNRECOGNIZED"
+	case http.StatusMethodNotAllowed:
+		return fe.ErrCode() == "M_UNRECOGNIZED"
 	}
-	if strings.Contains(msg, "M_UNRECOGNIZED") {
-		return true
-	}
-	// A 404 with an empty or non-JSON body is treated as an unrecognised
-	// endpoint (the body would only carry JSON if the server answered with an
-	// errcode).
-	return strings.Contains(msg, "HTTP 404")
+	return false
 }
 
 // isInviteTransportError reports whether an invite delivery error was a
 // transport-level failure (the peer never processed the request: timeout,
 // connection refused/reset, TLS) rather than an application-level rejection.
-// Only the former is retryable — a 403 M_INVITE_BLOCKED must propagate to the
-// inviter, and a malformed body would only recur. A peer response that fails
-// the room version's Canonical JSON check is also non-retryable: the peer saw
-// the request and answered, and retrying would just recur (sytest "Outbound
-// federation rejects invite response which include invalid JSON for room
-// version 6" expects the client invite to fail).
+// Only the former is retryable: a peer that answered (any HTTP status, or a
+// response that fails the room version's Canonical JSON check) would only
+// answer the same again.
 func isInviteTransportError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	if strings.Contains(msg, "M_INVITE_BLOCKED") {
-		return false
-	}
-	if strings.Contains(msg, "not Canonical JSON") {
-		return false
-	}
-	if strings.Contains(msg, "HTTP ") {
-		return false
-	}
-	return true
+	var fe *FedHTTPError
+	return !errors.As(err, &fe) && !errors.Is(err, ErrInviteResponseNotCanonical)
 }
 
 // sendRemoteInviteOnce performs a single signed PUT invite delivery against
-// dom with the pre-built body, and persists the doubly-signed invite event the
-// peer returns (the room's other servers then see the invite signed by both
-// parties). apiVersion selects the endpoint: "v2" sends the envelope body
+// dom with the pre-built body and returns the doubly-signed invite event the
+// peer sent back (nil when the response carried no usable event for eventID).
+// apiVersion selects the endpoint: "v2" sends the envelope body
 // {room_version, event, invite_room_state} to /v2/invite and reads the plain
 // {event} response; "v1" sends the bare signed event to /v1/invite and reads
 // the MSC1802 [200, {event}] array response.
-func (a *API) sendRemoteInviteOnce(ctx context.Context, dom, roomID, eventID string, raw json.RawMessage, version roomver.Version, apiVersion string) error {
+func (a *API) sendRemoteInviteOnce(ctx context.Context, dom, roomID, eventID string, raw json.RawMessage, version roomver.Version, apiVersion string) (json.RawMessage, error) {
 	url := a.client.serverBaseURL(dom) + "/_matrix/federation/" + apiVersion + "/invite/" + urlPathEscape(roomID) + "/" + urlPathEscape(eventID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(raw))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Host = dom
 	if err := signRequestWith(req, a.client.originName(), a.client.key); err != nil {
-		return err
+		return nil, err
 	}
 	metrics.Counters.FedOutboundRequests.Add(1)
 	resp, err := a.client.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("federation: invite %s: %w", dom, err)
+		return nil, fmt.Errorf("federation: invite %s: %w", dom, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("federation: invite %s: HTTP %d: %s", dom, resp.StatusCode, strings.TrimSpace(string(msg)))
+		return nil, NewFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: invite %s: HTTP %d: %s", dom, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
 	}
-	// The remote server returns the invite event signed by both parties.
-	// Persist it over our copy so the room's stored invite carries both
-	// signatures (matters when other servers receive it via transactions).
 	respBody, rerr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if rerr != nil {
-		return nil
+		return nil, nil
 	}
 	// The v1 endpoint wraps the body in the extraneous [200, {...}] array
 	// (MSC1802); unwrap it before reading the event.
@@ -547,7 +508,7 @@ func (a *API) sendRemoteInviteOnce(ctx context.Context, dom, roomID, eventID str
 	// version 6" injects a fractional number into the returned event).
 	if roomver.AtLeast(version, 6) {
 		if _, cerr := canonicaljson.Canonical(respBody); cerr != nil {
-			return fmt.Errorf("federation: invite %s: response is not Canonical JSON", dom)
+			return nil, fmt.Errorf("%w (from %s)", ErrInviteResponseNotCanonical, dom)
 		}
 	}
 	var out struct {
@@ -555,32 +516,10 @@ func (a *API) sendRemoteInviteOnce(ctx context.Context, dom, roomID, eventID str
 	}
 	if json.Unmarshal(respBody, &out) == nil && len(out.Event) > 0 {
 		if signedEv, err := events.New(out.Event, version); err == nil && signedEv.EventID() == eventID {
-			_ = a.Store.UpdateEventRaw(ctx, eventID, out.Event)
+			return out.Event, nil
 		}
 	}
-	return nil
-}
-
-// roomStatePDUsFor returns the room's current state as raw PDUs (the state
-// section delivered to a remote server that needs to learn the room).
-func (a *API) roomStatePDUsFor(ctx context.Context, roomID string) []json.RawMessage {
-	stateRows, err := a.Store.GetState(ctx, roomID)
-	if err != nil {
-		return nil
-	}
-	ids := make([]string, 0, len(stateRows))
-	for _, s := range stateRows {
-		ids = append(ids, s.EventID)
-	}
-	evs, err := a.Store.EventsByIDs(ctx, ids)
-	if err != nil {
-		return nil
-	}
-	out := make([]json.RawMessage, 0, len(evs))
-	for _, e := range evs {
-		out = append(out, e.RawJSON)
-	}
-	return out
+	return nil, nil
 }
 
 // pickJoinDestination chooses the server to contact for a join: the first
@@ -784,7 +723,7 @@ func (c *Client) makeJoin(ctx context.Context, dest, roomID, userID string) (*ma
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: make_join %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
+		return nil, NewFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: make_join %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
@@ -859,7 +798,7 @@ func (c *Client) sendJoinRequest(ctx context.Context, dest, version, roomID, idP
 	if resp.StatusCode != http.StatusOK {
 		// Surface the remote error body when the server returned one.
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: send_join %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
+		return nil, NewFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: send_join %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
@@ -900,7 +839,7 @@ func (c *Client) makeKnock(ctx context.Context, dest, roomID, userID string) (*m
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: make_knock %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
+		return nil, NewFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: make_knock %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
@@ -938,7 +877,7 @@ func (c *Client) sendKnock(ctx context.Context, dest, roomID, userID string, ev 
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: send_knock %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
+		return nil, NewFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: send_knock %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
@@ -1029,13 +968,10 @@ func (a *API) ingestRemoteJoin(ctx context.Context, roomID string, version roomv
 		return fmt.Errorf("federation: could not verify m.room.create in send_join state")
 	}
 
-	exists, _ := a.Store.RoomExists(ctx, roomID)
-	if !exists {
-		_ = a.Store.CreateRoom(ctx, storage.Room{
-			RoomID: roomID, Version: string(version),
-			Creator: creatorFromState(sj.State), CreatedTS: a.Now(),
-		})
-	}
+	_ = a.Store.EnsureRoom(ctx, storage.Room{
+		RoomID: roomID, Version: string(version),
+		Creator: creatorFromState(sj.State), CreatedTS: a.Now(),
+	})
 
 	// Insert the join event first so its forward-extremity bookkeeping runs on a
 	// clean slate; the delivered state/auth-chain PDUs are inserted afterwards
@@ -1392,7 +1328,7 @@ func (c *Client) makeLeave(ctx context.Context, dest, roomID, userID string) (*m
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: make_leave %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
+		return nil, NewFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: make_leave %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
@@ -1451,7 +1387,7 @@ func (c *Client) sendLeaveRequest(ctx context.Context, dest, version, roomID, id
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return newFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: send_leave %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
+		return NewFedHTTPError(resp.StatusCode, fmt.Sprintf("federation: send_leave %s: HTTP %d: %s", dest, resp.StatusCode, strings.TrimSpace(string(msg))), msg)
 	}
 	return nil
 }
@@ -1483,106 +1419,131 @@ func buildLeaveEvent(tpl *makeJoinResponse, userID, roomID string, now int64, ve
 	return b.BuildForVersion(serverName, key, version)
 }
 
-// LeaveRemoteRoom rejects an invite (or leaves a joined room) by federating
-// with dest: GET make_leave for an unsigned template, sign it, PUT send_leave,
-// and persist the local leave event. Best-effort by design — an invite
-// rejection must succeed locally even when the remote server refuses the
-// make_leave/send_leave (403/500) or is unreachable (sytest "Inbound
-// federation can receive invite and reject when remote replies with a
-// 403/500/unreachable"): the local user's leave is recorded regardless, and a
-// remote refusal is not propagated to the client. The local leave event is
-// persisted so the room moves into the user's leave section.
-func (a *API) LeaveRemoteRoom(ctx context.Context, dest, userID, roomID string) error {
-	var ev *events.Event
-	version := roomver.Default
-
-	tpl, err := a.client.makeLeave(ctx, dest, roomID, userID)
-	if err == nil {
-		version = roomver.Version(tpl.RoomVersion)
-		if version == "" {
-			version = inferTemplateRoomVersion(tpl.Event)
-		}
-		if version == "" {
-			version = roomver.Default
-		}
-		if rules, ok := roomver.Get(version); ok {
-			if e, berr := buildLeaveEvent(tpl, userID, roomID, a.Now(), version, rules, a.Key, a.ServerName()); berr == nil {
-				ev = e
-			}
-		}
-		// Deliver the leave to the remote.
-		if ev != nil {
-			if serr := a.client.sendLeave(ctx, dest, roomID, userID, ev, version); serr != nil {
-				// A refused send_leave still leaves the local record; best-effort.
-				_ = serr
-			}
+// OutOfBandServers returns the servers to contact about a room this server
+// holds no state for, where userID has an out-of-band membership (an invite
+// or a knock): the inviter's server first — it is necessarily in the room —
+// then the servers of the members and the creator named in the membership's
+// stripped state, then the server named in the room ID (absent for
+// hash-derived room IDs, MSC4291). This server itself is never included.
+func (a *API) OutOfBandServers(ctx context.Context, roomID, userID string) []string {
+	var out []string
+	seen := map[string]bool{a.ServerName(): true, "": true}
+	add := func(userOrRoomID string) {
+		if dom := ids.DomainOf(userOrRoomID); !seen[dom] {
+			seen[dom] = true
+			out = append(out, dom)
 		}
 	}
-	// make_leave failed (403/500/unreachable) or the template could not be
-	// built: the local leave still happens. Build a self-signed leave event for
-	// the room (its state is incomplete — the room was learned only via an
-	// invite — so the event carries no prev/auth refs) and persist it.
-	if ev == nil {
-		if rules, ok := roomver.Get(version); ok {
-			b := events.Builder{
-				Type:           "m.room.member",
-				Sender:         userID,
-				RoomID:         roomID,
-				Content:        json.RawMessage(`{"membership":"leave"}`),
-				Depth:          1,
-				OriginServerTS: a.Now(),
-				Origin:         a.ServerName(),
-			}
-			sk := userID
-			b.StateKey = &sk
-			if rules.EventFormatV1 {
-				if e, berr := b.BuildLegacy(a.ServerName(), a.Key, version, ids.RandomTxnSuffix()); berr == nil {
-					ev = e
+	if m, err := a.Store.GetMembership(ctx, roomID, userID); err == nil {
+		if ev, err := a.Store.GetEvent(ctx, m.EventID); err == nil {
+			add(ev.Sender)
+		}
+		if ss, err := a.Store.GetStrippedState(ctx, m.EventID); err == nil {
+			var create []string
+			var others []string
+			for _, pdu := range ss.PDUs {
+				ev, err := strippedstate.FromPDU(pdu)
+				if err != nil {
+					continue
 				}
-			} else if e, berr := b.BuildForVersion(a.ServerName(), a.Key, version); berr == nil {
-				ev = e
+				switch ev.Type {
+				case strippedstate.CreateType:
+					create = append(create, ev.Sender)
+				case "m.room.member":
+					others = append(others, ev.StateKey)
+				}
+			}
+			for _, u := range append(create, others...) {
+				add(u)
 			}
 		}
 	}
-	if ev == nil {
-		return fmt.Errorf("federation: could not build local leave for %s", roomID)
+	add(roomID)
+	return out
+}
+
+// LeaveRemoteRoom ends userID's out-of-band membership in roomID — rejecting
+// an invite or retracting a knock in a room this server holds no state for —
+// by federating with the room's servers (OutOfBandServers, tried in order):
+// GET make_leave for an unsigned template, sign it, PUT send_leave.
+//
+// Best-effort by design: a rejection must succeed locally even when every
+// server refuses the make_leave/send_leave (403/500) or is unreachable (sytest
+// "Inbound federation can receive invite and reject when remote replies with
+// a 403/500/unreachable"). Then this server records a leave it signs itself,
+// with no place in the room's DAG. Either way the leave is persisted as an
+// out-of-band membership event so the room moves into the user's leave
+// section, and it wins over the pending membership: the user's own decision
+// is authoritative for it.
+func (a *API) LeaveRemoteRoom(ctx context.Context, userID, roomID string) error {
+	version := roomver.Default
+	if room, err := a.Store.GetRoom(ctx, roomID); err == nil && room.Version != "" {
+		version = roomver.Version(room.Version)
 	}
-	// Persist the leave event locally and update the membership row so /sync
-	// reports the room under leave (the rejected invite). ForceUpsertMembership
-	// is required: the invite's membership row carries the remote template's
-	// (higher) depth, so the depth-monotonic UpsertMembership would silently
-	// keep the invite — the local rejection must win regardless (it is the
-	// authoritative local record of the rejection).
-	if stream, err := a.Store.InsertEvent(ctx, &storage.EventRow{
+	var ev *events.Event
+	for _, dest := range a.OutOfBandServers(ctx, roomID, userID) {
+		tpl, err := a.client.makeLeave(ctx, dest, roomID, userID)
+		if err != nil {
+			continue
+		}
+		tplVersion := roomver.Version(tpl.RoomVersion)
+		if tplVersion == "" {
+			tplVersion = inferTemplateRoomVersion(tpl.Event)
+		}
+		if tplVersion == "" {
+			tplVersion = version
+		}
+		rules, ok := roomver.Get(tplVersion)
+		if !ok {
+			continue
+		}
+		leave, err := buildLeaveEvent(tpl, userID, roomID, a.Now(), tplVersion, rules, a.Key, a.ServerName())
+		if err != nil {
+			continue
+		}
+		if err := a.client.sendLeave(ctx, dest, roomID, userID, leave, tplVersion); err != nil {
+			continue
+		}
+		ev = leave
+		break
+	}
+	if ev == nil {
+		// No server of the room accepted the leave: sign one locally. It carries
+		// no prev/auth events — this server knows nothing of the room's DAG.
+		rules, ok := roomver.Get(version)
+		if !ok {
+			return fmt.Errorf("federation: unknown room version %q for %s", version, roomID)
+		}
+		b := events.Builder{
+			Type:           "m.room.member",
+			Sender:         userID,
+			RoomID:         roomID,
+			Content:        json.RawMessage(`{"membership":"leave"}`),
+			Depth:          1,
+			OriginServerTS: a.Now(),
+			Origin:         a.ServerName(),
+		}
+		sk := userID
+		b.StateKey = &sk
+		var err error
+		if rules.EventFormatV1 {
+			ev, err = b.BuildLegacy(a.ServerName(), a.Key, version, ids.RandomTxnSuffix())
+		} else {
+			ev, err = b.BuildForVersion(a.ServerName(), a.Key, version)
+		}
+		if err != nil {
+			return fmt.Errorf("federation: could not build local leave for %s: %w", roomID, err)
+		}
+	}
+	row := &storage.EventRow{
 		EventID: ev.EventID(), RoomID: roomID, Type: ev.Type(),
 		StateKey: userID, Sender: userID, Depth: ev.Depth(),
 		OriginServerTS: ev.OriginServerTS(), Content: ev.Content(), RawJSON: ev.Raw(),
-	}); err == nil {
-		a.Store.IndexRelationFromRow(ctx, &storage.EventRow{EventID: ev.EventID(), RoomID: roomID})
-		if rules, ok := roomver.Get(version); ok {
-			_ = eventstate.Maintain(ctx, a.Store, &storage.EventRow{
-				EventID: ev.EventID(), RoomID: roomID, Type: ev.Type(), StateKey: userID,
-				Sender: userID, Depth: ev.Depth(), OriginServerTS: ev.OriginServerTS(),
-				Content: ev.Content(), RawJSON: ev.Raw(),
-			}, rules)
-		}
-		_ = a.Store.ForceUpsertMembership(ctx, storage.MembershipRow{
-			RoomID: roomID, UserID: userID, Membership: "leave",
-			EventID: ev.EventID(), StreamOrdering: stream, Depth: ev.Depth(),
-		})
+	}
+	if _, err := a.Store.InsertOutOfBandMembership(ctx, row,
+		storage.MembershipRow{RoomID: roomID, UserID: userID, Membership: "leave"}, true); err != nil {
+		return fmt.Errorf("federation: persist leave for %s: %w", roomID, err)
 	}
 	a.Notifier.NotifyUsers(userID)
 	return nil
-}
-
-// wellFormedStrippedState keeps the entries of a delivered stripped-state list
-// (invite_room_state / knock_room_state) that are well-formed state events.
-func wellFormedStrippedState(pdus []json.RawMessage) []json.RawMessage {
-	out := make([]json.RawMessage, 0, len(pdus))
-	for _, pdu := range pdus {
-		if _, err := strippedstate.FromPDU(pdu); err == nil {
-			out = append(out, pdu)
-		}
-	}
-	return out
 }

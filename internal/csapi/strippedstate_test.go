@@ -1,11 +1,15 @@
 package csapi
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"reflect"
 	"testing"
+
+	"github.com/AkagiYui/katrix/internal/federation"
 )
 
 // strippedKeys is the complete key set of a stripped state event (spec
@@ -169,4 +173,32 @@ func TestJoinViaParams(t *testing.T) {
 			t.Errorf("joinVia(%q) = %v, want %v", tc.query, got, tc.want)
 		}
 	}
+}
+
+// TestRemoteInviteErrorMapping: an invitee's server refusing an invite maps to
+// the client error per MSC4311 — a 400 over stripped state it cannot accept
+// is a 5xx (nothing the client can fix), a 403 passes through.
+func TestRemoteInviteErrorMapping(t *testing.T) {
+	fed403 := federationErr(t, 403, `{"errcode":"M_INVITE_BLOCKED"}`)
+	fed400 := federationErr(t, 400, `{"errcode":"M_MISSING_PARAM"}`)
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"blocked", fed403, 403, "M_INVITE_BLOCKED"},
+		{"missing create", fed400, 502, "M_UNKNOWN"},
+		{"not canonical", fmt.Errorf("%w (from hs)", federation.ErrInviteResponseNotCanonical), 400, "M_BAD_JSON"},
+	} {
+		var re *roomError
+		if !errors.As(remoteInviteError(tc.err), &re) || re.status != tc.status || re.code != tc.code {
+			t.Errorf("%s: got %+v, want %d %s", tc.name, re, tc.status, tc.code)
+		}
+	}
+}
+
+func federationErr(t *testing.T, status int, body string) error {
+	t.Helper()
+	return federation.NewFedHTTPError(status, fmt.Sprintf("HTTP %d: %s", status, body), []byte(body))
 }

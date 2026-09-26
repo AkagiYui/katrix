@@ -53,6 +53,13 @@ type Rules struct {
 	// hash rather than a random localpart (room version 12, MSC4291).
 	RoomIDIsCreateHash bool
 
+	// StrictStrippedState: invites MUST carry valid stripped state
+	// (MSC4311): servers SHOULD reject an invite whose invite_room_state lacks
+	// the m.room.create event or carries an entry that is not a correctly
+	// signed PDU of the room. For room versions 1-11 that validation is only a
+	// MAY (room version 12+).
+	StrictStrippedState bool
+
 	// CreatorPrivileged: the room creator has effectively infinite power and
 	// is exempt from power-level auth (room version 12, MSC4289).
 	CreatorPrivileged bool
@@ -178,6 +185,7 @@ func init() {
 	v12.Version = "12"
 	v12.StateResVersion = StateResV21
 	v12.RoomIDIsCreateHash = true
+	v12.StrictStrippedState = true
 	v12.CreatorPrivileged = true
 	register(v12)
 

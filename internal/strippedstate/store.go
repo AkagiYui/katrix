@@ -112,3 +112,25 @@ func ForMember(ctx context.Context, st *storage.Store, roomID, userID string) ([
 	}
 	return ForClient(prejoin, membership), nil
 }
+
+// ContentFor returns the content of one state event from the stripped state
+// of userID's current membership in roomID (nil when absent). It is how a
+// server that holds no state for a room answers questions about it — the
+// room's name for a push notification, whether a guest may join.
+func ContentFor(ctx context.Context, st *storage.Store, roomID, userID, eventType, stateKey string) json.RawMessage {
+	m, err := st.GetMembership(ctx, roomID, userID)
+	if err != nil {
+		return nil
+	}
+	ss, err := st.GetStrippedState(ctx, m.EventID)
+	if err != nil {
+		return nil
+	}
+	var content json.RawMessage
+	for _, pdu := range ss.PDUs {
+		if ev, err := FromPDU(pdu); err == nil && ev.Type == eventType && ev.StateKey == stateKey {
+			content = ev.Content
+		}
+	}
+	return content
+}

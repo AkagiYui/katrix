@@ -70,18 +70,22 @@ func (a *API) ingestPartialJoin(ctx context.Context, roomID string, version room
 	if !a.stateContainsVerifiableCreate(ctx, sj.State, rules) {
 		return fmt.Errorf("federation: could not verify m.room.create in partial send_join state")
 	}
-	exists, _ := a.Store.RoomExists(ctx, roomID)
-	if !exists {
-		_ = a.Store.CreateRoom(ctx, storage.Room{
-			RoomID: roomID, Version: string(version),
-			Creator: creatorFromState(sj.State), CreatedTS: a.Now(),
-			PartialState:  true,
-			ServersInRoom: sj.ServersInRoom,
-		})
-	}
 	alreadyPartial := false
-	if existing, err := a.Store.GetRoom(ctx, roomID); err == nil && existing.PartialState {
-		alreadyPartial = true
+	if existing, err := a.Store.GetRoom(ctx, roomID); err == nil {
+		alreadyPartial = existing.PartialState
+	}
+	_ = a.Store.EnsureRoom(ctx, storage.Room{
+		RoomID: roomID, Version: string(version),
+		Creator: creatorFromState(sj.State), CreatedTS: a.Now(),
+		PartialState:  true,
+		ServersInRoom: sj.ServersInRoom,
+	})
+	// A room already known — first learned of out of band through an invite
+	// or knock, or left earlier — has a row that is not marked partial: mark
+	// it, or the room would be treated as fully known while only its critical
+	// state is.
+	if !alreadyPartial {
+		_ = a.Store.SetRoomPartialState(ctx, roomID, true)
 	}
 	// Record the servers-in-room list for the resync (the sender + any list
 	// the response carried).

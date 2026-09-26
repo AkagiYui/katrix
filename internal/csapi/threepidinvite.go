@@ -352,22 +352,27 @@ func (a *API) persistThirdPartyMemberInvite(ctx context.Context, sender, target,
 	if err != nil {
 		return err
 	}
+	strippedState, _ := a.prejoinSnapshot(ctx, roomID, ev)
+	// A remote invitee's server cannot receive the invite via broadcast — it
+	// does not know the room yet. Deliver it via PUT
+	// /_matrix/federation/v2/invite/{roomID}/{eventID} before persisting (the
+	// same path the client invite flow uses): the invitee's server must accept
+	// it, and its doubly-signed copy is what gets persisted.
+	if a.fed != nil && !a.IsLocalUser(target) {
+		signed, err := a.fed.SendRemoteInvite(ctx, roomID, target, ev, version, strippedState)
+		if err != nil {
+			return remoteInviteError(err)
+		}
+		ev = signed
+	}
 	_, err = persistEventInRoom(ctx, a.Store, ev, version, roomID, membershipRowFromEvent(roomID, ev))
 	if err != nil {
 		return err
 	}
-	a.recordStrippedState(ctx, roomID, ev, version)
-	// The invitee is remote in the federated cases; notify local syncs and
-	// deliver the invite PDU to the room's servers (including the invitee's).
+	a.saveStrippedState(ctx, roomID, ev, version, strippedState)
+	// Notify local syncs and deliver the invite PDU to the room's servers.
 	a.notifyRoomMembers(ctx, roomID)
 	a.broadcastPDU(ctx, roomID, ev)
-	// A remote invitee's server cannot receive the invite via broadcast — it
-	// does not know the room yet. Deliver it via PUT
-	// /_matrix/federation/v2/invite/{roomID}/{eventID}, which creates the room
-	// view there (the same path the client invite flow uses).
-	if a.fed != nil && !a.IsLocalUser(target) {
-		_ = a.fed.SendRemoteInvite(ctx, roomID, target, ev, version)
-	}
 	return nil
 }
 

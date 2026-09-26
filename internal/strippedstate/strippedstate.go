@@ -26,8 +26,11 @@ import (
 const CreateType = "m.room.create"
 
 // Types lists the state event types (each with an empty state key) that make
-// up a room's prejoin state: the spec's recommended list. m.room.create comes
-// first because it is mandatory.
+// up a room's prejoin state: the spec's recommended list, m.room.create first
+// because it is mandatory, plus m.room.guest_access (the spec lets servers add
+// events). A server that holds no state for a room it was invited to knows
+// only this stripped state, and must decide from it whether a local guest
+// account may join — the room's servers have no notion of that guest.
 var Types = []string{
 	CreateType,
 	"m.room.name",
@@ -36,6 +39,7 @@ var Types = []string{
 	"m.room.join_rules",
 	"m.room.canonical_alias",
 	"m.room.encryption",
+	"m.room.guest_access",
 }
 
 var prejoinTypes = func() map[string]bool {

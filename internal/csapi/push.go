@@ -17,6 +17,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/pushrules"
 	"github.com/AkagiYui/katrix/internal/storage"
+	"github.com/AkagiYui/katrix/internal/strippedstate"
 )
 
 // This file implements the two halves of the Push Module's delivery side:
@@ -172,10 +173,10 @@ func (d *pushDispatcher) dispatchForUser(ctx context.Context, a *API, roomID, ev
 	if len(content) > 0 {
 		notif["content"] = content
 	}
-	if name := a.pushRoomName(ctx, roomID); name != "" {
+	if name := a.pushRoomName(ctx, roomID, userID); name != "" {
 		notif["room_name"] = name
 	}
-	if dn := a.pushSenderDisplayName(ctx, roomID, sender); dn != "" {
+	if dn := a.pushSenderDisplayName(ctx, roomID, sender, userID); dn != "" {
 		notif["sender_display_name"] = dn
 	}
 
@@ -496,10 +497,10 @@ func (d *pushDispatcher) refreshBadge(ctx context.Context, a *API, roomID, userI
 	if len(content) > 0 {
 		notif["content"] = content
 	}
-	if name := a.pushRoomName(ctx, roomID); name != "" {
+	if name := a.pushRoomName(ctx, roomID, userID); name != "" {
 		notif["room_name"] = name
 	}
-	if dn := a.pushSenderDisplayName(ctx, roomID, ev.Sender); dn != "" {
+	if dn := a.pushSenderDisplayName(ctx, roomID, ev.Sender, userID); dn != "" {
 		notif["sender_display_name"] = dn
 	}
 
@@ -566,46 +567,46 @@ func (a *API) totalUnreadCount(ctx context.Context, userID, localpart string) in
 	return total
 }
 
-// pushRoomName returns the room's display name for a push notification: the
-// m.room.name value, else the m.room.canonical_alias value, else "" (the spec
-// allows either; Synapse's push_tools uses the canonical "name" which prefers
-// the name and falls back to an alias).
-func (a *API) pushRoomName(ctx context.Context, roomID string) string {
-	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.name", ""); err == nil {
-		if ev, err := a.Store.GetEvent(ctx, id); err == nil {
-			var c struct {
-				Name string `json:"name"`
-			}
-			if json.Unmarshal(ev.Content, &c) == nil && c.Name != "" {
-				return c.Name
-			}
-		}
+// pushStateContent returns the content of a room state event as userID can
+// see it: from the room's state, or — for a room this server holds no state
+// for, where userID has an out-of-band invite or knock — from the stripped
+// state of that membership (sytest "Invites over federation are correctly
+// pushed with name" expects the room name of a remote room).
+func (a *API) pushStateContent(ctx context.Context, roomID, userID, eventType, stateKey string) json.RawMessage {
+	if c := a.stateContent(ctx, roomID, eventType, stateKey); c != nil {
+		return c
 	}
-	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.canonical_alias", ""); err == nil {
-		if ev, err := a.Store.GetEvent(ctx, id); err == nil {
-			var c struct {
-				Alias string `json:"alias"`
-			}
-			if json.Unmarshal(ev.Content, &c) == nil && c.Alias != "" {
-				return c.Alias
-			}
-		}
+	return strippedstate.ContentFor(ctx, a.Store, roomID, userID, eventType, stateKey)
+}
+
+// pushRoomName returns the room's display name for a push notification to
+// userID: the m.room.name value, else the m.room.canonical_alias value, else
+// "" (the spec allows either; Synapse's push_tools uses the canonical "name"
+// which prefers the name and falls back to an alias).
+func (a *API) pushRoomName(ctx context.Context, roomID, userID string) string {
+	var name struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(a.pushStateContent(ctx, roomID, userID, "m.room.name", ""), &name) == nil && name.Name != "" {
+		return name.Name
+	}
+	var alias struct {
+		Alias string `json:"alias"`
+	}
+	if json.Unmarshal(a.pushStateContent(ctx, roomID, userID, "m.room.canonical_alias", ""), &alias) == nil && alias.Alias != "" {
+		return alias.Alias
 	}
 	return ""
 }
 
 // pushSenderDisplayName returns the sender's display name in the room (their
-// m.room.member content displayname), falling back to "".
-func (a *API) pushSenderDisplayName(ctx context.Context, roomID, sender string) string {
-	if id, err := a.Store.GetStateEvent(ctx, roomID, "m.room.member", sender); err == nil {
-		if ev, err := a.Store.GetEvent(ctx, id); err == nil {
-			var c struct {
-				DisplayName string `json:"displayname"`
-			}
-			if json.Unmarshal(ev.Content, &c) == nil && c.DisplayName != "" {
-				return c.DisplayName
-			}
-		}
+// m.room.member content displayname) as userID can see it, falling back to "".
+func (a *API) pushSenderDisplayName(ctx context.Context, roomID, sender, userID string) string {
+	var member struct {
+		DisplayName string `json:"displayname"`
+	}
+	if json.Unmarshal(a.pushStateContent(ctx, roomID, userID, "m.room.member", sender), &member) == nil {
+		return member.DisplayName
 	}
 	return ""
 }

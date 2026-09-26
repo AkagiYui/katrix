@@ -2,6 +2,8 @@ package federation
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -173,5 +175,37 @@ func TestQueryRemoteDirectoryURL(t *testing.T) {
 	const want = "https://hs2.example:8448/_matrix/federation/v1/query/directory?room_alias=%23flibble%3Ahs2.example"
 	if u != want {
 		t.Fatalf("directory URL = %q, want %q", u, want)
+	}
+}
+
+func TestInviteErrorClassification(t *testing.T) {
+	notFound := NewFedHTTPError(404, "HTTP 404", nil)
+	unrecognised := NewFedHTTPError(404, "HTTP 404", []byte(`{"errcode":"M_UNRECOGNIZED"}`))
+	notFoundRoom := NewFedHTTPError(404, "HTTP 404", []byte(`{"errcode":"M_NOT_FOUND"}`))
+	methodUnrecognised := NewFedHTTPError(405, "HTTP 405", []byte(`{"errcode":"M_UNRECOGNIZED"}`))
+	missingParam := NewFedHTTPError(400, "HTTP 400", []byte(`{"errcode":"M_MISSING_PARAM"}`))
+	transport := fmt.Errorf("federation: invite hs: %w", errors.New("connection refused"))
+	notCanonical := fmt.Errorf("%w (from hs)", ErrInviteResponseNotCanonical)
+
+	for _, tc := range []struct {
+		name               string
+		err                error
+		unknown, transient bool
+	}{
+		{"404 without body", notFound, true, false},
+		{"404 M_UNRECOGNIZED", unrecognised, true, false},
+		{"404 M_NOT_FOUND", notFoundRoom, false, false},
+		{"405 M_UNRECOGNIZED", methodUnrecognised, true, false},
+		{"400 M_MISSING_PARAM", missingParam, false, false},
+		{"transport", transport, false, true},
+		{"not canonical", notCanonical, false, false},
+		{"nil", nil, false, false},
+	} {
+		if got := isUnknownInviteEndpoint(tc.err); got != tc.unknown {
+			t.Errorf("%s: isUnknownInviteEndpoint = %v, want %v", tc.name, got, tc.unknown)
+		}
+		if got := isInviteTransportError(tc.err); got != tc.transient {
+			t.Errorf("%s: isInviteTransportError = %v, want %v", tc.name, got, tc.transient)
+		}
 	}
 }
