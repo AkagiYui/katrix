@@ -1922,6 +1922,14 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) {
 	a.Store.IndexRelationFromRow(r.Context(), row)
 	metrics.Counters.FedInboundPDUs.Add(1)
 
+	// Keep the delivered invite_room_state as the invite's stripped-state
+	// snapshot: it is what the invitee is shown in /sync (rendered as stripped
+	// state events at the Client-Server boundary).
+	_ = a.Store.SaveStrippedState(r.Context(), storage.StrippedState{
+		EventID: evID, RoomID: ev.RoomID, RoomVersion: string(version),
+		PDUs: wellFormedStrippedState(req.InviteRoomState),
+	}, a.Now())
+
 	// Persist the delivered invite_room_state (stripped state) so the invitee's
 	// sync and /state have something to render. Best-effort: malformed entries
 	// are skipped.

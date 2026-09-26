@@ -89,7 +89,7 @@ func Truncate(ctx context.Context, pool pgxConn) error {
 			receipts, account_data,
 			room_memberships, room_state, room_aliases,
 			event_state_snapshots,
-			events, rooms, registration_tokens,
+			events, rooms, registration_tokens, stripped_state,
 			media_thumbnails, media,
 			access_tokens, devices, users,
 			delayed_events, thread_subscriptions,

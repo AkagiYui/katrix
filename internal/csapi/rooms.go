@@ -2715,8 +2715,8 @@ func joinCustomContent(r *http.Request) map[string]any {
 	return body
 }
 
-// splitVia parses the server_name query parameter (a comma-separated list of
-// servers to try when joining a remote room).
+// splitVia parses one via / server_name query value. Each value names one
+// server; a comma-separated list is also accepted.
 func splitVia(s string) []string {
 	if s == "" {
 		return nil
@@ -2731,13 +2731,24 @@ func splitVia(s string) []string {
 	return out
 }
 
-// joinVia collects the via servers from a join request. Per the spec the
-// server_name query parameter may be repeated (each value a candidate server
-// to try in order), so all values are gathered rather than just the first.
+// joinVia collects the candidate servers from a /join or /knock request, in
+// the order they should be tried. The spec's `via` query parameter (v1.12)
+// comes first; the deprecated `server_name` parameter it replaced is still
+// read so older clients keep working. Each parameter may be repeated, and
+// duplicates are dropped.
 func joinVia(r *http.Request) []string {
+	q := r.URL.Query()
+	seen := map[string]bool{}
 	var out []string
-	for _, v := range r.URL.Query()["server_name"] {
-		out = append(out, splitVia(v)...)
+	for _, key := range []string{"via", "server_name"} {
+		for _, v := range q[key] {
+			for _, server := range splitVia(v) {
+				if !seen[server] {
+					seen[server] = true
+					out = append(out, server)
+				}
+			}
+		}
 	}
 	return out
 }
@@ -2924,6 +2935,10 @@ func (a *API) sendMemberEventWithContent(r *http.Request, auth *homeserver.Auth,
 	if err != nil {
 		return "", err
 	}
+	// An invite or knock is accompanied by the room's stripped state, captured
+	// now so the invitee / knocker sees the room as it was when the membership
+	// was created.
+	a.recordStrippedState(r.Context(), roomID, ev, version)
 	// room_state is maintained by persistEvent (snapshot + recompute).
 	if mc != nil {
 		// A join/leave changes the user's device-list visibility to the room's

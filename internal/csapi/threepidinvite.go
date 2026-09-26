@@ -356,6 +356,7 @@ func (a *API) persistThirdPartyMemberInvite(ctx context.Context, sender, target,
 	if err != nil {
 		return err
 	}
+	a.recordStrippedState(ctx, roomID, ev, version)
 	// The invitee is remote in the federated cases; notify local syncs and
 	// deliver the invite PDU to the room's servers (including the invitee's).
 	a.notifyRoomMembers(ctx, roomID)

@@ -12,6 +12,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/storage"
+	"github.com/AkagiYui/katrix/internal/strippedstate"
 )
 
 // The MSC4186 / MSC3575 sliding-sync endpoint
@@ -103,15 +104,20 @@ type slidingSyncRoomResp struct {
 	// Timeline is always emitted, even when empty: clients (and test
 	// harnesses) rely on the field being present to locate a room's event
 	// list in the response.
-	Timeline      []json.RawMessage `json:"timeline"`
-	PrevBatch     string            `json:"prev_batch,omitempty"`
-	Limited       bool              `json:"limited,omitempty"`
-	NumLive       *int64            `json:"num_live,omitempty"`
-	BumpStamp     *int64            `json:"bump_stamp,omitempty"`
-	JoinedCount   *int              `json:"joined_count,omitempty"`
-	InvitedCount  *int              `json:"invited_count,omitempty"`
-	Membership    string            `json:"membership,omitempty"`
-	StrippedState []json.RawMessage `json:"invite_state,omitempty"`
+	Timeline     []json.RawMessage `json:"timeline"`
+	PrevBatch    string            `json:"prev_batch,omitempty"`
+	Limited      bool              `json:"limited,omitempty"`
+	NumLive      *int64            `json:"num_live,omitempty"`
+	BumpStamp    *int64            `json:"bump_stamp,omitempty"`
+	JoinedCount  *int              `json:"joined_count,omitempty"`
+	InvitedCount *int              `json:"invited_count,omitempty"`
+	Membership   string            `json:"membership,omitempty"`
+	// StrippedState carries the room's stripped state for invited and
+	// knocked rooms (MSC4186 `stripped_state`). MSC4186 renamed the field from
+	// `invite_state`, which deployed clients (ruma / matrix-rust-sdk) still
+	// read, so the same events are also emitted under the old name.
+	StrippedState       []json.RawMessage `json:"stripped_state,omitempty"`
+	LegacyStrippedState []json.RawMessage `json:"invite_state,omitempty"`
 	// Unread notification counts (flat form, per the sync v5 / sliding-sync
 	// room schema — the spec's UnreadNotificationsCount object is flattened
 	// into the room). The matrix-rust-sdk's NotificationClient reads these to
@@ -416,13 +422,14 @@ func (a *API) buildSlidingSync(ctx context.Context, auth *homeserver.Auth, since
 // roomEntry is a room in the sliding-window ordering.
 type roomEntry struct {
 	roomID     string
-	membership string // join | invite | leave
+	membership string // join | invite | knock | leave | ban
 	bump       int64  // recency stamp
 	stream     int64  // membership stream ordering (for "new since" checks)
 }
 
-// slidingRoomEntries returns the user's joined + invited rooms ordered by
-// recency (most recently active first), with invited rooms after joined ones.
+// slidingRoomEntries returns the user's joined rooms ordered by recency (most
+// recently active first), followed by the rooms they are invited to or have
+// knocked on (MSC4186 lists every room the user has a membership in).
 func (a *API) slidingRoomEntries(ctx context.Context, userID string) []roomEntry {
 	joined, _ := a.Store.RoomsForUser(ctx, userID)
 	entries := make([]roomEntry, 0, len(joined)+8)
@@ -436,9 +443,15 @@ func (a *API) slidingRoomEntries(ctx context.Context, userID string) []roomEntry
 	}
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].bump > entries[j].bump })
 
-	invited, _ := a.Store.InvitedRooms(ctx, userID)
-	for _, roomID := range invited {
-		entries = append(entries, roomEntry{roomID: roomID, membership: "invite", bump: 0, stream: membershipStream(ctx, a.Store, roomID, userID)})
+	invited, _ := a.Store.InvitedRooms(ctx, userID, 0)
+	knocked, _ := a.Store.KnockedRooms(ctx, userID, 0)
+	for _, pending := range []struct {
+		membership string
+		roomIDs    []string
+	}{{"invite", invited}, {"knock", knocked}} {
+		for _, roomID := range pending.roomIDs {
+			entries = append(entries, roomEntry{roomID: roomID, membership: pending.membership, bump: 0, stream: membershipStream(ctx, a.Store, roomID, userID)})
+		}
 	}
 	return entries
 }
@@ -450,7 +463,7 @@ func (a *API) slidingRoomEntryFor(ctx context.Context, roomID, userID string) *r
 		return nil
 	}
 	switch m.Membership {
-	case "join", "invite", "leave", "ban":
+	case "join", "invite", "knock", "leave", "ban":
 	default:
 		return nil
 	}
@@ -619,10 +632,13 @@ func (a *API) slidingRoomResult(ctx context.Context, entry roomEntry, userID, lo
 			}
 		}
 
-	case "invite":
-		// Invited rooms carry the stripped invite state; the client has no
-		// timeline access yet.
-		rr.StrippedState = a.slidingInviteState(ctx, roomID, maxStream)
+	case "invite", "knock":
+		// Invited and knocked rooms carry only the room's stripped state; the
+		// user is not in the room and has no timeline access yet.
+		if evs, err := strippedstate.ForMember(ctx, a.Store, roomID, userID); err == nil {
+			rr.StrippedState = evs
+			rr.LegacyStrippedState = evs
+		}
 	case "leave", "ban":
 		// A leave just needs to be surfaced so clients drop the room.
 		rr.Initial = true
@@ -690,26 +706,6 @@ func (a *API) slidingRequiredState(ctx context.Context, roomID, userID string, t
 		default:
 			add(byKey[typ+"\x00"+stateKey])
 		}
-	}
-	return out
-}
-
-// slidingInviteState builds the stripped state for an invited room (the same
-// events /v3/sync delivers under rooms.invite.<room>.invite_state).
-func (a *API) slidingInviteState(ctx context.Context, roomID string, maxStream int64) []json.RawMessage {
-	stateRows, err := a.Store.GetState(ctx, roomID)
-	if err != nil {
-		return nil
-	}
-	ids := make([]string, 0, len(stateRows))
-	for _, s := range stateRows {
-		ids = append(ids, s.EventID)
-	}
-	evs, _ := a.Store.EventsByIDs(ctx, ids)
-	render := a.ssPrevContentRenderer(ctx, roomID, maxStream)
-	out := make([]json.RawMessage, 0, len(evs))
-	for i := range evs {
-		out = append(out, render(&evs[i]))
 	}
 	return out
 }

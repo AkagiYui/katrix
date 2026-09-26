@@ -235,29 +235,26 @@ func (s *Store) MaxStreamOrdering(ctx context.Context) (int64, error) {
 	return n, nil
 }
 
-// InvitedRooms returns room IDs the user is currently invited to.
-func (s *Store) InvitedRooms(ctx context.Context, userID string) ([]string, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT room_id FROM room_memberships WHERE user_id=$1 AND membership='invite'`, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
+// InvitedRooms returns the rooms the user is currently invited to. On an
+// incremental sync (since>0) only invites that arrived after `since` are
+// reported: a pending invite already delivered must not be re-sent on every
+// incremental sync (spec /sync: rooms.invite carries the rooms the user has
+// been invited to *since the previous sync*).
+func (s *Store) InvitedRooms(ctx context.Context, userID string, since int64) ([]string, error) {
+	return s.pendingMembershipRooms(ctx, userID, "invite", since)
 }
 
-// KnockedRooms returns room IDs the user has knocked on (MSC2409).
-func (s *Store) KnockedRooms(ctx context.Context, userID string) ([]string, error) {
+// KnockedRooms returns the rooms the user has a pending knock on (MSC2409),
+// with the same incremental semantics as InvitedRooms.
+func (s *Store) KnockedRooms(ctx context.Context, userID string, since int64) ([]string, error) {
+	return s.pendingMembershipRooms(ctx, userID, "knock", since)
+}
+
+func (s *Store) pendingMembershipRooms(ctx context.Context, userID, membership string, since int64) ([]string, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT room_id FROM room_memberships WHERE user_id=$1 AND membership='knock'`, userID)
+		`SELECT room_id FROM room_memberships
+		  WHERE user_id=$1 AND membership=$2 AND ($3 = 0 OR stream_ordering > $3)`,
+		userID, membership, since)
 	if err != nil {
 		return nil, err
 	}

@@ -12,6 +12,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/pushrules"
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
+	"github.com/AkagiYui/katrix/internal/strippedstate"
 )
 
 // Response is the /sync response body.
@@ -38,7 +39,7 @@ type ProfileUpdatesForUser struct {
 }
 
 // hasDeltas reports whether an incremental response carries any content beyond
-// the empty baseline: room timeline/state/leave/invite changes, account data,
+// the empty baseline: room timeline/state/leave/invite/knock changes, account data,
 // presence (of peers — the user's own presence is always echoed), to-device
 // messages or device-list updates. The long-poll loop uses this to decide
 // whether to park: a response whose NextBatch token has not moved may still
@@ -51,7 +52,7 @@ type ProfileUpdatesForUser struct {
 // for use_state_after clients, so only rooms with non-empty timeline, state,
 // account_data or ephemeral content count as a delta.
 func (r *Response) HasDeltas(userID string) bool {
-	if len(r.Rooms.Invite) > 0 || len(r.Rooms.Leave) > 0 || len(r.Rooms.Peek) > 0 {
+	if len(r.Rooms.Invite) > 0 || len(r.Rooms.Knock) > 0 || len(r.Rooms.Leave) > 0 || len(r.Rooms.Peek) > 0 {
 		return true
 	}
 	for _, jr := range r.Rooms.Join {
@@ -608,8 +609,9 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 		rooms.Join[roomID] = jr
 	}
 
-	// Rooms the user is invited to (membership=invite).
-	invited, err := e.store.InvitedRooms(ctx, opts.UserID)
+	// Rooms the user is invited to (membership=invite). An incremental sync
+	// only carries invites that arrived since the previous sync.
+	invited, err := e.store.InvitedRooms(ctx, opts.UserID, opts.Since.Stream)
 	if err == nil {
 		for _, roomID := range invited {
 			// MSC4155 + m.ignored_user_list: an invite whose sender (or sender's
@@ -618,16 +620,17 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*Response, error) 
 			if e.inviteIsHidden(ctx, roomID, opts.UserID, opts.Localpart, ignored) {
 				continue
 			}
-			rooms.Invite[roomID] = e.buildInvitedRoom(ctx, roomID)
+			rooms.Invite[roomID] = e.buildInvitedRoom(ctx, roomID, opts.UserID)
 		}
 	}
 
 	// Rooms the user has knocked on (membership=knock, MSC2409). Knock rooms are
-	// delivered like invites but under `knock` with a `knock_state` section.
-	knocked, err := e.store.KnockedRooms(ctx, opts.UserID)
+	// delivered like invites but under `knock` with a `knock_state` section,
+	// with the same incremental semantics.
+	knocked, err := e.store.KnockedRooms(ctx, opts.UserID, opts.Since.Stream)
 	if err == nil {
 		for _, roomID := range knocked {
-			rooms.Knock[roomID] = e.buildKnockedRoom(ctx, roomID)
+			rooms.Knock[roomID] = e.buildKnockedRoom(ctx, roomID, opts.UserID)
 		}
 	}
 
@@ -2337,46 +2340,26 @@ func (e *Engine) roomHasName(ctx context.Context, roomID string) bool {
 	return false
 }
 
-// buildInvitedRoom constructs the InvitedRoom section (just the invite state).
-func (e *Engine) buildInvitedRoom(ctx context.Context, roomID string) InvitedRoom {
-	ir := InvitedRoom{}
-	// Fetch the invite m.room.member event.
-	id, err := e.store.GetStateEvent(ctx, roomID, "m.room.member", "")
-	_ = id
-	_ = err
-	// Best-effort: include the create + power_levels + join_rules + member.
-	stateRows, _ := e.store.GetState(ctx, roomID)
-	ids := make([]string, 0, len(stateRows))
-	for _, s := range stateRows {
-		ids = append(ids, s.EventID)
+// buildInvitedRoom constructs the InvitedRoom section: the room's stripped
+// state (spec §Stripped state), which always carries m.room.create, plus the
+// invite event itself — never federation PDUs.
+func (e *Engine) buildInvitedRoom(ctx context.Context, roomID, userID string) InvitedRoom {
+	evs, err := strippedstate.ForMember(ctx, e.store, roomID, userID)
+	if err != nil || evs == nil {
+		evs = []json.RawMessage{}
 	}
-	evs, _ := e.store.EventsByIDs(ctx, ids)
-	for _, se := range evs {
-		ir.InviteState.Events = append(ir.InviteState.Events, se.RawJSON)
-	}
-	return ir
+	return InvitedRoom{InviteState: StateSet{Events: evs}}
 }
 
 // buildKnockedRoom constructs the KnockedRoom section for a room the user has
-// knocked on (MSC2409): the room's current state events under `knock_state`
-// (mirroring the invite section's `invite_state`).
-func (e *Engine) buildKnockedRoom(ctx context.Context, roomID string) KnockedRoom {
-	kr := KnockedRoom{}
-	stateRows, err := e.store.GetState(ctx, roomID)
-	if err == nil {
-		ids := make([]string, 0, len(stateRows))
-		for _, s := range stateRows {
-			ids = append(ids, s.EventID)
-		}
-		evs, _ := e.store.EventsByIDs(ctx, ids)
-		for _, se := range evs {
-			kr.KnockState.Events = append(kr.KnockState.Events, se.RawJSON)
-		}
+// knocked on (MSC2409): the room's stripped state plus the knock event itself
+// under `knock_state`.
+func (e *Engine) buildKnockedRoom(ctx context.Context, roomID, userID string) KnockedRoom {
+	evs, err := strippedstate.ForMember(ctx, e.store, roomID, userID)
+	if err != nil || evs == nil {
+		evs = []json.RawMessage{}
 	}
-	if kr.KnockState.Events == nil {
-		kr.KnockState.Events = []json.RawMessage{}
-	}
-	return kr
+	return KnockedRoom{KnockState: StateSet{Events: evs}}
 }
 
 // buildLeftRoom constructs the LeftRoom section. The timeline is capped at the
@@ -2614,13 +2597,14 @@ func (e *Engine) ignoredUsers(ctx context.Context, localpart string) map[string]
 // invitee's /sync: the sender is in their m.ignored_user_list, or the sender /
 // sender's server is ignored under the MSC4155 invite-permission config.
 func (e *Engine) inviteIsHidden(ctx context.Context, roomID, inviteeUserID, inviteeLocalpart string, ignored map[string]bool) bool {
-	// The inviter is the sender of the room's m.room.member(invite) event for
-	// the invitee.
-	id, err := e.store.GetStateEvent(ctx, roomID, "m.room.member", inviteeUserID)
+	// The inviter is the sender of the invitee's current membership event (the
+	// invite). The membership row is authoritative for rooms the server is not
+	// resident in, which have no local room state.
+	m, err := e.store.GetMembership(ctx, roomID, inviteeUserID)
 	if err != nil {
 		return false
 	}
-	ev, err := e.store.GetEvent(ctx, id)
+	ev, err := e.store.GetEvent(ctx, m.EventID)
 	if err != nil || ev == nil {
 		return false
 	}

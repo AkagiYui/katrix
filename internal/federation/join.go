@@ -20,6 +20,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/rooms"
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
+	"github.com/AkagiYui/katrix/internal/strippedstate"
 )
 
 // ---- outbound federated room join (make_join / send_join / query_directory) ----
@@ -344,6 +345,12 @@ func (a *API) ingestRemoteKnock(ctx context.Context, roomID string, version room
 	if rejected, err := a.Store.IsEventRejected(ctx, ev.EventID()); err == nil && rejected {
 		a.Store.UnmarkEventRejected(ctx, ev.EventID())
 	}
+	// Keep the delivered knock_room_state as the knock's stripped-state
+	// snapshot, shown to the knocker in /sync knock_state.
+	_ = a.Store.SaveStrippedState(ctx, storage.StrippedState{
+		EventID: ev.EventID(), RoomID: roomID, RoomVersion: string(version),
+		PDUs: wellFormedStrippedState(state),
+	}, a.Now())
 	// Mark the knocking user as knocking.
 	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
 		RoomID: roomID, UserID: ev.Sender(), Membership: "knock",
@@ -1566,4 +1573,16 @@ func (a *API) LeaveRemoteRoom(ctx context.Context, dest, userID, roomID string) 
 	}
 	a.Notifier.NotifyUsers(userID)
 	return nil
+}
+
+// wellFormedStrippedState keeps the entries of a delivered stripped-state list
+// (invite_room_state / knock_room_state) that are well-formed state events.
+func wellFormedStrippedState(pdus []json.RawMessage) []json.RawMessage {
+	out := make([]json.RawMessage, 0, len(pdus))
+	for _, pdu := range pdus {
+		if _, err := strippedstate.FromPDU(pdu); err == nil {
+			out = append(out, pdu)
+		}
+	}
+	return out
 }
