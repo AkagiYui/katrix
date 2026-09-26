@@ -1,12 +1,23 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   getToken,
+  getUserId,
   setToken,
   createRoom as apiCreateRoom,
   joinRoom as apiJoinRoom,
+  knockRoom as apiKnockRoom,
+  leaveRoom as apiLeaveRoom,
   sendMessage as apiSendMessage,
   sendEncryptedMessage as apiSendEncrypted,
 } from "../lib/matrix";
+import {
+  previewRoom,
+  joinCandidates,
+  type InvitedRoomSync,
+  type KnockedRoomSync,
+  type RoomPreview,
+  type StrippedStateEvent,
+} from "../lib/stripped-state";
 import {
   bootstrapE2EE,
   getDeviceId,
@@ -34,13 +45,70 @@ interface SyncResponse {
   next_batch: string;
   rooms?: {
     join?: Record<string, JoinedRoom>;
-    invite?: Record<string, unknown>;
+    invite?: Record<string, InvitedRoomSync>;
+    knock?: Record<string, KnockedRoomSync>;
+    leave?: Record<string, unknown>;
   };
   to_device?: ToDevice;
 }
 
+type PendingRooms = Record<string, StrippedStateEvent[]>;
+
+/** A room's current state, keyed by "type\u0000state_key". */
+type StateMap = Record<string, MatrixEvent>;
+
+/** The client's view of a joined room. */
+interface RoomView {
+  timeline: MatrixEvent[];
+  state: StateMap;
+}
+
+/**
+ * Fold a /sync joined-room section into the room's current state. `state`
+ * carries the updates up to the start of the timeline, and state events in
+ * the timeline apply after them (spec /sync). For a newly joined room whose
+ * history fits in the timeline, all of its state arrives in the timeline.
+ */
+function applyState(prev: StateMap, r: JoinedRoom): StateMap {
+  const next = { ...prev };
+  for (const e of [...(r.state?.events ?? []), ...r.timeline.events]) {
+    if (e.state_key === undefined) continue;
+    next[`${e.type}\u0000${e.state_key}`] = e;
+  }
+  return next;
+}
+
+/** User IDs of the joined members in a room's current state. */
+function joinedMembers(state: StateMap): string[] {
+  return Object.values(state)
+    .filter((e) => e.type === "m.room.member" && e.content.membership === "join")
+    .map((e) => e.state_key ?? e.sender);
+}
+
+/**
+ * Fold a sync response's pending memberships into the client's view. A room's
+ * stripped state is only meaningful while the membership is pending: once the
+ * user joins or leaves (declines / retracts, or is rejected) it is discarded
+ * (spec §Stripped state), and an accepted knock turns into an invite.
+ */
+function foldPending(
+  prev: PendingRooms,
+  incoming: Record<string, StrippedStateEvent[]>,
+  settled: string[],
+): PendingRooms {
+  if (settled.length === 0 && Object.keys(incoming).length === 0) return prev;
+  const next = { ...prev };
+  for (const id of settled) delete next[id];
+  Object.assign(next, incoming);
+  return next;
+}
+
 export function ChatPage() {
-  const [rooms, setRooms] = useState<Record<string, JoinedRoom>>({});
+  const [rooms, setRooms] = useState<Record<string, RoomView>>({});
+  const [invites, setInvites] = useState<PendingRooms>({});
+  const [knocks, setKnocks] = useState<PendingRooms>({});
+  const [pendingError, setPendingError] = useState("");
+  const userId = getUserId();
   const [activeRoom, setActiveRoom] = useState<string | null>(null);
   const [since, setSince] = useState<string>("");
   const [roomInput, setRoomInput] = useState("");
@@ -95,6 +163,20 @@ export function ChatPage() {
           const data = (await resp.json()) as SyncResponse;
           setSince(data.next_batch ?? "");
 
+          // Pending memberships: invites and knocks carry stripped state.
+          const joinedIds = Object.keys(data.rooms?.join ?? {});
+          const leftIds = Object.keys(data.rooms?.leave ?? {});
+          const newInvites = Object.fromEntries(
+            Object.entries(data.rooms?.invite ?? {}).map(([id, r]) => [id, r.invite_state?.events ?? []]),
+          );
+          const newKnocks = Object.fromEntries(
+            Object.entries(data.rooms?.knock ?? {}).map(([id, r]) => [id, r.knock_state?.events ?? []]),
+          );
+          setInvites((prev) => foldPending(prev, newInvites, [...joinedIds, ...leftIds]));
+          setKnocks((prev) =>
+            foldPending(prev, newKnocks, [...joinedIds, ...leftIds, ...Object.keys(newInvites)]),
+          );
+
           // Process to-device events: room keys (m.room_key via m.encrypted).
           if (data.to_device?.events) {
             for (const ev of data.to_device.events) {
@@ -104,13 +186,11 @@ export function ChatPage() {
 
           if (data.rooms?.join) {
             // Collect member user ids across rooms for device-key queries.
+            const deltas: Record<string, StateMap> = {};
             const allUsers = new Set<string>();
-            for (const r of Object.values(data.rooms.join!)) {
-              for (const e of r.state?.events ?? []) {
-                if (e.type === "m.room.member" && e.content.membership === "join") {
-                  allUsers.add(e.state_key ?? e.sender);
-                }
-              }
+            for (const [id, r] of Object.entries(data.rooms.join)) {
+              deltas[id] = applyState({}, r);
+              for (const u of joinedMembers(deltas[id])) allUsers.add(u);
             }
             if (allUsers.size > 0) {
               queryUserDevices([...allUsers]).catch(() => {});
@@ -119,28 +199,20 @@ export function ChatPage() {
             setRooms((prev) => {
               const next = { ...prev };
               for (const [id, r] of Object.entries(data.rooms!.join!)) {
-                if (next[id]) {
-                  next[id] = {
-                    ...next[id],
-                    timeline: {
-                      events: [...next[id].timeline.events, ...r.timeline.events],
-                    },
-                    state: next[id].state ?? r.state,
-                  };
-                } else {
-                  next[id] = r;
-                }
+                const cur = next[id] ?? { timeline: [], state: {} };
+                next[id] = {
+                  timeline: [...cur.timeline, ...r.timeline.events],
+                  state: applyState(cur.state, r),
+                };
               }
               return next;
             });
 
             // Share room keys for rooms we haven't shared yet.
             if (e2eeReady) {
-              for (const [id, r] of Object.entries(data.rooms.join)) {
+              for (const id of Object.keys(data.rooms.join)) {
                 if (sharedRooms.current.has(id)) continue;
-                const members = (r.state?.events ?? [])
-                  .filter((e) => e.type === "m.room.member" && e.content.membership === "join")
-                  .map((e) => e.state_key ?? e.sender);
+                const members = joinedMembers(deltas[id]);
                 if (members.length > 0) {
                   // Ensure an outbound session exists before sharing.
                   await getOutboundGroupSession(id).catch(() => {});
@@ -160,11 +232,8 @@ export function ChatPage() {
   }, [since, e2eeReady, e2eeError]);
 
   const roomList = Object.keys(rooms);
-  const roomName = (id: string): string => {
-    const stateEvents = rooms[id]?.state?.events ?? [];
-    const nameEv = stateEvents.find((e) => e.type === "m.room.name");
-    return nameEv?.content?.name || id;
-  };
+  const roomName = (id: string): string =>
+    rooms[id]?.state["m.room.name\u0000"]?.content?.name || id;
 
   const handleCreate = async () => {
     const name = roomInput || `Room ${roomList.length + 1}`;
@@ -180,6 +249,39 @@ export function ChatPage() {
     setRoomInput("");
   };
 
+  const handleKnock = async () => {
+    if (!roomInput) return;
+    setPendingError("");
+    try {
+      await apiKnockRoom(roomInput);
+      setRoomInput("");
+    } catch (e) {
+      setPendingError(e instanceof Error ? e.message : "Knock failed");
+    }
+  };
+
+  const acceptInvite = async (preview: RoomPreview) => {
+    setPendingError("");
+    try {
+      const { room_id } = await apiJoinRoom(preview.roomId, joinCandidates(preview));
+      setActiveRoom(room_id);
+    } catch (e) {
+      setPendingError(e instanceof Error ? e.message : "Could not join the room");
+    }
+  };
+
+  const leavePending = async (preview: RoomPreview) => {
+    setPendingError("");
+    try {
+      await apiLeaveRoom(preview.roomId);
+    } catch (e) {
+      setPendingError(e instanceof Error ? e.message : "Could not leave the room");
+    }
+  };
+
+  const invitePreviews = Object.entries(invites).map(([id, evs]) => previewRoom(id, evs, userId));
+  const knockPreviews = Object.entries(knocks).map(([id, evs]) => previewRoom(id, evs, userId));
+
   return (
     <>
       <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)" }}>
@@ -188,6 +290,9 @@ export function ChatPage() {
             onChange={(e) => setRoomInput(e.target.value)} />
           <button className="btn btn-sm" onClick={handleCreate}>+ Create</button>
           <button className="btn btn-sm" onClick={handleJoin}>Join</button>
+          <button className="btn btn-sm" onClick={handleKnock} title="Ask to join a room with join rule “knock”">
+            Knock
+          </button>
         </div>
         {e2eeError && (
           <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
@@ -200,8 +305,27 @@ export function ChatPage() {
           </div>
         )}
       </div>
-      <div className="row" style={{ gap: 0, flex: 1, minHeight: 0 }}>
+      <div className="row" style={{ gap: 0, flex: 1, minHeight: 0, alignItems: "stretch" }}>
         <div style={{ width: 240, borderRight: "1px solid var(--border)", overflowY: "auto", padding: 8 }}>
+          {pendingError && <div className="error" style={{ margin: "0 4px 8px" }}>{pendingError}</div>}
+          {invitePreviews.length > 0 && (
+            <PendingSection title="Invites">
+              {invitePreviews.map((p) => (
+                <PendingRoomCard key={p.roomId} preview={p} kind="invite"
+                  onAccept={() => acceptInvite(p)} onLeave={() => leavePending(p)} />
+              ))}
+            </PendingSection>
+          )}
+          {knockPreviews.length > 0 && (
+            <PendingSection title="Requests to join">
+              {knockPreviews.map((p) => (
+                <PendingRoomCard key={p.roomId} preview={p} kind="knock" onLeave={() => leavePending(p)} />
+              ))}
+            </PendingSection>
+          )}
+          {(invitePreviews.length > 0 || knockPreviews.length > 0) && (
+            <div className="muted" style={{ padding: "8px 4px 4px", fontWeight: 600 }}>Rooms</div>
+          )}
           {roomList.map((id) => (
             <div key={id} className={`room-list-item${activeRoom === id ? " active" : ""}`}
               onClick={() => setActiveRoom(id)}>
@@ -222,6 +346,79 @@ export function ChatPage() {
         </div>
       </div>
     </>
+  );
+}
+
+function PendingSection({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <div className="muted" style={{ padding: "4px 4px 6px", fontWeight: 600 }}>{title}</div>
+      <div className="col" style={{ gap: 6 }}>{children}</div>
+    </div>
+  );
+}
+
+/**
+ * A room the user has a pending membership in, previewed from its stripped
+ * state: the room is not joined yet, so nothing but the stripped state is
+ * known about it.
+ */
+function PendingRoomCard({
+  preview,
+  kind,
+  onAccept,
+  onLeave,
+}: {
+  preview: RoomPreview;
+  kind: "invite" | "knock";
+  onAccept?: () => Promise<void>;
+  onLeave: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const run = (fn?: () => Promise<void>) => async () => {
+    if (!fn) return;
+    setBusy(true);
+    try {
+      await fn();
+    } finally {
+      setBusy(false);
+    }
+  };
+  const badges: string[] = [];
+  if (preview.roomType === "m.space") badges.push("Space");
+  if (preview.isDirect) badges.push("Direct");
+  if (preview.encrypted) badges.push("🔒 Encrypted");
+  if (preview.joinRule && preview.joinRule !== "invite") badges.push(preview.joinRule);
+
+  return (
+    <div className="card" style={{ padding: 10 }}>
+      <div style={{ fontWeight: 600, wordBreak: "break-word" }} title={preview.roomId}>{preview.name}</div>
+      {kind === "invite" && preview.inviter && (
+        <div className="muted" style={{ fontSize: 12 }}>
+          Invited by {preview.inviterDisplayName ?? preview.inviter}
+        </div>
+      )}
+      {kind === "knock" && <div className="muted" style={{ fontSize: 12 }}>Waiting for a member to let you in</div>}
+      {preview.topic && (
+        <div className="muted" style={{ fontSize: 12, marginTop: 4, wordBreak: "break-word" }}>{preview.topic}</div>
+      )}
+      {preview.reason && (
+        <div className="muted" style={{ fontSize: 12, marginTop: 4, fontStyle: "italic" }}>“{preview.reason}”</div>
+      )}
+      {badges.length > 0 && (
+        <div className="row" style={{ gap: 4, flexWrap: "wrap", marginTop: 6 }}>
+          {badges.map((b) => <span key={b} className="badge badge-muted">{b}</span>)}
+        </div>
+      )}
+      <div className="row" style={{ gap: 6, marginTop: 8 }}>
+        {kind === "invite" && (
+          <button className="btn btn-sm btn-primary" disabled={busy} onClick={run(onAccept)}>Accept</button>
+        )}
+        <button className="btn btn-sm btn-danger" disabled={busy} onClick={run(onLeave)}>
+          {kind === "invite" ? "Decline" : "Cancel request"}
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -266,10 +463,10 @@ function parseCiphertextMap(raw: string): Record<string, { type: number; body: s
   }
 }
 
-function ChatView({ roomId, room, e2eeReady }: { roomId: string; room?: JoinedRoom; e2eeReady: boolean }) {
+function ChatView({ roomId, room, e2eeReady }: { roomId: string; room?: RoomView; e2eeReady: boolean }) {
   const [text, setText] = useState("");
   const [decrypted, setDecrypted] = useState<Record<string, string>>({});
-  const events = room?.timeline.events ?? [];
+  const events = room?.timeline ?? [];
 
   // Decrypt any m.room.encrypted events we have inbound sessions for.
   useEffect(() => {

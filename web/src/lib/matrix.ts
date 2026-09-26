@@ -111,8 +111,43 @@ export async function createRoom(opts: {
   return request("POST", "/_matrix/client/v3/createRoom", opts);
 }
 
-export async function joinRoom(roomIdOrAlias: string): Promise<{ room_id: string }> {
-  return request("POST", `/_matrix/client/v3/join/${encodeURIComponent(roomIdOrAlias)}`, {});
+/** Query string for the servers to route a join / knock through (spec `via`). */
+function viaQuery(via?: string[]): string {
+  if (!via || via.length === 0) return "";
+  return "?" + via.map((v) => `via=${encodeURIComponent(v)}`).join("&");
+}
+
+export async function joinRoom(
+  roomIdOrAlias: string,
+  via?: string[],
+): Promise<{ room_id: string }> {
+  return request(
+    "POST",
+    `/_matrix/client/v3/join/${encodeURIComponent(roomIdOrAlias)}${viaQuery(via)}`,
+    {},
+  );
+}
+
+/** Ask to join a room whose join rule is `knock` (spec "Knocking on rooms"). */
+export async function knockRoom(
+  roomIdOrAlias: string,
+  via?: string[],
+  reason?: string,
+): Promise<{ room_id: string }> {
+  return request(
+    "POST",
+    `/_matrix/client/v3/knock/${encodeURIComponent(roomIdOrAlias)}${viaQuery(via)}`,
+    reason ? { reason } : {},
+  );
+}
+
+/** Leave a room; from an invite this declines it, from a knock it retracts it. */
+export async function leaveRoom(roomId: string, reason?: string): Promise<void> {
+  await request(
+    "POST",
+    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/leave`,
+    reason ? { reason } : {},
+  );
 }
 
 export async function sendMessage(
@@ -122,7 +157,7 @@ export async function sendMessage(
 ): Promise<{ event_id: string }> {
   return request(
     "PUT",
-    `/_matrix/client/v3/rooms/${roomId}/send/m.room.message/${txnId}`,
+    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${encodeURIComponent(txnId)}`,
     body,
   );
 }
@@ -135,19 +170,19 @@ export async function sendEncryptedMessage(
 ): Promise<{ event_id: string }> {
   return request(
     "PUT",
-    `/_matrix/client/v3/rooms/${roomId}/send/m.room.encrypted/${txnId}`,
+    `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.encrypted/${encodeURIComponent(txnId)}`,
     encrypted,
   );
 }
 
 export async function getRoomState(roomId: string): Promise<unknown[]> {
-  return request("GET", `/_matrix/client/v3/rooms/${roomId}/state`);
+  return request("GET", `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state`);
 }
 
 export async function getMembers(
   roomId: string,
 ): Promise<{ chunk: Record<string, { membership: string; displayname?: string }> }> {
-  return request("GET", `/_matrix/client/v3/rooms/${roomId}/members`);
+  return request("GET", `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/members`);
 }
 
 // ---- Admin API ----
