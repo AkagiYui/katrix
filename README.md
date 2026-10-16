@@ -107,7 +107,7 @@ katrix/
 Matrix 里有几套相互独立的版本编号，实现时必须分清：
 
 - **规范发布版本（spec release，`v1.x`）**：整份规范的发布快照，当前最新 **v1.19**。一次性覆盖所有子 API。
-- **房间版本（room version，`1`–`12`）**：每个房间独立、基本不可变，写在 `m.room.create` 的 `room_version`。固定该房间的：事件格式、event ID 计算方式、auth 规则、redaction 规则、状态解析算法。与 spec 发布号正交。关键分界：v1–v2 最老事件格式（event ID 为独立字段）+ v1 状态解析；v3 event ID = 事件哈希（MSC1659）；v4–v5 URL-safe base64 event ID + 签名密钥有效期；v6–v10 auth 收敛 + knocking + restricted join + 整数 power level（当今网络主流）；v11 redaction 算法澄清；v12 room ID = create 事件哈希（MSC4291）+ 创建者无限 power（MSC4289）+ 状态解析 v2.1。
+- **房间版本（room version，`1`–`12`，另有 unstable `org.matrix.msc3389.10`、`org.matrix.msc3757.10`、`org.matrix.msc4242.12`）**：每个房间独立、基本不可变，写在 `m.room.create` 的 `room_version`。固定该房间的：事件格式、event ID 计算方式、auth 规则、redaction 规则、状态解析算法。与 spec 发布号正交。关键分界：v1–v2 最老事件格式（event ID 为独立字段）+ v1 状态解析；v3 event ID = 事件哈希（MSC1659）；v4–v5 URL-safe base64 event ID + 签名密钥有效期；v6–v10 auth 收敛 + knocking + restricted join + 整数 power level（当今网络主流）；v11 redaction 算法澄清；v12 room ID = create 事件哈希（MSC4291）+ 创建者无限 power（MSC4289）+ 状态解析 v2.1。
 - **联邦"版本"**：没有全局联邦协议版本号。兼容性由三样承担：端点路径版本（per-endpoint `v1`/`v2`，如 `/_matrix/federation/v1/...`、`send_join`/`invite`/`send_leave` 有 `/v2`、密钥服务 `/_matrix/key/v2/...`）、房间版本（两台服务器能否就某房间达成一致取决于是否都实现了该 `room_version`）、发现 + 密钥（`.well-known/matrix/server` 或 SRV + `/_matrix/key/v2/server`）。`GET /_matrix/federation/v1/version` 只返回软件名/版本（信息性），不是协议协商。
 
 **`/versions` 声明策略**：`GET /_matrix/client/versions` 只声明已实现并通过 CI 的版本号（当前到 `v1.19` + 历史 `r0.6.1`），未完成特性走 `unstable_features`，不虚报。实测（Complement）与自报保持一致。
@@ -121,6 +121,7 @@ Matrix 里有几套相互独立的版本编号，实现时必须分清：
   - **v2.1**（房间 v12，含 MSC4289 创建者 power）：v2 基础上 creator 无限 power 经 SenderPowerLevel 表达（`stateres.MaxCreatorPowerLevel` = 2^53，对齐 Synapse `CREATOR_POWER_LEVEL`），无需单独代码路径。
   - **mainline depth** 对齐 Synapse：最老祖先 depth=1，head depth=len(mainline)，无匹配 depth=0，升序排序。
 - **canonical JSON + 签名**（`internal/canonicaljson` + `internal/events`）：字节级一致是联邦互通的隐形地雷。键按 Unicode code point 排序、无空白、整数渲染无小数点、禁止浮点、UTF-8 原样、仅强制转义。content hash + reference hash 按 room version 派生 event ID；redaction 算法按版本分支（v11+ `UpdatedRedaction` 修剪 origin/membership/prev_state、保留 create 全内容、保留 m.room.member.third_party_invite.signed、保留 m.room.redaction.redacts）。
+- **State DAG 房间（MSC4242，`org.matrix.msc4242.12`，基于 v12）**：事件不带 `auth_events`，改带 `prev_state_events`（房间 state DAG 的 forward extremities，create 为 `[]`，上限 20）；redaction 保留 `prev_state_events`。房间状态只由 state DAG 推导（不看 `prev_events`）：事件的 state-before = 对各 `prev_state_events` 的 state-after 快照做状态解析，`room_state` = 对 state DAG 头（`state_dag_extremities`，只计入已接受的状态事件）做解析；每事件按 auth 事件选择算法从 state-before 计算 `auth_events` 存入 `event_calculated_auth`，供状态解析与 `/event_auth` 使用。入站检查（`eventstate.CheckStateDAGEvent`）：`prev_state_events` 必须已知、同房间、是状态事件且未被拒绝——拒绝沿 state DAG 级联（包括之前批次已记录的拒绝）——再以 state-before 做 auth；只有非状态事件会 soft-fail。缺失的 state DAG 经 `/get_missing_events`（`org.matrix.msc4242.state_dag`，limit 指数增长）补齐，补不齐则拒收该 PDU。`/send_join` 收发 `state_dag`（整个 state DAG，逐个按拓扑序校验；join 的 `prev_state_events` 必须全部可达）；make_join/leave/knock 模板带 `prev_state_events`；`/get_missing_events` 按“距 latest 最少跳数 + event ID”确定性排序；backfill 到的事件同样走 state DAG 校验。成员变更若目标用户的服务器不在房间内，`prev_state_events` 会额外引用其当前 membership 事件（out-of-band 规则）。该版本不走 MSC3902 partial-state join。
 - **状态快照**（`internal/eventstate`）：每事件入库时维护一份 state-at-event 快照（`event_state_snapshots` 表）：0 prev（create）= `{}` + 自身 tuple；1 prev = 拷贝 prev 快照；>1 prev（merge）= `stateres.Resolve` 合并各 prev 快照。`room_state` 由对所有 `forward_extremities` 的快照做 `stateres.Resolve` 重算（单 extremity 直接用其快照），统一取代各调用点的盲写 `UpsertState`，正确处理深层 fork/merge。csapi 与 federation 两条入库路径均接入。
 
 ### 联邦（Server-Server API）
@@ -196,6 +197,7 @@ Matrix 需要的媒体处理只有"图片缩略图"一项，无需 ImageMagick /
 - **/sync**：`sync.Engine` 构建完整响应（joined/invited/knocked/left、timeline 窗口、account_data、ephemeral typing/receipts、to_device）。long-poll 经 `Notifier.Wait` 唤醒。待处理的 invite/knock 只在其到达后的首个增量 sync 下发一次。
 - **邀请 / 敲门与 stripped state（MSC4311，spec v1.16）**：`internal/strippedstate` 负责房间的 prejoin 状态（`m.room.create` 必含，另有 name/avatar/topic/join_rules/canonical_alias/encryption/guest_access）。邀请/敲门创建时对 prejoin 状态做快照，以完整 PDU 存入 `stripped_state` 表（按 membership 事件键控）；联邦 `invite_room_state` / `knock_room_state` 发送完整 PDU，Client-Server API（`/sync` 的 `invite_state`/`knock_state`、sliding sync 的 `stripped_state`）只下发 `type/state_key/sender/content` 四字段。入站 `/v2/invite` 对本服务器无状态的房间做 MSC4311 校验（PDU 格式、签名、同房间、create 事件哈希推导 room ID）：v12+ 不合规即 400 `M_MISSING_PARAM`/`M_INVALID_PARAM`，更早版本只保留合规条目；入站 `knock_room_state` 过滤不合规条目。
 - **Out-of-band 成员关系**：只经邀请/敲门得知的房间（本服务器无其状态）不会用不可信的 stripped state 播种 `room_state`/forward extremities/成员表；membership 事件以 out-of-band 事件入库（进 timeline、不进 DAG/状态）。拒绝邀请/撤回敲门经 `make_leave`/`send_leave` 依次尝试邀请者服务器、stripped state 中的服务器、room ID 域名，全部失败时本地签发 leave；加入房间在无 `via` 时使用同一候选列表；该类房间只接受原邀请者的撤销（rescind），不对外提供 make_leave/make_knock/send_*。
+- **延迟事件（MSC4140，已接受）**：`PUT /v3/rooms/{roomId}/delayed_event/{eventType}/{txnId}` 调度事件（body：`delay_ms` 正整数、`content` 对象、可选 `state_key`），`POST /v1/delayed_events/{delay_id}/{send|cancel|restart}` 管理，`GET /v1/delayed_events/{delay_id}` 查询（含 `finalised`）；同时提供 `org.matrix.msc4140` unstable 前缀路径与 unstable 列表接口 `GET .../delayed_events`。生命周期 scheduled → sending → sent / cancelled(+error)；重试与结局一致的操作返回成功，冲突返回 409；`send` 失败返回与直接发送一致的错误并保持 scheduled。发送时在进程内走真实的 `RoomSend`/`RoomStatePut`，鉴权、推送与错误码与普通发送一致。worker 按最早 `fire_at` 定时唤醒。`delayed_events.max_delay_ms`/`max_scheduled` 限制写入 `m.delayed_events` capability，超限分别返回 `M_DELAY_TOO_LARGE`（unstable 路径为 `ORG.MATRIX.MSC4140_DELAY_TOO_LARGE`）与 429 + `Retry-After`。已结束记录保留 7 天或每用户 1000 条；注销账号即删除其延迟事件；`unsigned` 中的 `org.matrix.msc4140.delay_id`（以及 `transaction_id`）只对发送者可见。
 - **配置**：YAML 文件 + 环境变量覆盖（`KATRIX_*`），单节点开发零配置。
 
 ### 主要风险
@@ -263,6 +265,9 @@ media:
   max_upload_bytes: 52428800
   store_path: media_store
 federation_enabled: true
+delayed_events:              # MSC4140；任一项为 0 即关闭
+  max_delay_ms: 86400000
+  max_scheduled: 100
 
 # SSO（可选）：CAS 与 OIDC 可同时配置；/login/sso/redirect 优先 OIDC
 # cas:
