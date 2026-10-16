@@ -10,6 +10,8 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
+	"sync"
 
 	"github.com/AkagiYui/katrix/internal/events"
 	"github.com/AkagiYui/katrix/internal/eventstate"
@@ -284,6 +286,13 @@ func (a *API) checkInboundStateDAGPDU(ctx context.Context, roomID string, rules 
 	if err != nil || !ev.HasPrevStateEvents() {
 		return false, false
 	}
+	// During a fast join's partial-state window the state DAG is still being
+	// verified: accept the event for now; it is checked in state-DAG order
+	// once the verification completes (MSC4242 "re-verify ... any live
+	// events which arrived in the interim").
+	if a.roomIsPartial(ctx, roomID) {
+		return false, true
+	}
 	err = eventstate.CheckStateDAGEvent(ctx, a.Store, ev, eventstate.StateDAGCheck{})
 	if errors.Is(err, eventstate.ErrMissingPrevState) && origin != "" {
 		a.fillStateDAG(ctx, roomID, rules, evID, origin)
@@ -516,6 +525,408 @@ func (a *API) settleBackfilledStateDAG(ctx context.Context, roomID string, rules
 	for _, ev := range topoSortStateDAG(byID) {
 		row := rowByID[ev.EventID()]
 		if err := eventstate.CheckStateDAGEvent(ctx, a.Store, ev, eventstate.StateDAGCheck{}); err != nil {
+			a.Store.MarkEventRejected(ctx, row.EventID)
+			continue
+		}
+		if err := eventstate.Maintain(ctx, a.Store, row, rules); err != nil {
+			a.Store.MarkEventRejected(ctx, row.EventID)
+		}
+	}
+}
+
+// Faster remote joins in state-DAG rooms (MSC4242 "Faster remote room joins").
+const (
+	stateDAGTimelineDefault = 10
+	stateDAGTimelineMax     = 64
+)
+
+// parseTimelineLimit parses the /send_join timeline_limit query parameter: a
+// non-zero integer, capped at 64.
+func parseTimelineLimit(v string) (int, bool) {
+	if v == "" {
+		return stateDAGTimelineDefault, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return min(n, stateDAGTimelineMax), true
+}
+
+// addStateDAGPartialJoin adds the faster-join fields to a state-DAG
+// /send_join response: the current state without members other than the
+// timeline events' and non-member state events' senders (the join itself is
+// implied), the calculated auth events of those events and the join closed
+// under auth events, and the latest timeline events the joining user may see.
+func (a *API) addStateDAGPartialJoin(ctx context.Context, resp map[string]any, roomID, joinEventID, joiner string, timelineLimit int) error {
+	joinRow, err := a.Store.GetEvent(ctx, joinEventID)
+	if err != nil {
+		return err
+	}
+	var timeline []json.RawMessage
+	keepMembers := map[string]bool{}
+	switch a.historyVisibility(ctx, roomID) {
+	case "world_readable", "shared":
+		recent, err := a.Store.RecentTimelineEvents(ctx, roomID, joinRow.StreamOrdering, timelineLimit)
+		if err != nil {
+			return err
+		}
+		for _, e := range recent {
+			timeline = append(timeline, e.RawJSON)
+			keepMembers[e.Sender] = true
+		}
+	}
+	state, err := a.Store.GetState(ctx, roomID)
+	if err != nil {
+		return err
+	}
+	stateIDs := make([]string, 0, len(state))
+	for _, st := range state {
+		if st.EventID == joinEventID {
+			continue
+		}
+		if st.Type != "m.room.member" {
+			stateIDs = append(stateIDs, st.EventID)
+		}
+	}
+	nonMember, err := a.Store.EventsByIDs(ctx, stateIDs)
+	if err != nil {
+		return err
+	}
+	for _, e := range nonMember {
+		keepMembers[e.Sender] = true
+	}
+	delete(keepMembers, joiner)
+	for _, st := range state {
+		if st.Type == "m.room.member" && keepMembers[st.StateKey] && st.EventID != joinEventID {
+			stateIDs = append(stateIDs, st.EventID)
+		}
+	}
+	sort.Strings(stateIDs)
+
+	chain := map[string][]string{}
+	queue := append([]string{joinEventID}, stateIDs...)
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if _, done := chain[id]; done {
+			continue
+		}
+		auth, _, err := a.Store.CalculatedAuth(ctx, id)
+		if err != nil {
+			return err
+		}
+		if auth == nil {
+			auth = []string{}
+		}
+		chain[id] = auth
+		queue = append(queue, auth...)
+	}
+	if timeline == nil {
+		timeline = []json.RawMessage{}
+	}
+	resp["members_omitted"] = true
+	resp["partial_state_event_ids"] = stateIDs
+	resp["partial_auth_chain_ids"] = chain
+	resp["timeline"] = timeline
+	return nil
+}
+
+// stateDAGJoinTimelineLimit is how many recent timeline events a faster join
+// asks for.
+const stateDAGJoinTimelineLimit = 20
+
+// stateDAGFastJoinMu serialises background settling per room.
+var stateDAGFastJoinMu sync.Map // roomID -> *sync.Mutex
+
+// ingestStateDAGFastJoin handles a faster-join /send_join response in a
+// state-DAG room (MSC4242 "Faster remote room joins"). It checks that the
+// delivered state DAG is connected, verifies only the claimed partial state,
+// the join and the timeline (signatures, hashes and auth against their
+// claimed auth events), persists them and unblocks the join; the whole state
+// DAG is verified in the background, after which the verified state replaces
+// the claimed one.
+func (a *API) ingestStateDAGFastJoin(ctx context.Context, roomID string, version roomver.Version, rules roomver.Rules, join *events.Event, sj *sendJoinResponse) error {
+	dag := map[string]*events.Event{}
+	var create *events.Event
+	for _, raw := range sj.StateDAG {
+		ev := a.parseStateDAGPDU(ctx, roomID, rules, raw)
+		if ev == nil {
+			continue
+		}
+		dag[ev.EventID()] = ev
+		if sk, ok := ev.StateKey(); ok && sk == "" && ev.Type() == "m.room.create" {
+			create = ev
+		}
+	}
+	if create == nil {
+		return fmt.Errorf("federation: state_dag has no valid m.room.create")
+	}
+	known := func(id string) bool {
+		if _, ok := dag[id]; ok {
+			return true
+		}
+		_, err := a.Store.GetEvent(ctx, id)
+		return err == nil
+	}
+	for _, ev := range append(mapValues(dag), join) {
+		for _, p := range ev.PrevStateEvents() {
+			if !known(p) {
+				return fmt.Errorf("federation: state_dag is not connected: %s references unknown %s", ev.EventID(), p)
+			}
+		}
+	}
+	// Steps 1-4 of the PDU checks for the claimed state and the join, with
+	// the auth events the join helper claims.
+	lookup := func(id string) *events.Event {
+		if ev, ok := dag[id]; ok {
+			return ev
+		}
+		if row, err := a.Store.GetEvent(ctx, id); err == nil {
+			if ev, err := events.New(row.RawJSON, rules.Version); err == nil {
+				return ev
+			}
+		}
+		return nil
+	}
+	checkClaimed := func(ev *events.Event) error {
+		if ev.EventID() == create.EventID() {
+			return nil
+		}
+		authIDs, ok := sj.PartialAuthChainIDs[ev.EventID()]
+		if !ok {
+			return fmt.Errorf("no claimed auth events for %s", ev.EventID())
+		}
+		auth := []*events.Event{create}
+		for _, id := range authIDs {
+			aev := lookup(id)
+			if aev == nil || !aev.IsState() {
+				return fmt.Errorf("claimed auth event %s of %s is unknown or not state", id, ev.EventID())
+			}
+			auth = append(auth, aev)
+		}
+		return authorizeAgainst(rules, ev, auth)
+	}
+	var partial []*events.Event
+	for _, id := range sj.PartialStateEventIDs {
+		ev, ok := dag[id]
+		if !ok || !ev.IsState() {
+			return fmt.Errorf("federation: partial state event %s is not in the state DAG", id)
+		}
+		if err := checkClaimed(ev); err != nil {
+			return fmt.Errorf("federation: partial state event %s: %w", id, err)
+		}
+		partial = append(partial, ev)
+	}
+	if err := checkClaimed(join); err != nil {
+		return fmt.Errorf("federation: join event: %w", err)
+	}
+
+	alreadyKnown := false
+	if existing, err := a.Store.GetRoom(ctx, roomID); err == nil {
+		alreadyKnown = existing.RoomID != ""
+	}
+	_ = a.Store.EnsureRoom(ctx, storage.Room{
+		RoomID: roomID, Version: string(version), Creator: create.Sender(),
+		CreatedTS: a.Now(), PartialState: true,
+	})
+	if alreadyKnown {
+		_ = a.Store.SetRoomPartialState(ctx, roomID, true)
+	}
+	// Persist the delivered state DAG unverified (signatures already
+	// checked): it is settled by the background verification, and persisting
+	// it first lets an interrupted verification resume.
+	for _, ev := range dag {
+		row := stateDAGRow(roomID, ev, true)
+		if _, err := a.Store.InsertEventWithMembership(ctx, row, nil, false); err != nil {
+			return fmt.Errorf("federation: persist state DAG: %w", err)
+		}
+	}
+	joinRow := stateDAGRow(roomID, join, false)
+	stream, err := a.Store.InsertEventWithMembership(ctx, joinRow, nil, false)
+	if err != nil {
+		return fmt.Errorf("federation: persist join event: %w", err)
+	}
+	if rej, err := a.Store.IsEventRejected(ctx, join.EventID()); err == nil && rej {
+		a.Store.UnmarkEventRejected(ctx, join.EventID())
+	}
+	// The claimed current state, with the join.
+	claimed := make([]storage.StateRow, 0, len(partial)+1)
+	claimedEvents := append([]*events.Event{}, partial...)
+	claimedEvents = append(claimedEvents, join)
+	for _, ev := range claimedEvents {
+		sk, _ := ev.StateKey()
+		claimed = append(claimed, storage.StateRow{RoomID: roomID, Type: ev.Type(), StateKey: sk, EventID: ev.EventID()})
+	}
+	if err := a.Store.SetRoomState(ctx, roomID, claimed); err != nil {
+		return fmt.Errorf("federation: seed claimed state: %w", err)
+	}
+	if err := a.Store.SetForwardExtremities(ctx, roomID, []storage.ForwardExtremity{
+		{RoomID: roomID, EventID: joinRow.EventID, Depth: joinRow.Depth},
+	}); err != nil {
+		return fmt.Errorf("federation: set join extremity: %w", err)
+	}
+	// The timeline: verified the same way against the claimed state, then
+	// persisted as history before the join.
+	var timelineRows []*storage.EventRow
+	for _, raw := range sj.Timeline {
+		ev := a.parseStateDAGPDU(ctx, roomID, rules, raw)
+		if ev == nil || ev.EventID() == join.EventID() {
+			continue
+		}
+		if _, err := a.Store.GetEvent(ctx, ev.EventID()); err == nil {
+			continue
+		}
+		if authorizeAgainst(rules, ev, append([]*events.Event{create}, claimedEvents...)) != nil {
+			continue
+		}
+		timelineRows = append(timelineRows, stateDAGRow(roomID, ev, false))
+	}
+	if len(timelineRows) > 0 {
+		// InsertBackfillEvents expects newest first.
+		for i, j := 0, len(timelineRows)-1; i < j; i, j = i+1, j-1 {
+			timelineRows[i], timelineRows[j] = timelineRows[j], timelineRows[i]
+		}
+		_ = a.Store.InsertBackfillEvents(ctx, timelineRows)
+	}
+	a.syncMembershipsFromState(ctx, roomID)
+	_ = a.Store.UpsertMembership(ctx, storage.MembershipRow{
+		RoomID: roomID, UserID: join.Sender(), Membership: "join",
+		EventID: join.EventID(), StreamOrdering: stream, Depth: join.Depth(),
+	})
+	_, _ = a.Store.RecordDeviceListChange(ctx, join.Sender(), false)
+	a.notifyRoomMembers(ctx, roomID)
+
+	log.Printf("federation: fast join of %s: %d state DAG events, %d claimed state events, %d timeline events; verifying in the background",
+		roomID, len(dag), len(partial), len(timelineRows))
+	go a.completeStateDAGFastJoin(context.WithoutCancel(ctx), roomID, rules, join.EventID(), join.Sender())
+	return nil
+}
+
+func mapValues(m map[string]*events.Event) []*events.Event {
+	out := make([]*events.Event, 0, len(m))
+	for _, v := range m {
+		out = append(out, v)
+	}
+	return out
+}
+
+// authorizeAgainst runs the auth rules for ev against the state formed by
+// the given (claimed) events.
+func authorizeAgainst(rules roomver.Rules, ev *events.Event, stateEvents []*events.Event) error {
+	byKey := map[string]*events.Event{}
+	for _, se := range stateEvents {
+		sk, _ := se.StateKey()
+		byKey[se.Type()+"\x00"+sk] = se
+	}
+	get := func(typ, sk string) *events.Event { return byKey[typ+"\x00"+sk] }
+	stateKey, isState := ev.StateKey()
+	var st rooms.StateSnapshot
+	if c := get("m.room.create", ""); c != nil {
+		st.Create, st.CreateSender = c.Content(), c.Sender()
+	}
+	if e := get("m.room.join_rules", ""); e != nil {
+		st.JoinRules = e.Content()
+	}
+	if e := get("m.room.power_levels", ""); e != nil {
+		st.PowerLevel = e.Content()
+	}
+	if e := get("m.room.guest_access", ""); e != nil {
+		st.GuestAccess = e.Content()
+	}
+	if e := get("m.room.member", ev.Sender()); e != nil {
+		st.SenderMember = e.Content()
+	}
+	if ev.Type() == "m.room.member" && stateKey != ev.Sender() {
+		if e := get("m.room.member", stateKey); e != nil {
+			st.TargetMember = e.Content()
+		}
+	}
+	if ev.Type() == "m.room.member" {
+		if mc, err := rooms.ParseMember(ev.Content()); err == nil && len(mc.ThirdParty) > 0 {
+			var tp struct {
+				Signed struct {
+					Token string `json:"token"`
+				} `json:"signed"`
+			}
+			if json.Unmarshal(mc.ThirdParty, &tp) == nil {
+				if e := get("m.room.third_party_invite", tp.Signed.Token); e != nil {
+					st.ThirdPartyInvite = e.Content()
+				}
+			}
+		}
+	}
+	if prevs := ev.PrevStateEvents(); len(prevs) == 1 {
+		if c := get("m.room.create", ""); c != nil && prevs[0] == c.EventID() {
+			st.OnlyPrevIsCreate = true
+		}
+	}
+	return rooms.Authorize(rules, ev.Type(), stateKey, ev.Sender(), ev.Content(), st, isState)
+}
+
+// completeStateDAGFastJoin verifies a fast-joined room's whole state DAG and
+// every event received since, then replaces the claimed state with the
+// verified one and ends the partial-state window. If the join itself is not
+// valid against the verified state DAG the join helper lied: the room's state
+// is destroyed and the joiner is not in the room. joinEventID may be empty
+// when resuming after a restart.
+func (a *API) completeStateDAGFastJoin(ctx context.Context, roomID string, rules roomver.Rules, joinEventID, joiner string) {
+	mu, _ := stateDAGFastJoinMu.LoadOrStore(roomID, &sync.Mutex{})
+	lock := mu.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	a.settleStateDAG(ctx, roomID, rules)
+	if err := a.Store.SetRoomPartialState(ctx, roomID, false); err != nil {
+		log.Printf("federation: end partial state for %s: %v", roomID, err)
+		return
+	}
+	// Events that arrived while the window was closing.
+	a.settleStateDAG(ctx, roomID, rules)
+
+	if joinEventID != "" {
+		if rej, err := a.Store.IsEventRejected(ctx, joinEventID); err == nil && rej {
+			log.Printf("federation: fast join %s of %s did not verify against the state DAG; dropping the room state", joinEventID, roomID)
+			_ = a.Store.SetRoomState(ctx, roomID, nil)
+			_ = a.Store.ForceUpsertMembership(ctx, storage.MembershipRow{
+				RoomID: roomID, UserID: joiner, Membership: "leave", EventID: joinEventID,
+			})
+			a.Notifier.NotifyUsers(joiner)
+			return
+		}
+	}
+	a.syncMembershipsFromState(ctx, roomID)
+	a.notifyRoomMembers(ctx, roomID)
+	log.Printf("federation: fast join of %s verified", roomID)
+}
+
+// resumeStateDAGFastJoin restarts the background verification of a
+// fast-joined state-DAG room left partial by a restart.
+func (a *API) resumeStateDAGFastJoin(ctx context.Context, roomID string, rules roomver.Rules) {
+	go a.completeStateDAGFastJoin(context.WithoutCancel(ctx), roomID, rules, "", "")
+}
+
+// settleStateDAG checks every persisted-but-unchecked event of a state-DAG
+// room in state-DAG order, accepting (and maintaining state for) or
+// rejecting each, as if each had arrived in order.
+func (a *API) settleStateDAG(ctx context.Context, roomID string, rules roomver.Rules) {
+	rows, err := a.Store.UnsettledStateDAGEvents(ctx, roomID)
+	if err != nil {
+		log.Printf("federation: load unsettled events of %s: %v", roomID, err)
+		return
+	}
+	byID := map[string]*events.Event{}
+	rowByID := map[string]*storage.EventRow{}
+	for i := range rows {
+		if ev, err := events.New(rows[i].RawJSON, rules.Version); err == nil {
+			byID[rows[i].EventID] = ev
+			rowByID[rows[i].EventID] = &rows[i]
+		}
+	}
+	for _, ev := range topoSortStateDAG(byID) {
+		row := rowByID[ev.EventID()]
+		if err := eventstate.CheckStateDAGEvent(ctx, a.Store, ev, eventstate.StateDAGCheck{}); err != nil {
+			log.Printf("federation: state DAG event %s (%s) in %s not accepted: %v", ev.EventID(), ev.Type(), roomID, err)
 			a.Store.MarkEventRejected(ctx, row.EventID)
 			continue
 		}

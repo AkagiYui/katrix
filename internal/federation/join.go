@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/AkagiYui/katrix/internal/canonicaljson"
@@ -48,6 +49,12 @@ type sendJoinResponse struct {
 	// StateDAG (MSC4242 state-DAG rooms) is the room's entire state DAG; it
 	// replaces state and auth_chain.
 	StateDAG []json.RawMessage `json:"state_dag,omitempty"`
+	// MSC4242 faster joins (members_omitted): the claimed current state
+	// (without most members and without the join), the calculated auth
+	// events of those events, and the latest timeline events.
+	PartialStateEventIDs []string            `json:"partial_state_event_ids,omitempty"`
+	PartialAuthChainIDs  map[string][]string `json:"partial_auth_chain_ids,omitempty"`
+	Timeline             []json.RawMessage   `json:"timeline,omitempty"`
 }
 
 // FedHTTPError is a federation request failure carrying the remote server's
@@ -198,12 +205,20 @@ func (a *API) joinRemoteRoomFrom(ctx context.Context, userID, roomID, dest strin
 	// Partial-state join is only meaningful for room versions with the
 	// join-rule auth changes (v2+); the remote server must agree to omit
 	// members (else it 500s on a send_join expecting the flag).
-	partial := rules.PartialStateAllowed
+	// State-DAG rooms (MSC4242) have their own faster-join shape: the full
+	// state DAG always arrives, with the claimed partial state alongside it.
+	partial := rules.PartialStateAllowed || rules.StateDAGs
 	sj, err := a.client.sendJoin(ctx, dest, roomID, userID, ev, partial)
 	if err != nil {
 		return false, err
 	}
 	if rules.StateDAGs {
+		if sj.MembersOmitted && sj.PartialStateEventIDs != nil {
+			if err := a.ingestStateDAGFastJoin(ctx, roomID, version, rules, ev, sj); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
 		if err := a.ingestStateDAGJoin(ctx, roomID, version, rules, ev, sj); err != nil {
 			return false, err
 		}
@@ -797,6 +812,10 @@ func (c *Client) sendJoinRequest(ctx context.Context, dest, version, roomID, idP
 		url = c.serverBaseURL(dest) + "/_matrix/federation/v2/send_join/" + urlPathEscape(roomID) + "/" + urlPathEscape(idPart)
 		if partial {
 			url += "?omit_members=true"
+			// MSC4242 faster joins: ask for the latest timeline events too.
+			if ev.Rules().StateDAGs {
+				url += "&timeline_limit=" + strconv.Itoa(stateDAGJoinTimelineLimit)
+			}
 		}
 	}
 	body := ev.Raw()

@@ -70,6 +70,12 @@ jobs:
       # complement checkout above).
       - name: register katrix with complement
         run: cp .complement-runtime/hs_katrix.go complement/runtime/hs_katrix.go
+      # Katrix's own Complement packages (e.g. two-server MSC4242 fast joins,
+      # which upstream has no test for) run alongside upstream's suites: the
+      # msc-suites group picks every tests/ subdirectory up automatically.
+      - name: add katrix complement tests
+        if: matrix.group == 'msc-suites'
+        run: cp -r .complement-runtime/tests/. complement/tests/
       - name: make MSC3902 waits scheduler-tolerant
         if: matrix.group == 'msc3902'
         # These checks still keep the partial-state resync blocked. Extending

@@ -2458,11 +2458,23 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
 			return
 		}
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		resp := map[string]any{
 			"origin":    a.ServerName(),
 			"state_dag": dag,
 			"event":     eventJSON,
-		})
+		}
+		if wantMembership == "join" && r.URL.Query().Get("omit_members") == "true" {
+			limit, ok := parseTimelineLimit(r.URL.Query().Get("timeline_limit"))
+			if !ok {
+				httpx.WriteError(w, httpx.ErrInvalidParam("timeline_limit must be a positive integer"))
+				return
+			}
+			if err := a.addStateDAGPartialJoin(r.Context(), resp, ev.RoomID, evID, ev.Sender, limit); err != nil {
+				httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+				return
+			}
+		}
+		httpx.WriteJSON(w, http.StatusOK, resp)
 		return
 	}
 	statePDUs, _ := a.roomStatePDUs(r, ev.RoomID)

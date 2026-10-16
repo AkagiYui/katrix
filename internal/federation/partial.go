@@ -42,6 +42,12 @@ func (a *API) ResumePartialStateResyncs(ctx context.Context) {
 		if !ok {
 			continue
 		}
+		if rules.StateDAGs {
+			// MSC4242 fast join: the state DAG is already persisted; finish
+			// verifying it.
+			a.resumeStateDAGFastJoin(ctx, r.RoomID, rules)
+			continue
+		}
 		candidates := r.ServersInRoom
 		dest := ""
 		if len(candidates) > 0 {

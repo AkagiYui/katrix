@@ -27,13 +27,18 @@ func (s *Store) StateDAGExtremities(ctx context.Context, roomID string) ([]strin
 func (s *Store) TxAdvanceStateDAG(ctx context.Context, tx pgx.Tx, roomID, eventID string, isState bool, prevStateEvents []string) error {
 	for _, p := range prevStateEvents {
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO state_dag_edges(room_id, event_id, prev_state_id) VALUES ($1,$2,$3)
-			 ON CONFLICT DO NOTHING`, roomID, eventID, p); err != nil {
+			`INSERT INTO state_dag_edges(room_id, event_id, prev_state_id, child_is_state) VALUES ($1,$2,$3,$4)
+			 ON CONFLICT DO NOTHING`, roomID, eventID, p, isState); err != nil {
 			return err
 		}
 	}
 	if !isState {
 		return nil
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO state_dag_state_events(event_id, room_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+		eventID, roomID); err != nil {
+		return err
 	}
 	if len(prevStateEvents) > 0 {
 		if _, err := tx.Exec(ctx,
@@ -47,8 +52,7 @@ func (s *Store) TxAdvanceStateDAG(ctx context.Context, tx pgx.Tx, roomID, eventI
 	_, err := tx.Exec(ctx,
 		`INSERT INTO state_dag_extremities(room_id, event_id)
 		 SELECT $1, $2 WHERE NOT EXISTS (
-		     SELECT 1 FROM state_dag_edges g JOIN events e ON e.event_id = g.event_id
-		     WHERE g.prev_state_id = $2 AND e.state_key IS NOT NULL)
+		     SELECT 1 FROM state_dag_edges g WHERE g.prev_state_id = $2 AND g.child_is_state)
 		 ON CONFLICT DO NOTHING`, roomID, eventID)
 	return err
 }
@@ -113,8 +117,10 @@ func (s *Store) StateDAGEventIDs(ctx context.Context, roomID string, from []stri
 		   UNION
 		     SELECT g.prev_state_id FROM dag d JOIN state_dag_edges g ON g.event_id = d.event_id
 		 )
-		 SELECT e.event_id FROM dag d JOIN events e ON e.event_id = d.event_id
-		 WHERE e.room_id=$1 AND e.state_key IS NOT NULL
+		 SELECT e.event_id FROM dag d
+		 JOIN state_dag_state_events s ON s.event_id = d.event_id
+		 JOIN events e ON e.event_id = d.event_id
+		 WHERE s.room_id=$1
 		 ORDER BY e.depth, e.event_id`, roomID, from))
 }
 
@@ -152,4 +158,53 @@ func collectStrings(rows pgx.Rows, err error) ([]string, error) {
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+const stateDAGEventCols = `event_id, room_id, type, COALESCE(state_key,''), sender, depth,
+	origin_server_ts, stream_ordering, content, json,
+	COALESCE(redacts,''), redacted, COALESCE(redacted_by,''), outlier,
+	COALESCE((SELECT version FROM rooms WHERE room_id=events.room_id),'')`
+
+func collectEventRows(rows pgx.Rows, err error) ([]EventRow, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EventRow
+	for rows.Next() {
+		e, err := scanEventRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// UnsettledStateDAGEvents returns a state-DAG room's events that have been
+// persisted but not yet checked against the state DAG: neither accepted (an
+// accepted event has calculated auth events) nor rejected. A fast join
+// persists the delivered state DAG this way and settles it in the background.
+func (s *Store) UnsettledStateDAGEvents(ctx context.Context, roomID string) ([]EventRow, error) {
+	return collectEventRows(s.pool.Query(ctx,
+		`SELECT `+stateDAGEventCols+` FROM events
+		 WHERE room_id=$1
+		   AND NOT EXISTS (SELECT 1 FROM event_calculated_auth c WHERE c.event_id = events.event_id)
+		   AND NOT EXISTS (SELECT 1 FROM rejected_events r WHERE r.event_id = events.event_id)
+		 ORDER BY depth, event_id`, roomID))
+}
+
+// RecentTimelineEvents returns up to limit of a room's latest accepted
+// timeline events (not outliers, not rejected) before the given stream
+// position, oldest first.
+func (s *Store) RecentTimelineEvents(ctx context.Context, roomID string, beforeStream int64, limit int) ([]EventRow, error) {
+	rows, err := collectEventRows(s.pool.Query(ctx,
+		`SELECT `+stateDAGEventCols+` FROM events
+		 WHERE room_id=$1 AND stream_ordering < $2 AND NOT outlier
+		   AND NOT EXISTS (SELECT 1 FROM rejected_events r WHERE r.event_id = events.event_id)
+		 ORDER BY stream_ordering DESC LIMIT $3`, roomID, beforeStream, limit))
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
+	return rows, err
 }

@@ -3488,6 +3488,12 @@ func (a *API) buildEvent(r *http.Request, auth *homeserver.Auth, roomID string, 
 		AuthEvents:     authIDs,
 	}
 	if rules, ok := roomver.Get(version); ok && rules.StateDAGs {
+		// A fast-joined room's state DAG is still being verified: its heads
+		// are not known yet, so new events wait for the verification (as
+		// Synapse waits for full state before sending into a partial room).
+		if err := a.awaitFullState(r.Context(), roomID); err != nil {
+			return nil, err
+		}
 		sk := ""
 		if isState {
 			sk = stateKey
@@ -3875,4 +3881,27 @@ func (a *API) limitMembership(r *http.Request, auth *homeserver.Auth, roomID str
 		return a.LimitKey(a.Limits.JoinsPerRoom, roomID)
 	}
 	return a.LimitAuth(r, auth, a.Limits.JoinsRemote)
+}
+
+// partialStateWait bounds how long a request waits for a fast-joined room's
+// state to be verified.
+const partialStateWait = 60 * time.Second
+
+// awaitFullState blocks while the room is in a partial-state window.
+func (a *API) awaitFullState(ctx context.Context, roomID string) error {
+	deadline := time.Now().Add(partialStateWait)
+	for {
+		room, err := a.Store.GetRoom(ctx, roomID)
+		if err != nil || !room.PartialState {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return httpx.NewError(http.StatusServiceUnavailable, "M_UNKNOWN", "the room's state is still being fetched")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
