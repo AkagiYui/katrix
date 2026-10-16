@@ -279,170 +279,181 @@ func (a *API) ingestPDU(r *http.Request, raw json.RawMessage, origin string) (st
 			return evID, true
 		}
 	}
-	// Gap filling first: if the event's prev_events reference events we do not
-	// have, ask the sending server for them (spec: a server that receives an
-	// event referencing unknown prev_events should request them via
-	// get_missing_events so the room's timeline stays contiguous). The fetched
-	// events must be persisted before this one so stream ordering (and thus the
-	// /sync timeline) reflects the true DAG order. Best-effort: a failure here
-	// must not reject the already-verified event.
-	gapFetched := false
-	if origin != "" && a.hasUnknownPrevEvents(r.Context(), raw) {
-		gapFetched = true
-		a.fetchMissingEventsFor(r.Context(), ev.RoomID, evID, origin)
-	} // If the near chain is still disconnected — the prevs of the events
-	// get_missing_events just filled are themselves unknown — reconcile the
-	// room's state from the origin (Synapse's state fetch for a room it cannot
-	// link): the frontier event anchors a /state_ids snapshot whose events are
-	// fetched and applied, with a corrupted/withheld auth chain soft-failing
-	// the whole snapshot. A reconcile is only attempted when the peer is
-	// actively serving the gap (a get_missing_events round-trip happened) AND
-	// the event's own prevs are present (the fetch succeeded but left a deeper
-	// gap): a gap behind already-present prevs (e.g. an event referencing a
-	// join whose own prev is pre-join history) is ordinary missing history,
-	// filled lazily by backfill, not reconciled.
-	//
-	// The reconcile runs synchronously so the pulled events are persisted
-	// before the triggering event's state-at-event is computed. Running it
-	// asynchronously races the background partial-state resync over the same
-	// room_state (concurrent event/state writes corrupt the snapshots and drop
-	// events that the synchronous path persists in order — Complement's
-	// half-missing-grandparents and events-before-their-prevs tests fail on
-	// the race).
-	//
-	// One partial-state (MSC3902) exception: when the frontier is the very
-	// event the background resync anchors on (the join event's prev), that
-	// state is already being fetched — and the peer deliberately holds the
-	// /state_ids request for that anchor open until the resync is released
-	// (Complement's partial-state suite blocks it), so reconciling state as of
-	// the same anchor here would block the /send response behind the resync
-	// and blow the sender's transaction deadline
-	// (CanReceiveEventsWithHalfMissingParents...). Skip the redundant fetch;
-	// the resync covers it. Any other frontier (a deeper gap the resync does
-	// not cover, e.g. half-missing grandparents, whose state the peer serves
-	// immediately) is reconciled synchronously as usual.
-	if origin != "" && gapFetched && !a.hasUnknownPrevEvents(r.Context(), raw) {
-		if frontier := a.unknownDeepFrontier(r.Context(), raw); frontier != "" {
-			if anchor := a.partialResyncAnchorID(r.Context(), ev.RoomID); anchor != frontier {
-				a.reconcileStateFrom(r.Context(), ev.RoomID, origin, frontier)
+	rejected := false
+	if rules, ok := roomver.Get(version); ok && rules.StateDAGs {
+		// MSC4242: prev_events are untrusted in a state-DAG room — the state
+		// DAG (prev_state_events) carries the authorisation, so its missing
+		// parts are fetched and the event is checked against the state before
+		// it instead of auth_events.
+		var ok bool
+		if rejected, ok = a.checkInboundStateDAGPDU(r.Context(), ev.RoomID, rules, raw, evID, origin, ev.StateKey != nil, ev.Type, ev.Sender, ev.Content); !ok {
+			return evID, false
+		}
+	} else {
+		// Gap filling first: if the event's prev_events reference events we do not
+		// have, ask the sending server for them (spec: a server that receives an
+		// event referencing unknown prev_events should request them via
+		// get_missing_events so the room's timeline stays contiguous). The fetched
+		// events must be persisted before this one so stream ordering (and thus the
+		// /sync timeline) reflects the true DAG order. Best-effort: a failure here
+		// must not reject the already-verified event.
+		gapFetched := false
+		if origin != "" && a.hasUnknownPrevEvents(r.Context(), raw) {
+			gapFetched = true
+			a.fetchMissingEventsFor(r.Context(), ev.RoomID, evID, origin)
+		} // If the near chain is still disconnected — the prevs of the events
+		// get_missing_events just filled are themselves unknown — reconcile the
+		// room's state from the origin (Synapse's state fetch for a room it cannot
+		// link): the frontier event anchors a /state_ids snapshot whose events are
+		// fetched and applied, with a corrupted/withheld auth chain soft-failing
+		// the whole snapshot. A reconcile is only attempted when the peer is
+		// actively serving the gap (a get_missing_events round-trip happened) AND
+		// the event's own prevs are present (the fetch succeeded but left a deeper
+		// gap): a gap behind already-present prevs (e.g. an event referencing a
+		// join whose own prev is pre-join history) is ordinary missing history,
+		// filled lazily by backfill, not reconciled.
+		//
+		// The reconcile runs synchronously so the pulled events are persisted
+		// before the triggering event's state-at-event is computed. Running it
+		// asynchronously races the background partial-state resync over the same
+		// room_state (concurrent event/state writes corrupt the snapshots and drop
+		// events that the synchronous path persists in order — Complement's
+		// half-missing-grandparents and events-before-their-prevs tests fail on
+		// the race).
+		//
+		// One partial-state (MSC3902) exception: when the frontier is the very
+		// event the background resync anchors on (the join event's prev), that
+		// state is already being fetched — and the peer deliberately holds the
+		// /state_ids request for that anchor open until the resync is released
+		// (Complement's partial-state suite blocks it), so reconciling state as of
+		// the same anchor here would block the /send response behind the resync
+		// and blow the sender's transaction deadline
+		// (CanReceiveEventsWithHalfMissingParents...). Skip the redundant fetch;
+		// the resync covers it. Any other frontier (a deeper gap the resync does
+		// not cover, e.g. half-missing grandparents, whose state the peer serves
+		// immediately) is reconciled synchronously as usual.
+		if origin != "" && gapFetched && !a.hasUnknownPrevEvents(r.Context(), raw) {
+			if frontier := a.unknownDeepFrontier(r.Context(), raw); frontier != "" {
+				if anchor := a.partialResyncAnchorID(r.Context(), ev.RoomID); anchor != frontier {
+					a.reconcileStateFrom(r.Context(), ev.RoomID, origin, frontier)
+				}
 			}
 		}
-	}
-	// If the prev_events are STILL missing after the fetch (the sending server
-	// did not deliver them, or the delivered events were rejected — bad JSON,
-	// failed verification), the event itself must be rejected rather than
-	// persisted: an event whose predecessors are unknown sits on nothing, and
-	// accepting it would surface an event the room's DAG never legitimately
-	// produced. Per the spec, a server only accepts an event once the events it
-	// references (prev_events and auth_events) are known and accepted; Synapse
-	// soft-fails such events. Rejection here is what lets a re-delivery later
-	// succeed once the missing events arrive (TestUnrejectRejectedEvents).
-	// Skipped for partial-state rooms (MSC3902), whose local DAG is
-	// intentionally incomplete until the background resync completes: only the
-	// critical state and the join event were seeded, so every remote event
-	// would reference unknown prevs and be dropped — including membership
-	// events (ban/kick/leave/invite) that arrive right after a partial join.
-	// The resync fills the history; dropping such events would silently lose
-	// membership transitions the joining user's /sync depends on.
-	if origin != "" && !room.PartialState && a.hasUnknownPrevEvents(r.Context(), raw) {
-		return evID, false
-	}
-	// Authorization. An event whose auth_events reference events this server
-	// does not hold is fetched via /event_auth (spec: the receiving server may
-	// ask the sending server for the auth chain of an event it cannot
-	// authorise); events that still fail authorization — insufficient power,
-	// referencing an unknown or rejected auth event — are soft-failed: they are
-	// persisted for DAG continuity but marked rejected and never delivered to
-	// clients or included in room state (mirror of Synapse's soft-fail, and the
-	// regression guard for events smuggling a rejected/outlier event into their
-	// Partial-state rooms (MSC3902) defer the authorization decision: their
-	// state (and therefore auth_events) is intentionally incomplete until the
-	// background resync finishes, and membership events (ban/kick/leave/invite)
-	// must keep flowing. The auth chain of inbound events is still fetched
-	// (lazy-loading /sync responses must include timeline senders' memberships,
-	// which live in those chains), but the event is accepted and re-validated
-	// against the full state by the resync once it completes.
-	rejected := false
-	if origin != "" && room.PartialState && a.hasUnknownAuthEvents(r.Context(), raw) {
-		a.fetchAuthChainFor(r.Context(), ev.RoomID, evID, origin)
-	}
-	if origin != "" && !room.PartialState {
-		if a.hasUnknownAuthEvents(r.Context(), raw) {
+		// If the prev_events are STILL missing after the fetch (the sending server
+		// did not deliver them, or the delivered events were rejected — bad JSON,
+		// failed verification), the event itself must be rejected rather than
+		// persisted: an event whose predecessors are unknown sits on nothing, and
+		// accepting it would surface an event the room's DAG never legitimately
+		// produced. Per the spec, a server only accepts an event once the events it
+		// references (prev_events and auth_events) are known and accepted; Synapse
+		// soft-fails such events. Rejection here is what lets a re-delivery later
+		// succeed once the missing events arrive (TestUnrejectRejectedEvents).
+		// Skipped for partial-state rooms (MSC3902), whose local DAG is
+		// intentionally incomplete until the background resync completes: only the
+		// critical state and the join event were seeded, so every remote event
+		// would reference unknown prevs and be dropped — including membership
+		// events (ban/kick/leave/invite) that arrive right after a partial join.
+		// The resync fills the history; dropping such events would silently lose
+		// membership transitions the joining user's /sync depends on.
+		if origin != "" && !room.PartialState && a.hasUnknownPrevEvents(r.Context(), raw) {
+			return evID, false
+		}
+		// Authorization. An event whose auth_events reference events this server
+		// does not hold is fetched via /event_auth (spec: the receiving server may
+		// ask the sending server for the auth chain of an event it cannot
+		// authorise); events that still fail authorization — insufficient power,
+		// referencing an unknown or rejected auth event — are soft-failed: they are
+		// persisted for DAG continuity but marked rejected and never delivered to
+		// clients or included in room state (mirror of Synapse's soft-fail, and the
+		// regression guard for events smuggling a rejected/outlier event into their
+		// Partial-state rooms (MSC3902) defer the authorization decision: their
+		// state (and therefore auth_events) is intentionally incomplete until the
+		// background resync finishes, and membership events (ban/kick/leave/invite)
+		// must keep flowing. The auth chain of inbound events is still fetched
+		// (lazy-loading /sync responses must include timeline senders' memberships,
+		// which live in those chains), but the event is accepted and re-validated
+		// against the full state by the resync once it completes.
+		if origin != "" && room.PartialState && a.hasUnknownAuthEvents(r.Context(), raw) {
 			a.fetchAuthChainFor(r.Context(), ev.RoomID, evID, origin)
 		}
-		if a.hasUnknownAuthEvents(r.Context(), raw) {
-			// The auth chain could not be established (the peer did not serve it,
-			// or served an empty chain): soft-fail the event.
-			rejected = true
-		} else if a.authReferencesRejected(r.Context(), raw) {
-			// An auth_event that was itself rejected (soft-failed) propagates the
-			// rejection: an event cannot be authorised by a rejected precedent.
-			rejected = true
-		} else if rules, ok := roomver.Get(version); ok {
-			stateKey := ""
-			if ev.StateKey != nil {
-				stateKey = *ev.StateKey
+		if origin != "" && !room.PartialState {
+			if a.hasUnknownAuthEvents(r.Context(), raw) {
+				a.fetchAuthChainFor(r.Context(), ev.RoomID, evID, origin)
 			}
-			st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey, ev.Content)
-			// Restricted-rule room (MSC3083): a join event names its authoriser
-			// via join_authorised_via_users_server. The verdict is computed
-			// against the allow-listed rooms the local server participates in
-			// (mirror of the send_join path in ingestRemoteMember). When this
-			// server cannot authoritatively answer (it does not participate in
-			// all the allowed rooms), the join is accepted unvetted: the event
-			// was already authorised by the server that processed the send_join,
-			// and rejecting the re-broadcast here would desync the room (the
-			// M_UNABLE_TO_AUTHORISE_JOIN fail-over lives on the client join
-			// path, not the transaction path).
-			skipAuth := false
-			if ev.Type == "m.room.member" && stateKey != "" {
-				var mc struct {
-					Membership string `json:"membership"`
+			if a.hasUnknownAuthEvents(r.Context(), raw) {
+				// The auth chain could not be established (the peer did not serve it,
+				// or served an empty chain): soft-fail the event.
+				rejected = true
+			} else if a.authReferencesRejected(r.Context(), raw) {
+				// An auth_event that was itself rejected (soft-failed) propagates the
+				// rejection: an event cannot be authorised by a rejected precedent.
+				rejected = true
+			} else if rules, ok := roomver.Get(version); ok {
+				stateKey := ""
+				if ev.StateKey != nil {
+					stateKey = *ev.StateKey
 				}
-				_ = json.Unmarshal(ev.Content, &mc)
-				if mc.Membership == rooms.MembershipJoin && a.restrictedRoomJoinRules(r.Context(), ev.RoomID) {
-					var authMember struct {
-						Authoriser string `json:"join_authorised_via_users_server"`
+				st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey, ev.Content)
+				// Restricted-rule room (MSC3083): a join event names its authoriser
+				// via join_authorised_via_users_server. The verdict is computed
+				// against the allow-listed rooms the local server participates in
+				// (mirror of the send_join path in ingestRemoteMember). When this
+				// server cannot authoritatively answer (it does not participate in
+				// all the allowed rooms), the join is accepted unvetted: the event
+				// was already authorised by the server that processed the send_join,
+				// and rejecting the re-broadcast here would desync the room (the
+				// M_UNABLE_TO_AUTHORISE_JOIN fail-over lives on the client join
+				// path, not the transaction path).
+				skipAuth := false
+				if ev.Type == "m.room.member" && stateKey != "" {
+					var mc struct {
+						Membership string `json:"membership"`
 					}
-					_ = json.Unmarshal(ev.Content, &authMember)
-					switch a.Store.RestrictedJoinAuthorised(r.Context(), ev.RoomID, stateKey, authMember.Authoriser, a.ServerName()) {
-					case storage.RestrictedJoinAuthorised:
-						st.RestrictedAuthorised = true
-					case storage.RestrictedJoinUnableToAuthorise:
-						skipAuth = true
+					_ = json.Unmarshal(ev.Content, &mc)
+					if mc.Membership == rooms.MembershipJoin && a.restrictedRoomJoinRules(r.Context(), ev.RoomID) {
+						var authMember struct {
+							Authoriser string `json:"join_authorised_via_users_server"`
+						}
+						_ = json.Unmarshal(ev.Content, &authMember)
+						switch a.Store.RestrictedJoinAuthorised(r.Context(), ev.RoomID, stateKey, authMember.Authoriser, a.ServerName()) {
+						case storage.RestrictedJoinAuthorised:
+							st.RestrictedAuthorised = true
+						case storage.RestrictedJoinUnableToAuthorise:
+							skipAuth = true
+						}
+					}
+				}
+				if !skipAuth {
+					if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, ev.StateKey != nil); err != nil {
+						rejected = true
 					}
 				}
 			}
-			if !skipAuth {
-				if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, ev.StateKey != nil); err != nil {
+		} else if origin != "" && room.PartialState && ev.StateKey != nil {
+			// Partial-state room (MSC3902): the room's state is incomplete, so
+			// every event is accepted optimistically and re-validated against the
+			// full state once the resync completes (revalidatePartialWindow).
+			// Non-member state events are checked against the partial snapshot (an
+			// obviously invalid event is rejected now). Member events are also
+			// checked when the SENDER's membership is known from the partial state
+			// (e.g. a banned user's kick is rejected immediately — Complement's
+			// "incorrectly believed to be in room" tests assert the 404); a sender
+			// whose membership is unknown is accepted leniently, because the
+			// partial state cannot vouch for them and their event must be deferred
+			// to revalidation (mirror of Synapse's MSC3902 handling — e.g. a kick
+			// by a user who actually left the room before the join is accepted
+			// during the partial window and rejected once the full state arrives).
+			if rules, ok := roomver.Get(version); ok {
+				stateKey := ""
+				if ev.StateKey != nil {
+					stateKey = *ev.StateKey
+				}
+				st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey, ev.Content)
+				if ev.Type == "m.room.member" && len(st.SenderMember) == 0 {
+					// Unknown sender membership: accept leniently (revalidated later).
+				} else if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, true); err != nil {
 					rejected = true
 				}
-			}
-		}
-	} else if origin != "" && room.PartialState && ev.StateKey != nil {
-		// Partial-state room (MSC3902): the room's state is incomplete, so
-		// every event is accepted optimistically and re-validated against the
-		// full state once the resync completes (revalidatePartialWindow).
-		// Non-member state events are checked against the partial snapshot (an
-		// obviously invalid event is rejected now). Member events are also
-		// checked when the SENDER's membership is known from the partial state
-		// (e.g. a banned user's kick is rejected immediately — Complement's
-		// "incorrectly believed to be in room" tests assert the 404); a sender
-		// whose membership is unknown is accepted leniently, because the
-		// partial state cannot vouch for them and their event must be deferred
-		// to revalidation (mirror of Synapse's MSC3902 handling — e.g. a kick
-		// by a user who actually left the room before the join is accepted
-		// during the partial window and rejected once the full state arrives).
-		if rules, ok := roomver.Get(version); ok {
-			stateKey := ""
-			if ev.StateKey != nil {
-				stateKey = *ev.StateKey
-			}
-			st := a.memberStateSnapshot(r, ev.RoomID, ev.Sender, stateKey, ev.Content)
-			if ev.Type == "m.room.member" && len(st.SenderMember) == 0 {
-				// Unknown sender membership: accept leniently (revalidated later).
-			} else if err := rooms.Authorize(rules, ev.Type, stateKey, ev.Sender, ev.Content, st, true); err != nil {
-				rejected = true
 			}
 		}
 	}
@@ -692,6 +703,11 @@ func (a *API) kickLocalGuest(ctx context.Context, roomID, userID string) {
 	}
 	sk := userID
 	b.StateKey = &sk
+	if rules, ok := roomver.Get(version); ok && rules.StateDAGs {
+		if b.PrevStateEvents, err = eventstate.PrevStateEventsForNew(ctx, a.Store, roomID, "m.room.member", userID, userID); err != nil {
+			return
+		}
+	}
 	ev, err := b.BuildForVersion(a.ServerName(), a.Key, version)
 	if err != nil {
 		return
@@ -1167,6 +1183,8 @@ func (a *API) GetMissingEvents(w http.ResponseWriter, r *http.Request) {
 		LatestEvents   []string `json:"latest_events"`
 		MinDepth       int64    `json:"min_depth"`
 		Limit          int      `json:"limit"`
+		// MSC4242: walk prev_state_events instead of prev_events.
+		StateDAG bool `json:"org.matrix.msc4242.state_dag"`
 	}
 	if err := httpx.DecodeJSON(w, r, &req); err != nil {
 		httpx.WriteError(w, err)
@@ -1175,6 +1193,10 @@ func (a *API) GetMissingEvents(w http.ResponseWriter, r *http.Request) {
 	limit := req.Limit
 	if limit <= 0 {
 		limit = 20
+	}
+	if req.StateDAG {
+		a.getMissingStateDAGEvents(w, r, roomID, req.EarliestEvents, req.LatestEvents, limit)
+		return
 	}
 	// The response is the events strictly between the earliest and latest sets:
 	// the ancestors of latest_events (walked via prev_events) that come after
@@ -1507,6 +1529,7 @@ func (a *API) MakeJoin(w http.ResponseWriter, r *http.Request) {
 		"auth_events":      authRefs,
 		"content":          content,
 	}
+	a.stateDAGTemplate(r.Context(), roomID, template, userID)
 	if rules.EventFormatV1 {
 		template["origin"] = a.ServerName()
 	}
@@ -1646,6 +1669,7 @@ func (a *API) MakeKnock(w http.ResponseWriter, r *http.Request) {
 		"auth_events":      authRefs,
 		"content":          map[string]string{"membership": "knock"},
 	}
+	a.stateDAGTemplate(r.Context(), roomID, template, userID)
 	if rules.EventFormatV1 {
 		template["origin"] = a.ServerName()
 	}
@@ -1746,6 +1770,7 @@ func (a *API) MakeLeave(w http.ResponseWriter, r *http.Request) {
 		"auth_events":      authRefs,
 		"content":          map[string]string{"membership": "leave"},
 	}
+	a.stateDAGTemplate(r.Context(), roomID, event, userID)
 	// `origin` is a top-level field of legacy room versions only (see MakeJoin).
 	if legacy {
 		event["origin"] = a.ServerName()
@@ -2327,7 +2352,20 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 				}
 			}
 		}
-		if err := rooms.Authorize(rules, ev.Type, *ev.StateKey, ev.Sender, ev.Content, st, true); err != nil {
+		if rules.StateDAGs {
+			// MSC4242: the event is authorised against the state before it,
+			// resolved from its prev_state_events, which this server must
+			// hold (it handed them out in the make_* template).
+			sev, perr := events.New(eventJSON, version)
+			if perr != nil || !sev.HasPrevStateEvents() {
+				httpx.WriteError(w, httpx.ErrBadJSON("send_* event is not a valid state-DAG event"))
+				return
+			}
+			if err := eventstate.CheckStateDAGEvent(r.Context(), a.Store, sev, eventstate.StateDAGCheck{RestrictedAuthorised: st.RestrictedAuthorised}); err != nil {
+				httpx.WriteError(w, httpx.NewError(http.StatusForbidden, "M_FORBIDDEN", err.Error()))
+				return
+			}
+		} else if err := rooms.Authorize(rules, ev.Type, *ev.StateKey, ev.Sender, ev.Content, st, true); err != nil {
 			httpx.WriteError(w, httpx.NewError(http.StatusForbidden, "M_FORBIDDEN", err.Error()))
 			return
 		}
@@ -2410,6 +2448,21 @@ func (a *API) ingestRemoteMember(w http.ResponseWriter, r *http.Request, wantMem
 	// shape.
 	if wantMembership == "knock" {
 		a.writeKnockRoomState(w, r, ev.RoomID)
+		return
+	}
+	if rules, ok := roomver.Get(version); ok && rules.StateDAGs {
+		// MSC4242 /send_join: the whole state DAG behind the join replaces
+		// state and auth_chain.
+		dag, err := a.stateDAGPDUs(r.Context(), ev.RoomID, eventJSON, version)
+		if err != nil {
+			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
+			return
+		}
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{
+			"origin":    a.ServerName(),
+			"state_dag": dag,
+			"event":     eventJSON,
+		})
 		return
 	}
 	statePDUs, _ := a.roomStatePDUs(r, ev.RoomID)
@@ -2757,7 +2810,13 @@ func (a *API) walkAuthChain(ctx context.Context, seed []string) map[string]bool 
 		if err != nil {
 			continue
 		}
-		for _, aid := range ev.AuthEvents() {
+		authIDs := ev.AuthEvents()
+		if rules.StateDAGs {
+			// MSC4242: state-DAG events carry no auth_events; their auth
+			// chain follows the auth events calculated from the state DAG.
+			authIDs, _, _ = a.Store.CalculatedAuth(ctx, id)
+		}
+		for _, aid := range authIDs {
 			if !visited[aid] {
 				stack = append(stack, aid)
 			}

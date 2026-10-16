@@ -609,6 +609,9 @@ func (a *API) MaybeBackfill(ctx context.Context, roomID string, limit int) int {
 		// The /backfill response is newest-first (BFS from the seeds), which is
 		// exactly the order InsertBackfillEvents expects for the stream range.
 		if err := a.Store.InsertBackfillEvents(ctx, rows); err == nil {
+			if rules, ok := roomver.Get(version); ok && rules.StateDAGs {
+				a.settleBackfilledStateDAG(ctx, roomID, rules, rows)
+			}
 			return len(rows)
 		}
 	}
@@ -1477,6 +1480,16 @@ func (a *API) persistVerifiedPDU(ctx context.Context, roomID string, version roo
 	}
 	if ev.RoomID != "" && ev.RoomID != roomID {
 		return errors.New("wrong room")
+	}
+	if rules.StateDAGs {
+		sev := a.parseStateDAGPDU(ctx, roomID, rules, raw)
+		if sev == nil {
+			return errors.New("invalid state-DAG event")
+		}
+		if v := a.applyStateDAGEvent(ctx, roomID, rules, sev, !authorize); v == stateDAGMissing {
+			return eventstate.ErrMissingPrevState
+		}
+		return nil
 	}
 	vres := a.verifier.Verify(ctx, raw, version)
 	if vres.Err != nil || (vres.Signed && !vres.Valid) {

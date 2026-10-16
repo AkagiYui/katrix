@@ -19,12 +19,16 @@ type Builder struct {
 	// Redacts is the event ID a redaction event targets. Per the spec it is a
 	// top-level event field (not part of content), so it is lifted onto the
 	// built PDU alongside content.
-	Redacts        string
-	Unsigned       json.RawMessage
-	PrevEvents     []string
-	AuthEvents     []string
-	Depth          int64
-	OriginServerTS int64
+	Redacts    string
+	Unsigned   json.RawMessage
+	PrevEvents []string
+	AuthEvents []string
+	// PrevStateEvents (MSC4242 state-DAG rooms only) are the room's state DAG
+	// forward extremities; empty for the m.room.create event. State-DAG events
+	// carry no auth_events.
+	PrevStateEvents []string
+	Depth           int64
+	OriginServerTS  int64
 	// Origin is the server that created the event, used on federated events
 	// (e.g. outbound make_join/send_join). It is part of the signable form for
 	// room versions < 11, so it must be set before Build signs the event.
@@ -61,7 +65,11 @@ func (b *Builder) Build(serverName string, key *crypto.SigningKey, version roomv
 	obj["depth"] = mustJSON(b.Depth)
 	obj["origin_server_ts"] = mustJSON(b.OriginServerTS)
 	obj["prev_events"] = mustJSON(nonNilSlice(b.PrevEvents))
-	obj["auth_events"] = mustJSON(nonNilSlice(b.AuthEvents))
+	if rules.StateDAGs {
+		obj["prev_state_events"] = mustJSON(nonNilSlice(b.PrevStateEvents))
+	} else {
+		obj["auth_events"] = mustJSON(nonNilSlice(b.AuthEvents))
+	}
 	if b.Redacts != "" {
 		setString(obj, "redacts", b.Redacts)
 	}

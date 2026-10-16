@@ -129,6 +129,17 @@ func (e *Event) PrevEvents() []string { return e.eventRefs("prev_events") }
 // AuthEvents returns the referenced auth_events as event IDs.
 func (e *Event) AuthEvents() []string { return e.eventRefs("auth_events") }
 
+// PrevStateEvents returns the MSC4242 prev_state_events (nil outside
+// state-DAG room versions).
+func (e *Event) PrevStateEvents() []string { return e.eventRefs("prev_state_events") }
+
+// HasPrevStateEvents reports whether the event carries a prev_state_events
+// field at all (required in state-DAG rooms, an empty array on the create).
+func (e *Event) HasPrevStateEvents() bool {
+	_, ok := e.fields["prev_state_events"]
+	return ok
+}
+
 func (e *Event) eventRefs(field string) []string {
 	v, ok := e.fields[field]
 	if !ok {

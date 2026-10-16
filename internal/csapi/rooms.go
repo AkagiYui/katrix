@@ -3443,6 +3443,17 @@ func (a *API) buildEvent(r *http.Request, auth *homeserver.Auth, roomID string, 
 		PrevEvents:     prev,
 		AuthEvents:     authIDs,
 	}
+	if rules, ok := roomver.Get(version); ok && rules.StateDAGs {
+		sk := ""
+		if isState {
+			sk = stateKey
+		}
+		pse, err := eventstate.PrevStateEventsForNew(r.Context(), a.Store, roomID, eventType, auth.UserID, sk)
+		if err != nil {
+			return nil, err
+		}
+		b.PrevStateEvents = pse
+	}
 	if len(redacts) > 0 {
 		b.Redacts = redacts[0]
 	}

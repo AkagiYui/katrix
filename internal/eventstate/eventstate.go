@@ -56,6 +56,11 @@ type roomWrite interface {
 	TxSetRoomState(ctx context.Context, tx pgx.Tx, roomID string, state []storage.StateRow) error
 	TxGetRoomState(ctx context.Context, tx pgx.Tx, roomID string) ([]storage.StateRow, error)
 	TxSetForwardExtremities(ctx context.Context, tx pgx.Tx, roomID string, extremities []storage.ForwardExtremity) error
+	// MSC4242 state DAGs.
+	TxStateDAGExtremities(ctx context.Context, tx pgx.Tx, roomID string) ([]string, error)
+	TxAdvanceStateDAG(ctx context.Context, tx pgx.Tx, roomID, eventID string, isState bool, prevStateEvents []string) error
+	TxSaveCalculatedAuth(ctx context.Context, tx pgx.Tx, roomID, eventID string, authEventIDs []string) error
+	TxCalculatedAuth(ctx context.Context, tx pgx.Tx, eventID string) ([]string, bool, error)
 }
 
 // powerLevelCache holds a parsed power_levels content keyed by event ID, to
@@ -108,7 +113,7 @@ func senderPowerLevel(ctx context.Context, store roomWrite, tx pgx.Tx, meta *sta
 	createContent := ""
 	createSender := ""
 	var pl *rooms.PowerLevels
-	for _, aid := range ev.AuthEvents() {
+	for _, aid := range meta.AuthEvents {
 		row, err := store.TxGetEvent(ctx, tx, aid)
 		if err != nil || row == nil {
 			continue
@@ -173,6 +178,13 @@ func buildEventMeta(ctx context.Context, store roomWrite, tx pgx.Tx, row *storag
 	if ev, err := events.New(row.RawJSON, rules.Version); err == nil {
 		meta.AuthEvents = ev.AuthEvents()
 		meta.PrevEvents = ev.PrevEvents()
+		if rules.StateDAGs {
+			// MSC4242: state-DAG events carry no auth_events; state resolution
+			// walks the auth events calculated from the state DAG, and the
+			// state DAG orders the events.
+			meta.AuthEvents, _, _ = store.TxCalculatedAuth(ctx, tx, row.EventID)
+			meta.PrevEvents = ev.PrevStateEvents()
+		}
 		meta.SenderPowerLevel = senderPowerLevel(ctx, store, tx, &meta, rules, ev, cache)
 	}
 	return meta
@@ -360,6 +372,9 @@ func snapshotForEventTx(ctx context.Context, store roomWrite, tx pgx.Tx, row *st
 // preserving prior best-effort behaviour. It is a no-op when the room has no
 // recorded extremities.
 func recomputeCurrentStateTx(ctx context.Context, store roomWrite, tx pgx.Tx, roomID string, rules roomver.Rules) error {
+	if rules.StateDAGs {
+		return recomputeStateDAGCurrentStateTx(ctx, store, tx, roomID, rules)
+	}
 	exts, err := store.TxForwardExtremities(ctx, tx, roomID)
 	if err != nil {
 		return fmt.Errorf("eventstate: load extremities: %w", err)
@@ -418,6 +433,9 @@ func recomputeCurrentStateTx(ctx context.Context, store roomWrite, tx pgx.Tx, ro
 // previous writer's complete state.
 func Maintain(ctx context.Context, store *storage.Store, row *storage.EventRow, rules roomver.Rules) error {
 	return store.WithRoomWrite(ctx, row.RoomID, func(tx pgx.Tx) error {
+		if rules.StateDAGs {
+			return maintainStateDAGTx(ctx, store, tx, row, rules)
+		}
 		snap, err := snapshotForEventTx(ctx, store, tx, row, rules)
 		if err != nil {
 			return err

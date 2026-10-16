@@ -24,6 +24,12 @@ func topLevelKeep(r roomver.Rules) map[string]bool {
 		"auth_events":      true,
 		"origin_server_ts": true,
 	}
+	// MSC4242: state-DAG events have no auth_events; prev_state_events is
+	// part of the event's reference hash instead.
+	if r.StateDAGs {
+		delete(keep, "auth_events")
+		keep["prev_state_events"] = true
+	}
 	if !r.UpdatedRedaction {
 		keep["origin"] = true
 		keep["membership"] = true

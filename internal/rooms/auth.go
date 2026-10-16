@@ -43,6 +43,12 @@ type StateSnapshot struct {
 	// one of the rooms in the join_rules allow list (MSC3083). It is computed
 	// by the caller (which has store access) and enforced by the auth rules.
 	RestrictedAuthorised bool
+	// OnlyPrevIsCreate records that the event's only previous event is the
+	// room's m.room.create (in state-DAG rooms: its only prev_state_event),
+	// which authorises the creator's initial join (spec auth rules for
+	// m.room.member, join: "If the only previous event is an m.room.create
+	// and the state_key is the sender of the m.room.create, allow").
+	OnlyPrevIsCreate bool
 }
 
 // Authorize determines whether an event passes the Matrix authorization rules
@@ -550,6 +556,10 @@ func authorizeMember(rules roomver.Rules, sender, stateKey string, content json.
 
 	switch mc.Membership {
 	case MembershipJoin:
+		// The creator's initial join, directly after the create event.
+		if st.OnlyPrevIsCreate && sender == stateKey && stateKey == create.CreatorOf(st.CreateSender) {
+			return nil
+		}
 		// Join: allowed if join_rule is public, or if the sender is the target
 		// and was already invited, or if the sender was already joined.
 		switch targetMembership {

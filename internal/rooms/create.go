@@ -477,6 +477,11 @@ func buildAndSign(serverName string, key *crypto.SigningKey, version roomver.Ver
 		PrevEvents:     prev,
 		AuthEvents:     auth,
 	}
+	// MSC4242: the genesis events form a linear chain, so each one's state
+	// DAG parent is its prev_event (the create references nothing).
+	if rules.StateDAGs {
+		b.PrevStateEvents = prev
+	}
 	// All genesis events are state events. create/power_levels/join_rules/
 	// history_visibility use state_key=""; member uses the target user id.
 	// A nil StateKey would make it a non-state message, so always set it.

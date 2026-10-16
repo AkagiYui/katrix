@@ -45,6 +45,9 @@ type sendJoinResponse struct {
 	Event          json.RawMessage   `json:"event"`
 	MembersOmitted bool              `json:"members_omitted,omitempty"`
 	ServersInRoom  []string          `json:"servers_in_room,omitempty"`
+	// StateDAG (MSC4242 state-DAG rooms) is the room's entire state DAG; it
+	// replaces state and auth_chain.
+	StateDAG []json.RawMessage `json:"state_dag,omitempty"`
 }
 
 // FedHTTPError is a federation request failure carrying the remote server's
@@ -199,6 +202,12 @@ func (a *API) joinRemoteRoomFrom(ctx context.Context, userID, roomID, dest strin
 	sj, err := a.client.sendJoin(ctx, dest, roomID, userID, ev, partial)
 	if err != nil {
 		return false, err
+	}
+	if rules.StateDAGs {
+		if err := a.ingestStateDAGJoin(ctx, roomID, version, rules, ev, sj); err != nil {
+			return false, err
+		}
+		return false, nil
 	}
 	if partial && sj.MembersOmitted {
 		if err := a.ingestPartialJoin(ctx, roomID, version, rules, ev, sj, dest); err != nil {
@@ -569,15 +578,16 @@ func buildJoinEvent(tpl *makeJoinResponse, userID, roomID string, now int64, ver
 		}
 	}
 	b := events.Builder{
-		Type:           "m.room.member",
-		Sender:         userID,
-		RoomID:         roomID,
-		Content:        content,
-		Depth:          tplEventDepth(tpl.Event),
-		OriginServerTS: tplEventTS(tpl.Event, now),
-		PrevEvents:     prev,
-		AuthEvents:     auth,
-		Origin:         serverName,
+		Type:            "m.room.member",
+		Sender:          userID,
+		RoomID:          roomID,
+		Content:         content,
+		Depth:           tplEventDepth(tpl.Event),
+		OriginServerTS:  tplEventTS(tpl.Event, now),
+		PrevEvents:      prev,
+		AuthEvents:      auth,
+		Origin:          serverName,
+		PrevStateEvents: tplPrevStateEvents(tpl.Event),
 	}
 	sk := userID
 	b.StateKey = &sk
@@ -604,15 +614,16 @@ func buildKnockEvent(tpl *makeJoinResponse, userID, roomID string, now int64, ve
 		}
 	}
 	b := events.Builder{
-		Type:           "m.room.member",
-		Sender:         userID,
-		RoomID:         roomID,
-		Content:        content,
-		Depth:          tplEventDepth(tpl.Event),
-		OriginServerTS: tplEventTS(tpl.Event, now),
-		PrevEvents:     prev,
-		AuthEvents:     auth,
-		Origin:         serverName,
+		Type:            "m.room.member",
+		Sender:          userID,
+		RoomID:          roomID,
+		Content:         content,
+		Depth:           tplEventDepth(tpl.Event),
+		OriginServerTS:  tplEventTS(tpl.Event, now),
+		PrevEvents:      prev,
+		AuthEvents:      auth,
+		Origin:          serverName,
+		PrevStateEvents: tplPrevStateEvents(tpl.Event),
 	}
 	sk := userID
 	b.StateKey = &sk
@@ -668,6 +679,15 @@ func tplEventRefs(raw json.RawMessage) (prev, auth []string) {
 }
 
 // tplEventContent returns the content object of a make_join template event.
+// tplPrevStateEvents returns a template event's MSC4242 prev_state_events.
+func tplPrevStateEvents(raw json.RawMessage) []string {
+	var t struct {
+		PrevStateEvents []string `json:"prev_state_events"`
+	}
+	_ = json.Unmarshal(raw, &t)
+	return t.PrevStateEvents
+}
+
 func tplEventContent(raw json.RawMessage) json.RawMessage {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil {
@@ -1401,15 +1421,16 @@ func buildLeaveEvent(tpl *makeJoinResponse, userID, roomID string, now int64, ve
 		content = json.RawMessage(`{"membership":"leave"}`)
 	}
 	b := events.Builder{
-		Type:           "m.room.member",
-		Sender:         userID,
-		RoomID:         roomID,
-		Content:        content,
-		Depth:          tplEventDepth(tpl.Event),
-		OriginServerTS: tplEventTS(tpl.Event, now),
-		PrevEvents:     prev,
-		AuthEvents:     auth,
-		Origin:         serverName,
+		Type:            "m.room.member",
+		Sender:          userID,
+		RoomID:          roomID,
+		Content:         content,
+		Depth:           tplEventDepth(tpl.Event),
+		OriginServerTS:  tplEventTS(tpl.Event, now),
+		PrevEvents:      prev,
+		AuthEvents:      auth,
+		Origin:          serverName,
+		PrevStateEvents: tplPrevStateEvents(tpl.Event),
 	}
 	sk := userID
 	b.StateKey = &sk

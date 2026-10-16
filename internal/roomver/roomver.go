@@ -111,6 +111,14 @@ type Rules struct {
 	// a state_key starting with @ must equal the sender exactly. Registered as
 	// the unstable room version "org.matrix.msc3757.10".
 	OwnedState bool
+
+	// StateDAGs (MSC4242): events carry prev_state_events (the room's state
+	// DAG forward extremities) instead of auth_events. Room state is derived
+	// from the state DAG, auth_events are calculated from the state before
+	// each event, and an event referencing a rejected state event is itself
+	// rejected. Registered as the unstable room version
+	// "org.matrix.msc4242.12", based on room version 12.
+	StateDAGs bool
 }
 
 var table = map[Version]Rules{}
@@ -201,6 +209,15 @@ func init() {
 	// MSC3389 changes only the redaction algorithm relative to room version 10.
 	// Keep it independent of UpdatedRedaction so the alias does not inherit the
 	// unrelated room-version-11 event-format and redaction changes.
+	// MSC4242 state DAGs, based on room version 12. Faster remote joins use a
+	// different shape for state-DAG rooms (the full state DAG is always
+	// returned), so the MSC3902 partial-state join is not used.
+	msc4242 := v12
+	msc4242.Version = "org.matrix.msc4242.12"
+	msc4242.StateDAGs = true
+	msc4242.PartialStateAllowed = false
+	register(msc4242)
+
 	msc3389 := v10
 	msc3389.Version = "org.matrix.msc3389.10"
 	msc3389.RedactionKeepsRelations = true
@@ -220,7 +237,7 @@ const Default Version = "11"
 func Supported() []Version {
 	return []Version{
 		"1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12",
-		"org.matrix.msc3389.10", "org.matrix.msc3757.10",
+		"org.matrix.msc3389.10", "org.matrix.msc3757.10", "org.matrix.msc4242.12",
 	}
 }
 

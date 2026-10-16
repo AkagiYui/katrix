@@ -16,6 +16,7 @@ import (
 
 	"github.com/AkagiYui/katrix/internal/crypto"
 	"github.com/AkagiYui/katrix/internal/events"
+	"github.com/AkagiYui/katrix/internal/eventstate"
 	"github.com/AkagiYui/katrix/internal/homeserver"
 	"github.com/AkagiYui/katrix/internal/httpx"
 	"github.com/AkagiYui/katrix/internal/ids"
@@ -347,6 +348,11 @@ func (a *API) persistThirdPartyMemberInvite(ctx context.Context, sender, target,
 		PrevEvents:     prev,
 		AuthEvents:     authIDs,
 		StateKey:       &sk,
+	}
+	if rules.StateDAGs {
+		if b.PrevStateEvents, err = eventstate.PrevStateEventsForNew(ctx, a.Store, roomID, "m.room.member", sender, target); err != nil {
+			return err
+		}
 	}
 	ev, err := b.BuildForVersion(a.ServerName(), a.Key, version)
 	if err != nil {
