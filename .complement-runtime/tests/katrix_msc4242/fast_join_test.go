@@ -78,4 +78,3 @@ func TestKatrixStateDAGFastJoinBetweenServers(t *testing.T) {
 	res = bob.MustDo(t, "GET", []string{"_matrix", "client", "v3", "rooms", roomID, "state", "m.room.name", ""})
 	must.MatchGJSON(t, must.ParseJSON(t, res.Body), match.JSONKeyEqual("name", "renamed while bob was away"))
 }
-
