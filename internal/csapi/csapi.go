@@ -28,6 +28,9 @@ type API struct {
 	// og:image blob so the response can carry an mxc:// URL. Set by
 	// SetMediaBackend during HTTP server assembly.
 	media *media.FileBackend
+	// delayedWake nudges the MSC4140 worker when a delayed event is scheduled
+	// or restarted, so it re-arms its timer for the new earliest fire time.
+	delayedWake chan struct{}
 	// ssConns tracks per (user, conn_id) sliding-sync connection state: which
 	// rooms have been delivered with initial=true and the subscription config
 	// each room was delivered with. When a client adds a room_subscription for
@@ -62,7 +65,7 @@ type API struct {
 
 // New constructs the CS API surface.
 func New(hs *homeserver.HS) *API {
-	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, hs.Typing), ssConns: newSSConnStore(), push: newPushDispatcher(hs.Config.PushInsecure), emailValidations: newEmailValidationStore(), tpMeta: newTPMetaCache(), oidcStates: map[string]oidcState{}, emailPushInterval: 30 * time.Second}
+	api := &API{HS: hs, uia: newUIAStore(), syncEngine: newSyncEngine(hs.Store, hs.Typing), ssConns: newSSConnStore(), push: newPushDispatcher(hs.Config.PushInsecure), emailValidations: newEmailValidationStore(), tpMeta: newTPMetaCache(), oidcStates: map[string]oidcState{}, emailPushInterval: 30 * time.Second, delayedWake: make(chan struct{}, 1)}
 	api.push.a = api
 	return api
 }
@@ -100,6 +103,10 @@ func (a *API) Versions(w http.ResponseWriter, r *http.Request) {
 			// QR / "sign in with another device" login (MSC4108 foundation):
 			// the m.login.token flow + POST /login/token minting endpoint.
 			"org.matrix.msc3886": true,
+			// MSC4140 delayed events; .stable: the accepted MSC's stable
+			// endpoints are served too.
+			"org.matrix.msc4140":        a.delayedEventsEnabled(),
+			"org.matrix.msc4140.stable": a.delayedEventsEnabled(),
 		},
 	})
 }
@@ -130,6 +137,8 @@ func (a *API) Capabilities(w http.ResponseWriter, r *http.Request) {
 				"default":   string(roomver.Default),
 				"available": roomVersionCapabilities(),
 			},
+			"m.delayed_events":                  a.delayedEventsCapability(),
+			"org.matrix.msc4140.delayed_events": a.delayedEventsCapability(),
 		},
 	})
 }

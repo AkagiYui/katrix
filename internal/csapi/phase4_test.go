@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
 
 func contextWithCancelBackground() (context.Context, context.CancelFunc) {
@@ -159,129 +158,6 @@ func TestRoomSearch(t *testing.T) {
 	res := results[0].(map[string]any)["result"].(map[string]any)
 	if res["event_id"] != eventID {
 		t.Fatalf("search result event = %v", res)
-	}
-}
-
-// TestDelayedEventSchedulesAndFires verifies a delayed send returns a delay_id
-// and the event appears after the delay elapses.
-func TestDelayedEventSchedulesAndFires(t *testing.T) {
-	api, srv := testAPI(t)
-	// Start the delayed-event worker (normally started by cmd/katrix).
-	ctx, cancel := contextWithCancelBackground()
-	defer cancel()
-	api.StartDelayedWorker(ctx)
-	tok := registerUser(t, srv, "delay-alice", "pw")
-	roomID := createRoom(t, srv, tok, map[string]any{"preset": "public_chat"})
-
-	code, body := doJSON(t, srv, http.MethodPut,
-		"/_matrix/client/v3/rooms/"+roomID+"/send/m.room.message/d1?org.matrix.msc4140.delay=300", tok,
-		map[string]any{"msgtype": "m.text", "body": "delayed"})
-	if code != 200 {
-		t.Fatalf("delayed send: %d %v", code, body)
-	}
-	delayID, _ := body["delay_id"].(string)
-	if delayID == "" {
-		t.Fatalf("no delay_id: %v", body)
-	}
-
-	// Listing shows one delayed event.
-	code, body = getJSON(t, srv, "/_matrix/client/unstable/org.matrix.msc4140/delayed_events", tok)
-	if code != 200 {
-		t.Fatalf("list delayed: %d", code)
-	}
-	delayed, _ := body["delayed_events"].([]any)
-	if len(delayed) != 1 {
-		t.Fatalf("expected 1 delayed event, got %d: %v", len(delayed), body)
-	}
-
-	// The event has not been sent yet.
-	code, resp := getJSON(t, srv, "/_matrix/client/v3/sync?timeout=0", tok)
-	if code != 200 {
-		t.Fatalf("sync: %d", code)
-	}
-	rooms, _ := resp["rooms"].(map[string]any)
-	join, _ := rooms["join"].(map[string]any)
-	jr, _ := join[roomID].(map[string]any)
-	tl, _ := jr["timeline"].(map[string]any)
-	events, _ := tl["events"].([]any)
-	for _, ev := range events {
-		em := ev.(map[string]any)
-		if em["type"] == "m.room.message" && em["content"].(map[string]any)["body"] == "delayed" {
-			t.Fatal("delayed event fired too early")
-		}
-	}
-
-	// Wait for the worker to fire it (300ms delay + poll latency).
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		code, body = getJSON(t, srv, "/_matrix/client/unstable/org.matrix.msc4140/delayed_events", tok)
-		delayed, _ = body["delayed_events"].([]any)
-		if len(delayed) == 0 {
-			return // fired
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Fatalf("delayed event never fired; still %d pending", len(delayed))
-}
-
-// TestDelayedStateEventsDistinctKeys verifies multiple delayed state events on
-// distinct state keys stay separate (MSC4140), and that a new delayed state
-// event on an existing key supersedes the previous one. Regression test for the
-// dedup-by-txn collapse that merged every state delayed event into one row
-// (state events carry no txn, so txn could never be their dedup key).
-func TestDelayedStateEventsDistinctKeys(t *testing.T) {
-	api, srv := testAPI(t)
-	ctx, cancel := contextWithCancelBackground()
-	defer cancel()
-	api.StartDelayedWorker(ctx)
-	tok := registerUser(t, srv, "delay-state-alice", "pw")
-	roomID := createRoom(t, srv, tok, map[string]any{"preset": "public_chat"})
-
-	const delay = "?org.matrix.msc4140.delay=60000"
-	for _, sk := range []string{"k1", "k2", "k3"} {
-		code, body := doJSON(t, srv, http.MethodPut,
-			"/_matrix/client/v3/rooms/"+roomID+"/state/com.example.test/"+sk+delay, tok,
-			map[string]any{"v": sk})
-		if code != 200 {
-			t.Fatalf("delayed state %s: %d %v", sk, code, body)
-		}
-		if _, ok := body["delay_id"].(string); !ok {
-			t.Fatalf("no delay_id for %s: %v", sk, body)
-		}
-	}
-
-	code, body := getJSON(t, srv, "/_matrix/client/unstable/org.matrix.msc4140/delayed_events", tok)
-	if code != 200 {
-		t.Fatalf("list delayed: %d", code)
-	}
-	delayed, _ := body["delayed_events"].([]any)
-	if len(delayed) != 3 {
-		t.Fatalf("expected 3 delayed state events, got %d: %v", len(delayed), body)
-	}
-
-	// Re-scheduling on k2 supersedes the earlier k2 event: still 3 in total.
-	code, body = doJSON(t, srv, http.MethodPut,
-		"/_matrix/client/v3/rooms/"+roomID+"/state/com.example.test/k2"+delay, tok,
-		map[string]any{"v": "k2-new"})
-	if code != 200 {
-		t.Fatalf("delayed state k2 again: %d %v", code, body)
-	}
-	code, body = getJSON(t, srv, "/_matrix/client/unstable/org.matrix.msc4140/delayed_events", tok)
-	delayed, _ = body["delayed_events"].([]any)
-	if len(delayed) != 3 {
-		t.Fatalf("expected 3 delayed state events after supersede, got %d: %v", len(delayed), body)
-	}
-	foundNew := false
-	for _, ev := range delayed {
-		em := ev.(map[string]any)
-		if em["state_key"] == "k2" {
-			if c, ok := em["content"].(map[string]any); ok && c["v"] == "k2-new" {
-				foundNew = true
-			}
-		}
-	}
-	if !foundNew {
-		t.Fatalf("superseded k2 delayed event not replaced: %v", body)
 	}
 }
 

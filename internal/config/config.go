@@ -59,6 +59,14 @@ type Config struct {
 		StorePath      string `yaml:"store_path"`
 	} `yaml:"media"`
 
+	// DelayedEvents bounds MSC4140 delayed events. Both limits are enforced
+	// and advertised in the m.delayed_events capability; setting either to 0
+	// disables the feature.
+	DelayedEvents struct {
+		MaxDelayMS   int64 `yaml:"max_delay_ms"`
+		MaxScheduled int   `yaml:"max_scheduled"`
+	} `yaml:"delayed_events"`
+
 	// FederationEnabled toggles the whole server-server surface.
 	FederationEnabled bool `yaml:"federation_enabled"`
 
@@ -218,6 +226,10 @@ func Default() *Config {
 	c.Database.MaxConns = 16
 	c.Database.MinConns = 2
 	c.Metrics.Enabled = true
+	// MSC4140 limits: a day's delay (MatrixRTC heartbeats need seconds to
+	// minutes) and a generous per-user cap.
+	c.DelayedEvents.MaxDelayMS = 24 * 60 * 60 * 1000
+	c.DelayedEvents.MaxScheduled = 100
 	// CAS SSO registers the user on first login by default (Synapse's
 	// cas_enable_registration defaults to true).
 	c.CAS.EnableRegistration = true

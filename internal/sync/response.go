@@ -1618,9 +1618,9 @@ func (e *Engine) buildJoinedRoom(ctx context.Context, roomID string, opts SyncOp
 		}
 		var raw json.RawMessage
 		if erased[ev.Sender] && (vis == nil || vis.MembershipAt(ev.Depth) != "join") {
-			raw = filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(filter.renderEventErased(&ev), &ev), &ev), ev.EventID))
+			raw = filter.applyEventFields(AnnotateClientUnsigned(ctx, e.store, prevContent(membershipAt(filter.renderEventErased(&ev), &ev), &ev), ev.EventID, ev.Sender, opts.UserID, opts.Localpart))
 		} else {
-			raw = filter.applyEventFields(e.annotateTxn(ctx, prevContent(membershipAt(filter.renderEvent(&ev), &ev), &ev), ev.EventID))
+			raw = filter.applyEventFields(AnnotateClientUnsigned(ctx, e.store, prevContent(membershipAt(filter.renderEvent(&ev), &ev), &ev), ev.EventID, ev.Sender, opts.UserID, opts.Localpart))
 		}
 		rendered = append(rendered, renderedEvent{raw: raw, send: ev.Sender, stream: ev.StreamOrdering})
 	}
@@ -2175,7 +2175,7 @@ func (e *Engine) membershipAnnotator(ctx context.Context, roomID, userID string,
 			return ev
 		}
 		// Merge into any existing unsigned object (e.g. unsigned.redacted_by from
-		// clientEvent) rather than replacing it, mirroring annotateTxn.
+		// clientEvent) rather than replacing it, mirroring AnnotateClientUnsigned.
 		unsigned := map[string]any{"membership": membership}
 		if existing, ok := obj["unsigned"]; ok {
 			var m map[string]json.RawMessage
@@ -2247,12 +2247,21 @@ func (e *Engine) prevContentAnnotator(ctx context.Context, roomID string, upto i
 	}
 }
 
-// annotateTxn merges unsigned.transaction_id into a rendered timeline event
-// when the event was produced by a client transaction (spec: events sent with a
-// transaction ID carry it in unsigned.transaction_id).
-func (e *Engine) annotateTxn(ctx context.Context, rendered json.RawMessage, eventID string) json.RawMessage {
-	txnID, err := e.store.GetEventTxnID(ctx, eventID)
-	if err != nil || txnID == "" {
+// DelayIDUnsignedKey is the unsigned key carrying the MSC4140 delay_id of a
+// sent delayed event (unstable name until a spec release includes MSC4140).
+const DelayIDUnsignedKey = "org.matrix.msc4140.delay_id"
+
+// AnnotateClientUnsigned merges the viewer-specific unsigned data into a
+// rendered event: unsigned.transaction_id when the viewer's request produced
+// the event (spec "Transaction identifiers"), and the MSC4140 delay_id when
+// the event is a sent delayed event of the viewer's. Both are only ever shown
+// to the event's sender, so other viewers skip the lookup entirely.
+func AnnotateClientUnsigned(ctx context.Context, store *storage.Store, rendered json.RawMessage, eventID, sender, viewerUserID, viewerLocalpart string) json.RawMessage {
+	if viewerUserID == "" || sender != viewerUserID {
+		return rendered
+	}
+	txnID, delayID, err := store.EventClientUnsigned(ctx, eventID, viewerLocalpart)
+	if err != nil || (txnID == "" && delayID == "") {
 		return rendered
 	}
 	var obj map[string]json.RawMessage
@@ -2261,7 +2270,7 @@ func (e *Engine) annotateTxn(ctx context.Context, rendered json.RawMessage, even
 	}
 	// Merge into any existing unsigned object (e.g. unsigned.membership from
 	// MSC4115) rather than replacing it.
-	unsigned := map[string]any{"transaction_id": txnID}
+	unsigned := map[string]any{}
 	if existing, ok := obj["unsigned"]; ok {
 		var m map[string]json.RawMessage
 		if err := json.Unmarshal(existing, &m); err == nil {
@@ -2269,6 +2278,12 @@ func (e *Engine) annotateTxn(ctx context.Context, rendered json.RawMessage, even
 				unsigned[k] = v
 			}
 		}
+	}
+	if txnID != "" {
+		unsigned["transaction_id"] = txnID
+	}
+	if delayID != "" {
+		unsigned[DelayIDUnsignedKey] = delayID
 	}
 	unsignedJSON, _ := json.Marshal(unsigned)
 	obj["unsigned"] = unsignedJSON

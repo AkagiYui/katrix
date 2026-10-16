@@ -104,7 +104,11 @@ func (s *Store) Deactivate(ctx context.Context, localpart string, erase bool) er
 		if _, err := tx.Exec(ctx, `UPDATE users SET deactivated=TRUE, password_hash=NULL, erased=$2 WHERE localpart=$1`, localpart, erase); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, `DELETE FROM access_tokens WHERE user_localpart=$1`, localpart)
+		if _, err := tx.Exec(ctx, `DELETE FROM access_tokens WHERE user_localpart=$1`, localpart); err != nil {
+			return err
+		}
+		// MSC4140: a deactivated account's delayed events must never be sent.
+		_, err := tx.Exec(ctx, `DELETE FROM delayed_events WHERE user_localpart=$1`, localpart)
 		return err
 	})
 }

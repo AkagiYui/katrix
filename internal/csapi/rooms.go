@@ -27,6 +27,7 @@ import (
 	"github.com/AkagiYui/katrix/internal/roomver"
 	"github.com/AkagiYui/katrix/internal/storage"
 	"github.com/AkagiYui/katrix/internal/strippedstate"
+	syncpkg "github.com/AkagiYui/katrix/internal/sync"
 )
 
 // registerRooms wires P2 room routes.
@@ -693,9 +694,12 @@ func (a *API) RoomSend(w http.ResponseWriter, r *http.Request) {
 		writeRoomErr(w, err)
 		return
 	}
+	// A delayed event being sent (MSC4140) is identified by its delay_id and
+	// carries no client transaction: skip the txn bookkeeping for it.
+	delayed := delayedSendID(r.Context()) != ""
 	// Idempotency: if this (user, room, txn) was already sent, return the same
 	// event_id without creating a duplicate.
-	if existingID, err := a.Store.GetTxnEventID(r.Context(), auth.Localpart, roomID, txnID); err == nil && existingID != "" {
+	if existingID, err := a.Store.GetTxnEventID(r.Context(), auth.Localpart, roomID, txnID); !delayed && err == nil && existingID != "" {
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": existingID})
 		return
 	}
@@ -703,17 +707,6 @@ func (a *API) RoomSend(w http.ResponseWriter, r *http.Request) {
 	content, err = readEventContent(r)
 	if err != nil {
 		httpx.WriteError(w, err)
-		return
-	}
-	// MSC4140: a delay query parameter schedules the event instead of sending
-	// it immediately.
-	if d := delayQuery(r); d > 0 {
-		delayID, err := a.scheduleDelayedEvent(auth.Localpart, roomID, eventType, "", txnID, content, d, false)
-		if err != nil {
-			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
-			return
-		}
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"delay_id": delayID})
 		return
 	}
 	// A known state event type sent via /send is a state event: it must be
@@ -730,7 +723,9 @@ func (a *API) RoomSend(w http.ResponseWriter, r *http.Request) {
 		writeRoomErr(w, err)
 		return
 	}
-	_ = a.Store.RecordTxnEventID(r.Context(), auth.Localpart, roomID, txnID, ev.EventID(), a.Now())
+	if !delayed {
+		_ = a.Store.RecordTxnEventID(r.Context(), auth.Localpart, roomID, txnID, ev.EventID(), a.Now())
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": ev.EventID()})
 }
 
@@ -748,7 +743,9 @@ func stateEventViaSend(a *API, w http.ResponseWriter, r *http.Request, auth *hom
 		writeRoomErr(w, err)
 		return
 	}
-	_ = a.Store.RecordTxnEventID(r.Context(), auth.Localpart, roomID, txnID, ev.EventID(), a.Now())
+	if delayedSendID(r.Context()) == "" {
+		_ = a.Store.RecordTxnEventID(r.Context(), auth.Localpart, roomID, txnID, ev.EventID(), a.Now())
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": ev.EventID()})
 }
 
@@ -772,17 +769,6 @@ func (a *API) RoomStatePut(w http.ResponseWriter, r *http.Request) {
 	content, err := readEventContent(r)
 	if err != nil {
 		httpx.WriteError(w, err)
-		return
-	}
-	// MSC4140: a delay query parameter schedules the state event instead of
-	// sending it immediately.
-	if d := delayQuery(r); d > 0 {
-		delayID, err := a.scheduleDelayedEvent(auth.Localpart, roomID, eventType, stateKey, "", content, d, true)
-		if err != nil {
-			httpx.WriteError(w, httpx.ErrUnknown(err.Error()))
-			return
-		}
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"delay_id": delayID})
 		return
 	}
 	if eventType == "m.room.member" {
@@ -986,32 +972,14 @@ func (a *API) RoomGetEvent(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, a.annotateTxnID(r, ev))
 }
 
-// annotateTxnID renders a client event and attaches unsigned.transaction_id
-// when the event was produced by a client transaction.
+// annotateTxnID renders a client event with the requester's unsigned data
+// (transaction_id, MSC4140 delay_id) when the requester sent it.
 func (a *API) annotateTxnID(r *http.Request, ev *storage.EventRow) json.RawMessage {
-	rendered := clientEvent(ev)
-	txnID, err := a.Store.GetEventTxnID(r.Context(), ev.EventID)
-	if err != nil || txnID == "" {
-		return rendered
+	auth, _ := homeserver.AuthFrom(r.Context())
+	if auth == nil {
+		return clientEvent(ev)
 	}
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(rendered, &obj); err != nil {
-		return rendered
-	}
-	// Merge into any existing unsigned object rather than replacing it.
-	unsigned := map[string]any{"transaction_id": txnID}
-	if existing, ok := obj["unsigned"]; ok {
-		var m map[string]json.RawMessage
-		if err := json.Unmarshal(existing, &m); err == nil {
-			for k, v := range m {
-				unsigned[k] = v
-			}
-		}
-	}
-	unsignedJSON, _ := json.Marshal(unsigned)
-	obj["unsigned"] = unsignedJSON
-	b, _ := json.Marshal(obj)
-	return b
+	return syncpkg.AnnotateClientUnsigned(r.Context(), a.Store, clientEvent(ev), ev.EventID, ev.Sender, auth.UserID, auth.Localpart)
 }
 
 // historyVisibility returns the room's m.room.history_visibility, defaulting
