@@ -48,6 +48,9 @@ func testAPI(t *testing.T) (*API, *httptest.Server) {
 	cfg.ServeClientWellKnown = true
 	cfg.Registration.Enabled = true
 	cfg.Registration.AllowGuest = true
+	// Tests drive endpoints far faster than any client would; rate limiting
+	// has dedicated tests (ratelimit_test.go) that switch it back on.
+	cfg.RateLimiting.Enabled = false
 
 	key, err := crypto.GenerateSigningKey("test")
 	if err != nil {

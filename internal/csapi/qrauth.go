@@ -17,7 +17,7 @@ const loginTokenTTL = 5 * time.Minute
 // another device" foundation). An authenticated device mints a single-use
 // login token; the new device presents it via m.login.token at /login.
 func (a *API) registerQRAuth(mux *http.ServeMux) {
-	mux.HandleFunc("POST /_matrix/client/v3/login/token", a.RequireAuth(a.CreateLoginToken))
+	mux.HandleFunc("POST /_matrix/client/v3/login/token", a.RequireAuth(a.PerUser(a.Limits.Account, a.CreateLoginToken)))
 }
 
 // CreateLoginToken handles POST /_matrix/client/v3/login/token. An already-

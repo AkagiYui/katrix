@@ -13,7 +13,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	// ---- P0: discovery / capabilities ----
 	mux.HandleFunc("GET /_matrix/client/versions", a.Versions)
 	mux.HandleFunc("GET /.well-known/matrix/client", a.WellKnownClient)
-	mux.HandleFunc("GET /_matrix/client/v3/capabilities", a.RequireAuth(a.Capabilities))
+	mux.HandleFunc("GET /_matrix/client/v3/capabilities", a.RequireAuth(a.PerUser(a.Limits.Account, a.Capabilities)))
 
 	a.registerAccounts(mux)
 	a.registerRooms(mux)

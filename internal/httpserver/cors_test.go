@@ -38,6 +38,7 @@ func TestCORSOnAllAPIResponses(t *testing.T) {
 	})
 
 	cfg := config.Default()
+	cfg.RateLimiting.Enabled = false
 	cfg.ServerName = "test.katrix"
 	cfg.PublicBaseURL = "https://test.katrix"
 	cfg.Registration.Enabled = true

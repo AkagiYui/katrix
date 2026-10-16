@@ -198,6 +198,7 @@ Matrix 需要的媒体处理只有"图片缩略图"一项，无需 ImageMagick /
 - **邀请 / 敲门与 stripped state（MSC4311，spec v1.16）**：`internal/strippedstate` 负责房间的 prejoin 状态（`m.room.create` 必含，另有 name/avatar/topic/join_rules/canonical_alias/encryption/guest_access）。邀请/敲门创建时对 prejoin 状态做快照，以完整 PDU 存入 `stripped_state` 表（按 membership 事件键控）；联邦 `invite_room_state` / `knock_room_state` 发送完整 PDU，Client-Server API（`/sync` 的 `invite_state`/`knock_state`、sliding sync 的 `stripped_state`）只下发 `type/state_key/sender/content` 四字段。入站 `/v2/invite` 对本服务器无状态的房间做 MSC4311 校验（PDU 格式、签名、同房间、create 事件哈希推导 room ID）：v12+ 不合规即 400 `M_MISSING_PARAM`/`M_INVALID_PARAM`，更早版本只保留合规条目；入站 `knock_room_state` 过滤不合规条目。
 - **Out-of-band 成员关系**：只经邀请/敲门得知的房间（本服务器无其状态）不会用不可信的 stripped state 播种 `room_state`/forward extremities/成员表；membership 事件以 out-of-band 事件入库（进 timeline、不进 DAG/状态）。拒绝邀请/撤回敲门经 `make_leave`/`send_leave` 依次尝试邀请者服务器、stripped state 中的服务器、room ID 域名，全部失败时本地签发 leave；加入房间在无 `via` 时使用同一候选列表；该类房间只接受原邀请者的撤销（rescind），不对外提供 make_leave/make_knock/send_*。
 - **延迟事件（MSC4140，已接受）**：`PUT /v3/rooms/{roomId}/delayed_event/{eventType}/{txnId}` 调度事件（body：`delay_ms` 正整数、`content` 对象、可选 `state_key`），`POST /v1/delayed_events/{delay_id}/{send|cancel|restart}` 管理，`GET /v1/delayed_events/{delay_id}` 查询（含 `finalised`）；同时提供 `org.matrix.msc4140` unstable 前缀路径与 unstable 列表接口 `GET .../delayed_events`。生命周期 scheduled → sending → sent / cancelled(+error)；重试与结局一致的操作返回成功，冲突返回 409；`send` 失败返回与直接发送一致的错误并保持 scheduled。发送时在进程内走真实的 `RoomSend`/`RoomStatePut`，鉴权、推送与错误码与普通发送一致。worker 按最早 `fire_at` 定时唤醒。`delayed_events.max_delay_ms`/`max_scheduled` 限制写入 `m.delayed_events` capability，超限分别返回 `M_DELAY_TOO_LARGE`（unstable 路径为 `ORG.MATRIX.MSC4140_DELAY_TOO_LARGE`）与 429 + `Retry-After`。已结束记录保留 7 天或每用户 1000 条；注销账号即删除其延迟事件；`unsigned` 中的 `org.matrix.msc4140.delay_id`（以及 `transaction_id`）只对发送者可见。
+- **限流**（`internal/ratelimit` + `homeserver.RateLimits`）：令牌桶，覆盖规范中标注 429 的客户端端点（注册/登录按地址与账号、join 区分本地/远程与按房间、invite 按房间/邀请人/被邀请人、建房、媒体、3PID、presence、举报、密钥备份等）以及消息发送（`/send`、`/state`、`/redact`）；超限返回 `M_LIMIT_EXCEEDED`、`retry_after_ms` 与 `Retry-After` 头。消息限流在处理函数内执行，事务重试不计数，延迟事件发送时同样受限（失败即带错误结束、不重试）。appservice 的 sender 永远豁免，被其代理的用户在注册文件 `rate_limited: false` 时豁免。测试环境（Go 测试、Complement、SyTest）关闭限流。
 - **配置**：YAML 文件 + 环境变量覆盖（`KATRIX_*`），单节点开发零配置。
 
 ### 主要风险
@@ -265,6 +266,13 @@ media:
   max_upload_bytes: 52428800
   store_path: media_store
 federation_enabled: true
+rate_limiting:               # 客户端 API 限流（M_LIMIT_EXCEEDED + Retry-After），默认值对齐 Synapse rc_*
+  enabled: true
+  trust_forwarded_for: false # 仅在会设置 X-Forwarded-For 的反向代理之后开启
+  message: {per_second: 0.2, burst_count: 10}   # 每个规则都是令牌桶；per_second 或 burst_count 为 0 即关闭该规则
+  # 其余规则：registration、login_address、login_account、login_failed、joins_local、joins_remote、
+  # joins_per_room、invites_per_room、invites_per_user、invites_per_issuer、room_creation、media_create、
+  # media_download、3pid_validation、presence、reports、delayed_event_mgmt、typing、account
 delayed_events:              # MSC4140；任一项为 0 即关闭
   max_delay_ms: 86400000
   max_scheduled: 100

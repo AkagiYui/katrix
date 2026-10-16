@@ -32,11 +32,11 @@ import (
 
 // registerRooms wires P2 room routes.
 func (a *API) registerRooms(mux *http.ServeMux) {
-	mux.HandleFunc("POST /_matrix/client/v3/createRoom", a.RequireUserAuth(a.CreateRoom))
+	mux.HandleFunc("POST /_matrix/client/v3/createRoom", a.RequireUserAuth(a.PerUser(a.Limits.RoomCreation, a.CreateRoom)))
 	mux.HandleFunc("POST /_matrix/client/v3/join/{roomIDOrAlias}", a.RequireAuth(a.JoinRoom))
 	mux.HandleFunc("POST /_matrix/client/v3/knock/{roomIDOrAlias}", a.RequireAuth(a.KnockRoom))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/join", a.RequireAuth(a.RoomJoin))
-	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/leave", a.RequireAuth(a.RoomLeave))
+	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/leave", a.RequireAuth(a.PerUser(a.Limits.Account, a.RoomLeave)))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/invite", a.RequireAuth(a.RoomInvite))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/kick", a.RequireAuth(a.RoomKick))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/ban", a.RequireAuth(a.RoomBan))
@@ -56,12 +56,12 @@ func (a *API) registerRooms(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/members", a.RequireAuth(a.RoomMembers))
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/joined_members", a.RequireAuth(a.RoomJoinedMembers))
 	mux.HandleFunc("GET /_matrix/client/v3/joined_rooms", a.RequireAuth(a.JoinedRooms))
-	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/aliases", a.RequireAuth(a.RoomAliases))
+	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/aliases", a.RequireAuth(a.PerUser(a.Limits.Account, a.RoomAliases)))
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/messages", a.RequireAuth(a.RoomMessages))
 	mux.HandleFunc("GET /_matrix/client/v3/rooms/{roomID}/context/{eventID}", a.RequireAuth(a.RoomContext))
 	mux.HandleFunc("PUT /_matrix/client/v3/rooms/{roomID}/redact/{eventID}/{txnID}", a.RequireAuth(a.RoomRedact))
-	mux.HandleFunc("PUT /_matrix/client/v3/rooms/{roomID}/typing/{userID}", a.RequireAuth(a.RoomTyping))
-	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/forget", a.RequireAuth(a.RoomForget))
+	mux.HandleFunc("PUT /_matrix/client/v3/rooms/{roomID}/typing/{userID}", a.RequireAuth(a.PerUser(a.Limits.Typing, a.RoomTyping)))
+	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/forget", a.RequireAuth(a.PerUser(a.Limits.Account, a.RoomForget)))
 	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/upgrade", a.RequireAuth(a.RoomUpgrade))
 	mux.HandleFunc("GET /_matrix/client/v3/directory/room/{roomAlias}", a.DirectoryLookupAlias)
 	mux.HandleFunc("PUT /_matrix/client/v3/directory/room/{roomAlias}", a.RequireAuth(a.DirectoryPutAlias))
@@ -332,6 +332,10 @@ func (a *API) KnockRoom(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrNotFound("unknown room"))
 		return
 	}
+	if err := a.limitMembership(r, auth, roomID); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
 	if err := a.knockRoom(r, auth, roomID, via); err != nil {
 		writeRoomErr(w, err)
 		return
@@ -499,6 +503,23 @@ func (a *API) RoomInvite(w http.ResponseWriter, r *http.Request) {
 	if req.UserID != "" && req.Address != "" {
 		httpx.WriteError(w, httpx.ErrBadJSON("invite must name either a user_id or a 3PID address, not both"))
 		return
+	}
+	// Invites are limited per room and per inviter, and invites of a given
+	// user per invitee (rc_invites).
+	for _, lim := range []error{
+		a.LimitAuth(r, auth, a.Limits.InvitesPerIssuer),
+		a.LimitKey(a.Limits.InvitesPerRoom, roomID),
+	} {
+		if lim != nil {
+			httpx.WriteError(w, lim)
+			return
+		}
+	}
+	if req.UserID != "" {
+		if err := a.LimitKey(a.Limits.InvitesPerUser, req.UserID); err != nil {
+			httpx.WriteError(w, err)
+			return
+		}
 	}
 	target := req.UserID
 	if target == "" && req.Address != "" {
@@ -703,6 +724,13 @@ func (a *API) RoomSend(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": existingID})
 		return
 	}
+	// Rate limit new events (a retried transaction is answered above). A
+	// delayed event being sent is limited here too, as if sent directly
+	// (MSC4140 "Rate-limiting at the point of sending").
+	if err := a.LimitAuth(r, auth, a.Limits.Message); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
 	var content json.RawMessage
 	content, err = readEventContent(r)
 	if err != nil {
@@ -768,6 +796,10 @@ func (a *API) RoomStatePut(w http.ResponseWriter, r *http.Request) {
 	stateKey := r.PathValue("stateKey")
 	content, err := readEventContent(r)
 	if err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
+	if err := a.LimitAuth(r, auth, a.Limits.Message); err != nil {
 		httpx.WriteError(w, err)
 		return
 	}
@@ -1721,6 +1753,10 @@ func (a *API) RoomRedact(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"event_id": existingID})
 		return
 	}
+	if err := a.LimitAuth(r, auth, a.Limits.Message); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
 	body, err := readEventContent(r)
 	if err != nil {
 		httpx.WriteError(w, err)
@@ -2270,6 +2306,11 @@ func writeRoomErr(w http.ResponseWriter, err error) {
 		httpx.WriteJSON(w, re.status, body)
 		return
 	}
+	var me *httpx.MatrixError
+	if errors.As(err, &me) {
+		httpx.WriteError(w, me)
+		return
+	}
 	if errors.Is(err, storage.ErrNotFound) {
 		httpx.WriteError(w, httpx.ErrNotFound("not found"))
 		return
@@ -2385,6 +2426,9 @@ func (a *API) joinRoom(r *http.Request, auth *homeserver.Auth, roomID string, vi
 	// request body are copied into the event content", e.g. `foo: bar`).
 	// third_party_signed (spec §3PID invites) is consumed first and turned into
 	// a verified third-party invite before the join is attempted.
+	if err := a.limitMembership(r, auth, roomID); err != nil {
+		return nil, err
+	}
 	tps := thirdPartySignedFromJoin(r)
 	extra := joinCustomContent(r)
 	if len(tps) > 0 {
@@ -3811,4 +3855,24 @@ func formatIntToken(n int64) string {
 		return "s-" + s
 	}
 	return "s" + s
+}
+
+// limitMembership applies the join limits (rc_joins) to a join or knock:
+// per user, by whether this server is already in the room (a local join) or
+// must join over federation, and per room for local joins. A user who is
+// already joined (e.g. a profile update) is not limited.
+func (a *API) limitMembership(r *http.Request, auth *homeserver.Auth, roomID string) error {
+	if !a.Limits.Enabled() {
+		return nil
+	}
+	if m, err := a.Store.GetMembership(r.Context(), roomID, auth.UserID); err == nil && m.Membership == rooms.MembershipJoin {
+		return nil
+	}
+	if a.Store.HasRoomState(r.Context(), roomID) && a.Store.ServerHasJoinedMember(r.Context(), roomID, a.ServerName()) {
+		if err := a.LimitAuth(r, auth, a.Limits.JoinsLocal); err != nil {
+			return err
+		}
+		return a.LimitKey(a.Limits.JoinsPerRoom, roomID)
+	}
+	return a.LimitAuth(r, auth, a.Limits.JoinsRemote)
 }

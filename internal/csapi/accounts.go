@@ -19,19 +19,19 @@ import (
 
 // registerAccounts wires P1 account/device/auth routes.
 func (a *API) registerAccounts(mux *http.ServeMux) {
-	mux.HandleFunc("POST /_matrix/client/v3/register", a.RegisterAccount)
-	mux.HandleFunc("GET /_matrix/client/v3/register/available", a.RegisterAvailable)
-	mux.HandleFunc("POST /_matrix/client/v3/register/email/requestToken", a.registerEmailRequestToken)
+	mux.HandleFunc("POST /_matrix/client/v3/register", a.PerAddress(a.Limits.Registration, a.RegisterAccount))
+	mux.HandleFunc("GET /_matrix/client/v3/register/available", a.PerAddress(a.Limits.Registration, a.RegisterAvailable))
+	mux.HandleFunc("POST /_matrix/client/v3/register/email/requestToken", a.PerAddress(a.Limits.ThreePID, a.registerEmailRequestToken))
 	mux.HandleFunc("GET /_matrix/client/unstable/registration/email/submit_token", a.registerEmailSubmitToken)
-	mux.HandleFunc("GET /_matrix/client/v3/login", a.LoginFlows)
+	mux.HandleFunc("GET /_matrix/client/v3/login", a.PerAddress(a.Limits.Account, a.LoginFlows))
 	mux.HandleFunc("POST /_matrix/client/v3/login", a.Login)
 	mux.HandleFunc("POST /_matrix/client/v3/logout", a.RequireAuth(a.Logout))
 	mux.HandleFunc("POST /_matrix/client/v3/logout/all", a.RequireAuth(a.LogoutAll))
-	mux.HandleFunc("POST /_matrix/client/v3/refresh", a.Refresh)
-	mux.HandleFunc("GET /_matrix/client/v3/account/whoami", a.RequireAuth(a.Whoami))
-	mux.HandleFunc("POST /_matrix/client/v3/account/password", a.RequireUserAuth(a.ChangePassword))
-	mux.HandleFunc("POST /_matrix/client/v3/account/deactivate", a.RequireUserAuth(a.Deactivate))
-	mux.HandleFunc("POST /_matrix/client/v3/user/{userID}/openid/request_token", a.RequireAuth(a.OpenIDRequestToken))
+	mux.HandleFunc("POST /_matrix/client/v3/refresh", a.PerAddress(a.Limits.Account, a.Refresh))
+	mux.HandleFunc("GET /_matrix/client/v3/account/whoami", a.RequireAuth(a.PerUser(a.Limits.Account, a.Whoami)))
+	mux.HandleFunc("POST /_matrix/client/v3/account/password", a.RequireUserAuth(a.PerUser(a.Limits.Account, a.ChangePassword)))
+	mux.HandleFunc("POST /_matrix/client/v3/account/deactivate", a.RequireUserAuth(a.PerUser(a.Limits.Account, a.Deactivate)))
+	mux.HandleFunc("POST /_matrix/client/v3/user/{userID}/openid/request_token", a.RequireAuth(a.PerUser(a.Limits.Account, a.OpenIDRequestToken)))
 
 	a.registerDevices(mux)
 	a.registerProfile(mux)
@@ -561,6 +561,11 @@ func (a *API) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Login attempts are limited per client address (rc_login.address).
+	if err := a.LimitAddress(r, a.Limits.LoginAddress); err != nil {
+		httpx.WriteError(w, err)
+		return
+	}
 	var localpart string
 	switch req.Type {
 	case "m.login.password":
@@ -590,6 +595,20 @@ func (a *API) Login(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, httpx.ErrForbidden("Invalid username or password"))
 			return
 		}
+		// Password attempts are limited per account, and failed ones more
+		// strictly (rc_login.account / rc_login.failed_attempts) — the
+		// failed bucket is checked first so a guessing attacker cannot learn
+		// anything once it is exhausted.
+		if a.Limits.Enabled() {
+			if ok, wait := a.Limits.LoginFailed.Check(localpart); !ok {
+				httpx.WriteError(w, httpx.ErrLimitExceeded(max(wait.Milliseconds(), 1)))
+				return
+			}
+		}
+		if err := a.LimitKey(a.Limits.LoginAccount, localpart); err != nil {
+			httpx.WriteError(w, err)
+			return
+		}
 		user, err := a.Store.GetUser(r.Context(), localpart)
 		// Deactivated accounts are reported with a distinct errcode (spec).
 		if err == nil && user.Deactivated {
@@ -600,6 +619,9 @@ func (a *API) Login(w http.ResponseWriter, r *http.Request) {
 		// time does not leak account existence (timing side-channel).
 		if err != nil || user.PasswordHash == "" || !homeserver.CheckPassword(user.PasswordHash, req.Password) {
 			_ = homeserver.CheckPassword("$2a$10$0123456789012345678901ABCDEFGHIJKLMNOPQRSTUVXXXXXXXXX", req.Password)
+			if a.Limits.Enabled() {
+				a.Limits.LoginFailed.Record(localpart)
+			}
 			httpx.WriteError(w, httpx.ErrForbidden("Invalid username or password"))
 			return
 		}

@@ -15,9 +15,9 @@ import (
 // persisted for admin review; the spec leaves how they are delivered to the
 // implementation.
 func (a *API) registerReporting(mux *http.ServeMux) {
-	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/report/{eventID}", a.RequireAuth(a.ReportEvent))
-	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/report", a.RequireAuth(a.ReportRoom))
-	mux.HandleFunc("POST /_matrix/client/v3/users/{userID}/report", a.RequireAuth(a.ReportUser))
+	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/report/{eventID}", a.RequireAuth(a.PerUser(a.Limits.Reports, a.ReportEvent)))
+	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/report", a.RequireAuth(a.PerUser(a.Limits.Reports, a.ReportRoom)))
+	mux.HandleFunc("POST /_matrix/client/v3/users/{userID}/report", a.RequireAuth(a.PerUser(a.Limits.Reports, a.ReportUser)))
 }
 
 // reportBody is the shared request body of the three reporting endpoints.

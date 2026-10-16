@@ -22,7 +22,9 @@ import (
 
 // HS is the homeserver dependency container.
 type HS struct {
-	Config   *config.Config
+	Config *config.Config
+	// Limits are the client API rate limiters (rate_limiting config).
+	Limits   *RateLimits
 	Store    *storage.Store
 	Key      *crypto.SigningKey
 	Notifier *Notifier
@@ -55,6 +57,7 @@ func New(cfg *config.Config, store *storage.Store, key *crypto.SigningKey) *HS {
 		Key:      key,
 		Notifier: NewNotifier(),
 		Typing:   syncpkg.NewTypingTracker(30 * time.Second),
+		Limits:   NewRateLimits(cfg.RateLimiting),
 	}
 }
 

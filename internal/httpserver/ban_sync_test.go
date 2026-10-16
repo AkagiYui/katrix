@@ -37,6 +37,7 @@ func TestBanAppearsInSync(t *testing.T) {
 	})
 
 	cfg := config.Default()
+	cfg.RateLimiting.Enabled = false
 	cfg.ServerName = "test.katrix"
 	cfg.PublicBaseURL = "https://test.katrix"
 	cfg.ServeClientWellKnown = true

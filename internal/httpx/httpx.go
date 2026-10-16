@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 )
 
 // MatrixError is the standard Matrix error body ({errcode, error, ...}).
@@ -98,6 +99,12 @@ func WriteJSON(w http.ResponseWriter, status int, v any) {
 func WriteError(w http.ResponseWriter, err error) {
 	var me *MatrixError
 	if errors.As(err, &me) {
+		// M_LIMIT_EXCEEDED carries its retry delay both in the body
+		// (retry_after_ms, deprecated) and as a Retry-After header in whole
+		// seconds (spec "Rate limiting", v1.10+).
+		if me.RetryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.FormatInt((me.RetryAfter+999)/1000, 10))
+		}
 		WriteJSON(w, me.Status(), me)
 		return
 	}

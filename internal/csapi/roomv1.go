@@ -18,8 +18,8 @@ import (
 // MSC2753 peeking. These live under /_matrix/client/v1 (hierarchy, summary)
 // or /_matrix/client/v3 (peek) per their spec paths.
 func (a *API) registerRoomV1(mux *http.ServeMux) {
-	mux.HandleFunc("GET /_matrix/client/v1/rooms/{roomID}/timestamp_to_event", a.RequireAuth(a.RoomTimestampToEvent))
-	mux.HandleFunc("GET /_matrix/client/v1/rooms/{roomID}/hierarchy", a.RequireAuth(a.RoomHierarchy))
+	mux.HandleFunc("GET /_matrix/client/v1/rooms/{roomID}/timestamp_to_event", a.RequireAuth(a.PerUser(a.Limits.Account, a.RoomTimestampToEvent)))
+	mux.HandleFunc("GET /_matrix/client/v1/rooms/{roomID}/hierarchy", a.RequireAuth(a.PerUser(a.Limits.Account, a.RoomHierarchy)))
 	mux.HandleFunc("GET /_matrix/client/v1/room_summary/{roomIDOrAlias}", a.RoomSummary)
 	mux.HandleFunc("POST /_matrix/client/v3/peek/{roomIDOrAlias}", a.RequireAuth(a.Peek))
 	mux.HandleFunc("POST /_matrix/client/v3/unpeek/{roomIDOrAlias}", a.RequireAuth(a.Unpeek))

@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"github.com/AkagiYui/katrix/internal/ratelimit"
 	"os"
 	"strconv"
 	"strings"
@@ -66,6 +67,12 @@ type Config struct {
 		MaxDelayMS   int64 `yaml:"max_delay_ms"`
 		MaxScheduled int   `yaml:"max_scheduled"`
 	} `yaml:"delayed_events"`
+
+	// RateLimiting configures the client API rate limits (the Matrix
+	// M_LIMIT_EXCEEDED error). Each rule is a token bucket; a rule with a
+	// zero per_second or burst_count is disabled. Defaults follow Synapse's
+	// rc_* settings.
+	RateLimiting RateLimiting `yaml:"rate_limiting"`
 
 	// FederationEnabled toggles the whole server-server surface.
 	FederationEnabled bool `yaml:"federation_enabled"`
@@ -209,6 +216,36 @@ type Config struct {
 }
 
 // Default returns a config populated with development defaults.
+// RateLimiting is the rate_limiting config block.
+type RateLimiting struct {
+	Enabled bool `yaml:"enabled"`
+	// TrustForwardedFor keys per-address limits on the leftmost
+	// X-Forwarded-For entry. Only enable it behind a reverse proxy that sets
+	// the header, or clients can pick their own address.
+	TrustForwardedFor bool `yaml:"trust_forwarded_for"`
+
+	Message            ratelimit.Rule `yaml:"message"`            // events sent, per user
+	Registration       ratelimit.Rule `yaml:"registration"`       // per address
+	LoginAddress       ratelimit.Rule `yaml:"login_address"`      // login attempts, per address
+	LoginAccount       ratelimit.Rule `yaml:"login_account"`      // login attempts, per account
+	LoginFailed        ratelimit.Rule `yaml:"login_failed"`       // failed logins, per account
+	JoinsLocal         ratelimit.Rule `yaml:"joins_local"`        // joins of rooms this server is in, per user
+	JoinsRemote        ratelimit.Rule `yaml:"joins_remote"`       // joins over federation, per user
+	JoinsPerRoom       ratelimit.Rule `yaml:"joins_per_room"`     // local joins, per room
+	InvitesPerRoom     ratelimit.Rule `yaml:"invites_per_room"`   // per room
+	InvitesPerUser     ratelimit.Rule `yaml:"invites_per_user"`   // per invitee
+	InvitesPerIssuer   ratelimit.Rule `yaml:"invites_per_issuer"` // per inviter
+	RoomCreation       ratelimit.Rule `yaml:"room_creation"`      // per user
+	MediaCreate        ratelimit.Rule `yaml:"media_create"`       // uploads / media IDs, per user
+	MediaDownload      ratelimit.Rule `yaml:"media_download"`     // downloads / thumbnails / previews, per user or address
+	ThreePIDValidation ratelimit.Rule `yaml:"3pid_validation"`    // requestToken, per address
+	Presence           ratelimit.Rule `yaml:"presence"`           // presence updates, per user
+	Reports            ratelimit.Rule `yaml:"reports"`            // content / room / user reports, per user
+	DelayedEventMgmt   ratelimit.Rule `yaml:"delayed_event_mgmt"` // MSC4140 schedule / manage / lookup, per user
+	Typing             ratelimit.Rule `yaml:"typing"`             // typing notifications, per user
+	Account            ratelimit.Rule `yaml:"account"`            // other account / key-backup writes, per user
+}
+
 func Default() *Config {
 	c := &Config{}
 	c.ServerName = "localhost"
@@ -230,6 +267,29 @@ func Default() *Config {
 	// minutes) and a generous per-user cap.
 	c.DelayedEvents.MaxDelayMS = 24 * 60 * 60 * 1000
 	c.DelayedEvents.MaxScheduled = 100
+	c.RateLimiting = RateLimiting{
+		Enabled:            true,
+		Message:            ratelimit.Rule{PerSecond: 0.2, Burst: 10},
+		Registration:       ratelimit.Rule{PerSecond: 0.17, Burst: 3},
+		LoginAddress:       ratelimit.Rule{PerSecond: 0.003, Burst: 5},
+		LoginAccount:       ratelimit.Rule{PerSecond: 0.003, Burst: 5},
+		LoginFailed:        ratelimit.Rule{PerSecond: 0.17, Burst: 3},
+		JoinsLocal:         ratelimit.Rule{PerSecond: 0.1, Burst: 10},
+		JoinsRemote:        ratelimit.Rule{PerSecond: 0.01, Burst: 10},
+		JoinsPerRoom:       ratelimit.Rule{PerSecond: 1, Burst: 10},
+		InvitesPerRoom:     ratelimit.Rule{PerSecond: 0.3, Burst: 10},
+		InvitesPerUser:     ratelimit.Rule{PerSecond: 0.003, Burst: 5},
+		InvitesPerIssuer:   ratelimit.Rule{PerSecond: 0.3, Burst: 10},
+		RoomCreation:       ratelimit.Rule{PerSecond: 0.016, Burst: 10},
+		MediaCreate:        ratelimit.Rule{PerSecond: 10, Burst: 50},
+		MediaDownload:      ratelimit.Rule{PerSecond: 20, Burst: 100},
+		ThreePIDValidation: ratelimit.Rule{PerSecond: 0.003, Burst: 5},
+		Presence:           ratelimit.Rule{PerSecond: 0.1, Burst: 1},
+		Reports:            ratelimit.Rule{PerSecond: 1, Burst: 5},
+		DelayedEventMgmt:   ratelimit.Rule{PerSecond: 1, Burst: 5},
+		Typing:             ratelimit.Rule{PerSecond: 1, Burst: 10},
+		Account:            ratelimit.Rule{PerSecond: 1, Burst: 10},
+	}
 	// CAS SSO registers the user on first login by default (Synapse's
 	// cas_enable_registration defaults to true).
 	c.CAS.EnableRegistration = true
@@ -328,6 +388,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("KATRIX_METRICS_ENABLED"); v != "" {
 		c.Metrics.Enabled = parseBool(v, c.Metrics.Enabled)
+	}
+	if v := os.Getenv("KATRIX_RATE_LIMITING_ENABLED"); v != "" {
+		c.RateLimiting.Enabled = v == "true" || v == "1"
 	}
 	if v := os.Getenv("KATRIX_FEDERATION_INSECURE"); v != "" {
 		c.FederationInsecure = parseBool(v, c.FederationInsecure)

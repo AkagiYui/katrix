@@ -42,14 +42,14 @@ func (a *API) registerDelayedEvents(mux *http.ServeMux) {
 		{"/_matrix/client/v3", "/_matrix/client/v1"},
 		{msc4140Prefix, msc4140Prefix},
 	} {
-		mux.HandleFunc("PUT "+p.schedule+"/rooms/{roomID}/delayed_event/{eventType}/{txnID}", a.RequireAuth(a.DelayedEventSchedule))
-		mux.HandleFunc("GET "+p.manage+"/delayed_events/{delayID}", a.RequireAuth(a.DelayedEventGet))
-		mux.HandleFunc("POST "+p.manage+"/delayed_events/{delayID}/{action}", a.RequireAuth(a.DelayedEventAction))
+		mux.HandleFunc("PUT "+p.schedule+"/rooms/{roomID}/delayed_event/{eventType}/{txnID}", a.RequireAuth(a.PerUser(a.Limits.Delayed, a.DelayedEventSchedule)))
+		mux.HandleFunc("GET "+p.manage+"/delayed_events/{delayID}", a.RequireAuth(a.PerUser(a.Limits.Delayed, a.DelayedEventGet)))
+		mux.HandleFunc("POST "+p.manage+"/delayed_events/{delayID}/{action}", a.RequireAuth(a.PerUser(a.Limits.Delayed, a.DelayedEventAction)))
 	}
 	// Listing a user's scheduled delayed events is not part of MSC4140 (it is
 	// listed as a possible future "bulk lookup" endpoint); it is served under
 	// the unstable prefix only, as Synapse and Complement use it.
-	mux.HandleFunc("GET "+msc4140Prefix+"/delayed_events", a.RequireAuth(a.DelayedEventsList))
+	mux.HandleFunc("GET "+msc4140Prefix+"/delayed_events", a.RequireAuth(a.PerUser(a.Limits.Delayed, a.DelayedEventsList)))
 }
 
 // delayedEventsEnabled reports whether the configured limits permit any
@@ -189,9 +189,8 @@ func (a *API) DelayedEventSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	now := a.Now()
 	if count >= a.Config.DelayedEvents.MaxScheduled {
-		retry := max(nextFire-now, 0)
-		w.Header().Set("Retry-After", strconv.FormatInt((retry+999)/1000, 10))
-		lim := httpx.ErrLimitExceeded(retry)
+		// Retry-After: until the user's next delayed event is sent.
+		lim := httpx.ErrLimitExceeded(max(nextFire-now, 1))
 		lim.Message = "The maximum number of delayed events has been reached."
 		httpx.WriteError(w, lim)
 		return

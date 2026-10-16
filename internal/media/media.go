@@ -65,26 +65,26 @@ func (a *API) Backend() *FileBackend { return a.backend }
 // path segment must match this server or the request is rejected, so a peer
 // can only retrieve media this server hosts.
 func (a *API) Register(mux *http.ServeMux) {
-	mux.HandleFunc("GET /_matrix/client/v1/media/config", a.RequireAuth(a.Config_))
-	mux.HandleFunc("GET /_matrix/media/v3/config", a.RequireAuth(a.Config_))
-	mux.HandleFunc("POST /_matrix/media/v3/upload", a.RequireAuth(a.Upload))
-	mux.HandleFunc("POST /_matrix/client/v1/media/upload", a.RequireAuth(a.Upload))
+	mux.HandleFunc("GET /_matrix/client/v1/media/config", a.RequireAuth(a.PerUser(a.Limits.MediaDownload, a.Config_)))
+	mux.HandleFunc("GET /_matrix/media/v3/config", a.RequireAuth(a.PerUser(a.Limits.MediaDownload, a.Config_)))
+	mux.HandleFunc("POST /_matrix/media/v3/upload", a.RequireAuth(a.PerUser(a.Limits.MediaCreate, a.Upload)))
+	mux.HandleFunc("POST /_matrix/client/v1/media/upload", a.RequireAuth(a.PerUser(a.Limits.MediaCreate, a.Upload)))
 	// The client/v1 download/thumbnail endpoints are authenticated. The legacy
 	// /_matrix/media/v3 variants are unauthenticated per the spec (the v3 route
 	// is the older, open content-repository path; the client/v1 route is its
 	// authenticated replacement). The v3 routes must stay open so servers can
 	// also fetch each other's media over the client path with a federation
 	// signature.
-	mux.HandleFunc("GET /_matrix/client/v1/media/download/{serverName}/{mediaID}", a.RequireAuth(a.Download))
-	mux.HandleFunc("GET /_matrix/media/v3/download/{serverName}/{mediaID}", a.Download)
-	mux.HandleFunc("GET /_matrix/client/v1/media/download/{serverName}/{mediaID}/{fileName}", a.RequireAuth(a.Download))
-	mux.HandleFunc("GET /_matrix/media/v3/download/{serverName}/{mediaID}/{fileName}", a.Download)
-	mux.HandleFunc("GET /_matrix/client/v1/media/thumbnail/{serverName}/{mediaID}", a.RequireAuth(a.Thumbnail))
-	mux.HandleFunc("GET /_matrix/media/v3/thumbnail/{serverName}/{mediaID}", a.Thumbnail)
+	mux.HandleFunc("GET /_matrix/client/v1/media/download/{serverName}/{mediaID}", a.RequireAuth(a.PerUser(a.Limits.MediaDownload, a.Download)))
+	mux.HandleFunc("GET /_matrix/media/v3/download/{serverName}/{mediaID}", a.PerRequester(a.Limits.MediaDownload, a.Download))
+	mux.HandleFunc("GET /_matrix/client/v1/media/download/{serverName}/{mediaID}/{fileName}", a.RequireAuth(a.PerUser(a.Limits.MediaDownload, a.Download)))
+	mux.HandleFunc("GET /_matrix/media/v3/download/{serverName}/{mediaID}/{fileName}", a.PerRequester(a.Limits.MediaDownload, a.Download))
+	mux.HandleFunc("GET /_matrix/client/v1/media/thumbnail/{serverName}/{mediaID}", a.RequireAuth(a.PerUser(a.Limits.MediaDownload, a.Thumbnail)))
+	mux.HandleFunc("GET /_matrix/media/v3/thumbnail/{serverName}/{mediaID}", a.PerRequester(a.Limits.MediaDownload, a.Thumbnail))
 	// Async upload (MSC2246): reserve a media ID, then upload the blob to it.
-	mux.HandleFunc("POST /_matrix/media/v1/create", a.RequireAuth(a.CreateMedia))
-	mux.HandleFunc("PUT /_matrix/media/v3/upload/{serverName}/{mediaID}", a.RequireAuth(a.UploadAsync))
-	mux.HandleFunc("PUT /_matrix/media/v3/upload/{serverName}/{mediaID}/{fileName}", a.RequireAuth(a.UploadAsync))
+	mux.HandleFunc("POST /_matrix/media/v1/create", a.RequireAuth(a.PerUser(a.Limits.MediaCreate, a.CreateMedia)))
+	mux.HandleFunc("PUT /_matrix/media/v3/upload/{serverName}/{mediaID}", a.RequireAuth(a.PerUser(a.Limits.MediaCreate, a.UploadAsync)))
+	mux.HandleFunc("PUT /_matrix/media/v3/upload/{serverName}/{mediaID}/{fileName}", a.RequireAuth(a.PerUser(a.Limits.MediaCreate, a.UploadAsync)))
 
 	// Server-Server media endpoints (spec v1.19 §Server-Server API /media).
 	// Register both the {serverName}-prefixed form and the legacy no-serverName

@@ -13,7 +13,7 @@ import (
 
 // registerVoIP wires the Voice over IP endpoints (spec §Voice over IP).
 func (a *API) registerVoIP(mux *http.ServeMux) {
-	mux.HandleFunc("GET /_matrix/client/v3/voip/turnServer", a.RequireAuth(a.TurnServer))
+	mux.HandleFunc("GET /_matrix/client/v3/voip/turnServer", a.RequireAuth(a.PerUser(a.Limits.Account, a.TurnServer)))
 }
 
 // TurnServer handles GET /_matrix/client/v3/voip/turnServer. It returns the

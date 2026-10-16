@@ -14,10 +14,10 @@ import (
 // /account/3pid/email/requestToken and confirmed through the email link.
 func (a *API) register3PID(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v3/account/3pid", a.RequireUserAuth(a.List3PIDs))
-	mux.HandleFunc("POST /_matrix/client/v3/account/3pid/email/requestToken", a.account3PIDEmailRequestToken)
+	mux.HandleFunc("POST /_matrix/client/v3/account/3pid/email/requestToken", a.PerAddress(a.Limits.ThreePID, a.account3PIDEmailRequestToken))
 	mux.HandleFunc("POST /_matrix/client/v3/account/3pid", a.RequireUserAuth(a.Add3PID))
-	mux.HandleFunc("POST /_matrix/client/unstable/account/3pid/bind", a.RequireUserAuth(a.Bind3PID))
-	mux.HandleFunc("POST /_matrix/client/v3/account/3pid/bind", a.RequireUserAuth(a.Bind3PID))
+	mux.HandleFunc("POST /_matrix/client/unstable/account/3pid/bind", a.RequireUserAuth(a.PerUser(a.Limits.Account, a.Bind3PID)))
+	mux.HandleFunc("POST /_matrix/client/v3/account/3pid/bind", a.RequireUserAuth(a.PerUser(a.Limits.Account, a.Bind3PID)))
 	mux.HandleFunc("POST /_matrix/client/v3/account/3pid/delete", a.RequireUserAuth(a.Delete3PID))
 	mux.HandleFunc("POST /_matrix/client/unstable/account/3pid/unbind", a.RequireUserAuth(a.Unbind3PID))
 	mux.HandleFunc("POST /_matrix/client/v3/account/3pid/unbind", a.RequireUserAuth(a.Unbind3PID))

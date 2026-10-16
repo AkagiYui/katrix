@@ -12,8 +12,8 @@ import (
 
 // registerDirectory wires the user directory and room-event search endpoints.
 func (a *API) registerDirectory(mux *http.ServeMux) {
-	mux.HandleFunc("POST /_matrix/client/v3/user_directory/search", a.RequireAuth(a.UserDirectorySearch))
-	mux.HandleFunc("POST /_matrix/client/v3/search", a.RequireAuth(a.Search))
+	mux.HandleFunc("POST /_matrix/client/v3/user_directory/search", a.RequireAuth(a.PerUser(a.Limits.Account, a.UserDirectorySearch)))
+	mux.HandleFunc("POST /_matrix/client/v3/search", a.RequireAuth(a.PerUser(a.Limits.Account, a.Search)))
 }
 
 // UserDirectorySearch handles POST /_matrix/client/v3/user_directory/search.

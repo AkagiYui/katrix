@@ -147,6 +147,10 @@ sub _get_config
       # skip TLS verification for outbound HTTP push notifications.
       push_insecure => $JSON::true,
 
+      # SyTest drives the client API far faster than the default rate limits
+      # allow (Synapse's sytest config raises its rc_* limits likewise).
+      rate_limiting => { enabled => $JSON::false },
+
       # The sytest URL-preview mock serves the previewed page from a loopback
       # URL (https://localhost:<port>/test.html) with a self-signed
       # certificate. The mock is part of the test environment, so allow

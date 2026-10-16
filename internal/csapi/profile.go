@@ -20,14 +20,14 @@ func (a *API) registerProfile(mux *http.ServeMux) {
 	// Profile edits use RequireAuth (not RequireUserAuth): per the spec a guest
 	// may set their own display name and avatar (the guest_access sytest suite
 	// exercises exactly this).
-	mux.HandleFunc("PUT /_matrix/client/v3/profile/{userId}/displayname", a.RequireAuth(a.SetDisplayName))
+	mux.HandleFunc("PUT /_matrix/client/v3/profile/{userId}/displayname", a.RequireAuth(a.PerUser(a.Limits.Account, a.SetDisplayName)))
 	mux.HandleFunc("GET /_matrix/client/v3/profile/{userId}/avatar_url", a.GetAvatarURL)
-	mux.HandleFunc("PUT /_matrix/client/v3/profile/{userId}/avatar_url", a.RequireAuth(a.SetAvatarURL))
+	mux.HandleFunc("PUT /_matrix/client/v3/profile/{userId}/avatar_url", a.RequireAuth(a.PerUser(a.Limits.Account, a.SetAvatarURL)))
 	// Extended profile fields (MSC4133, spec v1.16):
 	// GET/PUT/DELETE /profile/{userId}/{keyName}.
 	mux.HandleFunc("GET /_matrix/client/v3/profile/{userId}/{keyName}", a.GetProfileField)
-	mux.HandleFunc("PUT /_matrix/client/v3/profile/{userId}/{keyName}", a.RequireAuth(a.SetProfileField))
-	mux.HandleFunc("DELETE /_matrix/client/v3/profile/{userId}/{keyName}", a.RequireAuth(a.DeleteProfileField))
+	mux.HandleFunc("PUT /_matrix/client/v3/profile/{userId}/{keyName}", a.RequireAuth(a.PerUser(a.Limits.Account, a.SetProfileField)))
+	mux.HandleFunc("DELETE /_matrix/client/v3/profile/{userId}/{keyName}", a.RequireAuth(a.PerUser(a.Limits.Account, a.DeleteProfileField)))
 }
 
 // GetProfile handles GET /_matrix/client/v3/profile/{userId}.

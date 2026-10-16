@@ -41,6 +41,17 @@ type Registration struct {
 	// third-party protocols this AS provides. The homeserver exposes the AS's
 	// protocol metadata to clients via the thirdparty endpoints.
 	Protocols []string `yaml:"protocols"`
+
+	// RateLimited (spec "Registration"): whether requests from users the
+	// AS masquerades as are rate-limited; the AS sender never is. Absent
+	// means true.
+	RateLimited *bool `yaml:"rate_limited"`
+}
+
+// MasqueradeRateLimited reports whether requests the AS makes on behalf of
+// its users are subject to rate limits.
+func (r *Registration) MasqueradeRateLimited() bool {
+	return r.RateLimited == nil || *r.RateLimited
 }
 
 // Namespace is one regex (plus its exclusivity flag) in an appservice

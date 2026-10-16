@@ -43,10 +43,10 @@ func (a *API) registerSync(mux *http.ServeMux) {
 	// MSC3391: account data delete lives under the unstable namespace.
 	mux.HandleFunc("DELETE /_matrix/client/unstable/org.matrix.msc3391/user/{userID}/account_data/{type}", a.RequireAuth(a.DeleteAccountData))
 	mux.HandleFunc("DELETE /_matrix/client/unstable/org.matrix.msc3391/user/{userID}/rooms/{roomID}/account_data/{type}", a.RequireAuth(a.DeleteRoomAccountData))
-	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/read_markers", a.RequireAuth(a.ReadMarkers))
-	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/receipt/{receiptType}/{eventID}", a.RequireAuth(a.Receipt))
+	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/read_markers", a.RequireAuth(a.PerUser(a.Limits.Account, a.ReadMarkers)))
+	mux.HandleFunc("POST /_matrix/client/v3/rooms/{roomID}/receipt/{receiptType}/{eventID}", a.RequireAuth(a.PerUser(a.Limits.Account, a.Receipt)))
 	mux.HandleFunc("GET /_matrix/client/v3/presence/{userID}/status", a.RequireAuth(a.PresenceGet))
-	mux.HandleFunc("PUT /_matrix/client/v3/presence/{userID}/status", a.RequireAuth(a.PresencePut))
+	mux.HandleFunc("PUT /_matrix/client/v3/presence/{userID}/status", a.RequireAuth(a.PerUser(a.Limits.Presence, a.PresencePut)))
 }
 
 // Sync handles GET /_matrix/client/v3/sync.

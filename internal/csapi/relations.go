@@ -20,7 +20,7 @@ func (a *API) registerRelations(mux *http.ServeMux) {
 	mux.HandleFunc("GET /_matrix/client/v1/rooms/{roomID}/relations/{eventID}", a.RequireAuth(a.Relations))
 	mux.HandleFunc("GET /_matrix/client/v1/rooms/{roomID}/relations/{eventID}/{relType}", a.RequireAuth(a.Relations))
 	mux.HandleFunc("GET /_matrix/client/v1/rooms/{roomID}/relations/{eventID}/{relType}/{eventType}", a.RequireAuth(a.Relations))
-	mux.HandleFunc("GET /_matrix/client/v1/rooms/{roomID}/threads", a.RequireAuth(a.RoomThreads))
+	mux.HandleFunc("GET /_matrix/client/v1/rooms/{roomID}/threads", a.RequireAuth(a.PerUser(a.Limits.Account, a.RoomThreads)))
 	mux.HandleFunc("POST /_matrix/client/unstable/event_relationships", a.RequireAuth(a.EventRelationships))
 }
 
