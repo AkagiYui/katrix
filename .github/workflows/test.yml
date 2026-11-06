@@ -384,6 +384,12 @@ jobs:
           repository: matrix-org/matrix-rust-sdk
           ref: main
           path: complement-crypto/rust-sdk
+      - name: checkout matrix-js-sdk
+        uses: actions/checkout@v7
+        with:
+          repository: matrix-org/matrix-js-sdk
+          ref: develop
+          path: matrix-js-sdk
       # complement-crypto tracks matrix-rust-sdk main, which has moved ahead of
       # complement-crypto's wrapper code. Apply katrix's local patches before
       # building (see complement-crypto/patches/). A patch that no longer
@@ -413,14 +419,23 @@ jobs:
           # (sources), never the compiled target, so every build is coherent.
           cache-targets: false
 
-      # complement-crypto vendorises the JS SDK into its own tree via yarn.
-      # matrix-js-sdk's active branch is "develop" (it has no "main"), which is
-      # what complement-crypto's resolve_branch.sh resolves to on its main
-      # branch.
+      # Build the current develop branch with its own pnpm lockfile first.
+      # Installing the Git dependency directly with Yarn runs the SDK's pnpm
+      # prepare script in a Yarn-populated node_modules, loading duplicate
+      # @types/chai declarations. A built tarball keeps the SDK's development
+      # dependencies out of Complement's Yarn tree while still tracking upstream.
+      - name: package JS SDK
+        working-directory: matrix-js-sdk
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          # pack runs the SDK's prepare hook, compiling JS and declarations.
+          pnpm pack --out "$RUNNER_TEMP/matrix-js-sdk.tgz"
+
       - name: build JS SDK
         run: |
           cd complement-crypto
-          ./rebuild_js_sdk.sh "matrix-js-sdk@https://github.com/matrix-org/matrix-js-sdk#develop"
+          ./rebuild_js_sdk.sh "matrix-js-sdk@file:$RUNNER_TEMP/matrix-js-sdk.tgz"
 
       # Build the matrix-sdk-ffi crate and generate the Go bindings. Upstream
       # moved the one-off shell scripts into a `just` recipe set (justfile), so
